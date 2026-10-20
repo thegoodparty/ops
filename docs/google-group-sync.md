@@ -268,6 +268,44 @@ future pair is
 subject to the reserved-target invariant: it may not be `Admins`
 (`88c1b330-a001-707a-06ca-94e289013bf5`) or any future sheriff-managed group.
 
+### The second pair: `Approvers`
+
+A parallel sync of the `Engineering Admin` Workspace group
+(`eng-admin@goodparty.org`) into a new `Approvers` Identity Center group. It is
+the `engineers-google` entry with the source and the target swapped, and it
+changes the same two places "Adding a pair" names: the pair list and the
+grant's `TARGET_GROUP_ARNS`.
+
+```ts
+{
+  id: "approvers-google",
+  sourceGroupEmail: "eng-admin@goodparty.org",
+  targetGroupId: APPROVERS_GROUP_ID, // Approvers
+  mode: "dry-run",
+  removalCap: { maxCount: 5, maxFraction: 0.1 },
+  allowlist: ["@goodparty.org"],
+  removalAlertThreshold: 0,
+}
+```
+
+It starts in `dry-run`, per "Adding a pair" step 4: the change is one entry in
+the pair list, and the reviewed dry-run diff is what justifies flipping it to
+`apply`.
+
+One thing the pair could not carry is the group's id. Groups here are created
+out of band (non-goal 7), an id cannot be derived, and the change that added
+the pair had no access to the management account's identity store to read it
+back, so both files name the placeholder `PENDING_APPROVERS_GROUP_ID` until
+someone creates `Approvers` (identity store `d-9267e5cf96`, region `us-west-2`)
+and replaces it. A pair in that state fails closed: the target read aborts the
+pair with `identity-read-failed` before any write, so the `Aborted` alarm pages
+and the pair's heartbeat alarm trips, which is why it must not be applied
+before the id is in.
+
+Whether `Approvers` also gets a permission set and an account assignment is a
+separate decision, and an open one. A group with no assignment mirrors
+membership faithfully and gives its members nothing to sign in to.
+
 ### Where it lives
 
 - **The list**: `deploy-infrastructure/group-sync/config.ts`, as a typed

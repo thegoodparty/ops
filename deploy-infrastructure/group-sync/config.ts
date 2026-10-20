@@ -111,6 +111,31 @@ export type SyncAbortReason =
 export const POLL_INTERVAL_SECONDS = 15 * 60;
 
 /**
+ * The `Approvers` Identity Center group's id. **A placeholder, and the one
+ * value this change cannot supply.**
+ *
+ * Every Identity Center group in this repo is created out of band and recorded
+ * by id (`deploy/components/identity-center.ts`, and non-goal 7 in
+ * `docs/google-group-sync.md`); nothing here creates a group, and an id is not
+ * derivable -- it is read back from the identity store once the group exists.
+ * So `approvers-google` below cannot work until someone with management-account
+ * access creates `Approvers` in identity store `d-9267e5cf96` and replaces this
+ * token in the two files that name it:
+ *
+ *   1. this constant, and
+ *   2. `TARGET_GROUP_ARNS` in `deploy/components/identity-group-sync-grant.ts`,
+ *      as `arn:aws:identitystore:::group/<id>` -- the ARN the assumed role must
+ *      be authorized for, which is "Adding a pair" step 2.
+ *
+ * Until then the pair fails closed but noisily rather than dangerously: the
+ * target read against a group that does not exist aborts the pair with
+ * `identity-read-failed` before any write, so the `Aborted` alarm pages and the
+ * pair's heartbeat alarm trips (its `Success` metric never appears). Do not
+ * apply this before the id is in place.
+ */
+const APPROVERS_GROUP_ID = "PENDING_APPROVERS_GROUP_ID";
+
+/**
  * The first real pair, resolved by the engineer in step 3 (open question 7):
  * the `engineering@goodparty.org` Workspace group mirrors the `Engineers`
  * Identity Center group, whose id and ARN are already in the merged grant
@@ -128,6 +153,15 @@ export const POLL_INTERVAL_SECONDS = 15 * 60;
  * removal and nothing else. `runPair` returns before any write unless the mode
  * is `apply`, which is why the mode is the whole change.
  *
+ * The second entry is the `Engineering Admin` Workspace group
+ * (`eng-admin@goodparty.org`) mirroring the `Approvers` Identity Center group,
+ * as a parallel sync: same id shape (`<target>-google`), same cap, same alert
+ * threshold, same allowlist. It is `dry-run` because that is "Adding a pair"
+ * step 4 -- every pair starts there, and a reviewed dry-run diff is what
+ * justifies flipping it to `apply`, exactly as the first pair did in PR #351.
+ * Its `targetGroupId` is the placeholder above, so read that comment before
+ * enabling it.
+ *
  * The cap and alert threshold are the plan's defaults (`maxCount: 5`,
  * `maxFraction: 0.1`, `removalAlertThreshold: 0`), still placeholders for the
  * same reason as the interval. The allowlist is the organization's domain, as
@@ -141,6 +175,15 @@ export const SYNC_PAIRS: readonly SyncPair[] = [
     sourceGroupEmail: "engineering@goodparty.org",
     targetGroupId: "383193a0-7001-70d9-a321-ffe6d8af7378", // Engineers
     mode: "apply",
+    removalCap: { maxCount: 5, maxFraction: 0.1 },
+    allowlist: ["@goodparty.org"],
+    removalAlertThreshold: 0,
+  },
+  {
+    id: "approvers-google",
+    sourceGroupEmail: "eng-admin@goodparty.org",
+    targetGroupId: APPROVERS_GROUP_ID, // Approvers
+    mode: "dry-run",
     removalCap: { maxCount: 5, maxFraction: 0.1 },
     allowlist: ["@goodparty.org"],
     removalAlertThreshold: 0,

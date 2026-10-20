@@ -47,6 +47,14 @@ export const GRANT_SESSION_NAME = "identity-group-sync";
 // returns (AWS SDK `GetGroupId`/`GetUserId` examples).
 const TARGET_GROUP_ARNS = [
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378",
+  // The `Approvers` group, the target of the `approvers-google` pair in
+  // `deploy-infrastructure/group-sync/config.ts`. Its id is a placeholder
+  // there too: neither file can know the id until the group exists, because
+  // every Identity Center group in this repo is created out of band. Replace
+  // both occurrences together, and see the comment on `APPROVERS_GROUP_ID` in
+  // that config for what happens if this applies first (the pair fails closed
+  // on its target read; nothing is written).
+  "arn:aws:identitystore:::group/PENDING_APPROVERS_GROUP_ID",
 ];
 
 // The user id and the returned membership id do not exist when the policy is

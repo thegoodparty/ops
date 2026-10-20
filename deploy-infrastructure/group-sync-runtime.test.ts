@@ -75,6 +75,18 @@ import { GRANT_SESSION_NAME } from "../deploy/components/identity-group-sync-gra
 const ENGINEERS_GROUP_ID = "383193a0-7001-70d9-a321-ffe6d8af7378";
 const ADMINS_GROUP_ID = "88c1b330-a001-707a-06ca-94e289013bf5";
 
+// The `Approvers` group does not exist yet, so `approvers-google` carries the
+// placeholder id `deploy-infrastructure/group-sync/config.ts` declares. Pinned
+// so that the placeholder is a reviewed value and not something that can drift
+// into a pair that silently points at nothing.
+const APPROVERS_GROUP_ID = "PENDING_APPROVERS_GROUP_ID";
+
+const pairById = (id: string) => {
+  const found = SYNC_PAIRS.find((pair) => pair.id === id);
+  assert.ok(found, `no configured pair ${id}`);
+  return found;
+};
+
 const identityCenterSource = (): string =>
   fs.readFileSync(
     path.resolve(__dirname, "../deploy/components/identity-center.ts"),
@@ -87,13 +99,30 @@ describe("the configured sync pair", () => {
     // group was reviewed, and this is the reviewed change that flips it to
     // `apply`. It is asserted here rather than assumed, so a pair that quietly
     // starts writing -- or stops -- is a failing test.
-    assert.equal(SYNC_PAIRS.length, 1);
-    const [pair] = SYNC_PAIRS;
+    assert.equal(SYNC_PAIRS.length, 2);
+    const pair = pairById("engineers-google");
     assert.deepEqual(pair, {
       id: "engineers-google",
       sourceGroupEmail: "engineering@goodparty.org",
       targetGroupId: ENGINEERS_GROUP_ID,
       mode: "apply",
+      removalCap: { maxCount: 5, maxFraction: 0.1 },
+      allowlist: ["@goodparty.org"],
+      removalAlertThreshold: 0,
+    });
+  });
+
+  it("adds the eng-admin@ Workspace group into Approvers, starting in dry-run", () => {
+    // The second pair is a parallel copy of the first: same id shape, same cap,
+    // same allowlist. It starts in `dry-run` because that is "Adding a pair"
+    // step 4, and it is pinned here so flipping it to `apply` -- or changing
+    // its source, target or allowlist -- is a reviewed change to this test.
+    // Its target id is the placeholder until the group is created out of band.
+    assert.deepEqual(pairById("approvers-google"), {
+      id: "approvers-google",
+      sourceGroupEmail: "eng-admin@goodparty.org",
+      targetGroupId: APPROVERS_GROUP_ID,
+      mode: "dry-run",
       removalCap: { maxCount: 5, maxFraction: 0.1 },
       allowlist: ["@goodparty.org"],
       removalAlertThreshold: 0,
@@ -107,7 +136,7 @@ describe("the configured sync pair", () => {
     const source = identityCenterSource();
     assert.match(
       source,
-      new RegExp(`Engineers: "${SYNC_PAIRS[0].targetGroupId}"`),
+      new RegExp(`Engineers: "${pairById("engineers-google").targetGroupId}"`),
     );
   });
 
@@ -980,14 +1009,22 @@ describe("the invocation", () => {
     const { deps } = handlerDeps({ calls, metrics: metrics.metrics });
     const outcomes = await handle({ action: "sync" }, deps);
 
-    assert.equal(outcomes.length, 1);
-    assert.equal(outcomes[0].pairId, "engineers-google");
-    assert.equal(outcomes[0].aborted, null);
-    assert.equal(outcomes[0].counts.wouldAdd, 1);
+    // Both configured pairs run, in config order. The second one is `dry-run`,
+    // so the write assertions below stay the first pair's alone.
+    assert.deepEqual(
+      outcomes.map((outcome) => outcome.pairId),
+      ["engineers-google", "approvers-google"],
+    );
+    const outcome = outcomes.find(
+      (candidate) => candidate.pairId === "engineers-google",
+    );
+    assert.ok(outcome);
+    assert.equal(outcome.aborted, null);
+    assert.equal(outcome.counts.wouldAdd, 1);
     // The configured pair is `apply`, so the diff reaches the write path. The
     // dry-run path is covered separately above; this test is what would fail if
     // the mode in the config stopped matching the mode the handler acts on.
-    assert.equal(outcomes[0].counts.added, 1);
+    assert.equal(outcome.counts.added, 1);
     assert.deepEqual(writes(calls), [
       "CreateUser:alice@goodparty.org",
       "CreateGroupMembership:u-alice",
