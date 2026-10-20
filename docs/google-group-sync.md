@@ -1,16 +1,15 @@
 # Google Workspace → IAM Identity Center group sync
 
-> **Status: built through step 3, with step 4 in progress.** The
+> **Status: built through step 4, and the first pair is applying.** The
 > management-account grant, the Google read adapter, the pure diff and guards,
-> and the runtime are all in the repo and tested. Step 4's integration test
-> exists, and the deployment state it needs -- the impersonation admin's address
-> in the infrastructure stack's config -- is now set; what has not happened is
-> the rollout itself: a dry run against the real group, the review of that diff,
-> and the reviewed change that flips the first pair to `apply`. The decisions
-> below were settled in a design review and are recorded as decisions rather
-> than options; the few things still genuinely open are in "Open questions" at
-> the end and are marked **open**. The steps in "Implementation plan" carry
-> their own status; steps 1, 2 and 3 are `done` and step 4 is `doing`.
+> the runtime and the integration test are all in the repo and tested. The
+> rollout's dry run against the real group has been reviewed, and the reviewed
+> change that flips the first pair to `apply` has landed: the first apply is
+> the 2 removals that dry run reported and nothing else. The decisions below
+> were settled in a design review and are recorded as decisions rather than
+> options; the few things still genuinely open are in "Open questions" at the
+> end and are marked **open**. The steps in "Implementation plan" carry their
+> own status, and steps 1 to 4 are `done`.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -252,7 +251,7 @@ merged grant:
   id: "engineers-google",
   sourceGroupEmail: "engineering@goodparty.org",
   targetGroupId: "383193a0-7001-70d9-a321-ffe6d8af7378", // Engineers
-  mode: "dry-run",
+  mode: "apply",
   removalCap: { maxCount: 5, maxFraction: 0.1 },
   allowlist: ["@goodparty.org"],
   removalAlertThreshold: 0,
@@ -262,8 +261,10 @@ merged grant:
 The id keeps the plan's worked-example shape (`<target>-google`) rather than
 following the source group's spelling: the source is `engineering@` (the
 Workspace group's name) and the target is `Engineers` (the Identity Center
-group's name). The pair ships `dry-run`, per "Rollout"; the cap and the alert
-threshold are still the placeholders of open question 5. Any future pair is
+group's name). The pair shipped `dry-run` and was flipped to `apply` by
+"Rollout" step 4 once its dry-run diff was reviewed (2026-10-20, PR #351); the
+cap and the alert threshold are still the placeholders of open question 5. Any
+future pair is
 subject to the reserved-target invariant: it may not be `Admins`
 (`88c1b330-a001-707a-06ca-94e289013bf5`) or any future sheriff-managed group.
 
@@ -791,6 +792,10 @@ the email, which is called out in the PR body like the `sheriff` one.
    the dry-run removals are what a human expects.
 4. Flip the first pair to `mode: "apply"` in a reviewed Pulumi change. The
    removals alarm is on from the start, so the first real removal pages.
+   **Landed** 2026-10-20 (PR #351): the reviewed dry run reported 9 source
+   members, 11 target members, `wouldAdd: 0`, `wouldRemove: 2` and
+   `removalCapTripped: false`, so the first apply is those 2 removals and no
+   additions.
 5. Add further pairs the same way, one at a time, each starting dry-run.
 
 One rollout prerequisite is still manual. The `googleImpersonationEmail` key
@@ -899,16 +904,19 @@ the Lambda's first run is an `AssumeRole` and a missing role is an
       `Aborted` and the removal-cap alarm, plus the plan's separate removals
       alarm per pair, which the rollout leans on. The handler itself lives in
       `deploy-infrastructure/group-sync/`, beside the step 2 modules.)
-- [ ] 4. The integration test and the rollout: dry-run against the real group,
+- [x] 4. The integration test and the rollout: dry-run against the real group,
       review the diff, then the Pulumi change that flips the first pair to
-      `apply`. `doing`
+      `apply`. `done` (2026-10-20, PR #351)
       (Done by the step 4 test/config PR: the integration test
       `deploy-infrastructure/group-sync-integration.test.ts` and the
       `googleImpersonationEmail` stack config key, which is what lets the
-      first dry run succeed. **Not done:** the rollout. Nothing has been run
-      against the real group yet, its dry-run diff has not been reviewed, and
-      the first pair is still `mode: "dry-run"`. The box stays unticked until
-      that reviewed `apply` change lands.)
+      first dry run succeed. **Rollout:** the dry run completed successfully
+      and its diff was reviewed -- 9 source members, 11 target members,
+      `toCreate: 0`, `wouldAdd: 0`, `wouldRemove: 2`,
+      `removalCapTripped: false` -- so the first pair is `mode: "apply"` and
+      the first apply is those 2 removals, with nothing added. The deploy
+      workflow writes the new pair list to SSM on merge; the next scheduled
+      run applies it and the removals alarm pages for it, as designed.)
 
 ## Open questions
 
@@ -968,7 +976,7 @@ above.
    Center group, subject to the reserved-target invariant. **Resolved:** the
    `engineering@goodparty.org` Workspace group mirrors the `Engineers` Identity
    Center group (`383193a0-7001-70d9-a321-ffe6d8af7378`), whose ARN is already
-   in the merged grant. The pair ships `dry-run`.
+   in the merged grant. The pair shipped `dry-run` and is now `apply`.
 
 ## Grounding: the files this touches
 

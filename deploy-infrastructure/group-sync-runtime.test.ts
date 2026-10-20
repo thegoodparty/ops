@@ -82,14 +82,18 @@ const identityCenterSource = (): string =>
   );
 
 describe("the configured sync pair", () => {
-  it("ships the engineering@ Workspace group mirrored into Engineers, dry-run", () => {
+  it("applies the engineering@ Workspace group into Engineers after its reviewed dry run", () => {
+    // Rollout step 4: the pair shipped `dry-run`, the dry run against the real
+    // group was reviewed, and this is the reviewed change that flips it to
+    // `apply`. It is asserted here rather than assumed, so a pair that quietly
+    // starts writing -- or stops -- is a failing test.
     assert.equal(SYNC_PAIRS.length, 1);
     const [pair] = SYNC_PAIRS;
     assert.deepEqual(pair, {
       id: "engineers-google",
       sourceGroupEmail: "engineering@goodparty.org",
       targetGroupId: ENGINEERS_GROUP_ID,
-      mode: "dry-run",
+      mode: "apply",
       removalCap: { maxCount: 5, maxFraction: 0.1 },
       allowlist: ["@goodparty.org"],
       removalAlertThreshold: 0,
@@ -970,7 +974,7 @@ describe("the invocation", () => {
     assert.match(String(aborted?.fields.detail), /not-a-pair/);
   });
 
-  it("runs the configured pair from the SSM value, dry-run, with no writes", async () => {
+  it("runs the configured pair from the SSM value in its configured mode", async () => {
     const calls: string[] = [];
     const metrics = memoryMetrics();
     const { deps } = handlerDeps({ calls, metrics: metrics.metrics });
@@ -980,7 +984,14 @@ describe("the invocation", () => {
     assert.equal(outcomes[0].pairId, "engineers-google");
     assert.equal(outcomes[0].aborted, null);
     assert.equal(outcomes[0].counts.wouldAdd, 1);
-    assert.deepEqual(writes(calls), []);
+    // The configured pair is `apply`, so the diff reaches the write path. The
+    // dry-run path is covered separately above; this test is what would fail if
+    // the mode in the config stopped matching the mode the handler acts on.
+    assert.equal(outcomes[0].counts.added, 1);
+    assert.deepEqual(writes(calls), [
+      "CreateUser:alice@goodparty.org",
+      "CreateGroupMembership:u-alice",
+    ]);
     assert.equal(
       metricValues(
         metrics.records as never,
