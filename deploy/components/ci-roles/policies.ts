@@ -337,7 +337,6 @@ export const githubActionsPulumiDeploy: PolicyDocument = {
       ],
       Resource: [
         "arn:aws:sns:us-west-2:333022194791:autopilot-*",
-        "arn:aws:sns:us-west-2:333022194791:engineer-agent-*",
         "arn:aws:sns:us-west-2:333022194791:alert-filter-*",
       ],
     },
@@ -357,7 +356,6 @@ export const githubActionsPulumiDeploy: PolicyDocument = {
       ],
       Resource: [
         "arn:aws:events:us-west-2:333022194791:rule/autopilot-*",
-        "arn:aws:events:us-west-2:333022194791:rule/engineer-agent-*",
       ],
     },
     {
