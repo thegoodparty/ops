@@ -197,7 +197,7 @@ export const OAUTH2_PROXY_SECRET_NAME = "bifrost/oauth2-proxy";
 
 /**
  * The keys inside `bifrost/gateway`, in the order the runbook's header lists
- * them. These are the four the gateway container gets, and they are the keys
+ * them. These are the five the gateway container gets, and they are the keys
  * the script writes — the same names, so nothing has to be renamed on either
  * side.
  *
@@ -211,11 +211,20 @@ export const OAUTH2_PROXY_SECRET_NAME = "bifrost/oauth2-proxy";
  * credential for the dashboard and governance API; they arrive here now
  * because they belong to this container, and they are inert until the admin
  * surface is reachable (item 9 puts oauth2-proxy in front of it).
+ *
+ * `BIFROST_SETUP_TOKEN` is the bootstrap secret from phase 2 item 11 that a
+ * fresh deployment is claimed with. At the pinned tag Bifrost reads it from
+ * this environment variable as well as from `config.json`'s top-level
+ * `setup_token` (`resolveSetupToken` in `transports/bifrost-http/lib/config.go`
+ * at `v2.3.0`), so injecting it here is what makes the claim path work before
+ * item 10's `BIFROST_CONFIG` injection lands, and it stays the value the
+ * file's `env.BIFROST_SETUP_TOKEN` reference resolves to afterwards.
  */
 export const GATEWAY_SECRET_KEYS = [
   "BIFROST_ENCRYPTION_KEY",
   "BIFROST_ADMIN_USERNAME",
   "BIFROST_ADMIN_PASSWORD",
+  "BIFROST_SETUP_TOKEN",
   "FIREWORKS_API_KEY",
 ] as const;
 
@@ -594,9 +603,13 @@ export const createBifrostEcs = (args: {
    * - The `secrets` block is not a list of keys read from a secret. It is the
    *   declared lists above, plus `PG_PASSWORD` from the RDS-managed ARN; see
    *   the module header for why nothing here reads Secrets Manager. Bifrost
-   *   gets `bifrost/gateway`'s four and `PG_PASSWORD`; the sidecar gets
+   *   gets `bifrost/gateway`'s five and `PG_PASSWORD`; the sidecar gets
    *   `bifrost/oauth2-proxy`'s three and nothing else, so neither container
-   *   sees the other's credentials.
+   *   sees the other's credentials. The ECS agent resolves every entry before
+   *   the container starts, so a key listed here and absent from the secret is
+   *   a task that never starts: `fill-secrets.sh` has to write
+   *   `BIFROST_SETUP_TOKEN` before a task definition naming it deploys, exactly
+   *   as it already has to write the sidecar's three.
    * - `AWS_REGION` is set because the Bedrock provider needs a region; the
    *   delegate sets `AWS_DEFAULT_REGION` for the same reason. The sidecar has
    *   no AWS configuration at all: it is a Google OAuth proxy.

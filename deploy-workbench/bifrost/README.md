@@ -51,10 +51,26 @@ a later tag. It holds:
   override, metadata logging is on with an explicit 90-day retention, and the
   gateway's public origin is the only allowed CORS origin.
 - **Governance.** Admin username/password auth is on, with both values
-  referenced as `env.` names. The `engineering` team, its budget and the first
-  virtual keys are **item 14** and are deliberately absent, not empty: under
-  `source_of_truth: "config.json"` a present-but-empty section would prune
-  rows created later.
+  referenced as `env.` names. At the pinned tag a file's `auth_config` is
+  *not* write-only the way an API config write is: `loadAuthConfig` in
+  `transports/bifrost-http/lib/config.go` reads it at boot, hashes the
+  password and writes the admin account to the config store, so once this file
+  is injected the account exists and dashboard auth is active from the first
+  start. That is why those two keys stay generated: they are the credential
+  the injected file provisions the account with, and the login automation uses
+  for `/api` — the setup token is not a substitute. It is also why the block is
+  **not** the bootstrap path — see "Claiming a fresh deploy" below for the
+  window in which no admin account exists yet. The `engineering` team, its
+  budget and the first virtual keys are **item 14** and are deliberately
+  absent, not empty: under `source_of_truth: "config.json"` a present-but-empty
+  section would prune rows created later.
+- **The first-run claim.** Top-level `"setup_token":
+  "env.BIFROST_SETUP_TOKEN"` (phase 2 item 11). It is top-level and not under
+  `governance` because that is where `transports/config.schema.json` puts it at
+  `v2.3.0`, and `resolveSetupToken` also reads the `BIFROST_SETUP_TOKEN`
+  environment variable when the file does not set one. The value is a
+  credential: a reference only, never a literal, and the test fails if one
+  appears.
 - **`source_of_truth: "config.json"`** for the sections above, so a redeploy
   converges to the repo instead of preserving UI drift. An omitted section is
   left alone; an empty one prunes.
@@ -62,10 +78,12 @@ a later tag. It holds:
 **What is injected by env.** No secret is in the file. Every credential is an
 `env.NAME` reference, and the names are exactly the keys
 `fill-secrets.sh` writes: `BIFROST_ENCRYPTION_KEY`,
-`BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD` and `FIREWORKS_API_KEY`
-from `bifrost/gateway`. Bedrock has no entry because its credential is the
-role. `config.test.ts` parses the script's key arrays and fails on a
-reference to any name the script does not populate.
+`BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD`, `BIFROST_SETUP_TOKEN` and
+`FIREWORKS_API_KEY` from `bifrost/gateway`. Bedrock has no entry because its
+credential is the role. `config.test.ts` parses the script's key arrays and
+fails on a reference to any name the script does not populate, and
+`deploy-workbench/ecs.test.ts` fails on a reference the task definition does not
+inject either.
 
 **Not yet wired.** Pulumi storing this file as an SSM SecureString and
 injecting it as `BIFROST_CONFIG`, with the container entrypoint writing it to
@@ -75,7 +93,10 @@ PR; it edits the ECS task definition, which
 things follow from that, and neither is fixed here:
 
 - Nothing reads `config.json` until then, so changing this file alone changes
-  no running gateway.
+  no running gateway. The setup token is the exception: Bifrost also reads it
+  from the `BIFROST_SETUP_TOKEN` environment variable, which
+  `deploy-workbench/ecs.ts` already injects from `bifrost/gateway`, so the
+  claim path below works before this file is wired at all.
 - `config_store` and `logs_store` are absent. Their host, port, user and
   database are Pulumi outputs of `rds.ts`, not secrets, and no env name for
   them exists yet; the gateway therefore falls back to its local SQLite store
@@ -143,6 +164,7 @@ the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
 | `bifrost/gateway` | `BIFROST_ENCRYPTION_KEY` | generated, 32 bytes base64url |
 | | `BIFROST_ADMIN_USERNAME` | generated (`bifrost-admin`), safe to print |
 | | `BIFROST_ADMIN_PASSWORD` | generated, never printed |
+| | `BIFROST_SETUP_TOKEN` | generated, never printed; first-run claim, restore and proof of control |
 | | `FIREWORKS_API_KEY` | a human |
 | `bifrost/oauth2-proxy` | `OAUTH2_PROXY_COOKIE_SECRET` | generated, 32 bytes base64url |
 | | `OAUTH2_PROXY_CLIENT_ID` | a human, from the Google client above |
@@ -190,7 +212,11 @@ and exits 2 if a container is missing. `--force` overwrites the values a run
 supplies: it regenerates the admin password and the cookie secret (which signs
 the admin UI out once), and it does **not** rotate `BIFROST_ENCRYPTION_KEY`
 unless `--rotate-encryption-key` is passed too, because rotating that key
-invalidates every provider key already stored in the config store.
+invalidates every provider key already stored in the config store. It
+regenerates `BIFROST_SETUP_TOKEN` too, on the same deliberate `--force`: it is
+the first-admin and restore gate rather than a session, and the new value is in
+Secrets Manager by the end of the run. Keep it after setup — see "Claiming a
+fresh deploy" below for why.
 
 Read the admin username back without exposing anything else:
 
@@ -199,6 +225,77 @@ AWS_PROFILE=<admin profile> aws secretsmanager get-secret-value \
   --secret-id bifrost/gateway --region us-west-2 \
   --query SecretString --output text | jq -r .BIFROST_ADMIN_USERNAME
 ```
+
+Read the setup token back the same way when a fresh instance needs claiming:
+
+```sh
+AWS_PROFILE=<admin profile> aws secretsmanager get-secret-value \
+  --secret-id bifrost/gateway --region us-west-2 \
+  --query SecretString --output text | jq -r .BIFROST_SETUP_TOKEN
+```
+
+## Claiming a fresh deploy (phase 2 item 11)
+
+At the pinned tag Bifrost will not create the first admin account unless the
+operator's setup token is configured and supplied with the request that creates
+it. With no admin account in the config store, the `/api` surface is locked:
+the dashboard serves its setup page instead of the login form, and every `/api`
+call needs the token (or the setup session cookie the dashboard trades it for).
+That is what a technically-successful deploy with no claim looks like, so this
+is a step, not a failure — and it is the step to complete before calling the
+gateway up.
+
+Get the token (above), then **once**, by one of:
+
+- **The UI.** Open `https://bifrost.workbench.goodparty.org` (once item 9's
+oauth2-proxy is in front of it, after the Google sign-in), enter the token in
+the setup page, and create the admin account it hands off to. The dashboard
+keeps an HttpOnly setup session cookie (`POST /api/session/setup`), not the
+token.
+- **An API client.** Send the token in the `X-Bifrost-Setup-Token` header on the
+  `PUT /api/config` request that creates the first admin account; the
+  `auth_config.setup_token` field in that request body is the equivalent for a
+  client that would rather not set a header. Either way, that same request
+  carries the admin username and password.
+
+Then check the deployment is claimed. `is-auth-enabled` is whitelisted, so it
+answers without the token and reports the setup state:
+
+```sh
+curl -sS https://bifrost.workbench.goodparty.org/api/session/is-auth-enabled \
+  | jq '{is_auth_enabled, setup_required, setup_token_configured, inference_auth_enforced}'
+```
+
+`setup_required: false` and `is_auth_enabled: true` mean the claim is done. An
+instance with `setup_required: true, setup_token_configured: false` is the bug
+this section exists to prevent: the API is locked with no way in.
+
+Once dashboard auth is active — an admin account exists and is enabled — the
+setup lock is a no-op and **the token no longer works for `/api`**:
+`APIMiddleware` never consults it, and `ClearBootstrapToken` nils the
+first-admin half (`CheckBootstrapToken` also reports "no token required" as
+soon as any admin account exists). It is not a login and never becomes a bearer
+token. What it keeps is one narrow role: `CheckConfiguredSetupToken`, the
+operator's proof of control for `auth_config` changes made while dashboard auth
+is disabled. Three consequences:
+
+- Keep the value in Secrets Manager. A rebuilt task whose config store is empty
+  has no admin account, so a token nobody retained is a gateway nobody can
+  administer. That is the reason it survives setup.
+- It gates `/api` only. Inference is not behind the setup lock: it is refused
+  by the governance plugin because `client.enforce_auth_on_inference` is true,
+  and that flag remains the only inference control.
+- **Automation does not use it.** Anything scripted against the management API
+  signs in as the admin account — `BIFROST_ADMIN_USERNAME` and
+  `BIFROST_ADMIN_PASSWORD`, i.e. `POST /api/session/login` — or uses a scoped key
+  for inference. So those two keys stay: they are the admin credential, and the
+  setup token is not a replacement for them.
+
+When item 10's `BIFROST_CONFIG` injection lands, the file's
+`governance.auth_config` provisions the admin account at boot, which makes the
+setup lock inactive from the first start. From then on the generated
+`BIFROST_ADMIN_USERNAME` / `BIFROST_ADMIN_PASSWORD` pair *is* the admin login;
+the setup token is only the restore path and the proof of control above.
 
 Until both Google values are present, `bifrost/oauth2-proxy` holds one of three
 credentials. The task definition carries all three, so the ECS agent will not

@@ -72,6 +72,32 @@ const FILL_SECRETS_SOURCE = fs.readFileSync(
   path.resolve(__dirname, "bifrost/fill-secrets.sh"),
   "utf8",
 );
+const BIFROST_CONFIG_SOURCE = fs.readFileSync(
+  path.resolve(__dirname, "bifrost/config.json"),
+  "utf8",
+);
+
+/**
+ * The `env.NAME` references in `bifrost/config.json`. Only the name is looked
+ * at; the test never resolves one and never sees a value.
+ */
+const configEnvReferences = (): string[] => {
+  const out: string[] = [];
+  const walk = (value: unknown): void => {
+    if (typeof value === "string") {
+      const match = /^env\.([A-Z][A-Z0-9_]*)$/.exec(value);
+      if (match) out.push(match[1]);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) walk(entry);
+    } else if (value && typeof value === "object") {
+      for (const entry of Object.values(value as Record<string, unknown>)) {
+        walk(entry);
+      }
+    }
+  };
+  walk(JSON.parse(BIFROST_CONFIG_SOURCE));
+  return out;
+};
 
 /**
  * The source of one named resource's constructor call, from its logical-name
@@ -346,6 +372,7 @@ describe("bifrost ecs", () => {
       "BIFROST_ENCRYPTION_KEY",
       "BIFROST_ADMIN_USERNAME",
       "BIFROST_ADMIN_PASSWORD",
+      "BIFROST_SETUP_TOKEN",
       "FIREWORKS_API_KEY",
     ]);
     assert.deepEqual([...OAUTH2_PROXY_SECRET_KEYS], [
@@ -360,7 +387,7 @@ describe("bifrost ecs", () => {
       );
     }
 
-    // The gateway container gets exactly its own four, by name, from its own
+    // The gateway container gets exactly its own five, by name, from its own
     // container; the sidecar gets its own three, from its own container. Each
     // container's secrets name its own secret container and never the other's.
     const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
@@ -382,6 +409,28 @@ describe("bifrost ecs", () => {
     assert.ok(
       !sidecar.includes("GATEWAY_SECRET_NAME"),
       "the sidecar must not receive the gateway's provider or admin secrets",
+    );
+  });
+
+  it("injects every secret config.json resolves from the environment", () => {
+    // The hole this closes: a name `fill-secrets.sh` writes and `config.json`
+    // resolves by `env.NAME`, but that the task definition never injects,
+    // resolves to nothing at runtime. Every reference in the file has to be one
+    // of the gateway container's own secrets here, which is the check the setup
+    // token's missing injection would have failed.
+    const referenced = configEnvReferences();
+    assert.ok(referenced.length > 0, "config.json references no env vars");
+    for (const name of referenced) {
+      assert.ok(
+        (GATEWAY_SECRET_KEYS as readonly string[]).includes(name),
+        `config.json resolves env.${name}, which the gateway container's secrets do not carry; the reference would resolve to nothing`,
+      );
+    }
+    // And the bootstrap token is one of them, so the claim path cannot quietly
+    // lose its injection again.
+    assert.ok(
+      referenced.includes("BIFROST_SETUP_TOKEN"),
+      "config.json no longer resolves env.BIFROST_SETUP_TOKEN",
     );
   });
 
