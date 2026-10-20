@@ -3,6 +3,7 @@ import * as aws from "@pulumi/aws";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
+import { BIFROST_BOOTSTRAP_TAG } from "./bootstrap-image";
 import {
   BIFROST_PORT,
   createWorkbenchNetwork,
@@ -178,6 +179,11 @@ export const ECS_EXECUTION_MANAGED_POLICY_ARN =
  * failure (`The sum of the container memory and CPU reservations exceeds the
  * task reservation`) and a container with no reservation at all would silently
  * compete with Bifrost for the whole task.
+ *
+ * The bootstrap container below deliberately takes no reservation at all: the
+ * two above already sum to the task, and it is a curl+jq one-shot that lives
+ * for seconds. Fargate allows an unreserved container; it draws from whatever
+ * is not reserved at the time.
  */
 export const TASK_CPU = "512";
 export const TASK_MEMORY = "1024";
@@ -238,6 +244,74 @@ export const OAUTH2_PROXY_SECRET_KEYS = [
   "OAUTH2_PROXY_CLIENT_SECRET",
   "OAUTH2_PROXY_COOKIE_SECRET",
 ] as const;
+
+/**
+ * The one-shot container that claims a fresh deployment (phase 2 item 11), and
+ * the three keys it reads from `bifrost/gateway`.
+ *
+ * Upstream's setup lock only accepts one call while no admin account exists: a
+ * `PUT /api/config` carrying `auth_config`, authenticated with this token. It
+ * has to come from inside the task — once item 9's oauth2-proxy fronts the
+ * gateway, the ALB sends admin paths to Google sign-in before they reach
+ * Bifrost, and `127.0.0.1:8080` inside the task's namespace is the only path
+ * that does not.
+ *
+ * It is `essential: false` on purpose. A claim that cannot run (the gateway is
+ * not healthy, the password fails upstream's policy) must not stop the gateway
+ * serving inference; the failure is visible as this container's `awslogs`
+ * stream and its stopped reason, and a metric-filter alarm on it is the
+ * follow-up that turns it into a page. It is ordered after the gateway is
+ * `HEALTHY`, which is why the gateway container now carries an ECS
+ * `healthCheck`: `dependsOn` conditions are ECS's, not Docker's, and the
+ * `HEALTHCHECK` in the upstream Dockerfile is invisible to Fargate.
+ */
+export const BIFROST_BOOTSTRAP_CONTAINER_NAME = "bifrost-bootstrap";
+export const BIFROST_BOOTSTRAP_LOG_STREAM_PREFIX = "bifrost-bootstrap";
+
+/** The subset of `bifrost/gateway` the claim container reads, and no more. */
+export const BIFROST_BOOTSTRAP_SECRET_KEYS = [
+  "BIFROST_SETUP_TOKEN",
+  "BIFROST_ADMIN_USERNAME",
+  "BIFROST_ADMIN_PASSWORD",
+] as const;
+
+/**
+ * The address the claim talks to. The task's containers share a network
+ * namespace, so this is the gateway with no hop back through the ALB; the port
+ * comes from `network.ts`, the same constant the container publishes and the
+ * security group admits.
+ */
+export const BIFROST_API_BASE_URL_ENV_NAME = "BIFROST_API_BASE_URL";
+export const BIFROST_API_BASE_URL = `http://127.0.0.1:${BIFROST_PORT}`;
+
+/**
+ * The gateway's ECS health check, which is what the claim's `dependsOn: HEALTHY`
+ * waits on. `/health` is whitelisted by Bifrost's auth middleware and is served
+ * from the process itself, so this tests the gateway rather than the ALB. The
+ * command uses busybox `wget`, which the upstream runtime image ships (its own
+ * Dockerfile HEALTHCHECK uses the same binary).
+ *
+ * The values are generous on purpose: this is a Go process that loads its
+ * config store on start, and a start period that is too short would restart a
+ * healthy task mid-boot. Three failures at 15s intervals is the same
+ * order of magnitude the upstream Dockerfile uses.
+ */
+export const BIFROST_HEALTH_CHECK: {
+  command: string[];
+  interval: number;
+  timeout: number;
+  retries: number;
+  startPeriod: number;
+} = {
+  command: [
+    "CMD-SHELL",
+    `wget -q -O /dev/null ${BIFROST_API_BASE_URL}/health || exit 1`,
+  ],
+  interval: 15,
+  timeout: 5,
+  retries: 3,
+  startPeriod: 30,
+};
 
 /**
  * The RDS-managed master password, injected as the task's `PG_PASSWORD`.
@@ -456,6 +530,13 @@ export const createBifrostEcs = (args: {
    * task definition revision.
    */
   oauth2ProxyRepositoryUrl: pulumi.Input<string>;
+  /**
+   * The derived bootstrap image's repository, from `bootstrap-image.ts`. Its
+   * tag is content-addressed on the claim script and its Dockerfile, so it
+   * comes from that module rather than from a literal; a changed claim is a
+   * new tag and a new task definition revision.
+   */
+  bootstrapRepositoryUrl: pulumi.Input<string>;
 }) => {
   const {
     provider,
@@ -464,10 +545,12 @@ export const createBifrostEcs = (args: {
     ingress,
     repositoryUrl,
     oauth2ProxyRepositoryUrl,
+    bootstrapRepositoryUrl,
   } = args;
 
   const imageUri = pulumi.interpolate`${repositoryUrl}:${BIFROST_UPSTREAM_TAG}`;
   const oauth2ProxyImageUri = pulumi.interpolate`${oauth2ProxyRepositoryUrl}:${OAUTH2_PROXY_TAG}`;
+  const bootstrapImageUri = pulumi.interpolate`${bootstrapRepositoryUrl}:${BIFROST_BOOTSTRAP_TAG}`;
 
   /**
    * The cluster. Container insights on, per the plan: it is the only
@@ -594,7 +677,9 @@ export const createBifrostEcs = (args: {
    *
    * - Two containers: Bifrost, and the oauth2-proxy sidecar that gates the
    *   admin surface. Item 8 shipped Bifrost alone; item 9 adds the sidecar
-   *   once its image and secret references exist.
+   *   once its image and secret references exist. A third, non-essential
+   *   one-shot container (item 11) claims the deployment after the gateway is
+   *   healthy; see `BIFROST_BOOTSTRAP_CONTAINER_NAME` above.
    * - No review bucket, no `AGENT_VERSION`, no metric filters: those are the
    *   delegate's concerns, not the gateway's.
    * - `cpu`/`memory` are 512/1024 rather than 1024/4096, per the plan's
@@ -628,6 +713,7 @@ export const createBifrostEcs = (args: {
     .all([
       imageUri,
       oauth2ProxyImageUri,
+      bootstrapImageUri,
       database.secretArn,
       logGroup.name,
     ])
@@ -635,6 +721,7 @@ export const createBifrostEcs = (args: {
       ([
         resolvedImage,
         resolvedOauth2ProxyImage,
+        resolvedBootstrapImage,
         databaseSecretArn,
         resolvedLogGroupName,
       ]) => [
@@ -644,6 +731,7 @@ export const createBifrostEcs = (args: {
           cpu: BIFROST_CONTAINER_CPU,
           memory: BIFROST_CONTAINER_MEMORY,
           essential: true,
+          healthCheck: BIFROST_HEALTH_CHECK,
           portMappings: [
             {
               containerPort: BIFROST_PORT,
@@ -716,6 +804,47 @@ export const createBifrostEcs = (args: {
           // reaps its own children the same way Bifrost does, and ECS's
           // stop sequence depends on it.
           linuxParameters: { initProcessEnabled: true },
+        },
+        {
+          name: BIFROST_BOOTSTRAP_CONTAINER_NAME,
+          image: resolvedBootstrapImage,
+          // No cpu/memory reservation: the two containers above already sum to
+          // the task's 512/1024, and this one lives for seconds. Fargate lets
+          // an unreserved container draw on what is not reserved.
+          //
+          // Non-essential, so a claim that cannot run (a password upstream's
+          // policy rejects, a gateway that never goes healthy) leaves the
+          // gateway serving inference and surfaces as this container's log
+          // stream and stopped reason, not as a task that never starts. The
+          // Logs Insights / metric-filter alarm that would make it a page is a
+          // follow-up; there is no alerting target in this account yet.
+          essential: false,
+          environment: [
+            {
+              name: BIFROST_API_BASE_URL_ENV_NAME,
+              value: BIFROST_API_BASE_URL,
+            },
+          ],
+          secrets: BIFROST_BOOTSTRAP_SECRET_KEYS.map((key) => ({
+            name: key,
+            valueFrom: secretReference(GATEWAY_SECRET_NAME, key),
+          })),
+          // ECS's condition, not Docker's HEALTHCHECK: the claim needs a
+          // gateway that has finished loading its config store, and this is
+          // the only way to state that in a task definition.
+          dependsOn: [
+            { containerName: BIFROST_CONTAINER_NAME, condition: "HEALTHY" },
+          ],
+          logConfiguration: {
+            logDriver: "awslogs",
+            options: {
+              "awslogs-group": resolvedLogGroupName,
+              "awslogs-region": REGION,
+              // Its own prefix, so the claim's output is one filterable stream
+              // rather than a line among the gateway's request logs.
+              "awslogs-stream-prefix": BIFROST_BOOTSTRAP_LOG_STREAM_PREFIX,
+            },
+          },
         },
       ],
     );

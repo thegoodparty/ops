@@ -229,6 +229,17 @@ is_supplied() {
 
 gen_secret() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n'; }
 
+# Bifrost's first-admin request enforces a password policy. At the pinned tag
+# (`transports/v2.3.0`, `getPasswordPolicyFailures`) it is at least 12
+# characters with an uppercase letter, a lowercase letter, a digit and a
+# special character. `gen_secret`'s base64url alphabet does not reliably carry
+# a special character (about a quarter of values have none), so the admin
+# password is the random value plus a fixed suffix that supplies every class.
+# The entropy is the random prefix; the suffix is not a secret. The claim
+# container sends this value in a `PUT /api/config`, which is where the policy
+# is enforced, so generating it to policy is what makes the claim automatic.
+gen_password() { printf '%sAa1!' "$(gen_secret)"; }
+
 ask() {  # key, prefix, hint, keep_current
   local key="$1" prefix="${2:-}" hint="${3:-}" keep="${4:-0}" value
   while true; do
@@ -475,7 +486,7 @@ else
   echo "  BIFROST_ADMIN_USERNAME: set to $ADMIN_USERNAME (safe to print; the password is not)"
 fi
 
-ensure_generated BIFROST_ADMIN_PASSWORD "$(gen_secret)" 1
+ensure_generated BIFROST_ADMIN_PASSWORD "$(gen_password)" 1
 
 # The bootstrap secret a fresh deployment is claimed with, generated here and
 # only ever read back from Secrets Manager. Stored rather than generated per
