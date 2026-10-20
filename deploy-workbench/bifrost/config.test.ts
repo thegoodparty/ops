@@ -1,0 +1,358 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-models";
+import { BIFROST_HOSTNAME } from "../ingress";
+import { REGION } from "../network";
+
+/**
+ * The non-secret Bifrost configuration, checked against the properties a
+ * review is actually about. Phase 2 item 10 of `docs/bifrost-gateway.md`.
+ *
+ * The file is the authoring half of item 10: the other half, Pulumi storing it
+ * as an SSM SecureString and injecting it as `BIFROST_CONFIG`, edits the ECS
+ * task definition and lands separately. Until it does, nothing reads this
+ * file, which is why the test can be strict about shape without a deploy.
+ *
+ * The upstream schema is `transports/config.schema.json` at the pinned
+ * `maximhq/bifrost` tag (`v2.3.0`, `deploy-workbench/bifrost-image.ts`), not
+ * the docs at a later tag. Two things were checked against it rather than
+ * assumed:
+ *
+ * - `governance.auth_config.disable_auth_on_inference` exists but is marked
+ *   deprecated and ignored, so `client.enforce_auth_on_inference` is the only
+ *   switch this file sets.
+ * - A key's `models` array is deny-by-default in v2 semantics (`version`
+ *   omitted), so an empty list is not "all models".
+ */
+
+const CONFIG_PATH = path.resolve(__dirname, "config.json");
+const FILL_SECRETS_PATH = path.resolve(__dirname, "fill-secrets.sh");
+const CONFIG_SOURCE = fs.readFileSync(CONFIG_PATH, "utf8");
+
+type ProviderKey = {
+  name: string;
+  value?: string;
+  models: string[];
+  weight: number;
+  bedrock_key_config?: Record<string, unknown>;
+};
+
+type ProviderConfig = { keys: ProviderKey[] };
+
+type Config = {
+  $schema?: string;
+  source_of_truth?: string;
+  encryption_key?: string;
+  client?: Record<string, unknown>;
+  providers?: Record<string, ProviderConfig>;
+  governance?: {
+    auth_config?: Record<string, unknown>;
+    virtual_keys?: unknown;
+    budgets?: unknown;
+    teams?: unknown;
+    rate_limits?: unknown;
+  };
+};
+
+/**
+ * Parsed on demand so a malformed file fails a named test instead of crashing
+ * the module while the test runner is collecting it.
+ */
+const loadConfig = (): Config => JSON.parse(CONFIG_SOURCE) as Config;
+
+const provider = (config: Config, name: string): ProviderConfig => {
+  const found = config.providers?.[name];
+  assert.ok(found, `config.json has no ${name} provider`);
+  return found;
+};
+
+/** Every string anywhere in the document, for the two whole-file checks. */
+const collectStrings = (value: unknown, out: string[] = []): string[] => {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const entry of value) collectStrings(entry, out);
+  } else if (value && typeof value === "object") {
+    for (const entry of Object.values(value as Record<string, unknown>)) {
+      collectStrings(entry, out);
+    }
+  }
+  return out;
+};
+
+/**
+ * The `env.NAME` references in the file. Only the name is ever looked at; the
+ * test never resolves one and never sees a value.
+ */
+const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
+
+const envReferences = (config: Config): string[] =>
+  collectStrings(config).flatMap((value) => {
+    const match = ENV_REFERENCE.exec(value);
+    return match ? [match[1]] : [];
+  });
+
+/**
+ * Reads one `NAME=(...)` array from `fill-secrets.sh`. The script is the source
+ * of the key names, so this test fails on a rename in either direction rather
+ * than carrying a second copy of the list.
+ */
+const fillSecretsArray = (name: string): string[] => {
+  const source = fs.readFileSync(FILL_SECRETS_PATH, "utf8");
+  const match = source.match(new RegExp(`^${name}=\\(\\n([\\s\\S]*?)\\n\\)`, "m"));
+  assert.ok(match, `fill-secrets.sh has no ${name} array`);
+  return match[1]
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, "").trim())
+    .filter((line) => line.length > 0);
+};
+
+/**
+ * Shapes that are a credential on sight. Kept narrow: a false positive is a
+ * test that has to be argued with, and the generic rule below catches the
+ * shapeless case.
+ */
+const SECRET_SHAPES: Array<[string, RegExp]> = [
+  ["an sk- API key", /^sk-[A-Za-z0-9_-]{8,}$/],
+  ["a Bifrost virtual key", /^sk-bf-/],
+  ["an AWS access key id", /^(AKIA|ASIA)[0-9A-Z]{16}$/],
+  ["a Slack token", /^xox[baprs]-/],
+  ["a GitHub token", /^gh[pousr]_[A-Za-z0-9]{20,}$/],
+  ["a JWT", /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\./],
+];
+
+/**
+ * A long unbroken alphanumeric run is what a generated secret looks like once
+ * it is not a known prefix. URLs (`:`, `/`) and model names (`/`, `.`) are
+ * deliberately excluded by the character class.
+ */
+const looksGenerated = (value: string): boolean =>
+  !value.includes("/") && /^[A-Za-z0-9+=_-]{32,}$/.test(value);
+
+const noSecretLiteral = (config: Config) => {
+  for (const value of collectStrings(config)) {
+    for (const [shape, pattern] of SECRET_SHAPES) {
+      assert.ok(
+        !pattern.test(value),
+        `config.json contains a value shaped like ${shape}`,
+      );
+    }
+    assert.ok(
+      !looksGenerated(value),
+      "config.json contains a long unbroken value that looks like a generated secret",
+    );
+  }
+};
+
+describe("bifrost config.json", () => {
+  it("is valid JSON and names the pinned upstream schema", () => {
+    assert.doesNotThrow(() => JSON.parse(CONFIG_SOURCE));
+    assert.equal(
+      loadConfig().$schema,
+      "https://www.getbifrost.ai/schema",
+      "config.json must carry $schema so editors validate it",
+    );
+  });
+
+  it("makes the file authoritative for the sections it declares", () => {
+    // Present sections converge to the repo on redeploy; omitted sections
+    // (item 14's teams/budgets/virtual keys) are left alone. That asymmetry is
+    // why the governance test below asserts absence rather than emptiness.
+    assert.equal(loadConfig().source_of_truth, "config.json");
+  });
+
+  it("declares both providers the plan requires, each with a key", () => {
+    const config = loadConfig();
+    for (const name of ["fireworks", "bedrock"]) {
+      const configured = provider(config, name);
+      assert.ok(configured.keys.length > 0, `${name} has no key`);
+      for (const key of configured.keys) {
+        assert.ok(key.name.length > 0, `${name} key has no name`);
+        assert.ok(
+          key.models.length > 0,
+          `${name} key ${key.name} allows no models; v2 semantics read that as deny all`,
+        );
+        assert.ok(!key.models.includes("*"), `${name} must not allow "*"`);
+        assert.ok(
+          !key.models.some((model) => model.startsWith("regex:")),
+          `${name} must name models, not regexes`,
+        );
+      }
+    }
+  });
+
+  it("references every credential by an env name fill-secrets.sh actually fills", () => {
+    const config = loadConfig();
+    const filled = new Set([
+      ...fillSecretsArray("HUMAN_KEYS"),
+      ...fillSecretsArray("REQUIRED_KEYS"),
+    ]);
+    const referenced = envReferences(config);
+    assert.ok(referenced.length > 0, "config.json references no env vars");
+    for (const name of referenced) {
+      assert.ok(
+        filled.has(name),
+        `env.${name} is not a key fill-secrets.sh writes; the reference would resolve to nothing`,
+      );
+    }
+
+    // The four keys the gateway container receives from `bifrost/gateway`.
+    for (const name of [
+      "BIFROST_ENCRYPTION_KEY",
+      "BIFROST_ADMIN_USERNAME",
+      "BIFROST_ADMIN_PASSWORD",
+      "FIREWORKS_API_KEY",
+    ]) {
+      assert.ok(
+        referenced.includes(name),
+        `config.json no longer references env.${name}`,
+      );
+    }
+
+    // The encryption key must be a reference, never a passphrase in git.
+    assert.equal(config.encryption_key, "env.BIFROST_ENCRYPTION_KEY");
+  });
+
+  it("contains no literal that looks like a key or a token", () => {
+    noSecretLiteral(loadConfig());
+  });
+
+  it("authenticates Bedrock as the ECS task role, with no stored credentials", () => {
+    const config = loadConfig();
+    const bedrock = provider(config, "bedrock");
+    for (const key of bedrock.keys) {
+      assert.equal(
+        key.value,
+        "",
+        `bedrock key ${key.name} carries a value; the task role is the credential`,
+      );
+      assert.ok(
+        key.bedrock_key_config,
+        `bedrock key ${key.name} has no bedrock_key_config, so it has no region`,
+      );
+      assert.equal(
+        key.bedrock_key_config.region,
+        REGION,
+        "the Bedrock key must sign in the region the task runs in",
+      );
+      for (const forbidden of [
+        "access_key",
+        "secret_key",
+        "session_token",
+        "role_arn",
+        "external_id",
+      ]) {
+        assert.ok(
+          !(forbidden in key.bedrock_key_config),
+          `bedrock key ${key.name} sets ${forbidden}; inherited IAM role is the only supported auth here`,
+        );
+      }
+    }
+  });
+
+  it("lists exactly the Bedrock models the task role's IAM allows", () => {
+    const config = loadConfig();
+    const configured = provider(config, "bedrock").keys.flatMap((key) => key.models);
+
+    // `taskRolePolicyDocument(bedrockInvokeResources())` in the ECS module is
+    // built from this list, so anything here without a matching resource is an
+    // AccessDenied, and anything in it without an entry here is a 404. Both
+    // directions are asserted, including the transient profile and the base
+    // foundation-model ids the cross-region grant needs.
+    const allowed = [
+      ...new Set(
+        WORKBENCH_MODELS.flatMap((model) => [
+          model.id,
+          model.invokeId,
+          ...(model.transitionalInvokeIds ?? []),
+        ]),
+      ),
+    ].sort();
+
+    assert.deepEqual(
+      [...configured].sort(),
+      allowed,
+      "config.json's Bedrock models drifted from utils/bedrock-models.ts, which the task role's IAM is built from",
+    );
+
+    const resources = bedrockInvokeResources();
+    for (const model of configured) {
+      assert.ok(
+        resources.some((resource) => resource.endsWith(`/${model}`)),
+        `${model} has no IAM resource in bedrockInvokeResources()`,
+      );
+    }
+  });
+
+  it("reaches Fireworks with the key fill-secrets.sh writes", () => {
+    const config = loadConfig();
+    const fireworks = provider(config, "fireworks");
+    for (const key of fireworks.keys) {
+      assert.equal(
+        key.value,
+        "env.FIREWORKS_API_KEY",
+        `fireworks key ${key.name} must reference env.FIREWORKS_API_KEY`,
+      );
+    }
+    assert.ok(
+      fireworks.keys.some((key) =>
+        key.models.includes("accounts/fireworks/models/deepseek-v4p1-flash"),
+      ),
+      "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
+    );
+  });
+
+  it("turns on the client controls the plan calls data-boundary controls", () => {
+    const client = loadConfig().client;
+    assert.ok(client, "config.json has no client block");
+    // Inference auth is mandatory: a gateway that forwards anonymous traffic
+    // to a provider key is worse than no gateway.
+    assert.equal(client.enforce_auth_on_inference, true);
+    // Content logging is off, and the per-request header cannot turn it back
+    // on. Metadata logging and its retention stay explicit.
+    assert.equal(client.disable_content_logging, true);
+    assert.equal(client.allow_per_request_content_storage_override, false);
+    assert.equal(client.enable_logging, true);
+    assert.equal(client.log_retention_days, 90);
+    // x-bf-direct-key would bypass the virtual-key credential model.
+    assert.equal(client.allow_direct_keys, false);
+    assert.ok(
+      (client.allowed_origins as string[]).includes(`https://${BIFROST_HOSTNAME}`),
+      "allowed_origins must name the gateway's own public origin",
+    );
+  });
+
+  it("enables admin auth and leaves item 14's governance entities absent", () => {
+    const governance = loadConfig().governance;
+    assert.ok(governance, "config.json has no governance block");
+    const auth = governance.auth_config;
+    assert.ok(auth, "governance has no auth_config");
+    assert.equal(auth.is_enabled, true);
+    assert.equal(auth.admin_username, "env.BIFROST_ADMIN_USERNAME");
+    assert.equal(auth.admin_password, "env.BIFROST_ADMIN_PASSWORD");
+    // The v2.3.0 schema marks this deprecated and ignored; the client flag is
+    // the control, and setting both would suggest the file can override it.
+    assert.ok(
+      !("disable_auth_on_inference" in auth),
+      "governance.auth_config.disable_auth_on_inference is deprecated and ignored at the pinned tag",
+    );
+
+    // Item 14 adds the engineering team, its budget and the first virtual
+    // keys. Under source_of_truth: "config.json" a *present* empty array is
+    // authoritative and prunes stored rows, so the structure is ready but
+    // absent, not empty.
+    for (const section of [
+      "virtual_keys",
+      "budgets",
+      "teams",
+      "rate_limits",
+    ] as const) {
+      assert.ok(
+        !(section in governance),
+        `governance.${section} belongs to item 14; an empty section here would prune rows created later`,
+      );
+    }
+  });
+});
