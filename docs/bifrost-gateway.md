@@ -828,8 +828,9 @@ network or a permission can land before the item that creates it.
    action: `/oauth2/*` to oauth2-proxy (priority 10), `/` and `/api/*` to
    oauth2-proxy (20), the four inference prefixes to Bifrost (30), and
    `/health` and `/metrics` to Bifrost (40). An unmatched path still falls to
-   the oauth2-proxy default, so nothing reaches the gateway without the proxy
-   deciding first. `/health` is on Bifrost because item 12 proves it through
+   the oauth2-proxy default, and the only paths that reach the gateway directly
+   are the enumerated inference and telemetry ones, so no admin or login path
+   bypasses the proxy. `/health` is on Bifrost because item 12 proves it through
    the ALB, and `/metrics` stays on Bifrost's own basic auth; they are a
    separate rule because an ALB `path-pattern` condition accepts at most five
    values.

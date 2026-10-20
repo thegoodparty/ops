@@ -223,10 +223,11 @@ describe("bifrost ingress", () => {
     assert.deepEqual(priorities, [...priorities].sort((a, b) => a - b));
   });
 
-  it("leaves no public path that reaches Bifrost without oauth2-proxy", () => {
-    // The property the fail-closed default buys: the only paths that bypass the
-    // proxy are the ones enumerated here, and none of them is the admin surface
-    // or a login endpoint.
+  it("leaves no admin or login path that reaches Bifrost without oauth2-proxy", () => {
+    // The property the fail-closed default buys: the only paths that reach
+    // Bifrost directly are the enumerated inference and telemetry ones, and
+    // none of them is the admin surface or a login endpoint. `/health` and
+    // `/metrics` are the deliberate exceptions the plan names, not a bypass.
     const bifrostPaths = HTTPS_LISTENER_RULES.filter(
       (rule) => rule.target === "bifrost",
     ).flatMap((rule) => [...rule.pathPatterns]);
