@@ -282,8 +282,9 @@ point; the copy on disk is the entire risk of a static key.
 The Lambda reads the impersonation address from `GOOGLE_IMPERSONATION_EMAIL`,
 which `deploy-infrastructure/group-sync-lambda.ts` fills from the
 `googleImpersonationEmail` key of the `organization/infrastructure/main` stack.
-It is stack config rather than a repo literal because the address is deployment
-state, and it appears in no file in this repository. The pair list beside it is
+It is stack config rather than a handler literal because the address is
+deployment state: the deploy script declares it (below) and the handler only
+reads the environment it lands in. The pair list beside it is
 different: `/identity-group-sync/pairs` is written by the same stack from
 `deploy-infrastructure/group-sync/config.ts`. Do not edit it by hand: either the
 next apply replaces your value with the reviewed one, or the live value quietly
@@ -296,24 +297,15 @@ writes nothing. That is the expected first-run failure, and the detail string
 names it, so it is only indistinguishable from the other credential failures if
 you skipped this step.
 
-Set it from a session that can read the state passphrase — the management
-account's `pulumi-state-config-passphrase` parameter — and write to the state
-bucket:
-
-```bash
-aws sso login --profile <management-account-profile>
-
-export PULUMI_CONFIG_PASSPHRASE="$(aws ssm get-parameter \
-  --name pulumi-state-config-passphrase --with-decryption \
-  --region us-west-2 --profile <management-account-profile> \
-  --query Parameter.Value --output text)"
-
-cd deploy-infrastructure
-pulumi login s3://goodparty-iac-state
-pulumi stack select organization/infrastructure/main
-pulumi config set googleImpersonationEmail <impersonation-address>
-pulumi config get googleImpersonationEmail
-```
+**The value is set by `deploy-infrastructure/deploy.sh`, not by hand.** The
+script runs `pulumi config set googleImpersonationEmail
+svc-identity-group-sync@goodparty.org` before every preview and every apply, the
+same way it sets `providerRoleName`, because the address has to survive into the
+apply rather than sit in one person's checkout. `docs/google-group-sync.md`
+records that under "Deployment state: the impersonation admin", and a test in
+`deploy-infrastructure/group-sync-runtime.test.ts` pins both ends: that line in
+`deploy.sh` and the `get("googleImpersonationEmail")` in
+`deploy-infrastructure/group-sync-lambda.ts` that reads it.
 
 Two traps.
 
@@ -321,17 +313,33 @@ The address must be the account's **primary** address, not an alias. An alias ca
 exist in the directory and still not be impersonable; the token exchange then
 fails with HTTP 400 and no further detail.
 
-Setting the key does not deploy it. Pulumi config lives in the stack in the S3
-backend, so the value is in place as soon as `config set` returns, but the
-function's environment variable only changes when the program runs, and nothing
-runs on a config write: `.github/workflows/deploy-infrastructure.yml` applies on
-a push to `main` under `deploy-infrastructure/**` and has no
-`workflow_dispatch`. Either land a change under that path — a comment is enough,
-and the first dry-run review PR is the natural one — or run `pulumi up` yourself
-with the deploy role. Until then the function still has the empty value and the
-abort is unchanged. A `config set` against the wrong stack is silent, so the
-`config get` at the end and `pulumi stack` saying
-`organization/infrastructure/main` are the cheap checks.
+Setting a key by hand neither deploys it nor keeps it. This stack uses the S3
+DIY backend, where stack config lives in the local, gitignored
+`Pulumi.<stack>.yaml` and not in the state bucket — the stack's checkpoint
+carries no config — so a `pulumi config set` from a scratch checkout is
+invisible to CI, and the next apply overwrites `googleImpersonationEmail` from
+`deploy.sh` regardless. The function's environment changes only when the program
+runs, and `.github/workflows/deploy-infrastructure.yml` applies on a push to
+`main` under `deploy-infrastructure/**` (or its own file, `utils/accounts.ts`,
+`agent-swarm/**`) and has no `workflow_dispatch`. A value-only change therefore
+needs a commit under one of those paths; `deploy.sh` is the natural one.
+
+So this failure is diagnosed against the deployed function, not the config:
+
+```bash
+aws lambda get-function-configuration \
+  --function-name identity-group-sync \
+  --region us-west-2 \
+  --profile <infrastructure-account-profile> \
+  --query '{LastModified:LastModified,Env:Environment.Variables}'
+```
+
+The trigger is a plain `rate(15 minutes)` rule targeting the function's
+unqualified ARN, with no alias and no published version, so the next scheduled
+invocation picks up a new environment with no further action. An empty
+`GOOGLE_IMPERSONATION_EMAIL` whose `LastModified` predates the `deploy.sh` line
+means no apply has run since that line landed; an abort logged *before*
+`LastModified` is a stale line from the old environment, not a live failure.
 
 ## 7. What working looks like
 
@@ -472,8 +480,13 @@ Every credential failure is a per-pair `sync.aborted` with
 - `service-account secret is not valid JSON`, `has no client_email` or
   `has no private_key` — the value is the path, or the key/value editor mangled
   the document. Put it again as plaintext.
-- `no impersonation admin configured` — step 6: the stack config is set but not
-  applied, or it was set on another stack.
+- `no impersonation admin configured` — the function ran with an empty
+  `GOOGLE_IMPERSONATION_EMAIL`. `deploy.sh` sets it on every apply, so compare
+  the log line's timestamp with the function's `LastModified` before changing
+  anything: an abort from before the last apply is stale, and the next
+  `rate(15 minutes)` invocation uses the new value. Only if it recurs after an
+  apply is the deployed environment wrong, and then step 6's
+  `get-function-configuration` is what to read.
 - `Google token exchange failed with HTTP 400` — the delegation entry does not
   match. The usual causes are the wrong numeric ID (the email or the unique ID
   instead of the client ID), a scope list that is not exactly the two above, an
@@ -503,9 +516,11 @@ in the plan. This runbook assumes the Admin SDK Directory API. If the answer is
 the Cloud Identity API, `deploy-infrastructure/group-sync/google.ts` changes, the
 two scopes change with it, and steps 1 and 3 change to match.
 
-**The impersonation address itself** is stack config and appears nowhere in the
-repository, so no reader can recover it from here. Reading the function's
-environment is the only way to see what is deployed:
+**Whether the impersonation address is the right mailbox** is not something this
+repository can check. The address the deploy intends is in
+`deploy-infrastructure/deploy.sh` and in `docs/google-group-sync.md`, so it is
+recoverable from a checkout; what the live function actually has, and the only
+value that matters to a running sync, is its environment:
 
 ```bash
 aws lambda get-function-configuration \
@@ -515,8 +530,9 @@ aws lambda get-function-configuration \
   --query Environment.Variables
 ```
 
-That is also why it is worth recording in the ticket that closes this work, even
-though the value is not secret.
+Recording it in the ticket that closes this work is still worth doing, even
+though the value is not secret, because the mailbox's existence and its Groups
+Reader role are not verifiable from here.
 
 **Whether the key-creation constraint applies** to the project is an organization
 decision that this repository does not record. Step 4 says how to check and what
