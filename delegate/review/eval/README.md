@@ -128,9 +128,12 @@ judgement alone, and the manifest's `expect` is `{ "consistency": "..." }`
 rather than `approve`/`block`. Everything else is the runner above.
 
 Every `delegate eval` comment runs this corpus as its own `gating` job and posts
-a separate comment. It replays main's corpus once main has one and the PR's own
-copy on the PR that adds it, then scores against main's expectations. Two cases
-at three runs cost a few dollars and add no wall time.
+a separate comment. Like the expected-result job it replays main's corpus and
+scores from main, so a PR cannot change the cases it is graded on. Because an
+`issue_comment` workflow is read from the default branch, the job first runs
+once it is on main; until then the corpus can be replayed locally with
+`npm run review:expect -- --manifest delegate/review/eval/gating/manifest.json`.
+Two cases at three runs cost a few dollars and add no wall time.
 
 ## Cost expectations
 

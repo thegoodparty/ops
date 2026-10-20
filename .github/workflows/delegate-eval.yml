@@ -330,7 +330,10 @@ jobs:
   # own `planConsistency` answer rather than on a merge outcome: step 1 of
   # docs/plan-gated-merges.md adds them before the gate exists, so there is no
   # COMMENT to score yet. Runs against the PR head on its own runner so it adds
-  # no wall time, and posts as a separate comment.
+  # no wall time, and posts as a separate comment. Like the expected job it
+  # replays main's corpus and scores from main, so a PR cannot change the cases
+  # it is graded on. An `issue_comment` workflow is read from the default
+  # branch, so this job first runs on the PR after it lands on main.
   gating:
     if: |
       github.event.issue.pull_request != null &&
@@ -402,21 +405,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh auth setup-git
-          root=$(pwd)
-          corpus="$root/delegate/review/eval/gating/manifest.json"
-          # main's corpus once it has one, so a PR cannot change the cases it is
-          # graded on; the PR's copy before that, so the PR that adds the corpus
-          # can be evaluated on it.
-          if [ ! -f "$corpus" ]; then
-            corpus="$root/pr/delegate/review/eval/gating/manifest.json"
-          fi
-          if [ ! -f "$corpus" ]; then
-            echo "::error::no gating corpus at delegate/review/eval/gating/manifest.json"
-            exit 1
-          fi
           cd pr && npm run -s review:expect -- \
             --mode replay \
-            --manifest "$corpus" \
+            --manifest ../delegate/review/eval/gating/manifest.json \
             --runs 3 \
             --concurrency 5 \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
@@ -425,11 +416,9 @@ jobs:
 
       - name: Score against main's expectations
         run: |
-          manifest=delegate/review/eval/gating/manifest.json
-          if [ ! -f "$manifest" ]; then manifest=pr/$manifest; fi
           npm run -s review:expect -- \
             --mode score \
-            --manifest "$manifest" \
+            --manifest delegate/review/eval/gating/manifest.json \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
             --out ./eval-gating
 
