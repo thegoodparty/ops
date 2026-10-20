@@ -1,13 +1,16 @@
 # Google Workspace → IAM Identity Center group sync
 
-> **Status: built through step 3.** The management-account grant, the Google
-> read adapter, the pure diff and guards, and the runtime are all in the repo
-> and tested; the rollout in step 4 -- a dry run against the real group and the
-> reviewed change that flips the first pair to `apply` -- has not happened yet.
-> The decisions below were settled in a design review and are recorded as
-> decisions rather than options; the few things still genuinely open are in
-> "Open questions" at the end and are marked **open**. The steps in
-> "Implementation plan" carry their own status; steps 1, 2 and 3 are `done`.
+> **Status: built through step 3, with step 4 in progress.** The
+> management-account grant, the Google read adapter, the pure diff and guards,
+> and the runtime are all in the repo and tested. Step 4's integration test
+> exists, and the deployment state it needs -- the impersonation admin's address
+> in the infrastructure stack's config -- is now set; what has not happened is
+> the rollout itself: a dry run against the real group, the review of that diff,
+> and the reviewed change that flips the first pair to `apply`. The decisions
+> below were settled in a design review and are recorded as decisions rather
+> than options; the few things still genuinely open are in "Open questions" at
+> the end and are marked **open**. The steps in "Implementation plan" carry
+> their own status; steps 1, 2 and 3 are `done` and step 4 is `doing`.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -297,6 +300,34 @@ no Pulumi resource to read it from, and the identity store id and group ids
 are stable. If a future change makes the group Pulumi-created, the config must
 use an `Output<string>` so the engine orders the dependency, rather than
 recording a literal that needs a two-pass apply.
+
+### Deployment state: the impersonation admin
+
+The one value the pair list does not carry is the identity the Google read
+acts as, and it is per-stack state rather than policy:
+
+- **Key**: `googleImpersonationEmail` in the `deploy-infrastructure` stack,
+  consumed by `deploy-infrastructure/group-sync-lambda.ts` as
+  `GOOGLE_IMPERSONATION_EMAIL` on the function's environment. The handler reads
+  that variable and uses it as the delegated token's `sub`. If it is empty the
+  read fails closed as `source-read-failed` and every pair applies nothing.
+- **Value**: `svc-identity-group-sync@goodparty.org`, the dedicated
+  impersonation admin created by hand in manual Google setup step 4. The
+  address is **engineer-confirmed**: nothing in this repo can check that the
+  mailbox exists, that it is not an alias, or that it is the admin the
+  delegation was granted to.
+- **Where it is set**: `deploy-infrastructure/deploy.sh`, next to
+  `providerRoleName`, with `pulumi config set googleImpersonationEmail ...`.
+  `Pulumi.*.yaml` is local and gitignored (`docs/pr-previews.md`), so a value
+  that must survive into the apply is declared in the deploy script; that also
+  puts the address in the reviewed diff rather than in unreviewed local state.
+  A test in `deploy-infrastructure/group-sync-runtime.test.ts` pins both ends
+  of the wiring.
+
+Until that line existed every run aborted before reading Google, so this is
+the change that makes a first successful (dry-run) invocation possible. It
+does not make an apply safe: the rollout below still has to watch a dry run
+and review its diff first.
 
 ### Adding a pair
 
@@ -612,8 +643,14 @@ cannot be code:
    account) whose only purpose is this delegation, so revoking it is one
    account. Its address is deployment state, not policy: the Lambda reads it
    from `GOOGLE_IMPERSONATION_EMAIL`, which `deploy-infrastructure` fills from
-   the `googleImpersonationEmail` stack config key. Until the key is set the
+   the `googleImpersonationEmail` stack config key. With the key unset the
    handler aborts every pair with `source-read-failed` and writes nothing.
+   **The engineer created the account and assigned it Groups Reader**; step 4's
+   PR sets the key to `svc-identity-group-sync@goodparty.org` in
+   `deploy-infrastructure/deploy.sh` (see "Deployment state: the impersonation
+   admin"). The address is engineer-confirmed and not verifiable from here:
+   this plan records it as given, and if the mailbox is actually different the
+   one line in `deploy.sh` is the whole change.
 5. Create the service account key, put it in the Secrets Manager secret below,
    and never commit it.
 
@@ -756,6 +793,17 @@ the email, which is called out in the PR body like the `sheriff` one.
    removals alarm is on from the start, so the first real removal pages.
 5. Add further pairs the same way, one at a time, each starting dry-run.
 
+One rollout prerequisite is still manual. The `googleImpersonationEmail` key
+is now set by `deploy-infrastructure/deploy.sh`, so a dry run no longer aborts
+immediately for a missing impersonation admin. The service-account key still
+has to be put into the `identity-group-sync/google-service-account` secret by
+hand (manual Google setup step 5); until it is, the read fails closed as
+`source-read-failed` and the heartbeat stays red, which is the designed signal,
+not a rollout step that was skipped. The scratch pair the integration test
+uses is read with the operator's own Identity Store credentials, so it needs
+no change to the production grant; its ids go in the environment variables
+described under "Tests".
+
 ### Tests
 
 The unit tests below live next to the code they exercise:
@@ -787,15 +835,40 @@ role and wiring (step 3). Both are `node --test` via `tsx`, picked up by
   each treated as success, and a re-run of the same diff is a no-op.
 - **Unit, reserved target.** A pair naming the `Admins` group id aborts with
   `reason: "reserved-target"` and no writes.
-- **Integration, against a scratch identity store.** Run the fetch → diff →
-  apply path end to end against a scratch Google group and a scratch Identity
-  Center group, asserting the membership after a run. Whether "scratch
-  identity store" means a scratch group in the existing store or a dedicated
-  test account is **open**: Identity Center is one instance per account per
-  region, so a truly separate identity store needs a separate account. The
-  minimum viable version is a `group-sync-test` group in the existing store
-  and a scratch Google group, with the job configured for that pair only; the
-  stronger version is a dedicated account.
+- **Integration, against a scratch identity store.** Step 4's
+  `deploy-infrastructure/group-sync-integration.test.ts` runs the read, the
+  resolution, the target listing, the diff and the guards against a scratch
+  Google group and a scratch group in the **existing** identity store (open
+  question 4). It exercises what the unit tests cannot: that the real delegated
+  Google read returns the scratch source group's members, that the diff is
+  computed against the real target, that a dry run leaves the target's
+  membership byte-for-byte unchanged, and that the reserved-target guard
+  refuses `Admins` before any read or write. It is **dry-run only**, on
+  purpose: the apply is the rollout's reviewed change, and a test that applied
+  would either need cleanup that can itself fail mid-run or duplicate the
+  production write path outside that review. It uses its own `SyncPair` id and
+  asserts that neither its pair id nor its target collides with a configured
+  pair, so it never touches the real `engineering@goodparty.org` → `Engineers`
+  pair.
+
+  It is **not** part of the default `npm test` green path. `npm test` loads the
+  file, which prints a `SKIPPED` line to stderr and a node skip reason unless
+  `GROUP_SYNC_INTEGRATION=1`, because it needs credentials CI does not have:
+  real Google domain-wide delegation (`GROUP_SYNC_GOOGLE_KEY_FILE`,
+  `GOOGLE_IMPERSONATION_EMAIL`) and Identity Store credentials in the
+  management account (the ambient chain, or
+  `GROUP_SYNC_INTEGRATION_IDENTITY_ROLE_ARN`). It deliberately does **not**
+  assume `identity-group-sync-grant`: that role trusts only the
+  `identity-group-sync` Lambda role, so a test runner cannot assume it, and the
+  test reads the scratch group with the operator's own permissions instead.
+  That also means the scratch group's ARN does not have to be added to the
+  production grant. It also takes `GROUP_SYNC_SCRATCH_SOURCE_GROUP`,
+  `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID`, the optional
+  `GROUP_SYNC_SCRATCH_ALLOWLIST` and `GROUP_SYNC_SCRATCH_EXPECTED_MEMBER` so an
+  empty scratch group is not silently green. The exact invocation is in the
+  test file's header. It could not be run in the container that wrote it: there
+  is no Google key there and its AWS session has no reach into the management
+  account's identity store.
 - **Test-only IAM.** The assumed role's policy is asserted by a test that pins
   the exact action list and asserts the absence of `DeleteUser`,
   `CreateGroup`, `DeleteGroup` and every `sso:*` action, the way
@@ -828,7 +901,14 @@ the Lambda's first run is an `AssumeRole` and a missing role is an
       `deploy-infrastructure/group-sync/`, beside the step 2 modules.)
 - [ ] 4. The integration test and the rollout: dry-run against the real group,
       review the diff, then the Pulumi change that flips the first pair to
-      `apply`. `todo`
+      `apply`. `doing`
+      (Done by the step 4 test/config PR: the integration test
+      `deploy-infrastructure/group-sync-integration.test.ts` and the
+      `googleImpersonationEmail` stack config key, which is what lets the
+      first dry run succeed. **Not done:** the rollout. Nothing has been run
+      against the real group yet, its dry-run diff has not been reviewed, and
+      the first pair is still `mode: "dry-run"`. The box stays unticked until
+      that reviewed `apply` change lands.)
 
 ## Open questions
 
@@ -858,9 +938,18 @@ above.
    tokens split on `.`, `_` and `-`, capitalized, with `FamilyName` omitted
    when the local part is a single token. Nothing is created while the pair is
    `dry-run`, so the decision can still be revisited before the first apply.
-4. **The integration-test environment.** A scratch group in the existing
-   identity store is cheap but not isolated; a dedicated test account is
-   isolated but is a new account. Which one is acceptable is open.
+4. **The integration-test environment.** **Resolved:** a scratch group in the
+   existing identity store, plus a scratch Google group -- the cheap option,
+   not a dedicated test account. A truly separate identity store needs a
+   separate account (Identity Center is one instance per account per region),
+   and that is not worth an account for one test. The isolation that matters
+   comes from the test's own `SyncPair` id and its scratch target, which the
+   integration test asserts cannot collide with a configured pair, so the real
+   `engineering@goodparty.org` → `Engineers` pair is never in reach. The
+   scratch target is supplied as `GROUP_SYNC_SCRATCH_TARGET_GROUP_ID` rather
+   than added to the production pair list, and the test reads it with the
+   operator's own Identity Store credentials, so the scratch group's ARN does
+   not need to be in the grant either. No IAM change is required to run it.
 5. **The poll interval and the cap defaults.** The plan uses an interval
    expressed in the config and cap defaults of `maxCount: 5` and
    `maxFraction: 0.1`, with `removalAlertThreshold: 0`. The interval and the
@@ -908,6 +997,9 @@ For a reviewer checking the plan against the repo:
   and its role, policy, parameter, secret, schedule, filters and alarms, plus
   the handler, the algorithm, the Identity Store adapter and the Google
   transport.
+- `deploy-infrastructure/group-sync-integration.test.ts` — step 4's opt-in
+  integration test against the scratch pair, and
+  `deploy-infrastructure/deploy.sh` — where `googleImpersonationEmail` is set.
 - `deploy-infrastructure/index.ts` — where `createGroupSync` is registered,
   and the `allowedAccountIds` and explicit-provider rules every resource must
   follow.
