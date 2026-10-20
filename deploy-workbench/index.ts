@@ -14,6 +14,7 @@ import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
+import { createBifrostEcs } from "./ecs";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -476,3 +477,44 @@ export const bifrostDatabaseSecretArn = database.secretArn;
 
 /** Where Bifrost's `config_store`/`logs_store` will point (item 8). */
 export const bifrostDatabaseEndpoint = database.endpoint;
+
+// ---------------------------------------------------------------------------
+// The gateway's compute.
+//
+// Phase 1 item 8 of docs/bifrost-gateway.md: one ECS cluster with container
+// insights, one Fargate task definition and one service, the `/aws/ecs/bifrost`
+// log group, and the two IAM roles. The task definition copies the idiom in
+// `deploy/components/worker.ts` — `secrets` from Secrets Manager, `awslogs`,
+// `linuxParameters.initProcessEnabled` — with a separate task role scoped to
+// the Bedrock model list in `utils/bedrock-models.ts` rather than the
+// delegate's five broad read policies.
+//
+// It consumes item 5's private subnets and task security group and item 7's
+// database secret rather than declaring any of them again. The service's
+// load-balancer attachment is item 9's with the routing, because ECS refuses to
+// create a service against a target group that no listener or listener rule
+// references and item 6 attached neither group to a rule; see the note in
+// `ecs.ts`. The oauth2-proxy sidecar and the ALB's path rules are item 9;
+// `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so
+// the container cannot answer `/health` honestly until then. That is the plan's
+// staging, not a defect in this item.
+//
+// The two secret containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
+// **not** Pulumi resources. They were created out of band by
+// `bifrost/fill-secrets.sh` and hold real values, so declaring them here would
+// put their lifecycle — and a possible replace — in this stack. The task
+// definition references them by name and JSON key only, and nothing in this
+// project reads a secret's value, which is what keeps `pulumi preview` working
+// without `secretsmanager:GetSecretValue`.
+const ecs = createBifrostEcs({
+  provider,
+  network,
+  database,
+  repositoryUrl: bifrostRepository.repositoryUrl,
+});
+
+/** The service's task family, for a human reading `pulumi stack output`. */
+export const bifrostTaskDefinitionFamily = ecs.taskDefinition.family;
+
+/** The container log group, so item 12's first boot starts with a known name. */
+export const bifrostLogGroupName = ecs.logGroup.name;
