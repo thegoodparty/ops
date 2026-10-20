@@ -214,44 +214,16 @@ jobs:
               repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
           fi
 
-  # The known-answer suites, one matrix leg each, run against the PR head on
-  # their own runner so they add no wall time. Both legs are the same runner
-  # and the same manifest shape; they differ only in corpus, output directory
-  # and comment marker:
-  #
-  # - `expected` scores a merge outcome (block on the right file, or approve)
-  #   over recorded and simulated PRs, and posts `<!-- delegate-eval-expected -->`.
-  # - `gating` scores the model's own `planConsistency` answer, because step 1
-  #   of docs/plan-gated-merges.md adds those cases before the gate exists.
-  #   It posts `<!-- delegate-eval-gating -->`.
-  #
-  # Each leg replays main's corpus and is scored by main, so a PR cannot change
-  # the cases it is graded on. `fail-fast: false` because an `issue_comment`
-  # workflow is read from the default branch: the gating leg has no corpus on
-  # main until this lands, so it fails on the PR that adds it, and that must not
-  # stop the expected leg from running.
-  eval-suites:
-    name: eval suites (${{ matrix.suite }})
+  # The known-answer cases in expected/manifest.json, run against the PR head
+  # on their own runner so they add no wall time. Scored on outcome alone and
+  # posted as a separate comment.
+  expected:
     if: |
       github.event.issue.pull_request != null &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       startsWith(github.event.comment.body, 'delegate eval')
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: expected
-            manifest: delegate/review/eval/expected/manifest.json
-            out: eval-expected
-            artifact: delegate-eval-expected
-            marker: "<!-- delegate-eval-expected -->"
-          - suite: gating
-            manifest: delegate/review/eval/gating/manifest.json
-            out: eval-gating
-            artifact: delegate-eval-gating
-            marker: "<!-- delegate-eval-gating -->"
 
     steps:
       - name: Resolve PR head sha
@@ -307,7 +279,7 @@ jobs:
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
           owner: thegoodparty
 
-      - name: Run ${{ matrix.suite }} cases
+      - name: Run expected-result cases
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
@@ -318,31 +290,29 @@ jobs:
           gh auth setup-git
           cd pr && npm run -s review:expect -- \
             --mode replay \
-            --manifest ../${{ matrix.manifest }} \
+            --manifest ../delegate/review/eval/expected/manifest.json \
             --runs 3 \
             --concurrency 5 \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
-            --out ../${{ matrix.out }} \
-            --work-dir ${{ runner.temp }}/work-${{ matrix.suite }}
+            --out ../eval-expected \
+            --work-dir ${{ runner.temp }}/work-expected
 
       - name: Score against main's expectations
         run: |
           npm run -s review:expect -- \
             --mode score \
-            --manifest ${{ matrix.manifest }} \
             --variant pr-${{ steps.pr.outputs.sha7 }} \
-            --out ./${{ matrix.out }}
+            --out ./eval-expected
 
       - name: Post or update PR comment
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.issue.number }}
-          MARKER: ${{ matrix.marker }}
         run: |
-          body=$(printf '%s\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
-            "$MARKER" "$(cat ./${{ matrix.out }}/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
+          body=$(printf '<!-- delegate-eval-expected -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
+            "$(cat ./eval-expected/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
           existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
-            --jq ".[] | select(.body | startswith(\"${MARKER}\")) | .id" | sed -n 1p)
+            --jq '.[] | select(.body | startswith("<!-- delegate-eval-expected -->")) | .id' | sed -n 1p)
           if [ -n "$existing_id" ]; then
             gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} -f body="$body"
           else
@@ -353,5 +323,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}-${{ steps.pr.outputs.sha7 }}
-          path: ./${{ matrix.out }}/
+          name: delegate-eval-expected-${{ steps.pr.outputs.sha7 }}
+          path: ./eval-expected/

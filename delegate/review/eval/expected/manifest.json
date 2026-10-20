@@ -79,5 +79,23 @@
       "verdict": "approve"
     },
     "tests": "Production's third review at 43a641a, which re-listed the finding as an open prior. The reviewer wanted a `where: ... is not null` guard on a regex test over a nullable column. dbt_expectations returns failing rows with `where not(expression = true)`, and a null predicate is never returned: 0 failures over 218,051,528 voter rows with 8,725,708 null, and the same test already runs unguarded on `geocode_full`. Nothing to block."
+  },
+  {
+    "id": "ops-plan-consistent-change",
+    "bundle": "ops-plan-consistent-change.bundle.json",
+    "expect": {
+      "verdict": "consistency",
+      "consistency": "consistent"
+    },
+    "tests": "Simulated. The approved plan's step raises the `delegate-webhook` Lambda timeout from 30 to 60 seconds in `deploy/components/webhooks.ts`; the diff changes exactly that field and nothing else. The model must answer `consistent`. Step 1 scores that answer alone, because there is no gate yet to turn it into an approval; from step 5 the case asserts the approval and keeps the answer as a diagnostic."
+  },
+  {
+    "id": "ops-plan-inconsistent-change",
+    "bundle": "ops-plan-inconsistent-change.bundle.json",
+    "expect": {
+      "verdict": "consistency",
+      "consistency": "inconsistent"
+    },
+    "tests": "Simulated. The approved plan's only step raises the `/aws/ecs/delegate` log group retention in `deploy/components/worker.ts`; the diff instead rewrites the Playwright reports bucket in `deploy/components/playwright-reports.ts` and touches nothing the plan names. The model must answer `inconsistent`. Step 1 scores that answer alone; from step 5 the case asserts the flag and keeps the answer as a diagnostic."
   }
 ]

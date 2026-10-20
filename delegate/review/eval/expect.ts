@@ -17,21 +17,28 @@ const DEFAULT_MANIFEST = join(__dirname, "expected", "manifest.json");
 
 const ConsistencySchema = z.enum(["consistent", "inconsistent", "unclear"]);
 
-// A case asserts either a merge outcome (`verdict`) or, for the plan-gating
-// corpus, the model's own answer from `planConsistency`. The gating cases run
-// before the gate exists (step 1 of `docs/plan-gated-merges.md`), so there is no
-// COMMENT to score yet; they are scored on the answer alone and never on
-// findings. The `flag` outcome the other gating cases need arrives in step 5.
-const ExpectSchema = z.union([
-  z.strictObject({ consistency: ConsistencySchema }),
-  z.discriminatedUnion("verdict", [
-    z.strictObject({ verdict: z.literal("approve") }),
-    z.strictObject({
-      verdict: z.literal("block"),
-      paths: z.array(z.string().min(1)).min(1),
-      categories: z.array(FindingSchema.shape.category).optional(),
-    }),
-  ]),
+// One expectation type per case. `approve` and `block` score a merge outcome;
+// `consistency` scores the model's own `planConsistency` answer, for the plan
+// cases that run before the gate exists (step 1 of `docs/plan-gated-merges.md`).
+// An outcome case may also carry `consistency` as a diagnostic: when it does,
+// the model's answer has to be right as well, which is how a wrong outcome is
+// attributed to the model rather than to the gate. `flag` joins these in
+// step 5.
+const ExpectSchema = z.discriminatedUnion("verdict", [
+  z.strictObject({
+    verdict: z.literal("approve"),
+    consistency: ConsistencySchema.optional(),
+  }),
+  z.strictObject({
+    verdict: z.literal("block"),
+    paths: z.array(z.string().min(1)).min(1),
+    categories: z.array(FindingSchema.shape.category).optional(),
+    consistency: ConsistencySchema.optional(),
+  }),
+  z.strictObject({
+    verdict: z.literal("consistency"),
+    consistency: ConsistencySchema,
+  }),
 ]);
 export type Expect = z.infer<typeof ExpectSchema>;
 
@@ -136,32 +143,53 @@ export interface RunScore {
   outcome: string;
 }
 
+const describeAnswer = (answer: string | undefined, expected: string): string =>
+  answer === expected
+    ? `planConsistency: ${answer}`
+    : `planConsistency: ${answer ?? "absent"} (expected ${expected})`;
+
 export const scoreRun = (expect: Expect, result: Result): RunScore => {
   if (result.error || !result.output || result.output.status !== "complete") {
     const reason = result.error ?? (result.output?.status === "failed" ? result.output.reason : "no output");
     return { pass: false, outcome: `no review: ${reason.slice(0, 200)}` };
   }
-  if ("consistency" in expect) {
-    const answer = result.output.planConsistency?.verdict;
+  const answer = result.output.planConsistency?.verdict;
+
+  // Until the gate exists there is no outcome to score, so a plan case asserts
+  // the model's answer alone; findings are not consulted.
+  if (expect.verdict === "consistency") {
     return {
       pass: answer === expect.consistency,
-      outcome: `planConsistency: ${answer ?? "absent"}${answer === expect.consistency ? "" : ` (expected ${expect.consistency})`}`,
+      outcome: describeAnswer(answer, expect.consistency),
     };
   }
+
   const findings = result.output.findings;
   const listed = findings.map((f) => `${f.path}:${f.line} [${f.category}]`).join(", ");
+  let outcome: RunScore;
   if (expect.verdict === "approve") {
-    return findings.length === 0
-      ? { pass: true, outcome: "approved" }
-      : { pass: false, outcome: `blocked: ${listed}` };
+    outcome =
+      findings.length === 0
+        ? { pass: true, outcome: "approved" }
+        : { pass: false, outcome: `blocked: ${listed}` };
+  } else if (findings.length === 0) {
+    outcome = { pass: false, outcome: "approved" };
+  } else {
+    const hit = findings.some(
+      (f) =>
+        expect.paths.includes(f.path) &&
+        (!expect.categories || expect.categories.includes(f.category)),
+    );
+    outcome = { pass: hit, outcome: `blocked${hit ? "" : " on the wrong thing"}: ${listed}` };
   }
-  if (findings.length === 0) return { pass: false, outcome: "approved" };
-  const hit = findings.some(
-    (f) =>
-      expect.paths.includes(f.path) &&
-      (!expect.categories || expect.categories.includes(f.category)),
-  );
-  return { pass: hit, outcome: `blocked${hit ? "" : " on the wrong thing"}: ${listed}` };
+
+  // A diagnostic never changes what the outcome means, so the outcome stays
+  // first and the answer is reported after it.
+  if (expect.consistency === undefined) return outcome;
+  return {
+    pass: outcome.pass && answer === expect.consistency,
+    outcome: `${outcome.outcome}; ${describeAnswer(answer, expect.consistency)}`,
+  };
 };
 
 export interface CaseReport {
@@ -171,10 +199,11 @@ export interface CaseReport {
 }
 
 const describeExpect = (e: Expect): string => {
-  if ("consistency" in e) return `planConsistency: ${e.consistency}`;
-  if (e.verdict === "approve") return "approve";
+  if (e.verdict === "consistency") return `planConsistency: ${e.consistency}`;
+  const diagnostic = e.consistency ? ` (diagnostic: planConsistency: ${e.consistency})` : "";
+  if (e.verdict === "approve") return `approve${diagnostic}`;
   const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
-  return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}`;
+  return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
 };
 
 export const renderExpectReport = (reports: CaseReport[], variant: string): string => {

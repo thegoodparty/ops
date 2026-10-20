@@ -43,7 +43,7 @@ ${pd.inline}
   // Dormant in production: nothing populates bundle.plan until step 4 of
   // `docs/plan-gated-merges.md`, so a production prompt is byte-for-byte what
   // it was before this element existed. The eval corpus in
-  // delegate/review/eval/gating/ is the only caller that sets a plan today,
+  // delegate/review/eval/expected/ is the only caller that sets a plan today,
   // and it scores the answer this section asks for.
   //
   // The plan text is escaped rather than boundary-tokened like the diff: it is
