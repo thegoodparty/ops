@@ -75,11 +75,10 @@ import { GRANT_SESSION_NAME } from "../deploy/components/identity-group-sync-gra
 const ENGINEERS_GROUP_ID = "383193a0-7001-70d9-a321-ffe6d8af7378";
 const ADMINS_GROUP_ID = "88c1b330-a001-707a-06ca-94e289013bf5";
 
-// The `Approvers` group does not exist yet, so `approvers-google` carries the
-// placeholder id `deploy-infrastructure/group-sync/config.ts` declares. Pinned
-// so that the placeholder is a reviewed value and not something that can drift
-// into a pair that silently points at nothing.
-const APPROVERS_GROUP_ID = "PENDING_APPROVERS_GROUP_ID";
+// The `Approvers` group, the `approvers-google` pair's target. A literal in
+// `deploy-infrastructure/group-sync/config.ts` and in the management-account
+// grant, both pinned here so the three cannot drift.
+const APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e";
 
 const pairById = (id: string) => {
   const found = SYNC_PAIRS.find((pair) => pair.id === id);
@@ -117,7 +116,6 @@ describe("the configured sync pair", () => {
     // same allowlist. It starts in `dry-run` because that is "Adding a pair"
     // step 4, and it is pinned here so flipping it to `apply` -- or changing
     // its source, target or allowlist -- is a reviewed change to this test.
-    // Its target id is the placeholder until the group is created out of band.
     assert.deepEqual(pairById("approvers-google"), {
       id: "approvers-google",
       sourceGroupEmail: "eng-admin@goodparty.org",

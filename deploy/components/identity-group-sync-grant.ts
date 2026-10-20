@@ -48,13 +48,11 @@ export const GRANT_SESSION_NAME = "identity-group-sync";
 const TARGET_GROUP_ARNS = [
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378",
   // The `Approvers` group, the target of the `approvers-google` pair in
-  // `deploy-infrastructure/group-sync/config.ts`. Its id is a placeholder
-  // there too: neither file can know the id until the group exists, because
-  // every Identity Center group in this repo is created out of band. Replace
-  // both occurrences together, and see the comment on `APPROVERS_GROUP_ID` in
-  // that config for what happens if this applies first (the pair fails closed
-  // on its target read; nothing is written).
-  "arn:aws:identitystore:::group/PENDING_APPROVERS_GROUP_ID",
+  // `deploy-infrastructure/group-sync/config.ts`. Created out of band in the
+  // console like every other Identity Center group here, and named here as a
+  // literal for the same reason as the `Engineers` ARN above: there is no
+  // Pulumi resource to reference.
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e",
 ];
 
 // The user id and the returned membership id do not exist when the policy is

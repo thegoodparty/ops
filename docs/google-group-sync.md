@@ -271,7 +271,7 @@ subject to the reserved-target invariant: it may not be `Admins`
 ### The second pair: `Approvers`
 
 A parallel sync of the `Engineering Admin` Workspace group
-(`eng-admin@goodparty.org`) into a new `Approvers` Identity Center group. It is
+(`eng-admin@goodparty.org`) into the `Approvers` Identity Center group. It is
 the `engineers-google` entry with the source and the target swapped, and it
 changes the same two places "Adding a pair" names: the pair list and the
 grant's `TARGET_GROUP_ARNS`.
@@ -280,7 +280,7 @@ grant's `TARGET_GROUP_ARNS`.
 {
   id: "approvers-google",
   sourceGroupEmail: "eng-admin@goodparty.org",
-  targetGroupId: APPROVERS_GROUP_ID, // Approvers
+  targetGroupId: "e841e310-0051-7062-2ea4-9905d12f345e", // Approvers
   mode: "dry-run",
   removalCap: { maxCount: 5, maxFraction: 0.1 },
   allowlist: ["@goodparty.org"],
@@ -288,19 +288,16 @@ grant's `TARGET_GROUP_ARNS`.
 }
 ```
 
-It starts in `dry-run`, per "Adding a pair" step 4: the change is one entry in
-the pair list, and the reviewed dry-run diff is what justifies flipping it to
+The id keeps the same shape as the first pair's: the source is `eng-admin@`
+(the Workspace group's name) and the target is `Approvers` (the Identity Center
+group's name), so the pair id is `approvers-google` and not a spelling of the
+source. `Approvers` was created out of band, in the Identity Center console,
+and that does not change: group existence is not this job's business
+(non-goal 7), so no Pulumi resource is added for it and the id is a literal
+recorded the same way the `Engineers` id is, here and in the grant. The pair
+ships `dry-run`, per "Adding a pair" step 4: the change is one entry in the
+pair list, and the reviewed dry-run diff is what justifies flipping it to
 `apply`.
-
-One thing the pair could not carry is the group's id. Groups here are created
-out of band (non-goal 7), an id cannot be derived, and the change that added
-the pair had no access to the management account's identity store to read it
-back, so both files name the placeholder `PENDING_APPROVERS_GROUP_ID` until
-someone creates `Approvers` (identity store `d-9267e5cf96`, region `us-west-2`)
-and replaces it. A pair in that state fails closed: the target read aborts the
-pair with `identity-read-failed` before any write, so the `Aborted` alarm pages
-and the pair's heartbeat alarm trips, which is why it must not be applied
-before the id is in.
 
 Whether `Approvers` also gets a permission set and an account assignment is a
 separate decision, and an open one. A group with no assignment mirrors
@@ -1015,6 +1012,11 @@ above.
    `engineering@goodparty.org` Workspace group mirrors the `Engineers` Identity
    Center group (`383193a0-7001-70d9-a321-ffe6d8af7378`), whose ARN is already
    in the merged grant. The pair shipped `dry-run` and is now `apply`.
+   **Resolved for the second pair too:** the `eng-admin@goodparty.org`
+   (`Engineering Admin`) Workspace group mirrors the `Approvers` Identity
+   Center group (`e841e310-0051-7062-2ea4-9905d12f345e`), created out of band
+   in the console like the others, with its ARN in the grant. It ships
+   `dry-run`; flipping it to `apply` is a separate reviewed change.
 
 ## Grounding: the files this touches
 

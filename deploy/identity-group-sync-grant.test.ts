@@ -22,13 +22,13 @@ const IDENTITY_STORE_ARN =
 const ENGINEERS_GROUP_ARN =
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
 
-// The second target: `Approvers`, the `approvers-google` pair's group. Its id
-// is still the placeholder `deploy-infrastructure/group-sync/config.ts`
-// declares, because the group is created out of band and does not exist yet;
-// the two literals are pinned here for the same reason as `Admins` above, so
-// that replacing one without the other fails rather than grants nothing.
+// The `Approvers` group, the `approvers-google` pair's target. Created out of
+// band in the console, so the id is a literal here and in
+// `deploy-infrastructure/group-sync/config.ts`; the two are pinned against each
+// other by the run test, and this one is pinned for the same reason as
+// `Admins` above.
 const APPROVERS_GROUP_ARN =
-  "arn:aws:identitystore:::group/PENDING_APPROVERS_GROUP_ID";
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e";
 
 // Unavoidable: the looked-up user id and the returned membership id do not
 // exist when the policy is written, so they are wildcards scoped to their
