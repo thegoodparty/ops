@@ -1,3 +1,4 @@
+import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { WORKBENCH_ZONE_NAME } from "./dns";
 import {
@@ -13,22 +14,26 @@ import {
  * `docs/bifrost-gateway.md`; the "TLS and DNS" part of its "Network, TLS and
  * ingress" section is the requirement this file implements.
  *
- * What this module owns, and what it deliberately leaves to later items:
+ * What this module owns:
  *
  * - Owns: the internet-facing Application Load Balancer, its two target groups
  *   (Bifrost on 8080, oauth2-proxy on 4180), the HTTPS listener with the ACM
  *   certificate, the HTTP listener that redirects to HTTPS, the ACM
  *   certificate and its DNS validation record in the workbench zone, and the
  *   Route 53 alias for `bifrost.workbench.goodparty.org`.
- * - Does not own: the path rules that split inference from the admin surface
- *   (item 9). The HTTPS listener has a default action because a listener must
- *   have one, and it points at oauth2-proxy, the plan's catch-all, rather than
- *   at Bifrost. Until item 9 adds the inference-prefix rule that default
- *   reaches a target group with no registered targets and the request is a
- *   503, so the interim state fails closed: item 8 registering the ECS task
- *   cannot expose the Bifrost admin surface before oauth2-proxy is in front of
- *   it. Item 9 then adds the `/oauth2/*` and admin-path rules to oauth2-proxy
- *   and the inference-prefix rule to Bifrost, without re-pointing the default.
+ * - Owns since item 9: the four HTTPS listener rules that split inference from
+ *   the admin surface — `/oauth2/*` and the admin paths to oauth2-proxy, the
+ *   inference prefixes and health/metrics to Bifrost — and the rule set that
+ *   makes both target groups associated with a listener, which is what lets
+ *   item 9 register the ECS task against them.
+ *
+ * The HTTPS listener's default action still points at oauth2-proxy and is not
+ * re-pointed by the rules. That keeps the fail-closed property the rules
+ * inherit: a path no rule matches still goes through the authenticating proxy,
+ * never straight to Bifrost, and Bifrost is reachable only on the paths the
+ * rules enumerate below. Item 8 could not register the task because no rule
+ * referenced either group; item 9 supplies the rules and the registration
+ * together.
  *
  * Everything takes the explicit provider this project requires. The workbench
  * stack disables the default provider (`deploy.sh`), so a resource that omits
@@ -80,6 +85,88 @@ export type TargetGroupSpec = {
   port: number;
   healthCheckPath: string;
 };
+
+/**
+ * The HTTPS listener's path rules, as data.
+ *
+ * Item 9's routing, from "Protecting the admin surface" in
+ * `docs/bifrost-gateway.md`:
+ *
+ * - `/oauth2/*` is oauth2-proxy's own endpoints (login start, Google callback,
+ *   sign-out). It has to reach the proxy without a session, which is why it is
+ *   its own rule rather than part of the catch-all.
+ * - The admin surface — Bifrost's dashboard at `/` and its management API at
+ *   `/api/*` — is oauth2-proxy's, so a browser or a script is authenticated
+ *   before Bifrost ever sees the request. The HTTPS listener's default action
+ *   already points there; the explicit rule is what makes the intent visible
+ *   and what the "nothing bypasses oauth2-proxy" test asserts against, rather
+ *   than relying on a default nobody reads.
+ * - The inference prefixes go straight to Bifrost, so a harness never meets a
+ *   browser redirect. These are the four provider-shaped paths in the plan's
+ *   harness table.
+ * - `/health` and `/metrics` also belong on Bifrost: `/health` is item 12's
+ *   end-to-end proof through the ALB, and `/metrics` is scraped without a
+ *   Google session and stays on Bifrost's own basic auth (plan,
+ *   "Observability"). They are a separate rule from the inference prefixes
+ *   because an ALB `path-pattern` condition accepts at most five values.
+ *
+ * Priorities are explicit and ascending in the order above; the paths are
+ * disjoint, so the order is documentation rather than a precedence
+ * requirement. `HTTPS_LISTENER_RULES` is exported so the test can pin every
+ * priority, path pattern and target without parsing the resource calls.
+ */
+export const OAUTH2_CALLBACK_PATH_PATTERNS = ["/oauth2/*"] as const;
+export const ADMIN_PATH_PATTERNS = ["/", "/api/*"] as const;
+export const INFERENCE_PATH_PATTERNS = [
+  "/v1/*",
+  "/anthropic/*",
+  "/openai/*",
+  "/genai/*",
+] as const;
+export const TELEMETRY_PATH_PATTERNS = ["/health", "/metrics"] as const;
+
+export const OAUTH2_CALLBACK_RULE_PRIORITY = 10;
+export const ADMIN_RULE_PRIORITY = 20;
+export const INFERENCE_RULE_PRIORITY = 30;
+export const TELEMETRY_RULE_PRIORITY = 40;
+
+/** Which target group a rule forwards to, by the key `TARGET_GROUPS` uses. */
+export type ListenerRuleTarget = "bifrost" | "oauth2Proxy";
+
+export type ListenerRuleSpec = {
+  /** Logical-name fragment for the Pulumi `ListenerRule` resource. */
+  key: string;
+  priority: number;
+  pathPatterns: readonly string[];
+  target: ListenerRuleTarget;
+};
+
+export const HTTPS_LISTENER_RULES: ListenerRuleSpec[] = [
+  {
+    key: "oauth2Callback",
+    priority: OAUTH2_CALLBACK_RULE_PRIORITY,
+    pathPatterns: OAUTH2_CALLBACK_PATH_PATTERNS,
+    target: "oauth2Proxy",
+  },
+  {
+    key: "admin",
+    priority: ADMIN_RULE_PRIORITY,
+    pathPatterns: ADMIN_PATH_PATTERNS,
+    target: "oauth2Proxy",
+  },
+  {
+    key: "inference",
+    priority: INFERENCE_RULE_PRIORITY,
+    pathPatterns: INFERENCE_PATH_PATTERNS,
+    target: "bifrost",
+  },
+  {
+    key: "telemetry",
+    priority: TELEMETRY_RULE_PRIORITY,
+    pathPatterns: TELEMETRY_PATH_PATTERNS,
+    target: "bifrost",
+  },
+];
 
 export const TARGET_GROUPS: TargetGroupSpec[] = [
   {
@@ -237,13 +324,13 @@ export const createBifrostIngress = (args: {
 
   /**
    * HTTPS. The default action points at oauth2-proxy, the plan's catch-all
-   * ("everything else falls through to oauth2-proxy"), not at Bifrost. This is
-   * deliberately fail-closed: until item 9 adds the inference-prefix rule, the
-   * oauth2-proxy target group has no registered targets, so every request is a
-   * 503 rather than reaching Bifrost. That means item 8 registering the ECS
-   * task cannot put the Bifrost admin surface on the public internet ahead of
-   * oauth2-proxy. Item 9 adds the inference rule to Bifrost and the
-   * `/oauth2/*` and admin-path rules to oauth2-proxy without re-pointing this.
+   * ("everything else falls through to oauth2-proxy"), not at Bifrost. Item 9
+   * adds the path rules below without re-pointing it, which is what keeps the
+   * listener fail-closed: an unmatched path is still authenticated by the proxy
+   * before it can reach the gateway, and Bifrost is reachable only on the
+   * inference and telemetry paths the rules enumerate. There is deliberately
+   * no rule that sends `/api/*` or the dashboard to Bifrost directly; that is
+   * the bypass this default is here to prevent.
    */
   const httpsListener = new aws.lb.Listener(
     "bifrostHttpsListener",
@@ -261,6 +348,42 @@ export const createBifrostIngress = (args: {
       ],
     },
     { provider },
+  );
+
+  /**
+   * The path rules from `HTTPS_LISTENER_RULES`, created against the listener
+   * above and the two target groups created above it.
+   *
+   * These are also what makes the target groups attachable: ECS's
+   * `CreateService` refuses a target group that no listener or listener rule
+   * references (`InvalidParameterException: The target group with targetGroupArn
+   * ... does not have an associated load balancer`), which is why item 8 could
+   * not register the task. The oauth2-proxy group is referenced by the
+   * listener's default action and by the two proxy rules; the Bifrost group by
+   * the inference and telemetry rules. `ecs.ts` takes these resources as a
+   * dependency of the service so the rules exist before ECS registers the task,
+   * rather than relying on Pulumi's incidental ordering.
+   */
+  const ruleTargetGroupArns: Record<ListenerRuleTarget, pulumi.Output<string>> =
+    {
+      bifrost: bifrostTargetGroup.arn,
+      oauth2Proxy: oauth2ProxyTargetGroup.arn,
+    };
+
+  const listenerRules = HTTPS_LISTENER_RULES.map(
+    (spec) =>
+      new aws.lb.ListenerRule(
+        `${spec.key}ListenerRule`,
+        {
+          listenerArn: httpsListener.arn,
+          priority: spec.priority,
+          conditions: [{ pathPattern: { values: [...spec.pathPatterns] } }],
+          actions: [
+            { type: "forward", targetGroupArn: ruleTargetGroupArns[spec.target] },
+          ],
+        },
+        { provider },
+      ),
   );
 
   /**
@@ -316,15 +439,16 @@ export const createBifrostIngress = (args: {
   );
 
   /**
-   * The object index.ts binds and item 9 consumes. The two target groups are
-   * what the ECS service registers against; the ALB, listeners and record are
-   * returned so a later change has the ingress in hand rather than reaching
-   * back into this module.
+   * The object index.ts binds and `ecs.ts` consumes. The two target groups are
+   * what the ECS service registers against, and `listenerRules` is what makes
+   * them registrable; the ALB, listeners and record are returned so a later
+   * change has the ingress in hand rather than reaching back into this module.
    */
   return {
     loadBalancer,
     bifrostTargetGroup,
     oauth2ProxyTargetGroup,
+    listenerRules,
     certificate,
     certificateValidation,
     httpsListener,
@@ -332,3 +456,6 @@ export const createBifrostIngress = (args: {
     dnsRecord,
   };
 };
+
+/** The ingress object `ecs.ts` consumes, so the two modules cannot drift. */
+export type BifrostIngress = ReturnType<typeof createBifrostIngress>;

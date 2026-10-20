@@ -4,6 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_ALLOWLIST_PATH,
   OAUTH2_PROXY_REPOSITORY_NAME,
   OAUTH2_PROXY_TAG,
@@ -68,11 +69,15 @@ describe("derived oauth2-proxy image pin", () => {
 
   it("bakes the allowlist to the path the sidecar reads", () => {
     const dockerfile = fs.readFileSync(DOCKERFILE, "utf8");
+    assert.equal(
+      OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
+      "/etc/oauth2-proxy/allowed-emails.txt",
+    );
     assert.ok(
       dockerfile.includes(
-        "COPY allowed-emails.txt /etc/oauth2-proxy/allowed-emails.txt",
+        `COPY allowed-emails.txt ${OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH}`,
       ),
-      "the derived image must COPY allowed-emails.txt to /etc/oauth2-proxy/allowed-emails.txt",
+      `the derived image must COPY allowed-emails.txt to ${OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH}`,
     );
   });
 
