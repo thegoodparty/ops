@@ -112,6 +112,26 @@ Writes each run's result to `<out>/<case>/run-<n>.json` and the report to `<out>
 
 A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
 
+## Plan-consistency suite
+
+Two cases in `gating/manifest.json`, measuring the one model judgement the
+plan-gated merge design depends on, before the gate exists: a simulated PR whose
+diff implements the step its approved plan names, and one whose diff rewrites a
+different component. Each bundle carries the plan text and blob sha, so nothing
+is fetched from GitHub and the case replays exactly like a production bundle.
+
+These score the model's `planConsistency` answer directly (`consistent`,
+`inconsistent` or `unclear`) rather than a merge outcome, because step 1 of
+`docs/plan-gated-merges.md` ships no gate to turn that answer into an approval
+or a comment. Findings are ignored, so a case measures the consistency
+judgement alone, and the manifest's `expect` is `{ "consistency": "..." }`
+rather than `approve`/`block`. Everything else is the runner above.
+
+Every `delegate eval` comment runs this corpus as its own `gating` job and posts
+a separate comment. It replays main's corpus once main has one and the PR's own
+copy on the PR that adds it, then scores against main's expectations. Two cases
+at three runs cost a few dollars and add no wall time.
+
 ## Cost expectations
 
 - **Replay**: each case is a full `claude-opus-4-6` agent run. Budget $1–5 per case; a 20-case corpus costs roughly $20–100 depending on diff complexity.

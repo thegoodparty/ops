@@ -15,13 +15,23 @@ import type { CheckoutFn, Result } from "./replay";
 const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 const DEFAULT_MANIFEST = join(__dirname, "expected", "manifest.json");
 
-const ExpectSchema = z.discriminatedUnion("verdict", [
-  z.object({ verdict: z.literal("approve") }),
-  z.object({
-    verdict: z.literal("block"),
-    paths: z.array(z.string().min(1)).min(1),
-    categories: z.array(FindingSchema.shape.category).optional(),
-  }),
+const ConsistencySchema = z.enum(["consistent", "inconsistent", "unclear"]);
+
+// A case asserts either a merge outcome (`verdict`) or, for the plan-gating
+// corpus, the model's own answer from `planConsistency`. The gating cases run
+// before the gate exists (step 1 of `docs/plan-gated-merges.md`), so there is no
+// COMMENT to score yet; they are scored on the answer alone and never on
+// findings. The `flag` outcome the other gating cases need arrives in step 5.
+const ExpectSchema = z.union([
+  z.strictObject({ consistency: ConsistencySchema }),
+  z.discriminatedUnion("verdict", [
+    z.strictObject({ verdict: z.literal("approve") }),
+    z.strictObject({
+      verdict: z.literal("block"),
+      paths: z.array(z.string().min(1)).min(1),
+      categories: z.array(FindingSchema.shape.category).optional(),
+    }),
+  ]),
 ]);
 export type Expect = z.infer<typeof ExpectSchema>;
 
@@ -131,6 +141,13 @@ export const scoreRun = (expect: Expect, result: Result): RunScore => {
     const reason = result.error ?? (result.output?.status === "failed" ? result.output.reason : "no output");
     return { pass: false, outcome: `no review: ${reason.slice(0, 200)}` };
   }
+  if ("consistency" in expect) {
+    const answer = result.output.planConsistency?.verdict;
+    return {
+      pass: answer === expect.consistency,
+      outcome: `planConsistency: ${answer ?? "absent"}${answer === expect.consistency ? "" : ` (expected ${expect.consistency})`}`,
+    };
+  }
   const findings = result.output.findings;
   const listed = findings.map((f) => `${f.path}:${f.line} [${f.category}]`).join(", ");
   if (expect.verdict === "approve") {
@@ -154,6 +171,7 @@ export interface CaseReport {
 }
 
 const describeExpect = (e: Expect): string => {
+  if ("consistency" in e) return `planConsistency: ${e.consistency}`;
   if (e.verdict === "approve") return "approve";
   const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
   return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}`;

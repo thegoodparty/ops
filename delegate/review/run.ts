@@ -19,6 +19,7 @@ import {
 } from "./match";
 import {
   FindingSchema,
+  PlanConsistencySchema,
   ReviewOutputSchema,
   type Bundle,
   type Finding,
@@ -203,11 +204,18 @@ const parseCandidate = (candidate: unknown): ParsedReviewOutput | undefined => {
   const summary = typeof obj.summary === "string" ? obj.summary.trim() : "";
   if (findings.length === 0 && summary === "") return undefined;
 
+  // This path rebuilds the object field by field, so a valid planConsistency
+  // has to be carried over explicitly or a fallback parse would read as "the
+  // model gave no answer" in the gating eval. An invalid one is dropped rather
+  // than failing the review: findings and summary are what make it usable.
+  const planConsistency = PlanConsistencySchema.safeParse(obj.planConsistency);
+
   return {
     output: {
       status: "complete",
       findings,
       summary: summary || "The reviewer returned findings without a summary.",
+      ...(planConsistency.success ? { planConsistency: planConsistency.data } : {}),
     },
     droppedFindingCount,
   };

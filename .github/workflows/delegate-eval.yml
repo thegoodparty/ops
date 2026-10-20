@@ -325,3 +325,132 @@ jobs:
         with:
           name: delegate-eval-expected-${{ steps.pr.outputs.sha7 }}
           path: ./eval-expected/
+
+  # The plan-consistency cases in gating/manifest.json, scored on the model's
+  # own `planConsistency` answer rather than on a merge outcome: step 1 of
+  # docs/plan-gated-merges.md adds them before the gate exists, so there is no
+  # COMMENT to score yet. Runs against the PR head on its own runner so it adds
+  # no wall time, and posts as a separate comment.
+  gating:
+    if: |
+      github.event.issue.pull_request != null &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      startsWith(github.event.comment.body, 'delegate eval')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Resolve PR head sha
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          head_repo=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.repo.full_name')
+          if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "::error::delegate eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
+            exit 1
+          fi
+          sha=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.sha')
+          echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main (scoring)
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: .
+
+      - name: Checkout PR head (agent under test)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: pr/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps (main)
+        run: npm ci
+
+      - name: Install deps (pr)
+        run: npm ci
+        working-directory: pr/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Run gating cases
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh auth setup-git
+          root=$(pwd)
+          corpus="$root/delegate/review/eval/gating/manifest.json"
+          # main's corpus once it has one, so a PR cannot change the cases it is
+          # graded on; the PR's copy before that, so the PR that adds the corpus
+          # can be evaluated on it.
+          if [ ! -f "$corpus" ]; then
+            corpus="$root/pr/delegate/review/eval/gating/manifest.json"
+          fi
+          if [ ! -f "$corpus" ]; then
+            echo "::error::no gating corpus at delegate/review/eval/gating/manifest.json"
+            exit 1
+          fi
+          cd pr && npm run -s review:expect -- \
+            --mode replay \
+            --manifest "$corpus" \
+            --runs 3 \
+            --concurrency 5 \
+            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --out ../eval-gating \
+            --work-dir ${{ runner.temp }}/work-gating
+
+      - name: Score against main's expectations
+        run: |
+          manifest=delegate/review/eval/gating/manifest.json
+          if [ ! -f "$manifest" ]; then manifest=pr/$manifest; fi
+          npm run -s review:expect -- \
+            --mode score \
+            --manifest "$manifest" \
+            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --out ./eval-gating
+
+      - name: Post or update PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          body=$(printf '<!-- delegate-eval-gating -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
+            "$(cat ./eval-gating/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
+          existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq '.[] | select(.body | startswith("<!-- delegate-eval-gating -->")) | .id' | sed -n 1p)
+          if [ -n "$existing_id" ]; then
+            gh api --method PATCH repos/${{ github.repository }}/issues/comments/${existing_id} -f body="$body"
+          else
+            gh api --method POST repos/${{ github.repository }}/issues/${PR_NUMBER}/comments -f body="$body"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-gating-${{ steps.pr.outputs.sha7 }}
+          path: ./eval-gating/

@@ -1,0 +1,20 @@
+{
+  "repo": "thegoodparty/ops",
+  "prNumber": 99001,
+  "baseRef": "main",
+  "baseSha": "efbaa873ef0d608e8d23f3bf7b733a6c42090fd0",
+  "headSha": "56e9b617056ef8f4091cdc2975e84bcf213e1005",
+  "author": "delegate-eval",
+  "title": "Raise the delegate webhook Lambda timeout to 60s",
+  "body": "## Why\n\nSlack retries a delivery when the webhook takes more than three seconds, and a\ncold cluster start has been landing just under the function timeout. A retry\nstarts a second review task for the same PR.\n\nPlan: docs/example-webhook-timeout.md\nStep: 1\n\n## What changed\n\n`timeout` on the `delegate-webhook` Lambda, 30 to 60 seconds. Nothing else.\n",
+  "diff": "diff --git a/deploy/components/webhooks.ts b/deploy/components/webhooks.ts\nindex 97ee25f..6ed5233 100644\n--- a/deploy/components/webhooks.ts\n+++ b/deploy/components/webhooks.ts\n@@ -70,7 +70,7 @@ export const createWebhookLambda = (config: WebhookConfig) => {\n     runtime: aws.lambda.Runtime.NodeJS22dX,\n     handler: \"handler.handler\",\n     code: new pulumi.asset.FileArchive(\"../dist/lambda\"),\n-    timeout: 30,\n+    timeout: 60,\n     memorySize: 256,\n     environment: {\n       variables: {\n",
+  "plan": {
+    "path": "docs/example-webhook-timeout.md",
+    "blobSha": "1c7ac96f062c9263697f7208056f9941e4dc499a",
+    "text": "# Delegate webhook timeout\n\n> **Status: approved.** One step. A step PR implements the plan and does not\n> edit this document.\n\n## Why\n\nSlack retries a delivery that takes longer than three seconds, and the webhook\nhandler has been landing just under the Lambda's 30 second timeout when it has\nto resolve the GitHub App installation and start an ECS task on a cold cluster.\nThe retry starts a second agent run against the same PR, which is the\nduplicate-review case the per-sha S3 lock does not cover because the two tasks\nland at slightly different times.\n\n## Step 1\n\nRaise the `delegate-webhook` Lambda's timeout in\n`deploy/components/webhooks.ts` from 30 seconds to 60 seconds.\n\nNothing else changes: the memory size, the runtime, the role, the environment\nvariables and the function URL stay as they are, and the ECS task definition is\nnot part of this step.\n\n## Out of scope\n\n- The agent deadline (`AGENT_DEADLINE_MS` in `delegate/worker/entrypoint.ts`).\n- The webhook's Slack signature check.\n- Any change under `deploy/components/worker.ts`.\n"
+  },
+  "changedFiles": [
+    "deploy/components/webhooks.ts"
+  ],
+  "priorFindings": []
+}
