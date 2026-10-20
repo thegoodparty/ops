@@ -121,10 +121,12 @@ export const POLL_INTERVAL_SECONDS = 15 * 60;
  * `engineering@` (the Workspace group's name) and the target is `Engineers`
  * (the Identity Center group's name).
  *
- * `mode` is `dry-run` per "Rollout": the pair computes and logs the diff for
- * several intervals before a reviewed change flips it to `apply`. Nothing in
- * step 3 applies, so this is true by construction rather than by convention --
- * `runPair` returns before any write unless the mode is `apply`.
+ * `mode` is `apply`, the reviewed change of "Rollout" step 4. The pair shipped
+ * `dry-run` first, and the dry run against the real group that was reviewed
+ * before this flip reported 9 source members, 11 target members, 2 removals, 0
+ * additions and `removalCapTripped: false`, so the first apply is that same
+ * removal and nothing else. `runPair` returns before any write unless the mode
+ * is `apply`, which is why the mode is the whole change.
  *
  * The cap and alert threshold are the plan's defaults (`maxCount: 5`,
  * `maxFraction: 0.1`, `removalAlertThreshold: 0`), still placeholders for the
@@ -138,7 +140,7 @@ export const SYNC_PAIRS: readonly SyncPair[] = [
     id: "engineers-google",
     sourceGroupEmail: "engineering@goodparty.org",
     targetGroupId: "383193a0-7001-70d9-a321-ffe6d8af7378", // Engineers
-    mode: "dry-run",
+    mode: "apply",
     removalCap: { maxCount: 5, maxFraction: 0.1 },
     allowlist: ["@goodparty.org"],
     removalAlertThreshold: 0,
