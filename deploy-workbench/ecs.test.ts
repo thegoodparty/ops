@@ -658,6 +658,19 @@ describe("bifrost ecs", () => {
     const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(gateway.includes("cpu: BIFROST_CONTAINER_CPU"), gateway);
     assert.ok(gateway.includes("memory: BIFROST_CONTAINER_MEMORY"), gateway);
+
+    // The sum above runs on the exported constants, so it proves nothing about
+    // what the sidecar ships unless the definition actually uses them: a
+    // hardcoded `cpu: 64`, or no reservation at all, would pass the sums.
+    const sidecar = containerDefinitionBlock("OAUTH2_PROXY_CONTAINER_NAME");
+    assert.ok(
+      sidecar.includes("cpu: OAUTH2_PROXY_CONTAINER_CPU,"),
+      "the sidecar must take its cpu from OAUTH2_PROXY_CONTAINER_CPU",
+    );
+    assert.ok(
+      sidecar.includes("memory: OAUTH2_PROXY_CONTAINER_MEMORY,"),
+      "the sidecar must take its memory from OAUTH2_PROXY_CONTAINER_MEMORY",
+    );
   });
 
   it("resolves the log group name before building the containers", () => {
