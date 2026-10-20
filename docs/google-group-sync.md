@@ -793,12 +793,11 @@ the email, which is called out in the PR body like the `sheriff` one.
    removals alarm is on from the start, so the first real removal pages.
 5. Add further pairs the same way, one at a time, each starting dry-run.
 
-Two prerequisites are outside this PR's `deploy-infrastructure` change, and
-both are manual. The `googleImpersonationEmail` key is now set by
-`deploy-infrastructure/deploy.sh`, so a dry run no longer aborts immediately
-for a missing impersonation admin. The service-account key still has to be put
-into the `identity-group-sync/google-service-account` secret by hand (manual
-Google setup step 5); until it is, the read fails closed as
+One rollout prerequisite is still manual. The `googleImpersonationEmail` key
+is now set by `deploy-infrastructure/deploy.sh`, so a dry run no longer aborts
+immediately for a missing impersonation admin. The service-account key still
+has to be put into the `identity-group-sync/google-service-account` secret by
+hand (manual Google setup step 5); until it is, the read fails closed as
 `source-read-failed` and the heartbeat stays red, which is the designed signal,
 not a rollout step that was skipped. The scratch pair the integration test
 uses is read with the operator's own Identity Store credentials, so it needs
