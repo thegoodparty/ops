@@ -881,11 +881,19 @@ role and wiring (step 3). Both are `node --test` via `tsx`, picked up by
 
 ## Implementation plan
 
-One step at a time, one pull request per step. Statuses are `todo`, `doing`,
-and `done`. The order matters at one point: the management-account role must
-merge and finish applying before the Lambda that assumes it merges, because
-the Lambda's first run is an `AssumeRole` and a missing role is an
-`AccessDenied`, not an apply-time error.
+One step at a time, one pull request per step. The steps below are a historical
+record rather than a status: all four are done, the checklist is kept as what
+was built and how it was verified, it is frozen at merge, and it is not
+updated. Status is now derived from the pull requests that name a step, with
+the `Plan:` and `Step:` lines in their bodies, as "Progress" in
+[`workbench-account.md`](./workbench-account.md) sets out and decision 11 of
+[`plan-gated-merges.md`](./plan-gated-merges.md) decides: a merged PR naming the
+step is `done` with its merge date and PR link as the evidence, an open PR is
+`doing` with its author and open date, and a step with neither is `todo`. The
+order matters at one point: the management-account role must merge and finish
+applying before the Lambda that assumes it merges, because the Lambda's first
+run is an `AssumeRole` and a missing role is an `AccessDenied`, not an
+apply-time error.
 
 - [x] 1. Definitions only, no runtime: the `identity-group-sync-grant` role
       and its inline policy in `deploy/components/`, registered in

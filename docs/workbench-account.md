@@ -6,23 +6,45 @@ the work can be picked up across sessions.
 
 ## Progress
 
-One step at a time, one pull request per step. Statuses are `todo`, `doing
-(who, date)`, and `done (date, evidence)`. Evidence is a commit SHA for
-in-repo work, or an AWS case number or resource id for work done outside git.
+This document is a spec. It was frozen when it merged, and a step's status is
+not written here any more: it is derived from the pull requests that name the
+step, which is decision 11 of
+[`plan-gated-merges.md`](./plan-gated-merges.md). A merged PR naming the step is
+`done`, with its merge date and a link to that PR as the evidence. Failing
+that, an open PR naming it is `doing`, with its author and open date. A step
+with neither is `todo`, whether it never had a PR or its only one was closed
+unmerged. ClickUp is optional and carries only what git cannot express: a step
+deliberately dropped or reordered, or an operational step that is not a PR.
 
-Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Make `who` name the *session*, not the model:
-two concurrent sessions both wrote `claude` on 2026-09-22 across steps 9, 11
-and 15, which left no way to tell which claim was whose and would have made
-all three look abandoned together once the day-old rule below applied.
-Something like `claude-scp` costs nothing. Both sessions also shared one
-working tree, so check `git branch --show-current` before committing.
+A pull request says which plan it implements, and which numbered step it
+closes, in its body, each on its own line:
 
-Steps 1, 2, 12 and 16 happen in the console or in
-support cases and leave no other trace, so the claim is the only thing stopping
-two sessions from doing them twice. Step 11 used to be on that list and is not
-any more: it has a script now, though the terms acknowledgement inside it may
-still need the console once.
+```
+Plan: docs/workbench-account.md
+Step: 3
+```
+
+`Plan:` is a pointer to this file at `main` and nothing else. `Step:` names the
+numbered step the PR closes; it is deliberately not part of the merge gate, so
+a missing, malformed or duplicated one never flags a PR, it only leaves the
+step's status where it was. Status is read from the PRs and never written back
+into this document. The checkboxes below are the record of what was run, when,
+what the console or a support case returned, and which session did it. That is
+the only record some of that work left, so it is kept and not maintained.
+
+Steps 1, 2, 12 and 16 happen in the console or in support cases, so they leave
+no PR and have no derived status; their entries below are what to read before
+doing one again, and "How to resume" is how to check it against AWS. Step 11
+used to be on that list and is not any more: it has a script now, though the
+terms acknowledgement inside it may still need the console once.
+
+The convention this replaced was to claim a step by setting it to `doing` and
+pushing that change **before** the work started. It came with a rule that `who`
+name the *session*, not the model, because two concurrent sessions both wrote
+`claude` on 2026-09-22 across steps 9, 11 and 15, which left no way to tell
+which claim was whose. Both rules retire together: derived status takes `who`
+from the PR author, whom GitHub already distinguishes, and the two sessions
+shared one working tree, which the one-worktree-per-task rule now prevents.
 
 - [x] 1. Create and verify `aws-workbench@goodparty.org` group alias: done
       (2026-09-17, jeff, group created and receipt confirmed)
@@ -496,9 +518,10 @@ metadata, and the key names are declared in `deploy/delegate-secret.ts`; see
 account by assuming the read-only `pulumi-preview` role (steps 8 and 10 of that
 plan). Only an apply needs `gp-admin`.
 
-If a step is marked `doing` with a date more than a day old, assume the session
-that claimed it is gone. Verify actual state with the commands above, then
-either finish it or reset it to `todo`.
+A step whose open PR has gone quiet is still `doing`: the PR is open, and that
+is what git says. There is no claim to expire and nothing here to reset. Verify
+actual state with the commands above, then either finish the work, close the
+PR, or leave it open, and the derived status follows.
 
 Concurrent `pulumi up` is already safe: the S3 backend takes a state lock, and
 `.github/workflows/deploy.yml` serializes main-branch deploys through the
