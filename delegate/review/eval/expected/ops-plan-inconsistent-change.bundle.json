@@ -1,0 +1,20 @@
+{
+  "repo": "thegoodparty/ops",
+  "prNumber": 99002,
+  "baseRef": "main",
+  "baseSha": "efbaa873ef0d608e8d23f3bf7b733a6c42090fd0",
+  "headSha": "5b314b586e318ffc4ec50abcd7ad9e56877c0e61",
+  "author": "delegate-eval",
+  "title": "Make playwright reports private",
+  "body": "## Why\n\nThe Playwright report bucket is still public read, and the traces it holds can\ncontain request bodies from the dashboard's own test runs. Make it private,\ndrop the CORS rule the browser no longer needs, and expire traces after a week\ninstead of thirty days.\n\nPlan: docs/example-log-retention.md\nStep: 1\n",
+  "diff": "diff --git a/deploy/components/playwright-reports.ts b/deploy/components/playwright-reports.ts\nindex a49ba0d..5e8b5b3 100644\n--- a/deploy/components/playwright-reports.ts\n+++ b/deploy/components/playwright-reports.ts\n@@ -9,55 +9,20 @@ export const createPlaywrightReportsBucket = () => {\n     \"playwrightReportsPublicAccess\",\n     {\n       bucket: bucket.id,\n-      blockPublicAcls: false,\n-      blockPublicPolicy: false,\n-      ignorePublicAcls: false,\n-      restrictPublicBuckets: false,\n+      blockPublicAcls: true,\n+      blockPublicPolicy: true,\n+      ignorePublicAcls: true,\n+      restrictPublicBuckets: true,\n     }\n   );\n \n-  new aws.s3.BucketPolicy(\n-    \"playwrightReportsPolicy\",\n-    {\n-      bucket: bucket.id,\n-      policy: bucket.arn.apply((arn) =>\n-        JSON.stringify({\n-          Version: \"2012-10-17\",\n-          Statement: [\n-            {\n-              Sid: \"PublicReadGetObject\",\n-              Effect: \"Allow\",\n-              Principal: \"*\",\n-              Action: \"s3:GetObject\",\n-              Resource: `${arn}/*`,\n-            },\n-          ],\n-        })\n-      ),\n-    },\n-    { dependsOn: [publicAccessBlock] }\n-  );\n-\n   new aws.s3.BucketLifecycleConfigurationV2(\"playwrightReportsLifecycle\", {\n     bucket: bucket.id,\n     rules: [\n       {\n         id: \"expire-old-reports\",\n         status: \"Enabled\",\n-        expiration: { days: 30 },\n-      },\n-    ],\n-  });\n-\n-  new aws.s3.BucketCorsConfigurationV2(\"playwrightReportsCors\", {\n-    bucket: bucket.id,\n-    corsRules: [\n-      {\n-        allowedHeaders: [\"*\"],\n-        allowedMethods: [\"GET\"],\n-        allowedOrigins: [\"https://trace.playwright.dev\"],\n-        exposeHeaders: [\"Content-Length\", \"Content-Type\"],\n-        maxAgeSeconds: 3600,\n+        expiration: { days: 7 },\n       },\n     ],\n   });\n",
+  "plan": {
+    "path": "docs/example-log-retention.md",
+    "blobSha": "e68fe0682219c38aee1e47be66b7ca80fe41e326",
+    "text": "# Review worker log retention\n\n> **Status: approved.** One step. A step PR implements the plan and does not\n> edit this document.\n\n## Why\n\nThe `/aws/ecs/delegate` log group holds thirty days of agent runs. That is\nenough to read a re-review back after a PR has been idle over a long weekend,\nbut not enough for the monthly cost read: the workflow phase metrics are derived\nfrom those logs, so a slow leak in one phase is invisible past day 30.\n\n## Step 1\n\nChange the retention of the `/aws/ecs/delegate` log group in\n`deploy/components/worker.ts` from 30 days to 90 days.\n\nThat is the whole step: the log group name, the metric filters, the task\ndefinition, the ECS cluster and the execution role are unchanged.\n\n## Out of scope\n\n- The Playwright reports bucket, which belongs to a different plan.\n- Retention on any other log group.\n- The deploy role's `logs:*` permissions, which already allow `PutLogEvents`\n  and nothing that reads.\n"
+  },
+  "changedFiles": [
+    "deploy/components/playwright-reports.ts"
+  ],
+  "priorFindings": []
+}

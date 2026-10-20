@@ -13,6 +13,7 @@ import {
   scoreRun,
 } from "./expect";
 import type { Expect } from "./expect";
+import type { ExpectedCase } from "./expect";
 import type { Result } from "./replay";
 import type { Bundle, Finding } from "../schema";
 
@@ -51,6 +52,136 @@ test("the manifest parses and every simulated bundle matches its diff", () => {
     const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
     assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
   }
+});
+
+// The two plan cases are simulated PRs in the same corpus, and each carries the
+// plan the model is judged against inside its bundle: nothing fetches it, so a
+// case replays with no GitHub access.
+test("the corpus has one consistent and one inconsistent plan case, both with a plan", () => {
+  const cases = readManifest(MANIFEST).filter((c) => c.expect.verdict === "consistency");
+  const wanted = cases.map((c) =>
+    c.expect.verdict === "consistency" ? c.expect.consistency : null,
+  );
+  assert.deepEqual([...wanted].sort(), ["consistent", "inconsistent"]);
+  for (const c of cases) {
+    assert.ok(c.bundle, `${c.id} must be a simulated bundle`);
+    const bundle = readBundleFile(MANIFEST, c.bundle!);
+    const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
+    assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
+    assert.ok(bundle.plan, `${c.id} must carry the plan in its bundle`);
+    assert.match(bundle.plan!.path, /^docs\/.+\.md$/, c.id);
+    assert.ok(bundle.plan!.text.length > 0, c.id);
+    assert.match(bundle.plan!.blobSha, /^[0-9a-f]{40}$/, c.id);
+    assert.match(bundle.body, /^Plan: docs\//m, `${c.id} must name its plan in the body`);
+  }
+});
+
+test("the manifest rejects an unknown answer or verdict, and a consistency case without one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "expect-manifest-"));
+  const write = (name: string, body: unknown) => {
+    const path = join(dir, name);
+    writeFileSync(path, JSON.stringify(body));
+    return path;
+  };
+  const c = readManifest(MANIFEST).find((x) => x.expect.verdict === "consistency")!;
+  assert.throws(
+    () =>
+      readManifest(
+        write("bad.json", [{ ...c, expect: { verdict: "consistency", consistency: "probably" } }]),
+      ),
+    "consistency must be one of the three answers",
+  );
+  assert.throws(
+    () => readManifest(write("missing.json", [{ ...c, expect: { verdict: "consistency" } }])),
+    "a consistency expectation needs the answer it asserts",
+  );
+  assert.throws(
+    () => readManifest(write("unknown.json", [{ ...c, expect: { verdict: "flag" } }])),
+    "flag is not an expectation type until step 5",
+  );
+});
+
+const withConsistency = (
+  verdict?: "consistent" | "inconsistent" | "unclear",
+  findings: Finding[] = [],
+) =>
+  result({
+    output: {
+      status: "complete",
+      findings,
+      summary: "s",
+      ...(verdict ? { planConsistency: { verdict, reasoning: "r" } } : {}),
+    },
+  });
+
+const consistency = (answer: "consistent" | "inconsistent" | "unclear"): Expect => ({
+  verdict: "consistency",
+  consistency: answer,
+});
+
+test("a consistency expectation scores the model's answer alone", () => {
+  assert.equal(scoreRun(consistency("inconsistent"), withConsistency("inconsistent")).pass, true);
+  assert.equal(scoreRun(consistency("inconsistent"), withConsistency("consistent")).pass, false);
+  assert.match(
+    scoreRun(consistency("inconsistent"), withConsistency("consistent")).outcome,
+    /planConsistency: consistent \(expected inconsistent\)/,
+  );
+  assert.equal(scoreRun(consistency("consistent"), withConsistency()).pass, false);
+  assert.match(scoreRun(consistency("consistent"), withConsistency()).outcome, /absent/);
+  assert.equal(scoreRun(consistency("unclear"), withConsistency("unclear")).pass, true);
+});
+
+test("findings do not enter a consistency score, and no review still fails", () => {
+  assert.equal(
+    scoreRun(consistency("consistent"), withConsistency("consistent", [finding("a.ts")])).pass,
+    true,
+  );
+  assert.equal(
+    scoreRun(consistency("consistent"), result({ output: null, error: "agent returned no JSON" }))
+      .pass,
+    false,
+  );
+});
+
+// The diagnostic is what the consistency expectation becomes once the gate can
+// score an outcome (step 5): the outcome decides the case, and the answer says
+// whether a wrong outcome came from the model or from the gate.
+test("a diagnostic on an outcome case has to be right as well", () => {
+  const approveWithAnswer: Expect = { verdict: "approve", consistency: "consistent" };
+  assert.equal(scoreRun(approveWithAnswer, withConsistency("consistent")).pass, true);
+  assert.equal(scoreRun(approveWithAnswer, withConsistency("inconsistent")).pass, false);
+  assert.match(
+    scoreRun(approveWithAnswer, withConsistency("inconsistent")).outcome,
+    /approved; planConsistency: inconsistent \(expected consistent\)/,
+  );
+  assert.equal(scoreRun(approveWithAnswer, withConsistency()).pass, false);
+
+  const blockWithAnswer: Expect = {
+    verdict: "block",
+    paths: ["b.ts"],
+    consistency: "inconsistent",
+  };
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("b.ts")])).pass, true);
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("consistent", [finding("b.ts")])).pass, false);
+  // A matching answer never rescues a wrong outcome.
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("c.ts")])).pass, false);
+});
+
+test("the report names a consistency expectation and an outcome diagnostic", () => {
+  const cases = readManifest(MANIFEST);
+  const planCases = cases.filter((c) => c.expect.verdict === "consistency");
+  const diagnosed: ExpectedCase = {
+    ...cases[0],
+    id: "diagnosed",
+    expect: { verdict: "approve", consistency: "consistent" },
+  };
+  const report = renderExpectReport(
+    [...planCases, diagnosed].map((c) => ({ c, scores: [], costs: [] })),
+    "v",
+  );
+  assert.match(report, /planConsistency: consistent/);
+  assert.match(report, /planConsistency: inconsistent/);
+  assert.match(report, /approve \(diagnostic: planConsistency: consistent\)/);
 });
 
 test("approve passes only with zero findings", () => {

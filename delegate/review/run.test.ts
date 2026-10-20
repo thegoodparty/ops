@@ -112,6 +112,33 @@ test("parseReviewOutput rejects a verdict the agent is not allowed to emit", () 
   assert.match(out.error, /failed schema/);
 });
 
+test("parseReviewOutput keeps a valid planConsistency on the tolerant path", () => {
+  const answer = { verdict: "inconsistent", reasoning: "the plan names worker.ts" };
+  const kept = parseReviewOutput({
+    output: JSON.stringify({ status: "complete", findings: [], summary: "clean", planConsistency: answer }),
+  });
+  assert.ok(!("error" in kept));
+  assert.deepEqual(kept.output, {
+    status: "complete",
+    findings: [],
+    summary: "clean",
+    planConsistency: answer,
+  });
+
+  // A malformed answer must not fail an otherwise complete review; it just
+  // does not survive as a consistency answer.
+  const dropped = parseReviewOutput({
+    output: JSON.stringify({
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "mostly" },
+    }),
+  });
+  assert.ok(!("error" in dropped));
+  assert.deepEqual(dropped.output, { status: "complete", findings: [], summary: "clean" });
+});
+
 test("parseReviewOutput finds the JSON when the model wraps it in prose", () => {
   const out = parseReviewOutput({
     output: `All four deep-reviewers returned zero findings. Every lead was falsified:

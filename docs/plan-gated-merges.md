@@ -43,12 +43,12 @@ Nothing is made easier until step 6, and step 6 only touches paths that step 5
 measured.
 
 - [ ] 1. Evals first: the two consistency cases from "The corpus" as simulated
-      bundles, a `gating` eval job beside the existing expected-result job, the
-      optional `plan` bundle field and the one consistency enum they score, and
-      the expect field that asserts that enum. Production still fetches no plan
-      and the verdict does not read the enum, so no merge outcome changes; the
-      deliverable is a false-approve and false-flag number for the model
-      judgement before the gate exists. `todo`
+      bundles in `expected/` with `consistency` expectations, the optional
+      `plan` bundle field, and the one consistency enum they score. They join
+      the existing expected-result job; there is no second corpus and no second
+      job. Production still fetches no plan and the verdict does not read the
+      enum, so no merge outcome changes; the deliverable is a false-approve and
+      false-flag number for the model judgement before the gate exists. `todo`
 - [ ] 2. `CODEOWNERS`: empty the opt-out list, removing `/docs/`,
       `/README.md`, `/.gitignore`, `/CLAUDE.md` and `**/CLAUDE.md`, and rewrite
       the commentary so the list reads as the only mechanism that grants
@@ -61,10 +61,13 @@ measured.
       `CODEOWNERS`-derived authority, and flag-not-approve for each case in
       "The five cases that go to a human". Ships in a mode that cannot approve,
       so it changes no merge outcome on its own. `todo`
-- [ ] 5. The rest of the corpus and a flag-only shadow run: the six
-      deterministic cases, the `flag` expect outcome, and `shadow` mode on the
-      Pulumi trees for a few weeks, with `delegate`'s verdicts compared against
-      what humans actually did. `todo`
+- [ ] 5. The rest of the corpus and a flag-only shadow run: the deterministic
+      cases as `gating.test.ts` unit tests rather than eval replays, the two
+      plan cases switched to `approve`/`flag` with `consistency` kept as a
+      diagnostic, the push-after-approval case kept in the eval corpus, the
+      `flag` expect outcome, and `shadow` mode on the Pulumi trees for a few
+      weeks, with `delegate`'s verdicts compared against what humans actually
+      did. `todo`
 - [ ] 6. De-own the Pulumi trees, one path at a time, only where step 5 showed
       agreement: `deploy/`, `deploy-org/`, `deploy-workbench/`,
       `deploy-infrastructure/`, and flip the mode to `enforce` in the first of
@@ -348,8 +351,9 @@ different times. The two consistency cases run first, in step 1, against the
 production prompt but with no gate around them: they answer "can the model tell
 a consistent diff from an inconsistent one at all", before anything is built on
 the answer and while a bad result is still cheap to act on. The deterministic
-cases need the harness, so they join the same corpus in step 5, where the shadow
-run also measures the combined verdict against real merges.
+cases need the harness, so they arrive with it in step 5 as `gating.test.ts`
+unit tests rather than replays, where the shadow run also measures the combined
+verdict against real merges.
 
 - **False approve** is the security number. It is a case that should have gone
   to a human and did not. Step 6 does not happen on the strength of a good
@@ -368,11 +372,12 @@ The corpus is the eight cases named below. They are built as simulated PRs, not
 snapshots of production runs: `delegate/review/eval/expect.ts` already supports a
 case that is a bundle plus a diff, committed locally with a fixed author and
 date so its head sha is reproducible, and every one of these cases is defined by
-its inputs rather than by a review someone once got. They live in a `gating/`
-directory beside `expected/`, in the same manifest shape, and run through the
-same replay and scoring code. The last column says which step first makes the
-case runnable: the consistency pair in step 1, the harness cases once the gate
-exists in step 5.
+its inputs rather than by a review someone once got. They live in
+`delegate/review/eval/expected/` beside the existing known-answer cases and are
+listed in `expected/manifest.json`, so they run through the same expected-result
+job, replay and scoring code: there is no second corpus and no second job. The
+last column says which step first makes the case runnable: the consistency pair
+in step 1, the harness cases once the gate exists in step 5.
 
 | Case | Input | Passes when | First runnable in |
 |---|---|---|---|
@@ -385,12 +390,17 @@ exists in step 5.
 | a PR touching the plan it implements | diff and plan edit in one PR | flag `touches_docs` | step 5 |
 | a commit pushed after approval | an approval recorded at sha A, then a push to sha B | the B run never approves on A's authority: either it approves only after its own consistency judgement at B, or it flags. `require_last_push_approval` is what makes A's approval not count; the case pins that the bot does not reintroduce it. | step 5 |
 
-`ExpectSchema` in `expect.ts` currently has two outcomes, `approve` and `block`.
-The step-1 consistency cases cannot use either: there is no gate yet to turn an
-`inconsistent` answer into a `COMMENT`, and the finding gate may still approve.
-They therefore score the model's answer directly, through an optional
-`consistency: "consistent" | "inconsistent" | "unclear"` field that the scorer
-reads from `planConsistency`. In step 5 the harness cases need a third review
+`ExpectSchema` in `expect.ts` has one expectation type per case. `approve` and
+`block` score a merge outcome. The step-1 consistency cases cannot use either:
+there is no gate yet to turn an `inconsistent` answer into a `COMMENT`, and the
+finding gate may still approve. They therefore use the third expectation type,
+`{ verdict: "consistency", consistency: "consistent" | "inconsistent" |
+"unclear" }`, which scores the model's answer directly and reads it from
+`planConsistency`. In step 5 the two plan cases switch to their outcomes —
+`approve` for the consistent change, `flag` for the inconsistent one — and
+`consistency` stays as an optional diagnostic on the outcome: the outcome
+decides the case, and the answer says whether a wrong outcome came from the
+model or from the gate. In step 5 the harness cases need that third review
 outcome, `flag`: `{ verdict: "flag", reason: <gate name> }`, passing when the
 review event is `COMMENT` and the named gate fired. That needs one more field on
 the replay result, because the agent's output alone cannot distinguish a flag
@@ -399,11 +409,18 @@ the scorer reads it. Both are small, testable extensions, and they are what
 make the false-approve and false-flag counts mechanical instead of a judgement
 about a comment.
 
+Step 5 does not keep all eight as eval cases. The deterministic cases that need
+no model — no plan binding, a plan added or edited (`touches_docs`), a plan
+absent at `main`, and a PR touching its own plan — are cheaper and stronger as
+unit tests in `delegate/review/gating.test.ts` than as $1–5 replays. Only the
+two plan cases and the commit pushed after approval stay in `expected/`.
+
 Cost, from the eval README's own numbers: a replay is roughly $1–5 per case. The
-two consistency cases in step 1 cost a few dollars per run, and the full eight
-in step 5 cost on the order of $10–40 plus a few dollars of judging. That is
-cheap enough to run on every change to `delegate/review/`, and it should be,
-because the gate itself is now part of what a review can trust.
+two consistency cases in step 1 cost a few dollars per run, and step 5's three
+eval cases cost a few dollars plus a few dollars of judging; the deterministic
+cases are unit tests and free. That is cheap enough to run on every change to
+`delegate/review/`, and it should be, because the gate itself is now part of
+what a review can trust.
 
 ### Shadow mode
 
@@ -649,15 +666,17 @@ The Progress list is the checklist; this is the detail behind each step.
 1. **Evals first, for the model half.** Add the optional `plan` field to
    `Bundle` and the `planConsistency` field to the `complete` branch of
    `ReviewOutputSchema`; add the `<plan>` element and the consistency
-   instruction to `buildReviewPrompt`; write the two consistency cases as
-   simulated bundles in `delegate/review/eval/gating/` with an optional
-   `consistency` expectation that reads `planConsistency` directly; and add a
-   `gating` job to `.github/workflows/delegate-eval.yml` beside the existing
-   expected-result job (its `--manifest` flag already accepts a corpus path, so
-   no new runner is needed). Production fetches no plan until step 4, so the
-   prompt section is dormant there and no merge outcome changes. The deliverable
-   is a false-approve/false-flag number for the model judgement before the gate
-   exists; the six deterministic cases are not scoreable until step 5.
+   instruction to `buildReviewPrompt`; add the `consistency` expectation type to
+   `ExpectSchema` in `delegate/review/eval/expect.ts`, scored from
+   `planConsistency` alone; and write the two consistency cases as simulated
+   bundles in `delegate/review/eval/expected/`, listed in
+   `expected/manifest.json` beside the existing known-answer cases. They join
+   the existing expected-result job, which already replays a bundle-plus-diff
+   case from a manifest, so there is no new corpus, job or runner. Production
+   fetches no plan until step 4, so the prompt section is dormant there and no
+   merge outcome changes. The deliverable is a false-approve/false-flag number
+   for the model judgement before the gate exists; the deterministic cases are
+   not scoreable until step 5.
 2. **Empty the opt-out list.** In `.github/CODEOWNERS`, delete `/docs/`,
    `/README.md`, `/.gitignore`, `/CLAUDE.md` and `**/CLAUDE.md`, leaving `*` as
    the only rule, and rewrite the commentary: the opt-out list is now the only
@@ -693,15 +712,20 @@ The Progress list is the checklist; this is the detail behind each step.
    comment is rewritten. It is also the step where the subagents get nothing
    new: the consistency question is asked of the orchestrator, which already
    holds the plan and the diff.
-5. **The rest of the corpus and the shadow run.** The six deterministic cases in
-   `delegate/review/eval/gating/`, with a `flag` outcome added to `expect.ts`
-   (its `--manifest` flag already accepts a corpus path, so the job added in
-   step 1 picks them up with no new runner). Then
-   `DELEGATE_GATING_MODE=shadow` in `deploy/components/worker.ts` and the weekly
-   read of would-be verdicts against what humans did. The rates are recorded in
-   the de-owning PRs' bodies and on a plan's ClickUp task when one exists. Step
-   5 ends with the numbers in hand and a recommendation per Pulumi tree, not
-   with a date.
+5. **The rest of the corpus and the shadow run.** The deterministic cases need
+   no model, so they are unit tests in `delegate/review/gating.test.ts` rather
+   than $1–5 eval replays: no plan binding, a plan added or edited
+   (`touches_docs`), a plan absent at `main`, and a PR touching its own plan.
+   Only the model-judgement cases stay in the eval corpus: the two plan cases,
+   switched to their outcomes — `approve` for the consistent change and `flag`
+   for the inconsistent one — with `consistency` kept as a diagnostic on the
+   outcome; and the commit pushed after approval. That needs the `flag`
+   expectation type in `expect.ts`, which the existing expected-result job runs
+   with no new job. Then `DELEGATE_GATING_MODE=shadow` in
+   `deploy/components/worker.ts` and the weekly read of would-be verdicts
+   against what humans did. The rates are recorded in the de-owning PRs' bodies
+   and on a plan's ClickUp task when one exists. Step 5 ends with the numbers in
+   hand and a recommendation per Pulumi tree, not with a date.
 6. **De-own, one path at a time.** Four PRs, each removing one line in
    `.github/CODEOWNERS` and updating the commentary and `CLAUDE.md` as above,
    each citing the shadow evidence for that path in its body. The first of the

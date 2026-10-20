@@ -21,11 +21,24 @@ export const FindingSchema = z.object({
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
+// The one model judgement in a plan-gated review: is the diff consistent with
+// the plan the PR names? Everything else about the gate is deterministic, and
+// the verdict does not read this yet — step 1 of `docs/plan-gated-merges.md`
+// adds the field and the eval cases that score it, step 4 wires it into the
+// verdict. Optional so a run with no plan (every production run today) and
+// every record written before this landed still parse and still replay.
+export const PlanConsistencySchema = z.object({
+  verdict: z.enum(["consistent", "inconsistent", "unclear"]),
+  reasoning: z.string().min(1),
+});
+export type PlanConsistency = z.infer<typeof PlanConsistencySchema>;
+
 export const ReviewOutputSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("complete"),
     findings: z.array(FindingSchema),
     summary: z.string().min(1),
+    planConsistency: PlanConsistencySchema.optional(),
   }),
   z.object({
     status: z.literal("failed"),
@@ -47,6 +60,17 @@ export const PriorFindingSchema = z.object({
 });
 export type PriorFinding = z.infer<typeof PriorFindingSchema>;
 
+// The plan a gated PR is judged against: the path the PR binds, the blob sha
+// it was read at, and its text. Optional because no production run populates
+// it yet — step 4 fetches it at the base ref and the prompt only asks the
+// consistency question when it is here.
+export const PlanSchema = z.object({
+  path: z.string().min(1),
+  blobSha: z.string().min(1),
+  text: z.string(),
+});
+export type Plan = z.infer<typeof PlanSchema>;
+
 // Everything the agent is allowed to know. Built deterministically before
 // the agent runs; the agent has no network and no GitHub token, so if it is
 // not here the agent cannot see it. The bundle is persisted on the record so
@@ -63,6 +87,7 @@ export const BundleSchema = z.object({
   diff: z.string(),
   changedFiles: z.array(z.string()),
   priorFindings: z.array(PriorFindingSchema),
+  plan: PlanSchema.optional(),
 });
 export type Bundle = z.infer<typeof BundleSchema>;
 
