@@ -47,6 +47,14 @@ host; the next deploy overwrites them.
   `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
+- Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
+  25 GB together in `docker-compose.yml` (coder 14g, reviewer 6g, lead 5g)
+  so the API, embeddings and proxies always keep the rest. An agent that
+  hits its cap has its biggest process OOM-killed in its own container. If
+  the host itself runs short, the API is the last thing the kernel kills.
+  The symptom of running short is both EBS volumes reading at their
+  125 MB/s cap and `[db-client] slow sync statement blocked the event
+  loop` lines in the api stream, while Delegate ignores Slack.
 - GitHub identity: commits and PRs are authored by the `delegate-gp[bot]`
   App (see "Git identity"). There is no PAT.
 
