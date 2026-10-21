@@ -48,8 +48,10 @@ host; the next deploy overwrites them.
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
-  25 GB together in `docker-compose.yml` (coder 14g, reviewer 6g, lead 5g)
-  so the API, embeddings and proxies always keep the rest. An agent that
+  26 GB together in `docker-compose.yml` (coder 12g, reviewer 6g, lead 8g)
+  so the API, embeddings and proxies always keep the rest. The lead runs up
+  to 10 tasks at once (`MAX_CONCURRENT_TASKS`, default 2) so background
+  triggers cannot queue Slack mentions; its cap is sized for that. An agent that
   hits its cap has its biggest process OOM-killed in its own container. If
   the host itself runs short, the API is the last thing the kernel kills.
   The symptom of running short is both EBS volumes reading at their

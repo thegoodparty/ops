@@ -168,11 +168,15 @@ services:
       AGENT_NAME: delegate
       TEMPLATE_ID: official/lead
       MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
+      # The default is 2. Background triggers (ClickUp comments, schedules)
+      # can hold both slots for long stretches and queue Slack mentions behind
+      # them; most lead tasks are short model calls, not builds.
+      MAX_CONCURRENT_TASKS: "10"
     # Without caps one agent's build fills the 32 GB host, the kernel drops
     # its file cache, and the single-threaded API stalls on disk for minutes.
     # A capped agent is OOM-killed inside its own container instead.
-    mem_limit: 5g
-    memswap_limit: 5g
+    mem_limit: 8g
+    memswap_limit: 8g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
@@ -187,8 +191,8 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/coder
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
-    mem_limit: 14g
-    memswap_limit: 14g
+    mem_limit: 12g
+    memswap_limit: 12g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
