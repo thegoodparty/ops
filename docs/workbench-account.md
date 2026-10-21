@@ -873,7 +873,9 @@ to flip one boolean once.
 Against that cost, what code management buys here is close to nothing: one
 attribute, flipped a single time, whose value never changes again.
 
-Enablement must be done from an `AdministratorAccess` session.
+Enablement must be done from an `AdministratorAccess` session, which nobody
+holds standing: request one with `/breakglass` in Slack (see
+[`sheriff.md`](./sheriff.md)).
 `adminReservedActions` denies `organizations:Enable*` to every other
 permission set, `EngineerAccess` included. That is the guardrail working as
 designed, not an obstacle to route around.
