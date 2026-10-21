@@ -606,7 +606,9 @@ finishes applying before its consumer merges.
    `adopted: false`, with `Admins: ["administrator"]` and no `Engineers` entry
    yet. This is the human admin path: a member of `Admins` signs in through
    Identity Center and picks the `AdministratorAccess` role for this account.
-   It is also the break-glass path if the SCP or a bad deploy role locks CI out.
+   Nobody is a standing member; membership comes only from an approved
+   `/breakglass` request in Slack (see [`sheriff.md`](./sheriff.md)). It is
+   also the break-glass path if the SCP or a bad deploy role locks CI out.
    No grant PR: `githubActionsPulumiDeploy` already holds `sso:*` on `*`.
 
    The `adopted` flag's documented wart applies: it is a fact about the

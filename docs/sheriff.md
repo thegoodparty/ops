@@ -1,11 +1,11 @@
 # Break glass: just-in-time admin access
 
-> **Status: proposal, revised after review.** Steps 2 through 5 are built and
-> deployed; step 1 (CloudTrail) is not, and is a known and time-boxed gap. Most
-> of the decisions in it were settled in review of the first revision and now
-> read as decisions rather than options; the few that remain open are marked
-> **open**, and one residual ambiguity from review is called out explicitly
-> under "Existing members". It is still written to be reviewed line by line.
+> **Status: live.** This is the only way anyone gets admin in AWS. No one holds
+> standing admin: the standing `Admins` members were removed by hand once the
+> tool was working (by 2026-10-21). Steps 2 through 5 are built and deployed;
+> step 1 (CloudTrail) is not, and is a known and time-boxed gap. One follow-up
+> is still open: the sweeper logs an `Admins` membership with no grant record at
+> informational level, and should now alarm on it. See "Existing members".
 
 The goal is that admin in AWS is granted just in time rather than held. An
 engineer who needs it requests it in Slack, a designated approver approves, and
@@ -24,6 +24,28 @@ The shape of this proposal is deliberately boring. It is a deterministic Lambda
 plus a state machine, not an agent. There is no model anywhere in the approval
 path, and there is no reason for one: the whole value is that a human decided,
 and that decision is recorded.
+
+## Getting admin access
+
+1. In Slack, run `/breakglass`. Pick a duration (1 to 4 hours), give a reason,
+   and paste an incident or ticket link. You must be in the `Engineers`
+   Identity Center group to ask.
+2. The request posts to `#sensitive-access-requests`. An approver other than
+   you approves or denies it there. The approvers are
+   `APPROVER_SLACK_USER_IDS` in `deploy-infrastructure/sheriff/config.ts`, and
+   changing that list is a reviewed PR.
+3. Once approved, sign out of the AWS access portal and back in, then pick
+   `AdministratorAccess`. One grant covers the management, workbench and
+   infrastructure accounts. From the CLI, `aws sso login` with a profile whose
+   `sso_role_name` is `AdministratorAccess` (for example `gp-admin`, which
+   `omni/packages/gp-api/scripts/aws-setup.sh` writes).
+4. Access ends on its own when the window closes. A session you already opened
+   can last up to one hour past that, because the permission set's session
+   length is one hour. Each session is one hour regardless, so a longer grant
+   means signing in again.
+
+If Slack or the tool is down, the recovery path is the management-account root
+user with MFA (open question 1).
 
 ## Progress
 
@@ -76,14 +98,11 @@ see "The CloudTrail gap" and open question 7.
 
 Stated as an invariant rather than a feature:
 
-- No one outside the current `Admins` set holds standing `AdministratorAccess`
-  in any account, **for now**. This is a deliberate, two-phase softening of the
-  original "no person holds standing admin": the members of `Admins` today stay
-  as memberships the tool does not manage, and the JIT flow governs everyone
-  else. The transition ends when the engineer removes the remaining standing
-  members manually and a follow-up PR promotes the sweeper's no-grant-record
-  case from informational to an alarm, after which the invariant is the
-  original one. See "Existing members".
+- No one holds standing `AdministratorAccess` in any account. Every member of
+  `Admins` is there because of a live, approved grant. The launch-time standing
+  members were removed by hand. Until the sweeper alarms on a membership with
+  no grant record, this is observed rather than enforced. See "Existing
+  members".
 - Any member of `Engineers` can request admin, for a bounded duration, with a
   stated reason.
 - A designated human approver, not the requester, must approve it.
@@ -164,10 +183,10 @@ that group.
   record. A new grant is allowed once the active one is revoked or expires.
 - **Revoke**: `identitystore:DeleteGroupMembership` removes the requester,
   unconditionally at expiry, by the `MembershipId` stored on the grant. It does
-  not check whether the tool was the thing that added them. A standing admin who
-  drives a request through the tool therefore loses their standing membership
-  when the grant ends; the engineer accepts this, and it is what keeps the tool's
-  grant set and the group's membership set in agreement without a baseline.
+  not check whether the tool was the thing that added them. With no standing
+  members left, every membership should be one the tool granted, which is what
+  keeps the tool's grant set and the group's membership set in agreement
+  without a baseline.
 - The `Admins` group is already assigned `AdministratorAccess` in the
   management, workbench and infrastructure accounts
   (`deploy/components/identity-center.ts`), so one membership grants admin in
@@ -229,12 +248,9 @@ that session reaches the permission set's `sessionDuration`. So:
 
 - The existing `administrator` `sessionDuration` drops from `PT8H` to `PT1H`.
   Identity Center permits 1 to 12 hours, so `PT1H` is the floor.
-- This shortens **every** `Admins` session, including the standing members, not
-  only the JIT grants. That is deliberate and confirmed: it is a feature, not a
-  side effect. Nobody, standing admin or not, holds a long session, and the
-  escalated window is bounded for everyone. A standing member's long-lived
-  access is membership, in that they can sign in again at any time; the session
-  itself is one hour.
+- This shortens **every** `Admins` session. That is deliberate and confirmed:
+  nobody holds a long session, and the escalated window is bounded for
+  everyone.
 - Treat the requested duration as the **grant window**, not a guarantee. The
   honest worst case is `requested duration + remaining session`, which with a
   `PT1H` set is at most roughly twice the request. The Slack reply must say
@@ -273,34 +289,24 @@ the approver gate and the audit, not a narrower grant.
 
 ### Existing members
 
-The `Admins` group has members today. Review confirmed it is repurposed in
-place, so those members stay and there is no migration step. The tool manages
-**only the memberships it granted**; it keeps no second source of truth about
-who was already a member.
+`Admins` has no standing members. The group was repurposed in place, and the
+members it had at launch were removed by hand once the tool was working. The
+tool manages **only the memberships it granted**; it keeps no second source of
+truth about who else is a member.
 
-An existing member is therefore just a membership with no grant record in any
-state, and the sweeper leaves it alone and logs it at informational level. A
-grant record in the `granting` state is still a record, so a member the tool is
-mid-way through adding is reconciled by "Never leave a grant open", not mistaken
-for a pre-existing member. During the transition that is the expected state for
-a standing admin, so it is not suspicious and must not page. The engineer will
-remove the remaining standing members manually once the rest of the tool is
-working; a follow-up PR then promotes the no-grant-record case from
-informational to an alarm, at which point any membership the tool cannot explain
-is genuinely suspicious.
+A membership with no grant record in any state is therefore one the tool cannot
+explain. The sweeper still leaves it alone and logs `membership.unmanaged` at
+informational level, which was right while standing members existed and is now
+too quiet. The remaining follow-up is to promote that case to an alarm, at which
+point any membership the tool cannot explain pages. A grant record in the
+`granting` state is still a record, so a member the tool is mid-way through
+adding is reconciled by "Never leave a grant open", not mistaken for an
+unexplained member.
 
-A standing member who drives a request through the tool is not special. The
-grant is recorded, and `CreateGroupMembership` returns a `ConflictException`
-because they are already a member; the Lambda catches it, resolves the existing
-`MembershipId`, and records the grant. At expiry the revoke removes them by that
-`MembershipId` like anyone else. They lose the standing membership when their
-grant ends; the engineer accepts this, and it is the point of managing only what
-the tool granted.
-
-The invariant is two-phase, and the transition is ended by a manual cleanup plus
-a one-line change to the sweeper's treatment of no-grant memberships, not by
-emptying a list. Until then it is "no one outside the current `Admins` set holds
-standing admin"; after that it is the original "no standing admin".
+If someone is ever added to `Admins` by hand and then requests through the tool,
+`CreateGroupMembership` returns a `ConflictException`; the Lambda catches it,
+resolves the existing `MembershipId`, and records the grant. At expiry the
+revoke removes them by that `MembershipId` like anyone else.
 
 ## Architecture
 
@@ -667,8 +673,9 @@ tool's own records are structured for export and retention from day one.
   present **after** the sweeper's revoke attempt, which is `membership.orphaned`
   and the alarm. An active `granted` record is left alone. A membership with
   **no grant record at all** is left alone and logged informationally; the
-  sweeper never removes it, because that is the only shape a pre-existing
-  standing member can take. The scheduler is the normal path and the sweeper is
+  sweeper never removes it. That shape used to mean a pre-existing standing
+  member; with none left it should alarm, which is the open follow-up under
+  "Existing members". The scheduler is the normal path and the sweeper is
   what catches a failed schedule or a grant path that stopped partway.
 - **The grant record exists before the membership can.** The grant path writes a
   `granting` record first, then calls `CreateGroupMembership`, then flips the
@@ -777,9 +784,9 @@ rather than staying open.
    is a data-exposure problem. This is step 1 and no longer blocks the runtime,
    so the gap is known and time-boxed rather than a prerequisite.
 8. ~~**Existing members before manual cleanup.**~~ **Settled by the engineer:**
-   existing `Admins` members stay and are not removed by the sweeper; they will
-   be removed manually in a follow-up PR, which also promotes the sweeper's
-   no-grant-record case from informational to an alarm. See "Existing
+   existing `Admins` members were not removed by the sweeper; they were removed
+   by hand once the tool was working. The sweeper's no-grant-record case is
+   still informational and should be promoted to an alarm. See "Existing
    members".
 
 ## Implementation plan

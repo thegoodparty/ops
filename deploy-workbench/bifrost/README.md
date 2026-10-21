@@ -163,7 +163,9 @@ change to both.
 The session has to be able to write Secrets Manager in `024901689212`. The
 account's `WorkbenchAccess` set deliberately has no Secrets Manager write (its
 only secret read is `gp-pi/brave-search`), so use an admin session in that
-account, e.g. a profile for `AdministratorAccess`:
+account, e.g. a profile for `AdministratorAccess`. Nobody holds that role
+standing: run `/breakglass` in Slack first and wait for approval in
+`#sensitive-access-requests` (see [`docs/sheriff.md`](../../docs/sheriff.md)).
 
 ```sh
 # 1. the keys no human has to provide

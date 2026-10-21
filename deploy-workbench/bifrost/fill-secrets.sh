@@ -25,7 +25,8 @@
 #
 # The session needs to be able to write Secrets Manager in the workbench
 # account. `WorkbenchAccess` (the workbench account's normal engineer set)
-# deliberately cannot; use an admin session in 024901689212:
+# deliberately cannot; use an admin session in 024901689212. Nobody holds
+# admin standing: get it with `/breakglass` in Slack first (docs/sheriff.md).
 #
 #   aws sso login --profile <profile for AdministratorAccess in 024901689212>
 #   AWS_PROFILE=<profile> ./fill-secrets.sh
