@@ -93,6 +93,9 @@ services:
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
+    # If the host still runs out of memory, the kernel kills an agent's build
+    # before the API that holds the Slack socket.
+    oom_score_adj: -500
     depends_on:
       tei:
         condition: service_started
@@ -165,6 +168,11 @@ services:
       AGENT_NAME: delegate
       TEMPLATE_ID: official/lead
       MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
+    # Without caps one agent's build fills the 32 GB host, the kernel drops
+    # its file cache, and the single-threaded API stalls on disk for minutes.
+    # A capped agent is OOM-killed inside its own container instead.
+    mem_limit: 5g
+    memswap_limit: 5g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
@@ -179,6 +187,8 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/coder
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    mem_limit: 14g
+    memswap_limit: 14g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
@@ -193,6 +203,8 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/reviewer
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    mem_limit: 6g
+    memswap_limit: 6g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
