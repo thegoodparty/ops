@@ -268,6 +268,41 @@ future pair is
 subject to the reserved-target invariant: it may not be `Admins`
 (`88c1b330-a001-707a-06ca-94e289013bf5`) or any future sheriff-managed group.
 
+### The second pair: `Approvers`
+
+A parallel sync of the `Engineering Admin` Workspace group
+(`eng-admin@goodparty.org`) into the `Approvers` Identity Center group. It is
+the `engineers-google` entry with the source and the target swapped, and it
+changes the same two places "Adding a pair" names: the pair list and the
+grant's `TARGET_GROUP_ARNS`.
+
+```ts
+{
+  id: "approvers-google",
+  sourceGroupEmail: "eng-admin@goodparty.org",
+  targetGroupId: "e841e310-0051-7062-2ea4-9905d12f345e", // Approvers
+  mode: "dry-run",
+  removalCap: { maxCount: 5, maxFraction: 0.1 },
+  allowlist: ["@goodparty.org"],
+  removalAlertThreshold: 0,
+}
+```
+
+The id keeps the same shape as the first pair's: the source is `eng-admin@`
+(the Workspace group's name) and the target is `Approvers` (the Identity Center
+group's name), so the pair id is `approvers-google` and not a spelling of the
+source. `Approvers` was created out of band, in the Identity Center console,
+and that does not change: group existence is not this job's business
+(non-goal 7), so no Pulumi resource is added for it and the id is a literal
+recorded the same way the `Engineers` id is, here and in the grant. The pair
+ships `dry-run`, per "Adding a pair" step 4: the change is one entry in the
+pair list, and the reviewed dry-run diff is what justifies flipping it to
+`apply`.
+
+Whether `Approvers` also gets a permission set and an account assignment is a
+separate decision, and an open one. A group with no assignment mirrors
+membership faithfully and gives its members nothing to sign in to.
+
 ### Where it lives
 
 - **The list**: `deploy-infrastructure/group-sync/config.ts`, as a typed
@@ -977,6 +1012,11 @@ above.
    `engineering@goodparty.org` Workspace group mirrors the `Engineers` Identity
    Center group (`383193a0-7001-70d9-a321-ffe6d8af7378`), whose ARN is already
    in the merged grant. The pair shipped `dry-run` and is now `apply`.
+   **Resolved for the second pair too:** the `eng-admin@goodparty.org`
+   (`Engineering Admin`) Workspace group mirrors the `Approvers` Identity
+   Center group (`e841e310-0051-7062-2ea4-9905d12f345e`), created out of band
+   in the console like the others, with its ARN in the grant. It ships
+   `dry-run`; flipping it to `apply` is a separate reviewed change.
 
 ## Grounding: the files this touches
 

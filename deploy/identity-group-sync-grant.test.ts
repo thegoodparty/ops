@@ -22,6 +22,14 @@ const IDENTITY_STORE_ARN =
 const ENGINEERS_GROUP_ARN =
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
 
+// The `Approvers` group, the `approvers-google` pair's target. Created out of
+// band in the console, so the id is a literal here and in
+// `deploy-infrastructure/group-sync/config.ts`; the two are pinned against each
+// other by the run test, and this one is pinned for the same reason as
+// `Admins` above.
+const APPROVERS_GROUP_ARN =
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e";
+
 // Unavoidable: the looked-up user id and the returned membership id do not
 // exist when the policy is written, so they are wildcards scoped to their
 // resource type. See the policy comment.
@@ -118,6 +126,7 @@ describe("identityGroupSyncGrantPolicy", () => {
 
   it("names the target group, the one identity store and the two unavoidable wildcards", () => {
     assert.ok(allResources.includes(ENGINEERS_GROUP_ARN));
+    assert.ok(allResources.includes(APPROVERS_GROUP_ARN));
     assert.ok(allResources.includes(IDENTITY_STORE_ARN));
     assert.ok(allResources.includes(USER_ARN));
     assert.ok(allResources.includes(MEMBERSHIP_ARN));
@@ -135,17 +144,20 @@ describe("identityGroupSyncGrantPolicy", () => {
     assert.deepEqual(bySid.CreateMissingUser, [IDENTITY_STORE_ARN].sort());
     assert.deepEqual(bySid.AddMembership, [
       ENGINEERS_GROUP_ARN,
+      APPROVERS_GROUP_ARN,
       IDENTITY_STORE_ARN,
       USER_ARN,
     ].sort());
     assert.deepEqual(bySid.RemoveMembership, [
       ENGINEERS_GROUP_ARN,
+      APPROVERS_GROUP_ARN,
       IDENTITY_STORE_ARN,
       USER_ARN,
       MEMBERSHIP_ARN,
     ].sort());
     assert.deepEqual(bySid.ListMemberships, [
       ENGINEERS_GROUP_ARN,
+      APPROVERS_GROUP_ARN,
       IDENTITY_STORE_ARN,
       MEMBERSHIP_ARN,
     ].sort());
@@ -160,10 +172,9 @@ describe("identityGroupSyncGrantPolicy", () => {
       statements.map((s) => [s.Sid, asList(s.Resource)]),
     );
     for (const sid of ["AddMembership", "RemoveMembership", "ListMemberships"]) {
-      assert.ok(
-        bySid[sid].includes(ENGINEERS_GROUP_ARN),
-        `${sid} must name the target group`,
-      );
+      for (const arn of [ENGINEERS_GROUP_ARN, APPROVERS_GROUP_ARN]) {
+        assert.ok(bySid[sid].includes(arn), `${sid} must name ${arn}`);
+      }
     }
     assert.ok(!bySid.ResolveUser.includes(ENGINEERS_GROUP_ARN));
     assert.ok(!bySid.CreateMissingUser.includes(ENGINEERS_GROUP_ARN));
