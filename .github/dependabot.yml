@@ -1,0 +1,14 @@
+# Docker base images only. Version updates are disabled via
+# open-pull-requests-limit: 0, so Dependabot raises security updates only.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /delegate/worker
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 0
+  - package-ecosystem: docker
+    directory: /deploy-workbench/bifrost
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 0
