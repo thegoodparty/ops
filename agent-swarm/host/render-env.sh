@@ -126,6 +126,7 @@ EOF
   echo
   echo "SWARM_AUTH=$SWARM_AUTH"
   echo "GITHUB_DISABLE=$GITHUB_DISABLE"
+  echo "WORKER_PATCH_HASH=$(sha256sum /opt/agent-swarm/worker-patch/Dockerfile | cut -c1-12)"
 } >"$TMP"
 
 chmod 600 "$TMP"

@@ -60,8 +60,12 @@ x-worker-env: &worker-env
   AWS_CONFIG_FILE: /etc/delegate-swarm/aws-config
   AWS_SDK_LOAD_CONFIG: "1"
 
+# Built by up.sh from worker-patch/ on top of the upstream worker image. The
+# tag changes with the version or the patch, which is what makes compose
+# recreate the agents; an unchanged tag is not rebuilt.
 x-worker-base: &worker-base
-  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}"
+  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
+  pull_policy: never
   entrypoint: *agent-entrypoint
   platform: linux/amd64
   stop_grace_period: 60s
