@@ -25,6 +25,12 @@ import { REGION } from "../network";
  *   switch this file sets.
  * - A key's `models` array is deny-by-default in v2 semantics (`version`
  *   omitted), so an empty list is not "all models".
+ * - `setup_token` is a *top-level* key (not `governance.setup_token`) and
+ *   accepts a literal, `env.NAME` or `vault.path`; `resolveSetupToken` in
+ *   `transports/bifrost-http/lib/config.go` falls back to the
+ *   `BIFROST_SETUP_TOKEN` environment variable. It arms the first-run claim,
+ *   is consumed by the request that creates the first admin account and is
+ *   not an API token afterwards.
  */
 
 const CONFIG_PATH = path.resolve(__dirname, "config.json");
@@ -45,6 +51,7 @@ type Config = {
   $schema?: string;
   source_of_truth?: string;
   encryption_key?: string;
+  setup_token?: string;
   client?: Record<string, unknown>;
   providers?: Record<string, ProviderConfig>;
   governance?: {
@@ -198,11 +205,12 @@ describe("bifrost config.json", () => {
       );
     }
 
-    // The four keys the gateway container receives from `bifrost/gateway`.
+    // The five keys the gateway container receives from `bifrost/gateway`.
     for (const name of [
       "BIFROST_ENCRYPTION_KEY",
       "BIFROST_ADMIN_USERNAME",
       "BIFROST_ADMIN_PASSWORD",
+      "BIFROST_SETUP_TOKEN",
       "FIREWORKS_API_KEY",
     ]) {
       assert.ok(
@@ -217,6 +225,40 @@ describe("bifrost config.json", () => {
 
   it("contains no literal that looks like a key or a token", () => {
     noSecretLiteral(loadConfig());
+  });
+
+  it("arms the one-time first-run claim with a setup token reference", () => {
+    // Phase 2 item 11. At the pinned tag the setup token is a *top-level*
+    // `setup_token` (`transports/config.schema.json`: literal, `env.NAME` or
+    // `vault.path`), and `resolveSetupToken` in
+    // `transports/bifrost-http/lib/config.go` falls back to the
+    // `BIFROST_SETUP_TOKEN` environment variable. Both point at the same
+    // Secrets Manager key, so the claim works whether or not item 10's
+    // `BIFROST_CONFIG` injection has landed yet.
+    //
+    // Without it, a fresh instance with no admin account answers every /api
+    // call with 403 and its setup page cannot be completed by anyone: the
+    // bootstrap path this deployment is claimed through is simply absent.
+    // Afterwards it is not a bearer token — automation signs in as the admin
+    // account — but it still has to exist for the claim and for a restore.
+    const config = loadConfig();
+    assert.equal(
+      config.setup_token,
+      "env.BIFROST_SETUP_TOKEN",
+      "config.json must resolve the setup token from env.BIFROST_SETUP_TOKEN, never carry it",
+    );
+    // It is top-level at the pinned tag; nesting it under governance would be
+    // ignored, which reads as configured while leaving the API locked.
+    assert.ok(
+      !("setup_token" in (config.governance ?? {})),
+      "setup_token is a top-level key at the pinned tag, not governance.setup_token",
+    );
+    // And the reference has to be one the script actually writes, which is the
+    // same guarantee the loop above enforces for every other reference.
+    assert.ok(
+      fillSecretsArray("REQUIRED_KEYS").includes("BIFROST_SETUP_TOKEN"),
+      "fill-secrets.sh does not write BIFROST_SETUP_TOKEN, so the reference would resolve to nothing",
+    );
   });
 
   it("authenticates Bedrock as the ECS task role, with no stored credentials", () => {
@@ -325,6 +367,11 @@ describe("bifrost config.json", () => {
   });
 
   it("enables admin auth and leaves item 14's governance entities absent", () => {
+    // The admin account is config-store state, not a config.json field: at the
+    // pinned tag `loadAuthConfig` hashes this password and writes the account
+    // at boot, so the block provisions the login once the file is injected.
+    // It is not the bootstrap path — before an account exists, `/api` is gated
+    // by the setup lock and the setup token above is the only way in.
     const governance = loadConfig().governance;
     assert.ok(governance, "config.json has no governance block");
     const auth = governance.auth_config;
