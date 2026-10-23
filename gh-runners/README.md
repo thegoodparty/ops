@@ -99,7 +99,7 @@ omni and ops are public, so anyone can open a fork PR that runs workflows.
    on the `thegoodparty` org, limited to the selected repositories omni and ops.
 3. Set fork PR approval to all outside contributors.
 4. Open a PR setting `CONNECTION_READY = true` in
-   `deploy-infrastructure/gh-runners.ts`. Its apply creates the org webhook.
+   `deploy-infrastructure/gh-runners.ts`. Its apply creates the project and the org webhook.
 5. Dispatch the `gh-runners smoke` workflow. It is the first proof that a
    `services:` container is reachable on localhost inside CodeBuild's container
    mode, alongside `docker build`, buildx and `docker run`.

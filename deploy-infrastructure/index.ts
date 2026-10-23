@@ -211,4 +211,4 @@ export const groupSyncLogGroup = groupSync.logGroup.name;
 const ghRunners = createGhRunners({ provider });
 
 export const ghRunnersConnectionArn = ghRunners.connection.arn;
-export const ghRunnersProjectName = ghRunners.project.name;
+export const ghRunnersProjectName = ghRunners.project?.name;

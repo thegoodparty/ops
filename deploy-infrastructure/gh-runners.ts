@@ -21,7 +21,10 @@ export const GH_RUNNERS_GITHUB_ORG = "thegoodparty";
 /**
  * The connection is created PENDING and CodeBuild creates the org webhook in
  * GitHub through it, so the webhook cannot exist until a human has completed
- * the handshake in the console. The switch-on PR flips this.
+ * the handshake in the console. The project is gated too: whether CodeBuild
+ * accepts a project whose source auth is a PENDING connection is unverified,
+ * and a refusal would turn the first apply on main red. The switch-on PR
+ * flips this.
  */
 export const CONNECTION_READY = false;
 
@@ -143,7 +146,8 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     { provider },
   );
 
-  const project = new aws.codebuild.Project(
+  const project = CONNECTION_READY
+    ? new aws.codebuild.Project(
     "ghRunners",
     {
       name: GH_RUNNERS_PROJECT_NAME,
@@ -174,11 +178,12 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
       tags: TAGS,
     },
     { provider, dependsOn: [rolePolicy] },
-  );
+  )
+    : undefined;
 
   // Automatic creation: the AWS Connector for GitHub app holds
   // organization_hooks:write, so CodeBuild creates the org webhook itself.
-  const webhook = CONNECTION_READY
+  const webhook = project
     ? new aws.codebuild.Webhook(
         "ghRunnersWebhook",
         {
