@@ -18,6 +18,7 @@ own.
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
 - `deploy-infrastructure/` — Pulumi IaC for the contents of the `goodparty-infrastructure` account
+- `gh-runners/` — self-hosted GitHub Actions runners on ECS (`runs-on: gp-ecs`): webhook dispatch Lambda (`deploy-infrastructure/gh-runners-dispatch/`), runner image, design and security model in `gh-runners/README.md`
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Repo-wide facts that will bite
