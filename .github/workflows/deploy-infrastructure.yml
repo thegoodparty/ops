@@ -27,6 +27,8 @@ on:
       - "utils/accounts.ts"
       # The swarm host's files and first-boot script, synced by the stack.
       - "agent-swarm/**"
+      # The runner and scaler images, built and pushed by this workflow.
+      - "gh-runners/**"
 
 # Its own group: a different stack with a different S3 lock from the other
 # deploy workflows, so there is nothing to serialize between them.
@@ -65,6 +67,11 @@ jobs:
       # build: Pulumi compiles index.ts itself.
       - run: npm ci
 
+      # Built before any credentials exist, for the same reason as npm ci.
+      # Tags are content hashes from deploy-infrastructure/gh-runners.ts.
+      - name: Build gh-runners images
+        run: gh-runners/push-images.sh build
+
       - name: Install Pulumi
         uses: pulumi/actions@v6
         with:
@@ -79,6 +86,42 @@ jobs:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-infrastructure-deploy
           aws-region: us-west-2
 
+      # Push before the deploy, so a task definition never names a tag ECR
+      # does not have. The images live in the infrastructure account, so this
+      # hops into pulumi-deploy there. Session tagging is skipped because that
+      # role's trust does not grant sts:TagSession.
+      - name: Assume pulumi-deploy for the image push
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::394495727159:role/pulumi-deploy
+          role-chaining: true
+          role-skip-session-tagging: true
+          aws-region: us-west-2
+
+      - name: Push gh-runners images
+        run: gh-runners/push-images.sh push
+
+      # Back to the management-account role: deploy.sh reads the state
+      # passphrase there.
+      - name: Configure AWS Credentials for the deploy
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-infrastructure-deploy
+          aws-region: us-west-2
+
       - name: Deploy
         working-directory: deploy-infrastructure
         run: ./deploy.sh
+
+      # Only does anything on the deploy that first creates the repositories;
+      # every other run finds both tags already pushed above.
+      - name: Assume pulumi-deploy for the first-deploy push
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::394495727159:role/pulumi-deploy
+          role-chaining: true
+          role-skip-session-tagging: true
+          aws-region: us-west-2
+
+      - name: Push gh-runners images after the first deploy
+        run: gh-runners/push-images.sh push

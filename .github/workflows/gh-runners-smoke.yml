@@ -1,0 +1,46 @@
+name: gh-runners smoke
+
+# Proves a gp-ecs runner can do what omni CI asks of a hosted one: a service
+# container on localhost, docker build, sudo apt-get. Dispatch-only, so it
+# never runs on a fork PR. See gh-runners/README.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: gp-ecs
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - run: PGPASSWORD=smoke psql -h localhost -U postgres -c 'select 1'
+
+      - run: |
+          printf 'FROM alpine\nRUN echo built\n' > "$RUNNER_TEMP/Dockerfile"
+          docker build -t smoke "$RUNNER_TEMP"
+          docker buildx version
+          docker run --rm alpine echo ok
+
+      - run: nproc && free -g && df -h /var/lib/docker

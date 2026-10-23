@@ -7,6 +7,7 @@ import { createAgentSwarm } from "./agent-swarm";
 import { createSheriff } from "./sheriff-lambda";
 import { createGroupSync } from "./group-sync-lambda";
 import { createInfraZone } from "./dns";
+import { createGhRunners } from "./gh-runners";
 
 /**
  * Contents of the `goodparty-infrastructure` account.
@@ -182,6 +183,12 @@ const agentSwarm = createAgentSwarm({ provider, zone: infraZone });
 
 export const delegateSwarmInstanceId = agentSwarm.instance.id;
 export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;
+
+// Self-hosted GitHub Actions runners. See gh-runners/README.md.
+const ghRunners = createGhRunners({ provider });
+
+export const ghRunnersRunnerRepoUrl = ghRunners.runnerRepo.repositoryUrl;
+export const ghRunnersScalerRepoUrl = ghRunners.scalerRepo.repositoryUrl;
 
 // The break-glass Lambda, step 3 (dry) of docs/sheriff.md. The function
 // URL is the endpoint the separate break-glass Slack app points its slash
