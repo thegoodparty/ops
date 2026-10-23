@@ -18,6 +18,7 @@ own.
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
 - `deploy-infrastructure/` — Pulumi IaC for the contents of the `goodparty-infrastructure` account
+- `gh-runners/`: CodeBuild-hosted GitHub Actions runners (resources in `deploy-infrastructure/gh-runners.ts`)
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Repo-wide facts that will bite

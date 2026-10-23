@@ -1,0 +1,56 @@
+name: gh-runners smoke
+
+# Dispatch only, so it never runs on a fork PR.
+#
+# The first proof that service containers on localhost work in CodeBuild's
+# container mode, where the job's Docker daemon runs inside the build
+# container. Unverified until this runs. See gh-runners/README.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: codebuild-gh-runners-${{ github.run_id }}-${{ github.run_attempt }}
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+
+      - run: node --version
+
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - run: psql -h localhost -U postgres -c 'select 1'
+        env:
+          PGPASSWORD: smoke
+
+      - run: |
+          printf 'FROM alpine\nRUN echo built\n' > Dockerfile.smoke
+          docker build -f Dockerfile.smoke -t gh-runners-smoke .
+
+      - run: docker buildx version
+
+      - run: docker run --rm alpine echo ok
+
+      - run: |
+          nproc
+          free -g

@@ -6,6 +6,7 @@ import { createPreviewRole } from "./preview-role";
 import { createAgentSwarm } from "./agent-swarm";
 import { createSheriff } from "./sheriff-lambda";
 import { createGroupSync } from "./group-sync-lambda";
+import { createGhRunners } from "./gh-runners";
 import { createInfraZone } from "./dns";
 
 /**
@@ -204,3 +205,10 @@ export const groupSyncFunctionName = groupSync.fn.name;
 export const groupSyncParameterName = groupSync.parameter.name;
 export const groupSyncSecretArn = groupSync.secret.arn;
 export const groupSyncLogGroup = groupSync.logGroup.name;
+
+// CodeBuild-hosted GitHub Actions runners, gh-runners/README.md. The
+// connection is created PENDING and finished by hand in the console.
+const ghRunners = createGhRunners({ provider });
+
+export const ghRunnersConnectionArn = ghRunners.connection.arn;
+export const ghRunnersProjectName = ghRunners.project?.name;
