@@ -4,7 +4,7 @@ Ephemeral self-hosted GitHub Actions runner for ECS-on-EC2. One task runs one jo
 
 The image is `ghcr.io/actions/actions-runner` plus Docker Engine (docker-ce, containerd, buildx, compose) and the common tools jobs expect from hosted Ubuntu runners. The container runs its own `dockerd`, so `services:` containers, `docker build`, and `sudo apt-get` work, and published service ports (for example `5432:5432`) show up on the container's own `localhost`. No host Docker socket is mounted.
 
-`entrypoint.sh` runs as root. It starts `dockerd` with data root `/var/lib/docker`, waits up to 60s for `docker info`, then runs `/home/runner/run.sh` as `runner`. The runner reads its JIT config from `ACTIONS_RUNNER_INPUT_JITCONFIG`. When the runner exits, the entrypoint stops `dockerd` and exits with the runner's exit code. SIGTERM is passed to the runner, which shuts down cleanly (exit 143).
+`entrypoint.sh` runs as root. It starts `dockerd` with data root `/var/lib/docker`, waits up to 60s for `docker info`, then runs `/home/runner/run.sh` as `runner`. The runner reads its JIT config from `ACTIONS_RUNNER_INPUT_JITCONFIG`. When the runner exits, the entrypoint stops `dockerd` and exits with the runner's exit code. SIGTERM is passed to the runner, which shuts down cleanly (exit 143). If no job is assigned within `IDLE_TIMEOUT_SECONDS` (default 900), which happens when a webhook-started runner's job was cancelled or taken by another runner, the entrypoint stops the runner the same way and exits 0.
 
 ## What the ECS task needs
 

@@ -188,7 +188,8 @@ export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;
 const ghRunners = createGhRunners({ provider });
 
 export const ghRunnersRunnerRepoUrl = ghRunners.runnerRepo.repositoryUrl;
-export const ghRunnersScalerRepoUrl = ghRunners.scalerRepo.repositoryUrl;
+// The GitHub App's webhook URL. See the switch-on steps in the README.
+export const ghRunnersWebhookUrl = ghRunners.webhookUrl;
 
 // The break-glass Lambda, step 3 (dry) of docs/sheriff.md. The function
 // URL is the endpoint the separate break-glass Slack app points its slash

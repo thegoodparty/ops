@@ -73,6 +73,25 @@ forward_term() {
 }
 trap forward_term TERM INT
 
+# A webhook-started runner whose job was cancelled, or taken by another
+# runner, would otherwise wait forever. The runner writes a Worker_ log only
+# once it is assigned a job.
+IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-900}
+IDLE_STOPPED=0
+idle_stop() {
+  echo "entrypoint: no job assigned within ${IDLE_TIMEOUT_SECONDS}s, stopping runner"
+  IDLE_STOPPED=1
+  forward_term
+}
+trap idle_stop USR1
+(
+  sleep "$IDLE_TIMEOUT_SECONDS"
+  if ! compgen -G "/home/runner/_diag/Worker_*.log" > /dev/null; then
+    kill -USR1 $$
+  fi
+) &
+WATCHER_PID=$!
+
 set +e
 while true; do
   wait "$RUNNER_PID"
@@ -81,6 +100,10 @@ while true; do
 done
 set -e
 
+kill "$WATCHER_PID" 2>/dev/null || true
 echo "entrypoint: runner exited with $RUNNER_EXIT, stopping dockerd"
 stop_dockerd
+if [[ "$IDLE_STOPPED" == "1" ]]; then
+  exit 0
+fi
 exit "$RUNNER_EXIT"

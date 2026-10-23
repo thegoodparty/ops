@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as esbuild from "esbuild";
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
@@ -9,8 +10,8 @@ import { INFRASTRUCTURE_ACCOUNT_ID } from "../utils/accounts";
 // the switch-on checklist are in gh-runners/README.md; read it before
 // changing anything here.
 //
-// Two halves. The scaler is one Fargate task that long-polls GitHub's runner
-// scale set API and, per queued job, starts one runner task. Runner tasks run
+// Two halves. The dispatch Lambda receives the GitHub App's workflow_job
+// webhook and, per queued gp-ecs job, starts one runner task. Runner tasks run
 // on an EC2 capacity provider because jobs need a Docker daemon (service
 // containers, docker build), which Fargate cannot give them.
 
@@ -24,9 +25,11 @@ const LOG_GROUP = `/${NAME}`;
 export const CLUSTER_NAME = NAME;
 export const RUNNER_FAMILY = "gh-runner";
 export const RUNNER_CONTAINER = "runner";
-export const SCALESET_NAME = "gp-ecs";
-const GITHUB_CONFIG_URL = "https://github.com/thegoodparty";
+const DISPATCH_NAME = `${NAME}-dispatch`;
+const DISPATCH_LOG_GROUP = `/${NAME}/dispatch`;
+const ORG = "thegoodparty";
 const RUNNER_GROUP = "gp-ecs";
+const ALLOWED_REPOS = ["thegoodparty/ops", "thegoodparty/omni"];
 
 // Two runner tasks fit on one m7i.2xlarge (8 vCPU, 32 GiB) after the ECS
 // agent's reservation. A task matches GitHub's 4-core larger runner.
@@ -34,11 +37,6 @@ const INSTANCE_TYPE = "m7i.2xlarge";
 const RUNNER_CPU = 4096;
 const RUNNER_MEMORY_MIB = 14336;
 const MAX_INSTANCES = 4;
-const MAX_RUNNERS = 8;
-
-// 0 until the GitHub App secret is filled and the runner group exists. The
-// switch-on PR sets this to 1. See gh-runners/README.md.
-const SCALER_DESIRED_COUNT = 0;
 
 const TAGS = { Name: NAME, Project: NAME };
 
@@ -58,7 +56,7 @@ const listFiles = (dir: string): string[] =>
 // pushes under the same tag (gh-runners/push-images.sh calls this), so a
 // preview of an unchanged image shows no task definition diff, and a pushed
 // tag never needs to move.
-export const imageTag = (image: "runner" | "scaler") => {
+export const imageTag = (image: "runner") => {
   const dir = path.join(ROOT, image);
   const hash = crypto.createHash("sha256");
   for (const file of listFiles(dir).filter((f) => !f.endsWith(".md"))) {
@@ -84,6 +82,27 @@ export const instanceUserData = () =>
     "echo ECS_ENABLE_TASK_IAM_ROLE=false >> /etc/ecs/ecs.config",
   ].join("\n");
 
+// Bundled here rather than by a build step, the same as buildSheriffCode: the
+// deploy-infrastructure workflow and its preview run no build.
+export const buildDispatchCode = (): pulumi.asset.AssetArchive => {
+  const result = esbuild.buildSync({
+    entryPoints: [path.join(__dirname, "gh-runners-dispatch/handler.ts")],
+    bundle: true,
+    platform: "node",
+    target: "node22",
+    format: "cjs",
+    write: false,
+    logLevel: "silent",
+  });
+  const output = result.outputFiles?.[0];
+  if (!output) {
+    throw new Error("esbuild produced no output for the gh-runners dispatch handler");
+  }
+  return new pulumi.asset.AssetArchive({
+    "handler.js": new pulumi.asset.StringAsset(output.text),
+  });
+};
+
 export const createGhRunners = (args: { provider: aws.Provider }) => {
   const { provider } = args;
   const opts = { provider };
@@ -100,44 +119,27 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     opts,
   );
 
-  const scalerRepo = new aws.ecr.Repository(
-    "ghRunnersScalerRepo",
+  new aws.ecr.LifecyclePolicy(
+    "ghRunnersRunnerRepoLifecycle",
     {
-      name: `${NAME}/scaler`,
-      imageTagMutability: "IMMUTABLE",
-      imageScanningConfiguration: { scanOnPush: true },
-      forceDelete: true,
-      tags: TAGS,
+      repository: runnerRepo.name,
+      policy: JSON.stringify({
+        rules: [
+          {
+            rulePriority: 1,
+            description: "Keep the last 10 images",
+            selection: {
+              tagStatus: "any",
+              countType: "imageCountMoreThan",
+              countNumber: 10,
+            },
+            action: { type: "expire" },
+          },
+        ],
+      }),
     },
     opts,
   );
-
-  for (const [key, repo] of [
-    ["Runner", runnerRepo],
-    ["Scaler", scalerRepo],
-  ] as const) {
-    new aws.ecr.LifecyclePolicy(
-      `ghRunners${key}RepoLifecycle`,
-      {
-        repository: repo.name,
-        policy: JSON.stringify({
-          rules: [
-            {
-              rulePriority: 1,
-              description: "Keep the last 10 images",
-              selection: {
-                tagStatus: "any",
-                countType: "imageCountMoreThan",
-                countNumber: 10,
-              },
-              action: { type: "expire" },
-            },
-          ],
-        }),
-      },
-      opts,
-    );
-  }
 
   const logGroup = new aws.cloudwatch.LogGroup(
     "ghRunnersLogs",
@@ -149,7 +151,7 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     "ghRunnersSecurityGroup",
     {
       name: NAME,
-      description: "GitHub Actions runners and scaler: egress only",
+      description: "GitHub Actions runners: egress only",
       vpcId: VPC_ID,
       egress: [
         {
@@ -325,11 +327,11 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     opts,
   );
 
-  const clusterCapacityProviders = new aws.ecs.ClusterCapacityProviders(
+  new aws.ecs.ClusterCapacityProviders(
     "ghRunnersClusterCapacityProviders",
     {
       clusterName: cluster.name,
-      capacityProviders: [capacityProvider.name, "FARGATE"],
+      capacityProviders: [capacityProvider.name],
       defaultCapacityProviderStrategies: [
         { capacityProvider: capacityProvider.name, weight: 1 },
       ],
@@ -353,7 +355,7 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     {
       name: "GH_RUNNERS_GITHUB_APP",
       description:
-        "GitHub App credentials for the gh-runners scaler: JSON with client_id, installation_id, private_key. Filled by hand; see gh-runners/README.md.",
+        "GitHub App credentials for the gh-runners dispatch Lambda: JSON with app_id, installation_id, private_key, webhook_secret. Filled by hand; see gh-runners/README.md.",
       tags: TAGS,
     },
     { provider, protect: true },
@@ -371,27 +373,6 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
       role: executionRole.name,
       policyArn:
         "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-    },
-    opts,
-  );
-
-  new aws.iam.RolePolicy(
-    "ghRunnersExecutionSecret",
-    {
-      name: "read-github-app-secret",
-      role: executionRole.name,
-      policy: secret.arn.apply((arn) =>
-        JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Effect: "Allow",
-              Action: "secretsmanager:GetSecretValue",
-              Resource: arn,
-            },
-          ],
-        }),
-      ),
     },
     opts,
   );
@@ -449,151 +430,151 @@ export const createGhRunners = (args: { provider: aws.Provider }) => {
     opts,
   );
 
-  const scalerTaskRole = new aws.iam.Role(
-    "ghRunnersScalerTaskRole",
-    { name: `${NAME}-scaler`, assumeRolePolicy: ecsTasksTrust, tags: TAGS },
-    opts,
-  );
-
   const clusterArn = `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:cluster/${CLUSTER_NAME}`;
 
-  new aws.iam.RolePolicy(
-    "ghRunnersScalerTaskPolicy",
+  const dispatchLogGroup = new aws.cloudwatch.LogGroup(
+    "ghRunnersDispatchLogs",
+    { name: DISPATCH_LOG_GROUP, retentionInDays: 14, tags: TAGS },
+    opts,
+  );
+
+  const dispatchRole = new aws.iam.Role(
+    "ghRunnersDispatchRole",
     {
-      name: "start-runner-tasks",
-      role: scalerTaskRole.name,
-      policy: executionRole.arn.apply((executionRoleArn) =>
-        JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            {
-              Sid: "RunRunnerTasks",
-              Effect: "Allow",
-              Action: "ecs:RunTask",
-              Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:task-definition/${RUNNER_FAMILY}:*`,
-              Condition: { ArnEquals: { "ecs:cluster": clusterArn } },
-            },
-            {
-              Sid: "TagRunnerTasksAtLaunch",
-              Effect: "Allow",
-              Action: "ecs:TagResource",
-              Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:task/${CLUSTER_NAME}/*`,
-              Condition: { StringEquals: { "ecs:CreateAction": "RunTask" } },
-            },
-            {
-              Sid: "ManageRunnerTasks",
-              Effect: "Allow",
-              Action: ["ecs:StopTask", "ecs:DescribeTasks"],
-              Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:task/${CLUSTER_NAME}/*`,
-            },
-            {
-              Sid: "ListRunnerTasks",
-              Effect: "Allow",
-              Action: "ecs:ListTasks",
-              Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:container-instance/${CLUSTER_NAME}/*`,
-              Condition: { ArnEquals: { "ecs:cluster": clusterArn } },
-            },
-            {
-              Sid: "PassRunnerExecutionRole",
-              Effect: "Allow",
-              Action: "iam:PassRole",
-              Resource: executionRoleArn,
-              Condition: {
-                StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
-              },
-            },
-          ],
-        }),
-      ),
+      name: DISPATCH_NAME,
+      assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Principal: { Service: "lambda.amazonaws.com" },
+            Action: "sts:AssumeRole",
+          },
+        ],
+      }),
+      tags: TAGS,
     },
     opts,
   );
 
-  const scalerTaskDefinition = new aws.ecs.TaskDefinition(
-    "ghRunnersScalerTaskDefinition",
+  const dispatchPolicy = new aws.iam.RolePolicy(
+    "ghRunnersDispatchPolicy",
     {
-      family: `${NAME}-scaler`,
-      requiresCompatibilities: ["FARGATE"],
-      networkMode: "awsvpc",
-      cpu: "256",
-      memory: "512",
-      runtimePlatform: {
-        operatingSystemFamily: "LINUX",
-        cpuArchitecture: "X86_64",
-      },
-      executionRoleArn: executionRole.arn,
-      taskRoleArn: scalerTaskRole.arn,
-      containerDefinitions: pulumi
-        .all([scalerRepo.repositoryUrl, logGroup.name, secret.arn])
-        .apply(([repoUrl, logGroupName, secretArn]) =>
-          JSON.stringify([
-            {
-              name: "scaler",
-              image: `${repoUrl}:${imageTag("scaler")}`,
-              essential: true,
-              environment: [
-                { name: "GITHUB_CONFIG_URL", value: GITHUB_CONFIG_URL },
-                { name: "SCALESET_NAME", value: SCALESET_NAME },
-                { name: "RUNNER_GROUP", value: RUNNER_GROUP },
-                { name: "MIN_RUNNERS", value: "0" },
-                { name: "MAX_RUNNERS", value: String(MAX_RUNNERS) },
-                { name: "ECS_CLUSTER", value: CLUSTER_NAME },
-                { name: "RUNNER_TASK_DEFINITION", value: RUNNER_FAMILY },
-                { name: "RUNNER_CAPACITY_PROVIDER", value: NAME },
-                { name: "RUNNER_CONTAINER_NAME", value: RUNNER_CONTAINER },
-                { name: "AWS_REGION", value: REGION },
-              ],
-              secrets: [
-                { name: "GITHUB_APP_CLIENT_ID", valueFrom: `${secretArn}:client_id::` },
-                { name: "GITHUB_APP_INSTALLATION_ID", valueFrom: `${secretArn}:installation_id::` },
-                { name: "GITHUB_APP_PRIVATE_KEY", valueFrom: `${secretArn}:private_key::` },
-              ],
-              logConfiguration: {
-                logDriver: "awslogs",
-                options: {
-                  "awslogs-group": logGroupName,
-                  "awslogs-region": REGION,
-                  "awslogs-stream-prefix": "scaler",
+      name: "dispatch-runner-tasks",
+      role: dispatchRole.name,
+      policy: pulumi
+        .all([secret.arn, executionRole.arn])
+        .apply(([secretArn, executionRoleArn]) =>
+          JSON.stringify({
+            Version: "2012-10-17",
+            Statement: [
+              {
+                Sid: "OwnLogs",
+                Effect: "Allow",
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+                Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:${DISPATCH_LOG_GROUP}:*`,
+              },
+              {
+                Sid: "ReadGithubAppSecret",
+                Effect: "Allow",
+                Action: "secretsmanager:GetSecretValue",
+                Resource: secretArn,
+              },
+              {
+                Sid: "RunRunnerTasks",
+                Effect: "Allow",
+                Action: "ecs:RunTask",
+                Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:task-definition/${RUNNER_FAMILY}:*`,
+                Condition: { ArnEquals: { "ecs:cluster": clusterArn } },
+              },
+              {
+                Sid: "TagRunnerTasksAtLaunch",
+                Effect: "Allow",
+                Action: "ecs:TagResource",
+                Resource: `arn:aws:ecs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:task/${CLUSTER_NAME}/*`,
+                Condition: { StringEquals: { "ecs:CreateAction": "RunTask" } },
+              },
+              {
+                Sid: "PassRunnerExecutionRole",
+                Effect: "Allow",
+                Action: "iam:PassRole",
+                Resource: executionRoleArn,
+                Condition: {
+                  StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
                 },
               },
-            },
-          ]),
+            ],
+          }),
         ),
-      tags: TAGS,
     },
     opts,
   );
 
-  const scalerService = new aws.ecs.Service(
-    "ghRunnersScalerService",
+  const dispatchFunction = new aws.lambda.Function(
+    "ghRunnersDispatch",
     {
-      name: `${NAME}-scaler`,
-      cluster: cluster.arn,
-      taskDefinition: scalerTaskDefinition.arn,
-      desiredCount: SCALER_DESIRED_COUNT,
-      capacityProviderStrategies: [{ capacityProvider: "FARGATE", weight: 1 }],
-      // A scale set allows one message session at a time, so a deploy stops
-      // the old listener before it starts the new one. Runner tasks are not
-      // part of the service and keep running through it.
-      deploymentMinimumHealthyPercent: 0,
-      deploymentMaximumPercent: 100,
-      deploymentCircuitBreaker: { enable: true, rollback: true },
-      networkConfiguration: {
-        subnets: SUBNET_IDS,
-        securityGroups: [securityGroup.id],
-        assignPublicIp: true,
+      name: DISPATCH_NAME,
+      role: dispatchRole.arn,
+      runtime: aws.lambda.Runtime.NodeJS22dX,
+      handler: "handler.handler",
+      code: buildDispatchCode(),
+      // GitHub gives up on a delivery after 10 seconds.
+      timeout: 10,
+      memorySize: 256,
+      loggingConfig: { logFormat: "Text", logGroup: dispatchLogGroup.name },
+      environment: {
+        variables: {
+          SECRET_ARN: secret.arn,
+          ORG,
+          RUNNER_GROUP,
+          ALLOWED_REPOS: ALLOWED_REPOS.join(","),
+          ECS_CLUSTER: CLUSTER_NAME,
+          RUNNER_TASK_DEFINITION: RUNNER_FAMILY,
+          RUNNER_CAPACITY_PROVIDER: capacityProvider.name,
+        },
       },
       tags: TAGS,
     },
-    { provider, dependsOn: [clusterCapacityProviders] },
+    { provider, dependsOn: [dispatchLogGroup, dispatchPolicy] },
+  );
+
+  // Public, like the delegate and sheriff webhooks. The handler rejects any
+  // request without a valid X-Hub-Signature-256 before it does anything.
+  const dispatchUrl = new aws.lambda.FunctionUrl(
+    "ghRunnersDispatchUrl",
+    { functionName: dispatchFunction.name, authorizationType: "NONE" },
+    opts,
+  );
+
+  // New function URLs need both statements for public invoke.
+  new aws.lambda.Permission(
+    "ghRunnersDispatchUrlInvoke",
+    {
+      action: "lambda:InvokeFunctionUrl",
+      function: dispatchFunction.name,
+      principal: "*",
+      functionUrlAuthType: "NONE",
+    },
+    opts,
+  );
+
+  new aws.lambda.Permission(
+    "ghRunnersDispatchUrlInvokeFunction",
+    {
+      action: "lambda:InvokeFunction",
+      function: dispatchFunction.name,
+      principal: "*",
+      invokedViaFunctionUrl: true,
+    },
+    opts,
   );
 
   return {
     cluster,
     runnerRepo,
-    scalerRepo,
     runnerTaskDefinition,
-    scalerService,
+    dispatchFunction,
+    webhookUrl: dispatchUrl.functionUrl,
     secret,
   };
 };

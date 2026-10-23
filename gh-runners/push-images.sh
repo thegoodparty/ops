@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Usage: push-images.sh build | push
 #
-# build: docker build both images under their content-hash tags. Needs no AWS
+# build: docker build the runner image under its content-hash tag. Needs no AWS
 #   credentials, and runs before the workflow assumes any.
-# push: push each image whose tag is not already in ECR. Needs credentials in
+# push: push the image if its tag is not already in ECR. Needs credentials in
 #   the infrastructure account. A missing repository (the first deploy, before
 #   Pulumi creates it) is a warning, not a failure; the workflow calls push
 #   again after the deploy.
@@ -16,7 +16,7 @@ REGION=${AWS_REGION:-us-west-2}
 REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
 cd "$(dirname "$0")/.."
 
-for IMAGE in runner scaler; do
+for IMAGE in runner; do
   TAG=$(npx tsx -e "console.log(require('./deploy-infrastructure/gh-runners').imageTag('$IMAGE'))")
   URI="$REGISTRY/gh-runners/$IMAGE:$TAG"
 

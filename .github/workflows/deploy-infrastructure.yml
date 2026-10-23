@@ -27,7 +27,7 @@ on:
       - "utils/accounts.ts"
       # The swarm host's files and first-boot script, synced by the stack.
       - "agent-swarm/**"
-      # The runner and scaler images, built and pushed by this workflow.
+      # The runner image, built and pushed by this workflow.
       - "gh-runners/**"
 
 # Its own group: a different stack with a different S3 lock from the other
@@ -113,8 +113,8 @@ jobs:
         working-directory: deploy-infrastructure
         run: ./deploy.sh
 
-      # Only does anything on the deploy that first creates the repositories;
-      # every other run finds both tags already pushed above.
+      # Only does anything on the deploy that first creates the repository;
+      # every other run finds the tag already pushed above.
       - name: Assume pulumi-deploy for the first-deploy push
         uses: aws-actions/configure-aws-credentials@v5
         with:
