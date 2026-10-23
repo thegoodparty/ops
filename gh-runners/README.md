@@ -91,8 +91,8 @@ omni and ops are public, so anyone can open a fork PR that runs workflows.
 
 ## Switch-on
 
-1. Merge. The apply creates the connection in `PENDING`, plus the project, the
-   role and the log group. No webhook exists yet, so nothing runs.
+1. Merge. The apply creates the connection in `PENDING`, plus the role and
+   the log group. No project or webhook exists yet, so nothing runs.
 2. In the infrastructure account console, under Developer Tools, Settings,
    Connections, open the pending `gh-runners` connection and complete it. This
    needs a GitHub organization owner. Install the AWS Connector for GitHub app
