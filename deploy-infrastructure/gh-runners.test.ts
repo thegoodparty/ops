@@ -22,7 +22,9 @@ describe("gh-runners image tags", () => {
   // calling imageTag, CI pushes one tag and the task definition names another.
   it("are what push-images.sh pushes", () => {
     const script = fs.readFileSync(path.join(ROOT, "push-images.sh"), "utf8");
-    assert.ok(script.includes("imageTag"));
+    assert.ok(
+      script.includes("require('./deploy-infrastructure/gh-runners').imageTag"),
+    );
   });
 });
 

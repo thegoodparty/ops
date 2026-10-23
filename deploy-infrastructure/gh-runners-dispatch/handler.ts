@@ -181,6 +181,10 @@ export const handler = async (event: FunctionUrlEvent) => {
       runner_group_id: cachedRunnerGroupId,
       labels: RUNNER_LABELS,
       work_folder: "_work",
+    }).catch((error) => {
+      // A recreated runner group has a new id; look it up again next time.
+      cachedRunnerGroupId = undefined;
+      throw error;
     })) as { encoded_jit_config: string };
 
     const result = await ecsClient.send(
