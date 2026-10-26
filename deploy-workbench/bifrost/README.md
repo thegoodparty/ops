@@ -122,6 +122,16 @@ holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's teams
 and virtual key names, and past that it needs `tier: "Advanced"` rather than a
 silent truncation.
 
+**A change to this file reaches the gateway.** The container's `secrets` entry
+names the parameter's ARN, and an ARN does not change when the value does, so
+the task definition also carries the parameter's *version* as
+`BIFROST_CONFIG_VERSION`. A merged edit to `config.json` therefore registers a
+new task-definition revision and the service's stop-before-start rollout picks
+it up; without that, the apply would update the parameter and leave every
+running task on the file it booted with. The version is also how an operator
+answers "which config is this task running" from
+`describe-task-definition`.
+
 Two consequences worth knowing before a deploy:
 
 - The stores are now the RDS instance (`config_store` and `logs_store`,

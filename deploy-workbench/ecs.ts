@@ -415,6 +415,25 @@ export const GATEWAY_PLAIN_ENV_NAMES = [
 export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
 export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
 
+/**
+ * The parameter's version, carried into the task definition as an environment
+ * variable so that a `config.json` change reaches the running gateway.
+ *
+ * Without it the seam is dead: the container's `secrets` entry names the
+ * parameter's ARN (`valueFrom: configParameterArn`), and an ARN does not change
+ * when the value does. A PR that edits `config.json` would update the parameter
+ * and leave every running task on the file it booted with, which defeats
+ * "configuration is a reviewed PR" — the apply would look like it had
+ * converged. `aws.ssm.Parameter.version` increments whenever the value changes,
+ * so depending on it registers a new task-definition revision, and the
+ * service's stop-before-start rollout picks the new config up.
+ *
+ * It is also the only way to answer "which config is this task running" from
+ * `describe-task-definition`, which is what an operator asks when a config
+ * change appears not to have taken.
+ */
+export const BIFROST_CONFIG_VERSION_ENV_NAME = "BIFROST_CONFIG_VERSION";
+
 /** Where upstream's own container reads it from, and `APP_DIR` in its image. */
 export const BIFROST_APP_DIR = "/app/data";
 export const BIFROST_CONFIG_FILE_PATH = `${BIFROST_APP_DIR}/config.json`;
@@ -903,6 +922,7 @@ export const createBifrostEcs = (args: {
       database.port.apply(String),
       logGroup.name,
       configParameter.arn,
+      configParameter.version.apply(String),
     ])
     .apply(
       ([
@@ -914,6 +934,7 @@ export const createBifrostEcs = (args: {
         databasePort,
         resolvedLogGroupName,
         configParameterArn,
+        configParameterVersion,
       ]) => [
         {
           name: BIFROST_CONTAINER_NAME,
@@ -940,6 +961,11 @@ export const createBifrostEcs = (args: {
             { name: PG_PORT_ENV_NAME, value: databasePort },
             { name: PG_USER_ENV_NAME, value: DATABASE_USERNAME },
             { name: PG_DATABASE_ENV_NAME, value: DATABASE_NAME },
+            // A config change has to roll the task; see the constant.
+            {
+              name: BIFROST_CONFIG_VERSION_ENV_NAME,
+              value: configParameterVersion,
+            },
           ],
           secrets: [
             ...GATEWAY_SECRET_KEYS.map((key) => ({

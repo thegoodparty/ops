@@ -13,6 +13,7 @@ import {
   BIFROST_CONFIG_FILE_PATH,
   BIFROST_CONFIG_PARAMETER_NAME,
   BIFROST_CONFIG_SOURCE_PATH,
+  BIFROST_CONFIG_VERSION_ENV_NAME,
   BIFROST_CONTAINER_COMMAND,
   BIFROST_CONTAINER_ENTRY_POINT,
   BIFROST_CLUSTER_NAME,
@@ -1002,8 +1003,7 @@ describe("bifrost ecs", () => {
     );
 
     // And the role that resolves it may read exactly that parameter.
-    assert.deepEqual([...EXECUTION_PARAMETER_ACTIONS], ["ssm:GetParameters"]);
-    const policy = executionRoleConfigParameterPolicyDocument([
+    assert.deepEqual([...EXECUTION_PARAMETER_ACTIONS], ["ssm:GetParameters"]);    const policy = executionRoleConfigParameterPolicyDocument([
       "arn:aws:ssm:us-west-2:024901689212:parameter/bifrost/config",
     ]);
     assert.equal(policy.Statement[0].Action[0], "ssm:GetParameters");
@@ -1019,6 +1019,32 @@ describe("bifrost ecs", () => {
     assert.ok(
       roleBlock.includes("configParameter.arn.apply"),
       "the execution role is not granted read on the config parameter",
+    );
+  });
+
+  it("rolls the task when config.json changes, not only when its ARN does", () => {
+    // The ARN is stable across value changes, so a `secrets` entry alone leaves
+    // every running task on the config it booted with: a merged `config.json`
+    // PR would update the parameter and change nothing that is running. The
+    // parameter's version increments on each value change, so carrying it as an
+    // environment value registers a new task-definition revision and the
+    // service's stop-before-start rollout picks the new file up.
+    assert.equal(BIFROST_CONFIG_VERSION_ENV_NAME, "BIFROST_CONFIG_VERSION");
+    assert.ok(
+      ECS_SOURCE.includes("configParameter.version.apply(String)"),
+      "the task definition must depend on the parameter's version, not only its ARN",
+    );
+    const bifrostBlock = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(
+      bifrostBlock.includes("name: BIFROST_CONFIG_VERSION_ENV_NAME") &&
+        bifrostBlock.includes("value: configParameterVersion"),
+      `the gateway container does not carry the config version\n${bifrostBlock}`,
+    );
+    // The value comes from the parameter resource, so the dependency edge is
+    // real rather than a constant that never changes.
+    assert.ok(
+      containerBlock().includes("configParameterVersion,"),
+      "the version must be destructured out of the pulumi.all above the containers",
     );
   });
 
