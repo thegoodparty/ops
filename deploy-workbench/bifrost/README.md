@@ -113,12 +113,14 @@ bytes into the SSM parameter `/bifrost/config`, a plain **`String`** rather
 than a `SecureString`: the file is in git, so encrypting the deployed copy
 would only hide production's configuration from the reviewers who diff it.
 The task definition injects the parameter as `BIFROST_CONFIG` (through
-`secrets`, the only place ECS accepts a `valueFrom`) and overrides the
-container entrypoint to write it to `/app/data/config.json` before exec'ing
-the image's own entrypoint. The stock image does not read `BIFROST_CONFIG`
-itself; this is upstream's ECS-guide shape. A `BIFROST_CONFIG_SHA256`
-environment value makes a config edit a new task-definition revision, because
-an ARN does not change when the parameter's value does.
+`secrets`, the only place ECS accepts a `valueFrom`, naming the parameter's
+constructed ARN so the task definition is readable in `pulumi preview`) and
+overrides the container entrypoint to write it to `/app/data/config.json`
+before exec'ing the image's own entrypoint. The stock image does not read
+`BIFROST_CONFIG` itself; this is upstream's ECS-guide shape. A
+`BIFROST_CONFIG_SHA256` environment value makes a config edit a new
+task-definition revision, because an ARN does not change when the parameter's
+value does.
 
 Read the deployed config with one command (it is not encrypted):
 

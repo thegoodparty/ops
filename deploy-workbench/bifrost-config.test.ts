@@ -7,6 +7,7 @@ import {
   BIFROST_CONFIG_CONTAINER_PATH,
   BIFROST_CONFIG_ENV_NAME,
   BIFROST_CONFIG_JSON,
+  BIFROST_CONFIG_PARAMETER_ARN,
   BIFROST_CONFIG_PARAMETER_NAME,
   BIFROST_CONFIG_PARAMETER_TYPE,
   BIFROST_CONFIG_PATH,
@@ -103,6 +104,18 @@ describe("bifrost config parameter", () => {
     assert.ok(
       BIFROST_CONFIG_SOURCE.includes("bifrostConfigParameterArgs()"),
       "the resource must be built from the exported args",
+    );
+    // The ARN the task definition and the role name, constructed because an
+    // SSM ARN is fully determined by name/region/account. If this ever stops
+    // matching the parameter above, the container resolves a parameter that
+    // does not exist and the task never starts.
+    assert.equal(
+      BIFROST_CONFIG_PARAMETER_ARN,
+      `arn:aws:ssm:us-west-2:024901689212:parameter${args.name}`,
+    );
+    assert.ok(
+      BIFROST_CONFIG_SOURCE.includes("BIFROST_CONFIG_PARAMETER_ARN"),
+      "the module must export the constructed ARN the task definition names",
     );
   });
 

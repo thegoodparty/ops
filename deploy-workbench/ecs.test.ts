@@ -60,6 +60,7 @@ import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
 import {
   BIFROST_CONFIG_CONTAINER_PATH,
   BIFROST_CONFIG_ENV_NAME,
+  BIFROST_CONFIG_PARAMETER_ARN,
   BIFROST_CONFIG_PARAMETER_NAME,
   BIFROST_CONFIG_SHA256,
   BIFROST_CONFIG_SHA256_ENV_NAME,
@@ -512,8 +513,19 @@ describe("bifrost ecs", () => {
       gateway,
     );
     assert.ok(
-      gateway.includes("valueFrom: resolvedConfigParameterArn"),
+      gateway.includes("valueFrom: BIFROST_CONFIG_PARAMETER_ARN"),
       gateway,
+    );
+    // The ARN is constructed, not the resource's output, so the whole task
+    // definition is known at preview time and the diff shows the new
+    // container definition instead of `[unknown]`.
+    assert.equal(
+      BIFROST_CONFIG_PARAMETER_ARN,
+      `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter/bifrost/config`,
+    );
+    assert.ok(
+      !gateway.includes("valueFrom: configParameter"),
+      "the definition must not take the parameter ARN from the resource output",
     );
     assert.equal(BIFROST_CONFIG_PARAMETER_NAME, "/bifrost/config");
     // A config-only change updates the parameter's value and nothing else ECS
@@ -624,7 +636,7 @@ describe("bifrost ecs", () => {
       secrets,
     );
     assert.ok(
-      secrets.includes("valueFrom: resolvedConfigParameterArn"),
+      secrets.includes("valueFrom: BIFROST_CONFIG_PARAMETER_ARN"),
       secrets,
     );
   });
@@ -636,7 +648,11 @@ describe("bifrost ecs", () => {
     // and even a SecureString under `alias/aws/ssm` needs none (its key policy
     // admits the account through ssm).
     assert.deepEqual([...EXECUTION_SSM_ACTIONS], ["ssm:GetParameters"]);
-    const parameterArn = `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter${BIFROST_CONFIG_PARAMETER_NAME}`;
+    const parameterArn = BIFROST_CONFIG_PARAMETER_ARN;
+    assert.equal(
+      parameterArn,
+      `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter${BIFROST_CONFIG_PARAMETER_NAME}`,
+    );
     const policy = executionRoleConfigPolicyDocument(parameterArn);
     assert.equal(policy.Version, "2012-10-17");
     assert.deepEqual(
@@ -647,16 +663,21 @@ describe("bifrost ecs", () => {
       policy.Statement.flatMap((statement) => statement.Resource),
       [parameterArn],
     );
-    // The role attaches the document and passes the parameter's own ARN, so
-    // the grant cannot drift from the parameter the task reads.
+    // The role attaches the document, named by the constructed ARN so the
+    // policy is fully known in a preview rather than `[unknown]`.
     const executionRole = resourceBlock("bifrostExecutionRole");
     assert.ok(
-      executionRole.includes("executionRoleConfigPolicyDocument(parameterArn)"),
+      executionRole.includes(
+        "executionRoleConfigPolicyDocument(BIFROST_CONFIG_PARAMETER_ARN)",
+      ),
       executionRole,
     );
+    // The task definition still waits for the parameter, because the ARN is a
+    // string rather than a resource reference.
+    const taskDefinition = resourceBlock("bifrostTaskDefinition");
     assert.ok(
-      executionRole.includes("configParameter.arn.apply"),
-      executionRole,
+      taskDefinition.includes("dependsOn: [configParameter]"),
+      taskDefinition,
     );
   });
 

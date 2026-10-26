@@ -2,6 +2,8 @@ import * as aws from "@pulumi/aws";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+import { REGION } from "./network";
 
 /**
  * The SSM parameter that carries the committed `bifrost/config.json` into the
@@ -67,6 +69,27 @@ export const BIFROST_CONFIG_SHA256 = crypto
  * human can read the deployed config with one `aws ssm get-parameter`.
  */
 export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
+
+/**
+ * The parameter's ARN, constructed rather than read from the resource.
+ *
+ * An SSM parameter's ARN is fully determined by its name, region and account —
+ * unlike a Secrets Manager ARN, which appends six random characters — so this
+ * is exact, not a wildcard. Two reasons it is a constant:
+ *
+ * - The task definition and the execution role's policy name it. Using
+ *   `configParameter.arn` would make both properties unknown until the
+ *   parameter is created, which hides the actual container definition and IAM
+ *   change from `pulumi preview`; a preview that cannot show the new task
+ *   definition is not doing the job the PR checklist asks of it. The same
+ *   argument `secretArnPattern` in `ecs.ts` records for the two secrets.
+ * - It cannot drift: the parameter's name is the constant above.
+ *
+ * `bifrost-config.test.ts` pins the format, and `ecs.ts` keeps an explicit
+ * `dependsOn` on the resource so the task definition is never registered
+ * before the parameter it names exists.
+ */
+export const BIFROST_CONFIG_PARAMETER_ARN = `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter${BIFROST_CONFIG_PARAMETER_NAME}`;
 
 /**
  * `String`, not `SecureString`; see the module header. Exported so the test

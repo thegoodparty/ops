@@ -7,6 +7,7 @@ import { BIFROST_BOOTSTRAP_TAG } from "./bootstrap-image";
 import {
   BIFROST_CONFIG_CONTAINER_PATH,
   BIFROST_CONFIG_ENV_NAME,
+  BIFROST_CONFIG_PARAMETER_ARN,
   BIFROST_CONFIG_SHA256,
   BIFROST_CONFIG_SHA256_ENV_NAME,
 } from "./bifrost-config";
@@ -761,11 +762,14 @@ export const createBifrostEcs = (args: {
         },
         // Item 10's parameter. A second inline policy rather than a statement
         // in the first one, so “secrets” still means Secrets Manager and the
-        // SSM grant is one action on one resource, readable on its own.
+        // SSM grant is one action on one resource, readable on its own. The
+        // ARN is the constructed constant, not the resource's output: an
+        // unknown `Resource` would make this policy — and the whole role —
+        // invisible in `pulumi preview`.
         {
           name: "config",
-          policy: configParameter.arn.apply((parameterArn) =>
-            JSON.stringify(executionRoleConfigPolicyDocument(parameterArn)),
+          policy: JSON.stringify(
+            executionRoleConfigPolicyDocument(BIFROST_CONFIG_PARAMETER_ARN),
           ),
         },
       ],
@@ -866,7 +870,6 @@ export const createBifrostEcs = (args: {
       database.secretArn,
       database.address,
       database.port.apply((port) => String(port)),
-      configParameter.arn,
       logGroup.name,
     ])
     .apply(
@@ -877,7 +880,6 @@ export const createBifrostEcs = (args: {
         databaseSecretArn,
         resolvedDatabaseAddress,
         resolvedDatabasePort,
-        resolvedConfigParameterArn,
         resolvedLogGroupName,
       ]) => [
         {
@@ -923,9 +925,12 @@ export const createBifrostEcs = (args: {
             // because the parameter is encrypted: it is a plain `String`
             // (bifrost-config.ts). The value never appears in the task
             // definition, so the committed file stays the only readable copy.
+            // Constructed ARN rather than `configParameter.arn`, so the new
+            // definition is visible in `pulumi preview`; the `dependsOn`
+            // below keeps the parameter first anyway.
             {
               name: BIFROST_CONFIG_ENV_NAME,
-              valueFrom: resolvedConfigParameterArn,
+              valueFrom: BIFROST_CONFIG_PARAMETER_ARN,
             },
           ],
           logConfiguration: {
@@ -1045,7 +1050,15 @@ export const createBifrostEcs = (args: {
       },
       containerDefinitions: pulumi.jsonStringify(containerDefinitions),
     },
-    { provider },
+    {
+      provider,
+      // The container's `secrets` names the parameter by its constructed ARN
+      // rather than the resource's output, so the dependency is stated here:
+      // the parameter has to exist before a task that resolves it can start,
+      // and a preview that hid the definition behind an unknown ARN was the
+      // alternative. This keeps the ordering without hiding the diff.
+      dependsOn: [configParameter],
+    },
   );
 
   /**

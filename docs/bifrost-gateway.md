@@ -911,9 +911,15 @@ network or a permission can land before the item that creates it.
       deployed bytes, so every config change is a new task-definition revision
       and a real deployment.
     - **The IAM.** The execution role's second inline policy grants
-      `ssm:GetParameters` on the parameter's exact ARN and nothing else. No
-      `kms:Decrypt`: the parameter is a `String`, and even a `SecureString`
-      under `alias/aws/ssm` needs none, per the same reasoning recorded in
+      `ssm:GetParameters` on the parameter's exact ARN and nothing else. The
+      ARN is constructed from the name, region and account rather than taken
+      from the resource's output — an SSM ARN has no random suffix, so it is
+      exact — because an unknown `valueFrom`/`Resource` makes `pulumi preview`
+      print `[unknown]` for the whole container definition and its IAM policy,
+      which hides the change under review. The task definition keeps an
+      explicit `dependsOn` on the parameter instead. No `kms:Decrypt`: the
+      parameter is a `String`, and even a `SecureString` under `alias/aws/ssm`
+      needs none, per the same reasoning recorded in
       `docs/workbench-account.md`.
 
     What the item got wrong, corrected here:
