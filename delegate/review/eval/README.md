@@ -11,7 +11,7 @@ Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval
 3. Judges the two sides pairwise and posts a single comment to the PR with two verdicts: **Quality** (Better / Worse / Can't tell, from the sign test over the judged pairs) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). Per-case results sit in a drop-down; every raw result is on the workflow run as an artifact.
 4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
-**Cost and time:** each replay is a full `claude-opus-4-6` agent run at roughly $1.50 per case, and both sides are replayed. The 12-case `core` suite takes about 20 minutes and costs around $36 in replay plus a few dollars for judging.
+**Cost and time:** each replay is a full `claude-opus-5-5` agent run at roughly $1.50 per case, and both sides are replayed. The 12-case `core` suite takes about 20 minutes and costs around $36 in replay plus a few dollars for judging.
 
 **Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the S3 `key` of the record, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
 
@@ -69,7 +69,7 @@ npm run review:eval -- judge \
   --out report.md
 ```
 
-Compares result pairs using a blind pairwise judge (`claude-sonnet-4-6` by default, not the agent's opus model, to blunt self-preference). Each case is judged `--passes` times with alternating order; a majority of mapped winners determines the per-case verdict. Prints the markdown report to stdout and writes it to `--out` if given.
+Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by default, not the agent's opus model, to blunt self-preference). Each case is judged `--passes` times with alternating order; a majority of mapped winners determines the per-case verdict. Prints the markdown report to stdout and writes it to `--out` if given.
 
 ## Worked example — comparing main vs a branch
 
@@ -116,8 +116,8 @@ A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`)
 
 ## Cost expectations
 
-- **Replay**: each case is a full `claude-opus-4-6` agent run. Budget $1–5 per case; a 20-case corpus costs roughly $20–100 depending on diff complexity.
-- **Judge**: each pass is a short `claude-sonnet-4-6` call (one structured verdict). Budget a few cents per case per pass; 20 cases × 4 passes ≈ $0.50–2.
+- **Replay**: each case is a full `claude-opus-5-5` agent run. Budget $1–5 per case; a 20-case corpus costs roughly $20–100 depending on diff complexity.
+- **Judge**: each pass is a short `claude-sonnet-5-5` call (one structured verdict). Budget a few cents per case per pass; 20 cases × 4 passes ≈ $0.50–2.
 
 ## Statistical interpretation
 

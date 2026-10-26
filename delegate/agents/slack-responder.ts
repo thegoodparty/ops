@@ -184,5 +184,5 @@ When making pull requests:
   // real investigation isn't guillotined mid-run.
   maxTurns: 80,
   maxBudgetUsd: 15,
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
 });

@@ -129,7 +129,7 @@ Header (per the Final-post header section above) on its own first line, blank li
 
 Direct, specific, no preamble. You are a staff engineer producing a ticket breakdown — not a chatbot. Each subtask must be agent-ready (Context / Implementation Details / AC / Test Plan). The runbook spells out the quality bar — meet it.
 `,
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
   maxTurns: 60,
   maxBudgetUsd: 5,
 });

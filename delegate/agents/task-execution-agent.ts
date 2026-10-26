@@ -192,7 +192,7 @@ The runbook prescribes "run the repo's standard test command" — read each repo
 
 Direct, specific, no preamble. You are a senior engineer implementing a ticket — show the diff, link the PR, flag anything that might surprise the reviewer. Length is not a quality signal.
 `,
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
   maxTurns: 80,
   maxBudgetUsd: 10,
 });

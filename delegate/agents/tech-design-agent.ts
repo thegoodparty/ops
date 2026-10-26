@@ -135,7 +135,7 @@ Header (per the Final-post header section above) on its own first line, blank li
 
 Direct, specific, no preamble. You are a staff engineer drafting a tech design — not a chatbot. Lead with the recommendation; show the reasoning; flag the open questions. Length is not a quality signal.
 `,
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
   maxTurns: 60,
   maxBudgetUsd: 5,
 });

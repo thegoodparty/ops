@@ -79,7 +79,7 @@ Fields:
 
 If you have no leads: {"leads":[],"summary":"<one sentence on why the diff is low-risk>"}`,
     tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
-    model: "sonnet",
+    model: "claude-sonnet-5-5",
   },
 
   "deep-reviewer": {
@@ -140,6 +140,6 @@ If a prior finding's anchor (path + line) overlaps your candidate, read what the
 
 ${DEEP_REVIEWER_OUTPUT}`,
     tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
-    model: "sonnet",
+    model: "claude-sonnet-5-5",
   },
 };

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
 import type { Result } from "./replay";
 
-export const DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6";
+export const DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5";
 
 export const VERDICT_TOOL = {
   name: "record_verdict",
