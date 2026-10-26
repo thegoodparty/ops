@@ -6,7 +6,11 @@ import { promptDiff } from "../review/prompt-diff";
 import { ReviewOutputSchema, type Bundle } from "../review/schema";
 import { prReviewerSubagents } from "./pr-reviewer-subagents";
 
-export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(ReviewOutputSchema);
+// The Agent SDK's bundled CLI validates --json-schema against draft-07 and
+// rejects zod's default draft 2020-12 $schema, crashing every review.
+export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(ReviewOutputSchema, {
+  target: "draft-7",
+});
 
 // Author-controlled text, and model output that processed it, cannot be
 // allowed to close its own wrapper.

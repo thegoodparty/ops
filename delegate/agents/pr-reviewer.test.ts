@@ -156,6 +156,12 @@ describe("buildReviewPrompt with a plan", () => {
 });
 
 describe("REVIEW_OUTPUT_JSON_SCHEMA", () => {
+  it("declares draft-07, which the bundled CLI accepts", () => {
+    const schema = REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>;
+    assert.equal(schema.$schema, "http://json-schema.org/draft-07/schema#");
+  });
+
+
   it("is a plain object (JSON Schema)", () => {
     assert.equal(typeof REVIEW_OUTPUT_JSON_SCHEMA, "object");
     assert.notEqual(REVIEW_OUTPUT_JSON_SCHEMA, null);
