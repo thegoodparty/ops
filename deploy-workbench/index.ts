@@ -513,11 +513,10 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 // The sidecar (oauth2-proxy on 4180) and the service's registration in both
 // target groups are item 9's, with the listener rules that make the groups
 // attachable; the ingress object is passed in below for exactly that reason.
-// `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so the
-// container cannot answer `/health` honestly until then. That is the plan's
-// staging, not a defect here.
-//
-// The two secret containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
+// `BIFROST_CONFIG` is item 10's, and it lands in that module: the task
+// definition injects the repo's `config.json` from an SSM parameter and the
+// container's entry point writes it to `/app/data/config.json`. The two secret
+// containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
 // **not** Pulumi resources. They were created out of band by
 // `bifrost/fill-secrets.sh` and hold real values, so declaring them here would
 // put their lifecycle — and a possible replace — in this stack. The task

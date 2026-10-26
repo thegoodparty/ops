@@ -1,5 +1,7 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
@@ -16,7 +18,7 @@ import {
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_TAG,
 } from "./oauth2-proxy-image";
-import { BifrostDatabase } from "./rds";
+import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
 
 /**
  * The Bifrost gateway's compute: the ECS cluster, the task definition, the
@@ -50,13 +52,18 @@ import { BifrostDatabase } from "./rds";
  *   it. `oauth2-proxy-image.ts` pins the image and
  *   `bifrost/allowed-emails.txt` is the list; this file only names the tag and
  *   the container path the image writes the list to.
- * - Does not own: `BIFROST_CONFIG`, the SSM parameter that carries the
- *   non-secret `config.json`, or the rest of the gateway's runtime
- *   configuration. Those are item 10. **The consequence, stated plainly: the
- *   container cannot return a real `/health` until item 10 lands, so the
- *   service will not pass its target group health check before then.** That is
- *   expected and is recorded in the item 8 entry in the plan. Nothing here
- *   invents configuration to make the check green.
+ * - Does not own: `config.json` itself. That file is item 10's, in
+ *   `bifrost/config.json`, and is the deployment's declarative configuration;
+ *   this module only stores it and gets it into the container.
+ * - Owns since item 10: the SSM parameter that carries `config.json`, the
+ *   `BIFROST_CONFIG` injection, the container entry point that writes it to
+ *   `/app/data/config.json`, and the four non-secret Postgres env values
+ *   `config.json` resolves by name. Before this landed the container started
+ *   with Bifrost's built-in defaults: `"config file not found at path:
+ *   /app/data/config.json, initializing with default values"`, a default SQLite
+ *   config store (so no admin account survived a task replacement) and
+ *   inference auth not enforced. Item 8's note that the task could not answer a
+ *   real `/health` without item 10 is what this closes.
  * - Does not own: the two secret containers. `bifrost/gateway` and
  *   `bifrost/oauth2-proxy` were created out of band by
  *   `deploy-workbench/bifrost/fill-secrets.sh` and hold real values; declaring
@@ -331,13 +338,138 @@ export const RDS_PASSWORD_JSON_KEY = "password";
 export const PG_PASSWORD_ENV_NAME = "PG_PASSWORD";
 
 /**
- * The one plain environment variable. Bifrost's Bedrock provider authenticates
- * as the task role, and the AWS SDKs the provider sits on resolve a region
- * from the environment; without this the gateway has no region to invoke in.
- * Everything else about the runtime — providers, stores, governance — is
- * `BIFROST_CONFIG` in item 10.
+ * The plain environment variables, and what each is for.
+ *
+ * `AWS_REGION` is the Bedrock provider's region: the AWS SDKs the provider
+ * sits on resolve one from the environment, and without it the gateway has no
+ * region to invoke in.
+ *
+ * The four `PG_*` values are the non-secret half of the Postgres connection
+ * that `config.json`'s `config_store` and `logs_store` resolve by name. They
+ * are Pulumi outputs of `rds.ts` (host, port) or constants that module owns
+ * (user, database name), so the connection string has one source rather than a
+ * copy in a JSON file. The password is not here: it is `PG_PASSWORD`, already
+ * injected from the RDS-managed secret.
+ *
+ * Bifrost resolves `host`, `port`, `user`, `password` and `db_name` as
+ * `schemas.SecretVar`, which accepts a literal, `env.NAME` or a `vault.path`
+ * (`framework/postgresconn/postgresconn.go` at the pinned tag), so an `env.`
+ * reference is supported on every one of them, not only the ones the upstream
+ * docs' example happens to show.
  */
 export const AWS_REGION_ENV_NAME = "AWS_REGION";
+export const PG_HOST_ENV_NAME = "PG_HOST";
+export const PG_PORT_ENV_NAME = "PG_PORT";
+export const PG_USER_ENV_NAME = "PG_USER";
+export const PG_DATABASE_ENV_NAME = "PG_DATABASE";
+
+/**
+ * Every env name `config.json` may resolve that is *not* one of the gateway's
+ * Secrets Manager keys. The two together are the complete set an `env.`
+ * reference in that file can name, which is what makes a reference that
+ * resolves to nothing a test failure rather than a runtime surprise.
+ */
+export const GATEWAY_PLAIN_ENV_NAMES = [
+  AWS_REGION_ENV_NAME,
+  PG_HOST_ENV_NAME,
+  PG_PORT_ENV_NAME,
+  PG_USER_ENV_NAME,
+  PG_DATABASE_ENV_NAME,
+] as const;
+
+/**
+ * The gateway's runtime configuration (phase 2 item 10): the non-secret
+ * `bifrost/config.json`, stored as an SSM parameter and injected as
+ * `BIFROST_CONFIG`.
+ *
+ * Why a parameter rather than an `environment` entry with the JSON inlined in
+ * the task definition: the file is ~3 KB today and grows when item 14 adds
+ * teams and virtual keys, and task-definition environment entries are the
+ * wrong place for a document that changes on its own schedule. Why SSM rather
+ * than Secrets Manager: the file holds no secret by construction - every
+ * credential in it is an `env.NAME` reference, which `bifrost/config.test.ts`
+ * enforces - so a secret container would buy nothing but a second out-of-band
+ * write step for the value the repo already owns.
+ *
+ * `String`, not `SecureString`, and the reason is a permission rather than a
+ * preference. A `SecureString` is encrypted with the account's `aws/ssm` key,
+ * so the ECS agent would need `kms:Decrypt` on it; the key cannot be named
+ * without a deploy-time `kms` lookup, and a wildcard key resource is the shape
+ * every other policy in this module avoids. The parameter is therefore plain
+ * text, in an account only the fleet's own roles can read, holding a file that
+ * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
+ * see what the gateway is actually running with.
+ *
+ * Standard tier, which holds 4 KiB. The file is about 2.5 KB today, so item
+ * 14's teams and virtual key names have room; past 4 KiB this needs
+ * `tier: "Advanced"` explicitly, because the provider would otherwise fail the
+ * apply rather than truncate.
+ *
+ * The leading slash is not decoration: SSM rejects a hierarchical name that is
+ * not fully qualified, so `PutParameter` fails with "Parameter name must be a
+ * fully qualified name" on anything shaped like `bifrost/config`. The ARN it
+ * resolves to is still `...:parameter/bifrost/config`.
+ * `deploy-infrastructure/group-sync-lambda.ts` (`GROUP_SYNC_PARAMETER_NAME`)
+ * is the repo's other one and is written the same way.
+ */
+export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
+export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
+
+/**
+ * The parameter's version, carried into the task definition as an environment
+ * variable so that a `config.json` change reaches the running gateway.
+ *
+ * Without it the seam is dead: the container's `secrets` entry names the
+ * parameter's ARN (`valueFrom: configParameterArn`), and an ARN does not change
+ * when the value does. A PR that edits `config.json` would update the parameter
+ * and leave every running task on the file it booted with, which defeats
+ * "configuration is a reviewed PR" — the apply would look like it had
+ * converged. `aws.ssm.Parameter.version` increments whenever the value changes,
+ * so depending on it registers a new task-definition revision, and the
+ * service's stop-before-start rollout picks the new config up.
+ *
+ * It is also the only way to answer "which config is this task running" from
+ * `describe-task-definition`, which is what an operator asks when a config
+ * change appears not to have taken.
+ */
+export const BIFROST_CONFIG_VERSION_ENV_NAME = "BIFROST_CONFIG_VERSION";
+
+/** Where upstream's own container reads it from, and `APP_DIR` in its image. */
+export const BIFROST_APP_DIR = "/app/data";
+export const BIFROST_CONFIG_FILE_PATH = `${BIFROST_APP_DIR}/config.json`;
+
+/**
+ * The repo file the parameter is built from, read at deploy time so the
+ * deployed configuration is the reviewed one and not a copy that can drift.
+ */
+export const BIFROST_CONFIG_SOURCE_PATH = path.resolve(
+  __dirname,
+  "bifrost/config.json",
+);
+export const readBifrostConfig = (): string =>
+  fs.readFileSync(BIFROST_CONFIG_SOURCE_PATH, "utf8");
+
+/**
+ * The entry point and command that turn the injected variable into the file
+ * Bifrost actually reads. This is upstream's own documented ECS shape
+ * (`docs/deployment-guides/ecs.mdx` at the pinned tag): write `BIFROST_CONFIG`
+ * to `/app/data/config.json`, then `exec` the image's entry point with its
+ * normal argument so PID 1 is still upstream's script and the app dir checks
+ * and signal handling are unchanged.
+ *
+ * `printf '%s'` rather than `echo`: the value is JSON and `echo` would add a
+ * trailing newline to it, which is harmless to Bifrost but makes the on-disk
+ * file differ from the reviewed one. `umask 077` keeps the file private to the
+ * container user. A missing variable exits rather than starting a gateway on
+ * defaults: a task with no configuration is exactly the state this closes.
+ */
+export const BIFROST_CONTAINER_ENTRY_POINT = ["/bin/sh", "-c"] as const;
+export const BIFROST_CONTAINER_COMMAND = [
+  `if [ -z "$${BIFROST_CONFIG_ENV_NAME}" ]; then echo "${BIFROST_CONFIG_ENV_NAME} is not set" >&2; exit 1; fi; ` +
+    `umask 077; ` +
+    `printf '%s' "$${BIFROST_CONFIG_ENV_NAME}" > ${BIFROST_CONFIG_FILE_PATH} || exit 1; ` +
+    `exec /app/docker-entrypoint.sh /app/main`,
+] as const;
 
 /**
  * The sidecar's non-secret configuration, as a table rather than a list of
@@ -394,6 +526,17 @@ export const OAUTH2_PROXY_ENVIRONMENT: Readonly<Record<string, string>> = {
  * `secretsmanager:*`, no `bedrock:*`, no wildcard resource on either.
  */
 export const EXECUTION_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
+
+/**
+ * The one action the config parameter needs, and no wider.
+ *
+ * The ECS agent resolves a `secrets` entry whose `valueFrom` is an SSM
+ * parameter ARN with `ssm:GetParameters` (the plural form, since it batches).
+ * Not `ssm:GetParameter`, not `ssm:GetParametersByPath`: the ARN names this one
+ * parameter, so a path or `*` grant would widen a permission the gateway has no
+ * use for.
+ */
+export const EXECUTION_PARAMETER_ACTIONS = ["ssm:GetParameters"] as const;
 
 /**
  * The invoke actions, matching the set `WorkbenchAccess` grants engineers
@@ -477,6 +620,26 @@ export const executionRoleSecretsPolicyDocument = (
       Effect: "Allow",
       Action: [...EXECUTION_SECRET_ACTIONS],
       Resource: secretArns,
+    },
+  ],
+});
+
+/**
+ * The execution role's second policy: read the one config parameter the task
+ * injects as `BIFROST_CONFIG`. Kept separate from the secrets statement so
+ * "what may this identity read" stays one statement per kind of resource
+ * rather than one list of mixed ARNs.
+ */
+export const executionRoleConfigParameterPolicyDocument = (
+  parameterArns: string[],
+): PolicyDocument => ({
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "ReadConfigParameter",
+      Effect: "Allow",
+      Action: [...EXECUTION_PARAMETER_ACTIONS],
+      Resource: parameterArns,
     },
   ],
 });
@@ -585,13 +748,36 @@ export const createBifrostEcs = (args: {
   );
 
   /**
+   * The gateway's runtime configuration, as the SSM parameter the task
+   * injects. Pulumi owns it and its value is the reviewed `config.json`, so a
+   * configuration change is a PR that registers a new task-definition revision
+   * rather than a console edit - which is what `source_of_truth: "config.json"`
+   * in the file expects.
+   *
+   * The file is read here rather than imported as an asset: the parameter's
+   * value is a string, and an asset would make the diff depend on an uploaded
+   * object key instead of the file's contents.
+   */
+  const configParameter = new aws.ssm.Parameter(
+    "bifrostConfigParameter",
+    {
+      name: BIFROST_CONFIG_PARAMETER_NAME,
+      type: "String",
+      value: readBifrostConfig(),
+      description:
+        "Bifrost gateway config.json (docs/bifrost-gateway.md phase 2 item 10); injected as BIFROST_CONFIG.",
+      tags: { Name: BIFROST_CONFIG_PARAMETER_NAME },
+    },
+    { provider },
+  );
+
+  /**
    * The execution role: the ECS agent's identity, not the gateway's. It pulls
    * the image from ECR, writes the container's logs and resolves the `secrets`
    * block before the container starts.
    *
    * DIFFERS from `deploy/components/worker.ts`: that role grants read on one
    * secret by its exact Pulumi ARN, because Pulumi owns that container. These
-   * three are script-owned or RDS-owned, so two are named patterns and the
    * third is the ARN item 7 returned — which is also why the policy is built
    * with `apply` rather than inline.
    */
@@ -622,6 +808,14 @@ export const createBifrostEcs = (args: {
                 secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
                 databaseSecretArn,
               ]),
+            ),
+          ),
+        },
+        {
+          name: "config-parameter",
+          policy: configParameter.arn.apply((parameterArn) =>
+            JSON.stringify(
+              executionRoleConfigParameterPolicyDocument([parameterArn]),
             ),
           ),
         },
@@ -686,21 +880,30 @@ export const createBifrostEcs = (args: {
    *   sizing, and the containers' own reservations split that total rather
    *   than each repeating it; see the constants above.
    * - The `secrets` block is not a list of keys read from a secret. It is the
-   *   declared lists above, plus `PG_PASSWORD` from the RDS-managed ARN; see
-   *   the module header for why nothing here reads Secrets Manager. Bifrost
-   *   gets `bifrost/gateway`'s five and `PG_PASSWORD`; the sidecar gets
+   *   declared lists above, plus `PG_PASSWORD` from the RDS-managed ARN and
+   *   `BIFROST_CONFIG` from the SSM parameter; see the module header for why
+   *   nothing here reads Secrets Manager. Bifrost gets `bifrost/gateway`'s five,
+   *   `PG_PASSWORD` and `BIFROST_CONFIG`; the sidecar gets
    *   `bifrost/oauth2-proxy`'s three and nothing else, so neither container
    *   sees the other's credentials. The ECS agent resolves every entry before
    *   the container starts, so a key listed here and absent from the secret is
    *   a task that never starts: `fill-secrets.sh` has to write
    *   `BIFROST_SETUP_TOKEN` before a task definition naming it deploys, exactly
    *   as it already has to write the sidecar's three.
-   * - `AWS_REGION` is set because the Bedrock provider needs a region; the
-   *   delegate sets `AWS_DEFAULT_REGION` for the same reason. The sidecar has
-   *   no AWS configuration at all: it is a Google OAuth proxy.
+   * - The environment carries `AWS_REGION`, because the Bedrock provider needs
+   *   a region (the delegate sets `AWS_DEFAULT_REGION` for the same reason),
+   *   and the four non-secret Postgres values `config.json` resolves by name.
+   *   The sidecar has no AWS configuration at all: it is a Google OAuth proxy.
+   * - The entry point is overridden, which the delegate's container does not
+   *   do. Upstream's own ECS guide is the reason: the gateway has to write the
+   *   injected config to `/app/data/config.json` before Bifrost starts, and
+   *   ECS has no init-container equivalent here. `BIFROST_CONTAINER_COMMAND`
+   *   writes it and then `exec`s the image's own entry point, so PID 1, signal
+   *   handling and the app-dir checks stay upstream's.
    *
    * Every value that comes from another resource is put through one `pulumi.all`
-   * *before* the object is built, including `logGroup.name`. An `Output`
+   * *before* the object is built, including `logGroup.name`, `database.address`,
+   * `database.port` and `configParameter.arn`. An `Output`
    * interpolated inside an `apply` callback is not resolved for you: the
    * callback's return value is taken as-is, and `JSON.stringify` on it throws
    * `Calling [toJSON] on an [Output<T>] is not supported`
@@ -715,7 +918,11 @@ export const createBifrostEcs = (args: {
       oauth2ProxyImageUri,
       bootstrapImageUri,
       database.secretArn,
+      database.address,
+      database.port.apply(String),
       logGroup.name,
+      configParameter.arn,
+      configParameter.version.apply(String),
     ])
     .apply(
       ([
@@ -723,7 +930,11 @@ export const createBifrostEcs = (args: {
         resolvedOauth2ProxyImage,
         resolvedBootstrapImage,
         databaseSecretArn,
+        databaseAddress,
+        databasePort,
         resolvedLogGroupName,
+        configParameterArn,
+        configParameterVersion,
       ]) => [
         {
           name: BIFROST_CONTAINER_NAME,
@@ -732,6 +943,11 @@ export const createBifrostEcs = (args: {
           memory: BIFROST_CONTAINER_MEMORY,
           essential: true,
           healthCheck: BIFROST_HEALTH_CHECK,
+          // Upstream's documented ECS shape (`docs/deployment-guides/ecs.mdx`
+          // at the pinned tag): the injected config becomes the file Bifrost
+          // reads, and then the image's own entry point starts the process.
+          entryPoint: [...BIFROST_CONTAINER_ENTRY_POINT],
+          command: [...BIFROST_CONTAINER_COMMAND],
           portMappings: [
             {
               containerPort: BIFROST_PORT,
@@ -739,7 +955,18 @@ export const createBifrostEcs = (args: {
               protocol: "tcp",
             },
           ],
-          environment: [{ name: AWS_REGION_ENV_NAME, value: REGION }],
+          environment: [
+            { name: AWS_REGION_ENV_NAME, value: REGION },
+            { name: PG_HOST_ENV_NAME, value: databaseAddress },
+            { name: PG_PORT_ENV_NAME, value: databasePort },
+            { name: PG_USER_ENV_NAME, value: DATABASE_USERNAME },
+            { name: PG_DATABASE_ENV_NAME, value: DATABASE_NAME },
+            // A config change has to roll the task; see the constant.
+            {
+              name: BIFROST_CONFIG_VERSION_ENV_NAME,
+              value: configParameterVersion,
+            },
+          ],
           secrets: [
             ...GATEWAY_SECRET_KEYS.map((key) => ({
               name: key,
@@ -748,6 +975,14 @@ export const createBifrostEcs = (args: {
             {
               name: PG_PASSWORD_ENV_NAME,
               valueFrom: `${databaseSecretArn}:${RDS_PASSWORD_JSON_KEY}::`,
+            },
+            // The one `secrets` entry that is not a secret: an SSM parameter
+            // ARN. ECS resolves it through the execution role's
+            // `ssm:GetParameters` grant and hands the value to the entry point
+            // above as an environment variable.
+            {
+              name: BIFROST_CONFIG_ENV_NAME,
+              valueFrom: configParameterArn,
             },
           ],
           logConfiguration: {

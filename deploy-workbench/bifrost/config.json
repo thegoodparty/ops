@@ -3,6 +3,35 @@
   "source_of_truth": "config.json",
   "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
   "setup_token": "env.BIFROST_SETUP_TOKEN",
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.PG_HOST",
+      "port": "env.PG_PORT",
+      "user": "env.PG_USER",
+      "password": "env.PG_PASSWORD",
+      "db_name": "env.PG_DATABASE",
+      "ssl_mode": "require",
+      "max_idle_conns": 5,
+      "max_open_conns": 50
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.PG_HOST",
+      "port": "env.PG_PORT",
+      "user": "env.PG_USER",
+      "password": "env.PG_PASSWORD",
+      "db_name": "env.PG_DATABASE",
+      "ssl_mode": "require",
+      "max_idle_conns": 10,
+      "max_open_conns": 100
+    },
+    "retention_days": 90
+  },
   "client": {
     "enable_logging": true,
     "disable_content_logging": true,
