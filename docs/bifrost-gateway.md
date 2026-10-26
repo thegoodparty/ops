@@ -397,10 +397,21 @@ third holds secret values:
    `deploy-workbench/bifrost/config.json`) and holds the providers, the
    client settings, and the `governance` block — teams, budgets and virtual
    keys — with an `env.` reference everywhere a secret would otherwise be.
-   Pulumi stores it as an SSM SecureString (or Secrets Manager entry) and
+   Pulumi stores it as a plain SSM `String` parameter (`/bifrost/config`) and
    injects it as `BIFROST_CONFIG`; the container entrypoint writes it to
    `/app/data/config.json`, which is the shape the upstream ECS guide
    documents. A change to it is a reviewed PR, not a console edit.
+   `String`, not `SecureString`: the file is committed here, so encrypting the
+   deployed copy protects nothing, while it would hide the configuration
+   production is running from the reviewers who would diff it, and it would
+   put `kms:Decrypt` on the account's `aws/ssm` key in the ECS agent's policy.
+   No secret lives in the file — every credential in it is an `env.` name
+   resolved from Secrets Manager, and the database password reaches the task
+   through `secrets` — which `deploy-workbench/bifrost/config.test.ts`
+   checks: no credential-shaped literal, and every `env.` name is one the
+   deployment actually provides. The mechanism, including the parameter's
+   version in the task definition so an edit rolls the task, is documented in
+   `deploy-workbench/bifrost/README.md`.
    `source_of_truth: "config.json"` makes the file authoritative for the
    sections it declares, so a redeploy converges to the repo instead of
    preserving UI drift; the upstream "missing vs empty" caveat in
@@ -517,8 +528,16 @@ Virtual keys are Bifrost's primary governance entity
   on for one request. Upstream is explicit that the layers compose and that a
   key with `false` overrides the global setting
   (`docs/features/observability/content-logging.mdx`).
-- **Retention.** Set `logs_store.retention_days` explicitly (90 days is a
-  reasonable first value) rather than accepting the default. The account's
+- **Retention.** There are two settings at the pinned tag and they are not
+  interchangeable. `client.log_retention_days` is the cleanup job's window and
+  the one `PUT /api/config` validates — it rejects anything below `1`
+  (`handlers/config.go`, "log_retention_days must be at least 1") — while
+  `logs_store.retention_days` is the store's own purge window, whose valid
+  range starts at `0`. A store that has never saved the first one reports `0`
+  on `GET /api/config`, so anything that round-trips the server's own config
+  back (the first-admin claim does) gets a `400` until it raises the value.
+  `deploy-workbench/bifrost/config.json` sets both to 90 days, so there is one
+  retention story rather than two. The account's
   Bedrock invocation log uses 365 days because it is the durable
   cost-attribution record; the gateway log is an operational and budget
   record, and 90 days covers a budget cycle. Raise it, or offload to object
@@ -853,9 +872,9 @@ network or a permission can land before the item that creates it.
 
 10. Commit the non-secret `config.json` under `deploy-workbench/` with
     providers, client settings and the `governance` block, using `env.`
-    references; have Pulumi store it as an SSM SecureString and inject it as
-    `BIFROST_CONFIG`. Set `source_of_truth: "config.json"` for the sections
-    the repo owns.
+    references; have Pulumi store it as a plain SSM `String` parameter and
+    inject it as `BIFROST_CONFIG`. Set `source_of_truth: "config.json"` for
+    the sections the repo owns.
 11. Add the secret containers and the read grants, and write the secret
     values out of band (provider keys, `BIFROST_ENCRYPTION_KEY`, admin
     credential, `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,
