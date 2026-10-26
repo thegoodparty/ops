@@ -85,8 +85,11 @@ jobs:
     runs-on: ubuntu-latest
     # No CreateAccount here, so nothing in this stack polls for minutes the
     # way deploy-org does. Well above the expected runtime, far below the six
-    # hour default that would let a wedged run hold the lock all day.
-    timeout-minutes: 15
+    # hour default that would let a wedged run hold the lock all day. The
+    # post-apply health check can wait up to its own 10-minute timeout, and it
+    # must still be running when that timeout expires so it can print the
+    # service's events: a job killed at the limit would lose the diagnosis.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -328,10 +331,34 @@ jobs:
 
       # Only now: every image above is in ECR, or the run stopped before this.
       # This is the step that drains the running task, so it is the last thing
-      # that may happen before the stack is known to be startable.
+      # that may happen before the stack is known to be startable. `deploy.sh`
+      # also runs the pre-apply secret check immediately before its `pulumi
+      # up`, so an unresolvable Secrets Manager key stops the run before the
+      # drain rather than at task launch.
       - name: Deploy
         working-directory: deploy-workbench
         run: ./deploy.sh
+
+      # The apply is not the same thing as a running service. `pulumi up`
+      # exits 0 once ECS has accepted the new task definition and service, not
+      # once a task is healthy; on 2026-10-26 the run reported success while
+      # `bifrost` sat at running 0 / desired 1 for about three hours. This
+      # waits for one deployment whose rollout is COMPLETED and whose running
+      # count equals desired, fails immediately if a rollout is FAILED, and
+      # prints the service's recent events on failure. It fails the run, not
+      # warns, and it is before Bedrock enablement so a broken service stops
+      # the workflow before it mutates the account further.
+      #
+      # The script assumes `pulumi-deploy` itself for the `ecs:DescribeServices`
+      # reads, using the first-hop session the apply left in the job. Doing the
+      # hop inside the script rather than with another `configure-aws-credentials`
+      # step keeps that first-hop session in place for the Bedrock step below,
+      # which makes the same hop and does not trust the workbench role itself.
+      - name: Verify the service returned to a steady state
+        working-directory: deploy-workbench
+        env:
+          WORKBENCH_DEPLOY_ROLE_ARN: arn:aws:iam::024901689212:role/pulumi-deploy
+        run: npx --no-install tsx scripts/verify-service.ts --timeout-seconds 600 --interval-seconds 10
 
       # Bedrock model access is not a Pulumi resource, so it cannot ride in
       # deploy.sh; see the header of the script for why none exists. Without
