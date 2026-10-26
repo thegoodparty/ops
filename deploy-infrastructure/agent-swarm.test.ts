@@ -67,7 +67,7 @@ describe("delegate swarm host files", () => {
     assert.ok(!compose.includes("ghcr.io/desplega-ai/agent-swarm-worker"));
     assert.ok(
       compose.includes(
-        'image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"',
+        'image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.6.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"',
       ),
     );
   });
