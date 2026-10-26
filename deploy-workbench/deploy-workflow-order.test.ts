@@ -264,3 +264,92 @@ describe("deploy-workbench.yml step order", () => {
     }
   });
 });
+
+describe("deploy-workbench.yml deploy health checks", () => {
+  // Two failures of the 2026-10-26 deploy, and where each check sits.
+  //
+  // 1. The task definition named `BIFROST_SETUP_TOKEN`, which `bifrost/gateway`
+  //    did not contain. ECS found that at task launch, after the apply had
+  //    already drained the only healthy task. The preflight therefore runs
+  //    inside deploy.sh, after the stack is selected and configured, and
+  //    before the full `pulumi up`. It is unconditional on the full-apply path:
+  //    there is no "could not check, carry on" branch.
+  //
+  // 2. The run reported success while the service was empty. The post-apply
+  //    step waits for a real steady state and prints the service's events on
+  //    failure. It runs after the apply and before Bedrock enablement, so a
+  //    broken service stops the workflow before it mutates anything else.
+  it("checks every referenced secret before the full apply, from the synthesized task definition", () => {
+    const preflightAt = DEPLOY_SH.indexOf("scripts/preflight-secrets.ts");
+    assert.notEqual(
+      preflightAt,
+      -1,
+      "deploy.sh must run the pre-apply secret check",
+    );
+
+    const targetedAt = DEPLOY_SH.indexOf("--target");
+    const fullApplyAt = DEPLOY_SH.lastIndexOf("pulumi up --diff --yes");
+    assert.notEqual(targetedAt, -1, "the targeted repositories apply is gone");
+    assert.notEqual(fullApplyAt, -1, "the full apply is gone");
+    assert.ok(
+      preflightAt > targetedAt,
+      "the secret check belongs on the full-apply path, not the repositories pass",
+    );
+    assert.ok(
+      preflightAt < fullApplyAt,
+      "the secret check must run before the apply that drains the task",
+    );
+
+    assert.ok(
+      DEPLOY_SH.includes("pulumi preview --json"),
+      "the required keys must come from the synthesized task definition, not a hand-maintained list",
+    );
+    assert.ok(
+      DEPLOY_SH.includes("pulumi stack export"),
+      "an unchanged task definition can be absent from preview steps; the exported state is the fallback",
+    );
+
+    const invocationLine = DEPLOY_SH
+      .split("\n")
+      .find((line) => line.includes("scripts/preflight-secrets.ts"));
+    assert.ok(invocationLine, "no preflight invocation line");
+    assert.ok(
+      !invocationLine.includes("|| true"),
+      "a secret check that cannot run must fail the deploy, never pass silently",
+    );
+  });
+
+  it("waits for the service to come back up after the apply, before Bedrock", () => {
+    const verifyAt = stepIndex("Verify the service returned to a steady state");
+    assert.ok(
+      verifyAt > stepIndex("Deploy"),
+      "the health check must run after the apply that can drain the task",
+    );
+    assert.ok(
+      verifyAt < stepIndex("Enable Bedrock models"),
+      "a failed service must stop the run before it mutates the account further",
+    );
+
+    const body = stepNamed("Verify the service returned to a steady state").body;
+    assert.ok(
+      body.includes("scripts/verify-service.ts"),
+      "the check must run the service verifier",
+    );
+    assert.ok(
+      /--timeout-seconds\s+\d+/.test(body),
+      "the wait must be bounded by an explicit timeout",
+    );
+    assert.ok(
+      !body.includes("::warning::"),
+      "the post-apply check must fail the run, not warn",
+    );
+    assert.ok(
+      !body.includes("continue-on-error"),
+      "the post-apply check must fail the run, not continue",
+    );
+    assert.ok(
+      !body.includes("configure-aws-credentials"),
+      "the check must not replace the job's first-hop session; Bedrock enablement below needs it back",
+    );
+  });
+});

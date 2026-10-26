@@ -1,6 +1,10 @@
 #!/bin/sh
 set -e
 
+# Resolve the script's own directory so the pre-apply check below works no
+# matter which directory the workflow invokes this from.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
 # See deploy/deploy.sh for why preview mode is an explicit variable and never
 # writes. This project has no image to resolve. The one preview-specific
 # setting is which role the provider assumes: the read-only `pulumi-preview`
@@ -119,6 +123,30 @@ if [ "$CI" = "true" ]; then
     # split on either.
     pulumi up --diff --yes --target "$DEPLOY_TARGET"
   else
+    # The pre-apply secret check. It runs here, after the stack has been
+    # selected and configured and immediately before the apply that can drain
+    # the running task, because ECS does not resolve a task definition's
+    # `secrets` until the task launches: an apply that names a JSON key a
+    # secret does not contain succeeds, drains the old task and leaves the
+    # service empty. That is the 2026-10-26 outage, when `bifrost:3` named
+    # `BIFROST_SETUP_TOKEN` and `bifrost/gateway` did not have it.
+    #
+    # The required keys are derived from the task definition Pulumi is about
+    # to deploy, not from a list in the repo. The preview JSON is the
+    # synthesized state; the stack export is the fallback for an unchanged
+    # task definition, which can be absent from preview's steps. Neither is
+    # printed: the check reports key names only, and a secret value never
+    # reaches the log. Anything that stops the comparison -- a preview that
+    # has no task definition, a missing permission, a secret that is not JSON
+    # -- exits non-zero under `set -e` rather than being read as success.
+    PREFLIGHT_DIR=$(mktemp -d)
+    trap 'rm -rf "$PREFLIGHT_DIR"' EXIT
+    pulumi preview --json > "$PREFLIGHT_DIR/preview.json"
+    pulumi stack export > "$PREFLIGHT_DIR/stack.json"
+    npx --no-install tsx "$SCRIPT_DIR/scripts/preflight-secrets.ts" \
+      --preview "$PREFLIGHT_DIR/preview.json" \
+      --stack-export "$PREFLIGHT_DIR/stack.json"
+
     pulumi up --diff --yes
   fi
 else
