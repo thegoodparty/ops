@@ -1,4 +1,4 @@
-# agent-swarm 1.171.0 on delegate-swarm.infra.goodparty.org
+# agent-swarm 2.6.0 on delegate-swarm.infra.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
@@ -64,7 +64,7 @@ x-worker-env: &worker-env
 # tag changes with the version or the patch, which is what makes compose
 # recreate the agents; an unchanged tag is not rebuilt.
 x-worker-base: &worker-base
-  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
+  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.6.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
   pull_policy: never
   entrypoint: *agent-entrypoint
   platform: linux/amd64
@@ -93,7 +93,7 @@ services:
     logging: *logging
 
   api:
-    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-1.171.0}"
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.6.0}"
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
