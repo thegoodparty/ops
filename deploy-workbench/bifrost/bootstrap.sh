@@ -25,6 +25,22 @@ set -eu
 API="${BIFROST_API_BASE_URL:-http://127.0.0.1:8080}"
 SETUP_TOKEN_HEADER="X-Bifrost-Setup-Token"
 
+# The one field of the echoed config this script has to correct. `PUT
+# /api/config` validates more strictly than the `GET /api/config` it
+# round-trips: the read path hands back the store's zero value for
+# `log_retention_days`, and the write path refuses anything below 1
+# (`handlers/config.go` at the pinned tag: "log_retention_days must be at
+# least 1"). Echoing the server's own view back is therefore a 400 on the very
+# first claim, before any admin account exists -- which is exactly how a
+# deployed gateway stayed unclaimed after phase 2 item 11 landed.
+#
+# The smallest value the write path accepts, not the repo's real retention:
+# `config.json` declares 90 days and is authoritative for it once item 10's
+# `BIFROST_CONFIG` injection lands, so this script must not encode a policy of
+# its own. It only has to stop a server-supplied default from failing the
+# server's own validation.
+CLAIM_LOG_RETENTION_DAYS=1
+
 log() { printf 'bifrost-bootstrap: %s\n' "$*"; }
 fail() { printf 'bifrost-bootstrap: error: %s\n' "$*" >&2; exit 1; }
 
@@ -50,11 +66,17 @@ fi
 
 # PUT /api/config takes the client and framework config as values, so a payload
 # built from config.json would replace whatever the store holds with whatever
-# the file says. Take the server's own view and add one field to it instead.
-# Providers are not part of this payload at the pinned tag; only client and
-# framework config round-trip, and they go back exactly as they arrived.
+# the file says. Take the server's own view and add the fields it needs
+# instead. Providers are not part of this payload at the pinned tag; only
+# client and framework config round-trip, and they go back as they arrived.
 config="$(curl -fsS -H "$SETUP_TOKEN_HEADER: $BIFROST_SETUP_TOKEN" "$API/api/config")" \
   || fail "GET /api/config was refused; the setup token the process loaded is not the one in the secret"
+
+# Without the block there is nothing to correct, and adding one would replace
+# the live client config with a fragment; that is a payload we cannot build.
+if [ "$(printf '%s' "$config" | jq 'has("client_config")')" != "true" ]; then
+  fail "GET /api/config returned no client_config, so a claim payload cannot be built"
+fi
 
 # An admin account with dashboard auth switched off lands here. Re-enabling it
 # is a deliberate act that needs proof of control, so leave it to a human
@@ -66,25 +88,41 @@ fi
 
 body="$(printf '%s' "$config" | jq -c \
   --arg u "$BIFROST_ADMIN_USERNAME" --arg p "$BIFROST_ADMIN_PASSWORD" \
-  '. + {auth_config: {admin_username: $u, admin_password: $p, is_enabled: true}}')" \
-  || fail "could not add auth_config to the config payload"
+  --argjson retention "$CLAIM_LOG_RETENTION_DAYS" \
+  '(.client_config.log_retention_days // 0) as $current
+   | (if $current < 1 then .client_config.log_retention_days = $retention else . end)
+   | . + {auth_config: {admin_username: $u, admin_password: $p, is_enabled: true}}')" \
+  || fail "could not build the config payload"
 
 # The body is written to a file so the password never appears in argv. The
-# response is discarded for the same reason: it is the updated config.
+# response is written to a file too: on success it is the updated config, which
+# is why it is never printed, but on a rejection its `error` field is the only
+# statement of why the claim failed. Discarding it unconditionally is what made
+# the first failure here a status code with no reason attached.
 umask 077
 body_file="$(mktemp)"
-trap 'rm -f "$body_file"' EXIT
+response_file="$(mktemp)"
+trap 'rm -f "$body_file" "$response_file"' EXIT
 printf '%s' "$body" > "$body_file"
 
-status="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT \
+# The server's own reason for a rejection, truncated. Only ever called on a
+# non-2xx response, so it cannot print a config body.
+server_error() {
+  local text
+  text="$(jq -r '.error // empty' < "$response_file" 2>/dev/null | head -c 300)"
+  [ -n "$text" ] || text="$(head -c 300 "$response_file" 2>/dev/null)"
+  printf '%s' "$text"
+}
+
+status="$(curl -sS -o "$response_file" -w '%{http_code}' -X PUT \
   -H "$SETUP_TOKEN_HEADER: $BIFROST_SETUP_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary "@$body_file" "$API/api/config")" \
   || fail "PUT /api/config did not complete"
 case "$status" in
   2??) ;;
-  400) fail "PUT /api/config was rejected (400). If the gateway logged a password policy failure, regenerate BIFROST_ADMIN_PASSWORD with fill-secrets.sh --force" ;;
-  *) fail "PUT /api/config returned $status" ;;
+  400) fail "PUT /api/config was rejected (400): $(server_error). A password policy message here means BIFROST_ADMIN_PASSWORD has to be regenerated with fill-secrets.sh --force" ;;
+  *) fail "PUT /api/config returned $status: $(server_error)" ;;
 esac
 
 # Bifrost clears the bootstrap token once the first admin account exists, so a

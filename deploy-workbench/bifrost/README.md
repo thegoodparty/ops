@@ -258,43 +258,56 @@ runs on every task start after the gateway is `HEALTHY` and creates the admin
 account with the credential from `bifrost/gateway`.
 
 It is convergent, not one-shot. It asks `GET /api/session/is-auth-enabled`
-first (whitelisted, so it answers with no credential) and exits 0 without
-writing anything when dashboard auth is already active. A redeploy is a no-op,
-and a restore into an empty config store heals itself. When a claim is needed
-it takes the server's own `GET /api/config` body, adds `auth_config` with the
-username, password and `is_enabled: true`, and `PUT`s that back with
-`X-Bifrost-Setup-Token`. It builds the payload from the server's view rather
-than from `config.json` because `PUT /api/config` replaces the client and
-framework configuration: a synthesised body would drop settings the store
-holds. A store that already has an admin account with dashboard auth disabled
-is left alone; re-enabling it needs proof of control, and that is a human
-decision.
+first (whitelisted by Bifrost's own auth middleware, so it answers with no
+credential) and exits 0 without writing anything when dashboard auth is
+already active. A redeploy is a no-op, and a restore into an empty config store
+heals itself. When a claim is needed it takes the server's own `GET /api/config`
+body, adds `auth_config` with the username, password and `is_enabled: true`,
+and `PUT`s that back with `X-Bifrost-Setup-Token`. It builds the payload from
+the server's view rather than from `config.json` because `PUT /api/config`
+replaces the client and framework configuration: a synthesised body would drop
+settings the store holds. A store that already has an admin account with
+dashboard auth disabled is left alone; re-enabling it needs proof of control,
+and that is a human decision.
+
+**One field it has to correct, and why that mattered.** The write path is
+stricter than the read path: a store that has never saved a retention returns
+`client_config.log_retention_days: 0`, and `PUT /api/config` refuses anything
+below 1 (`handlers/config.go` at the pinned tag, "log_retention_days must be at
+least 1"). Echoing the server's own view back was therefore a 400 on the first
+claim of every fresh store, and the deployed gateway sat unclaimed for exactly
+that reason — the setup page kept asking for the token because no admin account
+ever existed. The script now raises that one field to the smallest value the
+write path accepts (`CLAIM_LOG_RETENTION_DAYS`) and leaves every other value
+alone; the repo's real retention is `config.json`'s 90 days, and the file is
+authoritative for it once item 10's injection lands. Nothing else in the echoed
+payload needs correcting: the validations that run before this one (including
+the first-admin password policy) had already passed.
 
 It runs inside the task, against `127.0.0.1:8080`, because once item 9's
 oauth2-proxy is in front of the gateway the ALB sends every admin path to
 Google sign-in before Bifrost sees it. There is no public path and no host
 association. No secret is printed: the password goes from the secret to a
-temporary file and into the request body, never argv, and the container logs
-statuses only.
+temporary file and into the request body, never argv.
 
 **When it fails.** It is non-essential so a claim that cannot run — a password
 upstream's policy rejects, a gateway that never goes healthy — does not stop
 the gateway serving inference. That also means a non-zero exit does not fail
 the task: the failure is this container's `bifrost-bootstrap` log stream
-(`/aws/ecs/bifrost`) and its stopped reason. A metric-filter alarm on that
-stream is the follow-up that turns it into a page; this account has no
-alerting target yet.
+(`/aws/ecs/bifrost`) and its stopped reason. The script prints the server's own
+`error` text on a rejection and the status code with it, so a failure names its
+cause instead of leaving a bare 400 to be dug out of the gateway's log; a
+password-policy message there means the credential has to be regenerated with
+`fill-secrets.sh --force`. A metric-filter alarm on that stream is the
+follow-up that turns it into a page; this account has no alerting target yet.
 
-Check the claim from anywhere (the endpoint is whitelisted):
-
-```sh
-curl -sS https://bifrost.workbench.goodparty.org/api/session/is-auth-enabled \
-  | jq '{is_auth_enabled, setup_required, setup_token_configured, inference_auth_enforced}'
-```
-
-`is_auth_enabled: true` and `setup_required: false` mean it is claimed.
-`setup_required: true, setup_token_configured: false` is the bug this section
-exists to prevent: the API is locked with no way in.
+**Reading the claim state is not a public `curl`.** `/api/session/is-auth-enabled`
+is whitelisted by Bifrost's middleware, but not by the ALB: `/api/*` is routed
+to oauth2-proxy (`ingress.ts`, `ADMIN_PATH_PATTERNS`), so from a laptop the
+request is a 302 to Google sign-in, and the useful output never arrives. The
+state is therefore read from inside the task (or from the claim container's
+log line), and from the dashboard, which serves the setup page while the lock
+is on and the login form once the account exists.
 
 **Doing it by hand**, for a break-glass claim or when the container's log says
 it exited non-zero. Read the token and the admin password from

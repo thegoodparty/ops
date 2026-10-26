@@ -33,6 +33,7 @@ type StubState = {
   authActive: boolean;
   setupTokenConfigured?: boolean;
   putStatus?: number;
+  putError?: string;
 };
 
 type BootstrapResult = {
@@ -101,7 +102,9 @@ const withStubBifrost = async (
       if (request.url === "/api/config" && request.method === "PUT") {
         if (state.putStatus && state.putStatus !== 200) {
           response.statusCode = state.putStatus;
-          response.end(JSON.stringify({ error: "rejected" }));
+          response.end(
+            JSON.stringify({ error: state.putError ?? "rejected" }),
+          );
           return;
         }
         state.config = JSON.parse(body) as Record<string, unknown>;
@@ -239,6 +242,90 @@ describe("bifrost bootstrap claim", () => {
           "the claim must not re-enable dashboard auth",
         );
         assert.ok(result.output.includes("leaving it alone"), result.output);
+      },
+    );
+  });
+
+  it("corrects the one field the write path rejects when the store has none", async () => {
+    // The read path returns the zero value of `log_retention_days` on a store
+    // that has never saved one, and the write path refuses anything below 1.
+    // Echoing the server's own view back therefore 400s the very first claim,
+    // which is how the deployed gateway stayed unclaimed. The script has to
+    // send a value the server accepts -- and change nothing else.
+    const serverConfig = freshConfig();
+    (serverConfig.client_config as Record<string, unknown>).log_retention_days = 0;
+    await withStubBifrost(
+      { config: serverConfig, authActive: false },
+      async (baseUrl, requests) => {
+        const result = await runBootstrap(baseUrl);
+        assert.equal(result.status, 0, result.output);
+
+        const put = requests.find(
+          (request) => request.method === "PUT" && request.url === "/api/config",
+        );
+        assert.ok(put, "the claim did not PUT /api/config");
+        const sent = JSON.parse(put.body) as {
+          client_config: Record<string, unknown>;
+        };
+        assert.equal(
+          sent.client_config.log_retention_days,
+          1,
+          "the claim must send the smallest retention the write path accepts",
+        );
+
+        const { auth_config: _authConfig, ...withoutAuthConfig } = sent as Record<
+          string,
+          unknown
+        >;
+        assert.deepEqual(withoutAuthConfig, {
+          ...serverConfig,
+          client_config: {
+            ...(serverConfig.client_config as Record<string, unknown>),
+            log_retention_days: 1,
+          },
+        });
+      },
+    );
+  });
+
+  it("leaves a retention the store already holds alone", async () => {
+    // config.json's 90 days, once item 10 injects it, is authoritative; the
+    // claim must not overwrite it with its own minimum.
+    await withStubBifrost(
+      { config: freshConfig(), authActive: false },
+      async (baseUrl, requests) => {
+        const result = await runBootstrap(baseUrl);
+        assert.equal(result.status, 0, result.output);
+        const put = requests.find(
+          (request) => request.method === "PUT" && request.url === "/api/config",
+        );
+        assert.ok(put, "the claim did not PUT /api/config");
+        const sent = JSON.parse(put.body) as {
+          client_config: Record<string, unknown>;
+        };
+        assert.equal(sent.client_config.log_retention_days, 90);
+      },
+    );
+  });
+
+  it("prints the server's reason for a rejection, never the credentials", async () => {
+    // The status code alone is why the live failure took a log dig to explain.
+    await withStubBifrost(
+      {
+        config: freshConfig(),
+        authActive: false,
+        putStatus: 400,
+        putError: "log_retention_days must be at least 1",
+      },
+      async (baseUrl) => {
+        const result = await runBootstrap(baseUrl);
+        assert.notEqual(result.status, 0);
+        assert.ok(
+          result.output.includes("log_retention_days must be at least 1"),
+          result.output,
+        );
+        assert.ok(!result.output.includes(PASSWORD), result.output);
+        assert.ok(!result.output.includes(TOKEN), result.output);
       },
     );
   });
