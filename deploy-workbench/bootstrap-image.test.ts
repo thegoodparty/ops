@@ -67,6 +67,44 @@ describe("derived bootstrap image pin", () => {
     );
   });
 
+  it("drops to the base image's user only after the steps that need root", () => {
+    // The base image runs as 1000:0, and `COPY` lays its files down as 0:0
+    // whatever the active `USER` is: a `chmod` on a copied file issued after
+    // the drop is a chmod by a non-owner, which fails with "Operation not
+    // permitted" and fails the image build (deploy run 40329170411). So no
+    // step that needs root may follow the final non-root `USER`, and the only
+    // escape hatch is `--chown`, where the builder sets the owner itself.
+    const instructions = DOCKERFILE.split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#"));
+    const isRootUser = (instruction: string): boolean => {
+      const match = instruction.match(/^USER\s+(\S+)$/);
+      return match !== null && (match[1] === "root" || /^0(:0)?$/.test(match[1]));
+    };
+    const lastNonRootUser = instructions.reduce(
+      (last, instruction, index) =>
+        instruction.startsWith("USER ") && !isRootUser(instruction)
+          ? index
+          : last,
+      -1,
+    );
+    assert.ok(
+      lastNonRootUser > 0,
+      "the derived image must drop to the base image's non-root user",
+    );
+    assert.deepEqual(
+      instructions
+        .slice(lastNonRootUser + 1)
+        .filter(
+          (instruction) =>
+            /^(RUN|COPY|ADD)\b/.test(instruction) &&
+            !instruction.includes("--chown="),
+        ),
+      [],
+      "these steps run after the privilege drop, and COPY leaves files owned by 0:0",
+    );
+  });
+
   it("builds into a repository of its own, apart from both other images", () => {
     assert.equal(BIFROST_BOOTSTRAP_REPOSITORY_NAME, "bifrost-bootstrap");
     assert.notEqual(BIFROST_BOOTSTRAP_REPOSITORY_NAME, "bifrost");
