@@ -23,18 +23,24 @@ import * as path from "node:path";
  * goodparty.org` served 503 from 13:23 UTC on 2026-10-26 until someone rolled
  * the service by hand.
  *
- * The rule these tests pin: **everything the task definition can resolve is
- * pushed, and the run has stopped if any of it could not be, before an apply
- * that can drain the running task.** The workflow is read as text rather than
- * parsed: the repo has no YAML dependency, and every value checked here is a
- * step name or a one-line scalar.
+ * The rule these tests pin: **every image the task definition can resolve is in
+ * ECR before an apply that can drain the running task, and the run has stopped
+ * if any of them could not be pushed.** No step may decide to skip a push and
+ * carry on: a skipped push is an apply onto an image that does not exist, which
+ * is the outage. The one thing that cannot be pushed before an apply is a
+ * repository the apply has never created, so the run creates those first with a
+ * targeted apply that touches nothing else -- and if the probe cannot tell
+ * whether a repository exists, it stops.
+ *
+ * The workflow is read as text rather than parsed: the repo has no YAML
+ * dependency, and the assertions here are about the order and the shape of the
+ * steps, both of which are a `- name:` line and the block under it.
  */
 const WORKFLOW = path.resolve(
   __dirname,
   "../.github/workflows/deploy-workbench.yml",
 );
 const SOURCE = fs.readFileSync(WORKFLOW, "utf8");
-
 /** The management account's role, the first hop every apply starts from. */
 const FIRST_HOP_ROLE_ARN =
   "arn:aws:iam::333022194791:role/github-actions-workbench-deploy";
@@ -46,15 +52,47 @@ const IMAGE_STEPS = [
   "Build and push the derived bootstrap image",
 ];
 
-/** Step names in file order. Steps without a `name:` are not steps here. */
-const stepNames = (): string[] =>
-  [...SOURCE.matchAll(/^ {6}- name: (.+)$/gm)].map((match) => match[1].trim());
+type Step = { name: string; body: string };
+
+/**
+ * A block with its comment lines removed. Every assertion below is about what
+ * the workflow *does*, and a comment that mentions `describe-repositories` or
+ * `--target` (explaining why the step exists) is not the step doing it.
+ */
+const codeOnly = (text: string): string =>
+  text
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
+
+const DEPLOY_SH = codeOnly(
+  fs.readFileSync(path.resolve(__dirname, "deploy.sh"), "utf8"),
+);
+
+/**
+ * The job's steps in file order. A step is a line starting with six spaces and
+ * `- `; its body runs to the next one. Steps without a `name:` (the plain
+ * `run:`/`uses:` ones) come back with an empty name, and the comment block
+ * above a step belongs to the step before it, so nothing asserted below reads a
+ * step's leading comment as its body.
+ */
+const steps = (): Step[] => {
+  const starts = [...SOURCE.matchAll(/^ {6}- /gm)].map((match) => match.index);
+  return starts.map((start, index) => {
+    const end = index + 1 < starts.length ? starts[index + 1] : SOURCE.length;
+    const body = codeOnly(SOURCE.slice(start, end));
+    const name = body.match(/^ {6}- name: (.+)$/m)?.[1].trim() ?? "";
+    return { name, body };
+  });
+};
 
 const stepIndex = (name: string): number => {
-  const index = stepNames().indexOf(name);
+  const index = steps().findIndex((step) => step.name === name);
   assert.notEqual(index, -1, `deploy-workbench.yml has no step named "${name}"`);
   return index;
 };
+
+const stepNamed = (name: string): Step => steps()[stepIndex(name)];
 
 describe("deploy-workbench.yml step order", () => {
   it("pushes every image the task definition resolves before the apply", () => {
@@ -67,6 +105,67 @@ describe("deploy-workbench.yml step order", () => {
         `"${step}" runs after the apply; a task definition naming an image pushed there cannot start`,
       );
     }
+  });
+
+  it("creates a missing repository with a targeted apply, before anything pushes", () => {
+    // The only write allowed before the images exist, and it must be limited to
+    // the ECR repositories: a full apply here would create the repository and
+    // roll the service out onto the image in the same breath, which is the
+    // outage. `--target` updates what it matches and leaves the stack alone.
+    //
+    // Unconditional on purpose. A conditional pass has to decide that a
+    // repository is missing from a failed API call, and an expired session or a
+    // throttle answers the same way a missing repository does; a check that
+    // gets that wrong skips the creation and the pushes, then lets the apply
+    // drain the task onto an image ECR does not have.
+    const create = stepIndex(
+      "Create the image repositories if the stack does not have them yet",
+    );
+    assert.ok(
+      create < stepIndex(IMAGE_STEPS[0]),
+      "the targeted apply must run before the first push, or the push has nowhere to go",
+    );
+    assert.ok(
+      create < stepIndex("Configure AWS Credentials (workbench)"),
+      "it must run before the workbench session replaces the first-hop credentials deploy.sh needs for the state passphrase",
+    );
+
+    const createBody = stepNamed(
+      "Create the image repositories if the stack does not have them yet",
+    ).body;
+    assert.ok(
+      !/\n\s+if:/.test(createBody),
+      "the targeted apply must not be conditional: its point is that no check decides whether a push can happen",
+    );
+    assert.ok(
+      createBody.includes(
+        'DEPLOY_TARGET: "urn:pulumi:*::*::aws:ecr/repository:Repository::*"',
+      ),
+      "the create step must target the stack's ECR repositories and nothing else",
+    );
+    assert.ok(
+      createBody.includes("run: ./deploy.sh"),
+      "the create step must go through deploy.sh, which owns the login and stack select",
+    );
+  });
+
+  it("cannot skip a push", () => {
+    // Nothing here may decide that an image does not have to be pushed: no
+    // repository probe to read a failure as an absence, and no
+    // warning-and-yield path. The targeted apply above is what makes the
+    // repositories exist, so every push either succeeds or stops the run before
+    // the apply. The `describe-images` checks that remain are a different
+    // thing: they skip a push only when the tag is already in ECR.
+    const skipPaths = steps().filter(
+      (step) =>
+        step.body.includes("describe-repositories") ||
+        step.body.includes("::warning::"),
+    );
+    assert.deepEqual(
+      skipPaths.map((step) => step.name),
+      [],
+      "these steps can skip a push and carry on to the apply",
+    );
   });
 
   it("applies as the first-hop role, not the chained workbench session", () => {
@@ -90,21 +189,19 @@ describe("deploy-workbench.yml step order", () => {
     );
   });
 
-  it("skips a push whose repository the first apply has not created yet", () => {
-    // Not every run has repositories to push to: Pulumi creates them, so on a
-    // brand-new stack there is no apply behind the first run. The push steps
-    // therefore have to be able to decline without failing the run, because
-    // failing before the apply would mean the stack never gets created at all.
-    // The run warns instead, and the next run pushes.
-    assert.equal(
-      [...SOURCE.matchAll(/--repository-names/g)].length,
-      IMAGE_STEPS.length,
-      "every image step must ask whether its repository exists before pushing",
-    );
-    assert.match(
-      SOURCE,
-      /::warning::/,
-      "a skipped push must be visible in the run, not silent",
+  it("applies the whole stack exactly once, and only after every push", () => {
+    // A second full apply is a second drain of the running task, and the
+    // ordering above only guarantees the images exist for the first. The one
+    // other `deploy.sh` invocation is the targeted repositories pass.
+    const running = steps().filter((step) => step.body.includes("run: ./deploy.sh"));
+    assert.equal(running.length, 2, "expected one targeted and one full apply");
+    const full = running.filter((step) => !step.body.includes("DEPLOY_TARGET"));
+    const targeted = running.filter((step) => step.body.includes("DEPLOY_TARGET"));
+    assert.equal(full.length, 1, "exactly one untargeted apply");
+    assert.equal(targeted.length, 1, "exactly one targeted apply");
+    assert.ok(
+      stepIndex(full[0].name) > stepIndex(IMAGE_STEPS[IMAGE_STEPS.length - 1]),
+      "the full apply must run after the last push",
     );
   });
 
@@ -116,12 +213,54 @@ describe("deploy-workbench.yml step order", () => {
     assert.ok(stepIndex("Enable Bedrock models") > stepIndex("Deploy"));
   });
 
-  it("applies exactly once", () => {
-    // A second apply is a second drain of the running task, and the ordering
-    // above only guarantees the images exist for the first.
-    assert.equal(
-      [...SOURCE.matchAll(/^ +run: \.\/deploy\.sh$/gm)].length,
-      1,
+  it("supports the targeted apply in deploy.sh, and only on the write path", () => {
+    assert.ok(
+      DEPLOY_SH.includes('pulumi up --diff --yes --target "$DEPLOY_TARGET"'),
+      "deploy.sh must pass the target through to pulumi up",
     );
+    assert.equal(
+      [...DEPLOY_SH.matchAll(/--target/g)].length,
+      1,
+      "one target, one flag: the glob is passed whole rather than split",
+    );
+    // Preview mode returns before the apply, so a preview never becomes a
+    // targeted write: the target is read only by the `pulumi up` below.
+    const previewAt = DEPLOY_SH.indexOf('if [ "$PREVIEW" = "true" ]');
+    const targetUsage = DEPLOY_SH.indexOf("--target");
+    assert.ok(previewAt !== -1 && targetUsage > previewAt, "the target is used outside the preview path");
+  });
+
+  it("targets every ECR repository this stack declares, by type", () => {
+    // The glob is written by type rather than by name so that renaming a
+    // repository resource does not silently stop matching it -- and this
+    // checks the type it names is the one the modules declare, and that the
+    // URNs those modules produce are what a `urn:pulumi:<stack>::<project>` glob
+    // matches.
+    const pattern = stepNamed(
+      "Create the image repositories if the stack does not have them yet",
+    ).body.match(/DEPLOY_TARGET: "([^"]+)"/)?.[1];
+    assert.ok(pattern, "the create step has no DEPLOY_TARGET");
+    const asRegExp = new RegExp(
+      `^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^:]*")}$`,
+    );
+
+    const logicalNames = [
+      "bifrost-image.ts",
+      "oauth2-proxy-image.ts",
+      "bootstrap-image.ts",
+    ].flatMap((file) => {
+      const source = fs.readFileSync(path.resolve(__dirname, file), "utf8");
+      return [...source.matchAll(/new aws\.ecr\.Repository\(\s*"([^"]+)"/g)].map(
+        (match) => match[1],
+      );
+    });
+    assert.equal(logicalNames.length, 3, `expected three ECR repositories: ${logicalNames}`);
+    for (const name of logicalNames) {
+      assert.match(
+        `urn:pulumi:main::workbench::aws:ecr/repository:Repository::${name}`,
+        asRegExp,
+        `the target glob does not match the ${name} repository this stack declares`,
+      );
+    }
   });
 });

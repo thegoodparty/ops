@@ -10,6 +10,27 @@ if [ "$PULUMI_MODE" = "preview" ]; then
   PREVIEW=true
 fi
 
+# Restrict the apply to a subset of the stack, for `deploy-workbench.yml`.
+#
+# The workflow has to push the images the task definition names before the apply
+# that can drain the running task (see its header comment), and the ECR
+# repositories those images are pushed into are created by this same stack. A
+# stack that has never been applied, or that just gained an image, therefore has
+# nowhere to push until something creates the repository -- and a full apply
+# would create it while also rolling the service onto an image that does not
+# exist yet, which is the outage this exists to prevent. So the workflow runs
+# this script once with DEPLOY_TARGET set to the stack's ECR repositories: a
+# `--target`ed update touches only what it matches, so there is no service in it
+# to drain, and the push that follows has somewhere to go. The full apply runs
+# afterwards, with the images already in ECR.
+#
+# One URN or glob, passed to `pulumi up --target`. `--target` updates the
+# resources it matches and leaves the rest of the stack alone; multi-value is
+# not needed here and would make the argument splitting below subtle. Ignored
+# in preview mode: a preview is not a write, and a targeted preview would be a
+# plan for something this script does not do.
+DEPLOY_TARGET=${DEPLOY_TARGET:-}
+
 # Mirrors deploy-org/deploy.sh, plus the role names below.
 #
 # The passphrase is the same one every stack in this backend uses. The role
@@ -93,7 +114,13 @@ if [ "$PREVIEW" = "true" ]; then
 fi
 
 if [ "$CI" = "true" ]; then
-  pulumi up --diff --yes
+  if [ -n "$DEPLOY_TARGET" ]; then
+    # Quoted: the glob contains `*` and `:`, and the shell must not expand or
+    # split on either.
+    pulumi up --diff --yes --target "$DEPLOY_TARGET"
+  else
+    pulumi up --diff --yes
+  fi
 else
   pulumi preview --diff
 fi

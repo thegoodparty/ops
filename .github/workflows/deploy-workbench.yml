@@ -111,6 +111,25 @@ jobs:
 
       - run: npm ci
 
+      # The targeted repositories pass. It runs on the first-hop credentials the
+      # step above configured, because `deploy.sh` reads the Pulumi state
+      # passphrase from SSM in the management account and then assumes
+      # `pulumi-deploy` through the provider (`index.ts`), exactly as the full
+      # apply below does. It comes before the workbench credentials and the
+      # pushes on purpose: those two steps replace this session in the job
+      # environment for every step after them.
+      #
+      # `--target` updates the resources it matches and leaves the rest of the
+      # stack alone; the value is a glob over the resource *type* rather than a
+      # list of names, so renaming a repository resource does not silently stop
+      # matching it. `deploy-workflow-order.test.ts` checks the glob against the
+      # URNs the three image modules declare.
+      - name: Create the image repositories if the stack does not have them yet
+        working-directory: deploy-workbench
+        env:
+          DEPLOY_TARGET: "urn:pulumi:*::*::aws:ecr/repository:Repository::*"
+        run: ./deploy.sh
+
       # Everything the task definition can resolve is pushed BEFORE the apply
       # below, and the run has stopped if any of it could not be. That order is
       # load-bearing: the service runs one Fargate task with
@@ -130,12 +149,23 @@ jobs:
       # goodparty.org` served 503 until someone rolled the service by hand.
       # `deploy-workflow-order.test.ts` pins the ordering.
       #
-      # The one case this order cannot serve is a stack whose repositories do
-      # not exist yet, because the apply creates them. Each push step therefore
-      # warns and yields when its repository is missing rather than failing:
-      # the apply below creates the repository, and the next run pushes the
-      # image. That case is a brand-new stack's first run, where there is no
-      # running task to strand.
+      # The one case the ordering above cannot serve, handled, rather than
+      # probed for: a stack whose ECR repositories do not exist yet, because the
+      # apply creates them. Nothing can be pushed before the first apply, and
+      # pushing after it is the wrong order again -- so the run creates them
+      # itself, with a `--target`ed apply limited to this stack's ECR
+      # repositories. That apply matches no service, so there is nothing to
+      # drain, and the pushes below have somewhere to push to.
+      #
+      # Unconditional, and that is the point. A conditional version (probe, then
+      # create only if something is missing) has to read "the repository is not
+      # there" out of a failed API call, and an expired session or a throttle
+      # looks the same as a missing repository unless the error is parsed. Any
+      # version of that check that gets it wrong skips a push and then lets the
+      # apply drain the task onto an image ECR does not have, which is this
+      # file's outage. One extra update per run, usually "no changes", removes
+      # the whole class: nothing here can decide to skip a push, so a push that
+      # cannot happen stops the run before the apply.
       #
       # Mirror the pinned Bifrost image into this account's ECR. The same
       # shape as the delegate worker's build/push in deploy.yml -- configure
@@ -184,15 +214,6 @@ jobs:
         run: |
           set -euo pipefail
           image_uri="${ECR_REGISTRY}/${BIFROST_REPOSITORY}:${BIFROST_TAG}"
-          # The apply below creates the repository, so a stack that has never
-          # been applied has nowhere to push. Warn and let the apply create it;
-          # the next run pushes the image. Failing here would mean a new stack
-          # could never reach its first apply at all.
-          if ! aws ecr describe-repositories \
-              --repository-names "$BIFROST_REPOSITORY" >/dev/null 2>&1; then
-            echo "::warning::$BIFROST_REPOSITORY does not exist yet: this stack has never been applied. The apply below creates it; run this workflow again to push the image."
-            exit 0
-          fi
           # The repository is immutable and this workflow runs on every
           # workbench change, not only on a digest bump, so a re-push of a tag
           # that is already there is rejected. Upstream release tags do not
@@ -240,14 +261,6 @@ jobs:
           allowlist_digest="$(sha256sum deploy-workbench/bifrost/allowed-emails.txt | cut -c1-12)"
           image_tag="${OAUTH2_PROXY_UPSTREAM_TAG}-${allowlist_digest}"
           image_uri="${ECR_REGISTRY}/${OAUTH2_PROXY_REPOSITORY}:${image_tag}"
-          # Same first-run case as the mirror above: the apply creates the
-          # repository, so a stack that has never been applied has nowhere to
-          # push. Warn and let the apply create it; the next run pushes.
-          if ! aws ecr describe-repositories \
-              --repository-names "$OAUTH2_PROXY_REPOSITORY" >/dev/null 2>&1; then
-            echo "::warning::$OAUTH2_PROXY_REPOSITORY does not exist yet: this stack has never been applied. The apply below creates it; run this workflow again to push the image."
-            exit 0
-          fi
           if aws ecr describe-images \
               --repository-name "$OAUTH2_PROXY_REPOSITORY" \
               --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
@@ -275,8 +288,10 @@ jobs:
       # the other two, so a build that fails stops the run while the old task
       # is still serving.
       #
-      # The repository comes from the apply, so the same first-run case as the
-      # mirror above applies: warn and yield when it does not exist yet.
+      # The repository exists by the time this runs: the targeted apply above
+      # creates any this stack does not have. A push that fails here is a failed
+      # run, not a skipped push, because the apply below must not run without
+      # this image in ECR.
       - name: Build and push the derived bootstrap image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
@@ -285,11 +300,6 @@ jobs:
           bootstrap_digest="$(cat deploy-workbench/bifrost/bootstrap.sh deploy-workbench/bifrost/bootstrap.Dockerfile | sha256sum | cut -c1-12)"
           image_tag="${BIFROST_TAG}-${bootstrap_digest}"
           image_uri="${ECR_REGISTRY}/${BIFROST_BOOTSTRAP_REPOSITORY}:${image_tag}"
-          if ! aws ecr describe-repositories \
-              --repository-names "$BIFROST_BOOTSTRAP_REPOSITORY" >/dev/null 2>&1; then
-            echo "::warning::$BIFROST_BOOTSTRAP_REPOSITORY does not exist yet: this stack has never been applied. The apply below creates it; run this workflow again to push the image."
-            exit 0
-          fi
           if aws ecr describe-images \
               --repository-name "$BIFROST_BOOTSTRAP_REPOSITORY" \
               --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
