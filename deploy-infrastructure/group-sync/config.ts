@@ -111,6 +111,26 @@ export type SyncAbortReason =
 export const POLL_INTERVAL_SECONDS = 15 * 60;
 
 /**
+ * The `Approvers` Identity Center group's id, added for the `approvers-google`
+ * pair below: the `Engineering Admin` Workspace group
+ * (`eng-admin@goodparty.org`) mirrors it.
+ *
+ * A literal for the same reason the `Engineers` id is one: it is a stable
+ * Identity Center id recorded from the group as it exists in AWS. The group was
+ * created out of band, in the console, and stays that way -- group existence is
+ * not this job's business (non-goal 7 in `docs/google-group-sync.md`), so this
+ * change deliberately adds no Pulumi resource for it. If that is ever revisited
+ * and the group is brought under Pulumi, this becomes an `Output` and nothing
+ * else changes.
+ *
+ * The id is also named as an ARN in `TARGET_GROUP_ARNS`
+ * (`deploy/components/identity-group-sync-grant.ts`), which is "Adding a pair"
+ * step 2: without it the assumed role is not authorized for the group's
+ * memberships.
+ */
+const APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e";
+
+/**
  * The first real pair, resolved by the engineer in step 3 (open question 7):
  * the `engineering@goodparty.org` Workspace group mirrors the `Engineers`
  * Identity Center group, whose id and ARN are already in the merged grant
@@ -128,6 +148,14 @@ export const POLL_INTERVAL_SECONDS = 15 * 60;
  * removal and nothing else. `runPair` returns before any write unless the mode
  * is `apply`, which is why the mode is the whole change.
  *
+ * The second entry is the `Engineering Admin` Workspace group
+ * (`eng-admin@goodparty.org`) mirroring the `Approvers` Identity Center group,
+ * as a parallel sync: same id shape (`<target>-google`), same cap, same alert
+ * threshold, same allowlist. It ships `dry-run` because that is "Adding a pair"
+ * step 4 -- every pair starts there, and a reviewed dry-run diff is what
+ * justifies flipping it to `apply`, exactly as the first pair did in PR #351.
+ * The flip is a separate reviewed change; nothing here writes until it lands.
+ *
  * The cap and alert threshold are the plan's defaults (`maxCount: 5`,
  * `maxFraction: 0.1`, `removalAlertThreshold: 0`), still placeholders for the
  * same reason as the interval. The allowlist is the organization's domain, as
@@ -141,6 +169,15 @@ export const SYNC_PAIRS: readonly SyncPair[] = [
     sourceGroupEmail: "engineering@goodparty.org",
     targetGroupId: "383193a0-7001-70d9-a321-ffe6d8af7378", // Engineers
     mode: "apply",
+    removalCap: { maxCount: 5, maxFraction: 0.1 },
+    allowlist: ["@goodparty.org"],
+    removalAlertThreshold: 0,
+  },
+  {
+    id: "approvers-google",
+    sourceGroupEmail: "eng-admin@goodparty.org",
+    targetGroupId: APPROVERS_GROUP_ID, // Approvers
+    mode: "dry-run",
     removalCap: { maxCount: 5, maxFraction: 0.1 },
     allowlist: ["@goodparty.org"],
     removalAlertThreshold: 0,
