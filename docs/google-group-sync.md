@@ -1,15 +1,17 @@
 # Google Workspace → IAM Identity Center group sync
 
-> **Status: built through step 4, and the first pair is applying.** The
+> **Status: built through step 4, and both pairs are applying.** The
 > management-account grant, the Google read adapter, the pure diff and guards,
 > the runtime and the integration test are all in the repo and tested. The
-> rollout's dry run against the real group has been reviewed, and the reviewed
-> change that flips the first pair to `apply` has landed: the first apply is
-> the 2 removals that dry run reported and nothing else. The decisions below
-> were settled in a design review and are recorded as decisions rather than
-> options; the few things still genuinely open are in "Open questions" at the
-> end and are marked **open**. The steps in "Implementation plan" carry their
-> own status, and steps 1 to 4 are `done`.
+> rollout's dry runs against the real groups have been reviewed, and the
+> reviewed changes that flip both pairs to `apply` have landed: the first apply
+> is the 2 removals the first pair's dry run reported and nothing else, and the
+> second is the 5 additions the `approvers-google` dry run reported into an
+> empty group, again with no removals. The decisions below were settled in a
+> design review and are recorded as decisions rather than options; the few
+> things still genuinely open are in "Open questions" at the end and are marked
+> **open**. The steps in "Implementation plan" carry their own status, and
+> steps 1 to 4 are `done`.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -281,7 +283,7 @@ grant's `TARGET_GROUP_ARNS`.
   id: "approvers-google",
   sourceGroupEmail: "eng-admin@goodparty.org",
   targetGroupId: "e841e310-0051-7062-2ea4-9905d12f345e", // Approvers
-  mode: "dry-run",
+  mode: "apply",
   removalCap: { maxCount: 5, maxFraction: 0.1 },
   allowlist: ["@goodparty.org"],
   removalAlertThreshold: 0,
@@ -295,9 +297,11 @@ source. `Approvers` was created out of band, in the Identity Center console,
 and that does not change: group existence is not this job's business
 (non-goal 7), so no Pulumi resource is added for it and the id is a literal
 recorded the same way the `Engineers` id is, here and in the grant. The pair
-ships `dry-run`, per "Adding a pair" step 4: the change is one entry in the
-pair list, and the reviewed dry-run diff is what justifies flipping it to
-`apply`.
+shipped `dry-run`, per "Adding a pair" step 4, and was flipped to `apply` once
+its dry-run diff was reviewed (2026-10-26, PR #376): the dry run reported 5
+source members, 0 target members, `toCreate: 0`, `wouldAdd: 5`,
+`wouldRemove: 0`, no skipped or failed members and `removalCapTripped: false`,
+so the first apply is those 5 additions into an empty group and no removals.
 
 Whether `Approvers` also gets a permission set and an account assignment is a
 separate decision, and an open one. A group with no assignment mirrors
@@ -832,6 +836,11 @@ the email, which is called out in the PR body like the `sheriff` one.
    `removalCapTripped: false`, so the first apply is those 2 removals and no
    additions.
 5. Add further pairs the same way, one at a time, each starting dry-run.
+   **Completed for `approvers-google`** 2026-10-26 (PR #376): the reviewed
+   dry run reported 5 source members, 0 target members, `toCreate: 0`,
+   `wouldAdd: 5`, `wouldRemove: 0` and `removalCapTripped: false`, so its first
+   apply is those 5 additions into an empty group and no removals. The rule
+   still stands for future pairs: add one at a time, each starting `dry-run`.
 
 One rollout prerequisite is still manual. The `googleImpersonationEmail` key
 is now set by `deploy-infrastructure/deploy.sh`, so a dry run no longer aborts
@@ -1023,8 +1032,10 @@ above.
    **Resolved for the second pair too:** the `eng-admin@goodparty.org`
    (`Engineering Admin`) Workspace group mirrors the `Approvers` Identity
    Center group (`e841e310-0051-7062-2ea4-9905d12f345e`), created out of band
-   in the console like the others, with its ARN in the grant. It ships
-   `dry-run`; flipping it to `apply` is a separate reviewed change.
+   in the console like the others, with its ARN in the grant. It shipped
+   `dry-run` and is now `apply` (2026-10-26, PR #376), after its reviewed
+   dry run reported 5 source members, 0 target members, `wouldAdd: 5`,
+   `wouldRemove: 0` and `removalCapTripped: false`.
 
 ## Grounding: the files this touches
 
