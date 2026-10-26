@@ -19,8 +19,10 @@ Everything in `host/` is the contents of `/opt/agent-swarm/` on the host
 association runs `host/install.sh` on the instance whenever any file
 changed. `install.sh` copies the files in place, installs the systemd unit,
 and runs `up.sh`, which renders `.env` from the secret, rebuilds the
-dashboard if the version or login mode changed, runs `docker compose up -d`
-and, with Google login on, syncs the dashboard users (below). Compose
+dashboard if the version or login mode changed, builds the worker image if
+the version or `host/worker-patch/` changed (see "Upgrade agent-swarm"),
+runs `docker compose up -d` and, with Google login on, syncs the dashboard
+users (below). Compose
 only recreates the containers whose definition changed. `pulumi up` waits
 for the association, so a host that fails to take a change fails the
 deploy. `install.sh` never stops the stack.
@@ -47,6 +49,16 @@ host; the next deploy overwrites them.
   `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
+- Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
+  26 GB together in `docker-compose.yml` (coder 12g, reviewer 6g, lead 8g)
+  so the API, embeddings and proxies always keep the rest. The lead runs up
+  to 10 tasks at once (`MAX_CONCURRENT_TASKS`, default 2) so background
+  triggers cannot queue Slack mentions; its cap is sized for that. An agent that
+  hits its cap has its biggest process OOM-killed in its own container. If
+  the host itself runs short, the API is the last thing the kernel kills.
+  The symptom of running short is both EBS volumes reading at their
+  125 MB/s cap and `[db-client] slow sync statement blocked the event
+  loop` lines in the api stream, while Delegate ignores Slack.
 - GitHub identity: commits and PRs are authored by the `delegate-gp[bot]`
   App (see "Git identity"). There is no PAT.
 
@@ -70,14 +82,34 @@ AWS_PROFILE=gp-infrastructure aws ssm start-session --region us-west-2 --target 
 
 ## Upgrade agent-swarm
 
+The lead and both workers do not run the upstream worker image directly.
+`up.sh` builds `delegate-swarm-worker:<version>-<patch hash>` from
+`host/worker-patch/Dockerfile`, which starts from
+`ghcr.io/desplega-ai/agent-swarm-worker:<version>` and upgrades Node to
+22.23.4 (the [October 2026 security
+release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases));
+upstream images up to v2.4.5 still ship 22.23.3. The build fails if Node is
+still older than v22.23.4. `render-env.sh` writes the patch hash to `.env`
+as `WORKER_PATCH_HASH`, so the tag changes, and the agents are rebuilt and
+recreated, only when the version or the Dockerfile changes. A deploy that
+changes neither builds nothing and restarts no agent. The API image has no
+Node and is used as is.
+
 1. Edit `AGENT_SWARM_VERSION` in `host/render-env.sh`. It is the only place
    the version lives.
-2. Merge. `up.sh` sees the dashboard marker
+2. Check the new worker's Node:
+   `docker run --rm --entrypoint node ghcr.io/desplega-ai/agent-swarm-worker:<version> -v`.
+   If it is v22.23.4 or later, delete `host/worker-patch/`, point
+   `x-worker-base` in `host/docker-compose.yml` back at that image, and
+   drop the build from `up.sh` and `WORKER_PATCH_HASH` from
+   `render-env.sh`.
+3. Merge. `up.sh` sees the dashboard marker
    (`ui-dist/.agent-swarm-version`) is stale and rebuilds the UI from the new
-   tag, then compose pulls the new images and recreates every agent-swarm
-   container. The API drains for up to 30 seconds; a task still running is
-   superseded into a resume task on the same agent.
-3. Check: `/health` is 200, the three agents show idle in the dashboard, and
+   tag, builds the worker image, then compose pulls the new API image and
+   recreates every agent-swarm container. The API drains for up to 30
+   seconds; a task still running is superseded into a resume task on the
+   same agent.
+4. Check: `/health` is 200, the three agents show idle in the dashboard, and
    Delegate answers a mention in `#swarm-testing`.
 
 Read the release notes for migrations before bumping; SQLite migrations are
@@ -322,8 +354,8 @@ The swarm starts with fresh state. In order:
    either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
    stores. It ends by listing any required key still missing.
 3. **Start.** On the host: `sudo systemctl start agent-swarm`. The first
-   start pulls the images (the worker image is about 5 GB) and builds the
-   dashboard. Check `curl -s http://127.0.0.1:3013/health` and
+   start pulls the images (the worker image is about 5 GB), builds the
+   patched worker image and the dashboard. Check `curl -s http://127.0.0.1:3013/health` and
    `cd /opt/agent-swarm && sudo docker compose ps`.
 4. **Bootstrap.** On the host: `sudo /opt/agent-swarm/bootstrap.sh`. It waits
    up to 5 minutes for the three agents to register, then prints one line

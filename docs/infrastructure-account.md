@@ -14,9 +14,10 @@ there are the rules this plan is staged against. They are not repeated here.
 ## Progress
 
 One step at a time, one pull request per step. The checklist below was complete
-when this document merged, and it is a historical record rather than a status: it is kept as the record of
-what was run and how it was verified, frozen at merge, and it is not updated.
-A step's status is now derived from the pull requests that name it, with the
+when this document merged, and it is a historical record rather than a status:
+it is kept as the record of what was run and how it was verified, frozen at
+merge, and it is not updated. A step's status is now derived from the pull
+requests that name it, with the
 `Plan:` and `Step:` lines in their bodies, as "Progress" in
 [`workbench-account.md`](./workbench-account.md) sets out and decision 11 of
 [`plan-gated-merges.md`](./plan-gated-merges.md) decides: a merged PR naming the
@@ -611,7 +612,9 @@ finishes applying before its consumer merges.
    `adopted: false`, with `Admins: ["administrator"]` and no `Engineers` entry
    yet. This is the human admin path: a member of `Admins` signs in through
    Identity Center and picks the `AdministratorAccess` role for this account.
-   It is also the break-glass path if the SCP or a bad deploy role locks CI out.
+   Nobody is a standing member; membership comes only from an approved
+   `/breakglass` request in Slack (see [`sheriff.md`](./sheriff.md)). It is
+   also the break-glass path if the SCP or a bad deploy role locks CI out.
    No grant PR: `githubActionsPulumiDeploy` already holds `sso:*` on `*`.
 
    The `adopted` flag's documented wart applies: it is a fact about the

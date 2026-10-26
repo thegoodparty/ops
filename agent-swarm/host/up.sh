@@ -10,6 +10,11 @@ if [[ "$built" != "$version+$auth" ]]; then
   ./build-ui.sh
 fi
 
+worker_image="delegate-swarm-worker:$version-$(sed -n 's/^WORKER_PATCH_HASH=//p' .env)"
+if ! docker image inspect "$worker_image" >/dev/null 2>&1; then
+  docker build --build-arg AGENT_SWARM_VERSION="$version" -t "$worker_image" worker-patch
+fi
+
 # Bind-mounted into caddy; it must exist before compose starts it, or docker
 # creates a directory in its place.
 if [[ ! -e dashboard-tokens.caddy ]]; then

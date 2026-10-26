@@ -72,6 +72,13 @@ env:
   # module by the same test.
   OAUTH2_PROXY_REPOSITORY: bifrost-oauth2-proxy
   OAUTH2_PROXY_UPSTREAM_TAG: v7.15.5
+  # The derived one-shot image that claims a fresh deployment (phase 2 item 11).
+  # The repository name is duplicated from `deploy-workbench/bootstrap-image.ts`
+  # because Actions cannot import a TypeScript module, and
+  # `bootstrap-image.test.ts` fails if they drift. The tag is not a literal: the
+  # build step derives it from the committed claim script and Dockerfile, the
+  # same two files the module hashes in that order.
+  BIFROST_BOOTSTRAP_REPOSITORY: bifrost-bootstrap
 
 jobs:
   deploy:
@@ -104,36 +111,62 @@ jobs:
 
       - run: npm ci
 
-      - name: Deploy
+      # The targeted repositories pass. It runs on the first-hop credentials the
+      # step above configured, because `deploy.sh` reads the Pulumi state
+      # passphrase from SSM in the management account and then assumes
+      # `pulumi-deploy` through the provider (`index.ts`), exactly as the full
+      # apply below does. It comes before the workbench credentials and the
+      # pushes on purpose: those two steps replace this session in the job
+      # environment for every step after them.
+      #
+      # `--target` updates the resources it matches and leaves the rest of the
+      # stack alone; the value is a glob over the resource *type* rather than a
+      # list of names, so renaming a repository resource does not silently stop
+      # matching it. `deploy-workflow-order.test.ts` checks the glob against the
+      # URNs the three image modules declare.
+      - name: Create the image repositories if the stack does not have them yet
         working-directory: deploy-workbench
+        env:
+          DEPLOY_TARGET: "urn:pulumi:*::*::aws:ecr/repository:Repository::*"
         run: ./deploy.sh
 
-      # Bedrock model access is not a Pulumi resource, so it cannot ride in
-      # deploy.sh; see the header of the script for why none exists. Without
-      # this step the script would be something a human had to remember, which
-      # is the failure it was written to prevent: enablement half-done reads
-      # as an intermittent AccessDenied rather than as missing setup.
+      # Everything the task definition can resolve is pushed BEFORE the apply
+      # below, and the run has stopped if any of it could not be. That order is
+      # load-bearing: the service runs one Fargate task with
+      # `minimumHealthyPercent: 0` (`DEPLOYMENT_MINIMUM_HEALTHY_PERCENT` in
+      # ecs.ts), so an apply that updates the service drains the only healthy
+      # task before it starts the replacement -- because OSS Bifrost is
+      # single-node. A task definition that names an image ECR does not have
+      # yet therefore has nothing to replace the drained task with, and the ALB
+      # has no healthy target: 503 from the edge, indefinitely, from a green
+      # apply.
       #
-      # After the apply on purpose. Enablement does not depend on anything in
-      # the stack, but a failed apply is a reason to stop rather than to carry
-      # on mutating the account.
+      # That is exactly what happened on 2026-10-26. This workflow applied
+      # first and built afterwards, so the merge of #353 rolled the service
+      # onto `bifrost-bootstrap:v2.3.0-dc6dd0e438a6` before anything pushed
+      # that tag, and the run then died in the build (deploy run 40329170411).
+      # The old task was drained at 13:23 UTC and `bifrost.workbench.
+      # goodparty.org` served 503 until someone rolled the service by hand.
+      # `deploy-workflow-order.test.ts` pins the ordering.
       #
-      # It makes the second hop itself, assuming pulumi-deploy exactly as
-      # index.ts does, so the credentials configured above are all it needs.
+      # The one case the ordering above cannot serve, handled, rather than
+      # probed for: a stack whose ECR repositories do not exist yet, because the
+      # apply creates them. Nothing can be pushed before the first apply, and
+      # pushing after it is the wrong order again -- so the run creates them
+      # itself, with a `--target`ed apply limited to this stack's ECR
+      # repositories. That apply matches no service, so there is nothing to
+      # drain, and the pushes below have somewhere to push to.
       #
-      # Idempotent, so running it on every workbench deploy is a handful of
-      # availability reads once the models are entitled. It exits non-zero
-      # when a model still needs its terms accepted in the console, which will
-      # hold this workflow red until someone does it. That is deliberate: a
-      # green deploy over a half-enabled account is the exact state this whole
-      # step exists to make impossible.
+      # Unconditional, and that is the point. A conditional version (probe, then
+      # create only if something is missing) has to read "the repository is not
+      # there" out of a failed API call, and an expired session or a throttle
+      # looks the same as a missing repository unless the error is parsed. Any
+      # version of that check that gets it wrong skips a push and then lets the
+      # apply drain the task onto an image ECR does not have, which is this
+      # file's outage. One extra update per run, usually "no changes", removes
+      # the whole class: nothing here can decide to skip a push, so a push that
+      # cannot happen stops the run before the apply.
       #
-      # Worth naming, since merging now does it automatically: creating an
-      # agreement accepts that model provider's terms on GoodParty's behalf.
-      # The reviewed model list in the script is where that consent lives.
-      - name: Enable Bedrock models
-        run: APPLY=1 npm run script enable-bedrock-models
-
       # Mirror the pinned Bifrost image into this account's ECR. The same
       # shape as the delegate worker's build/push in deploy.yml -- configure
       # credentials, log in to ECR, move the image -- with two differences:
@@ -144,9 +177,9 @@ jobs:
       # the management account; the repository lives here, so this assumes
       # `pulumi-deploy` the way deploy.sh and enable-bedrock-models.ts do.
       # `role-chaining` makes the action use the session from the step above
-      # as the source rather than the runner's OIDC token. It runs last, after
-      # the apply, so the repository exists before anything is pushed to it,
-      # and after the Bedrock step, which needs the first-hop session.
+      # as the source rather than the runner's OIDC token. The apply takes the
+      # first-hop session back in its own step below, because the action
+      # exports this session into the job environment for every later step.
       #
       # `role-skip-session-tagging` because the trust grants only
       # `sts:AssumeRole`: the action tags a chained assume by default, which
@@ -236,3 +269,93 @@ jobs:
           fi
           docker build --platform linux/amd64 -t "$image_uri" deploy-workbench/bifrost
           docker push "$image_uri"
+
+      # Build and push the derived bootstrap image that claims a fresh
+      # deployment: the one-shot container that creates the first admin account
+      # from inside the task (phase 2 item 11). It is derived from the same
+      # pinned Bifrost release plus curl and jq, because the Alpine runtime
+      # ships neither and the claim has to round-trip the live config.
+      #
+      # The tag is content-addressed over both committed inputs, so a change to
+      # the script or the Dockerfile is a new tag and a push, while a re-run
+      # with neither changed skips. The digest is `cat` in the same order the
+      # module hashes them, with nothing between the two files.
+      #
+      # This is the image whose ordering cost the outage this workflow now
+      # guards against: its tag moves whenever the claim script or its
+      # Dockerfile changes, which is exactly the moment the task definition
+      # starts naming a tag nothing has pushed. It runs before the apply, with
+      # the other two, so a build that fails stops the run while the old task
+      # is still serving.
+      #
+      # The repository exists by the time this runs: the targeted apply above
+      # creates any this stack does not have. A push that fails here is a failed
+      # run, not a skipped push, because the apply below must not run without
+      # this image in ECR.
+      - name: Build and push the derived bootstrap image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          bootstrap_digest="$(cat deploy-workbench/bifrost/bootstrap.sh deploy-workbench/bifrost/bootstrap.Dockerfile | sha256sum | cut -c1-12)"
+          image_tag="${BIFROST_TAG}-${bootstrap_digest}"
+          image_uri="${ECR_REGISTRY}/${BIFROST_BOOTSTRAP_REPOSITORY}:${image_tag}"
+          if aws ecr describe-images \
+              --repository-name "$BIFROST_BOOTSTRAP_REPOSITORY" \
+              --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
+            echo "bifrost-bootstrap:$image_tag is already built; nothing to do."
+            exit 0
+          fi
+          docker build --platform linux/amd64 \
+            -f deploy-workbench/bifrost/bootstrap.Dockerfile \
+            -t "$image_uri" deploy-workbench/bifrost
+          docker push "$image_uri"
+
+      # The first-hop credentials again, deliberately. The image steps above
+      # configured the chained `pulumi-deploy` session, and
+      # `aws-actions/configure-aws-credentials` exports the session it obtains
+      # into the job environment for every later step -- so without this the
+      # apply below would run as the workbench role. It needs the management
+      # account's role back: `deploy.sh` reads the Pulumi state passphrase from
+      # SSM there, and the provider makes its own hop into 024901689212 from
+      # `index.ts`. Same ARN as the first `Configure AWS Credentials` step; the
+      # duplication is the point, since the ordering is what changed.
+      - name: Configure AWS Credentials (first hop, for the apply)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-workbench-deploy
+          aws-region: us-west-2
+
+      # Only now: every image above is in ECR, or the run stopped before this.
+      # This is the step that drains the running task, so it is the last thing
+      # that may happen before the stack is known to be startable.
+      - name: Deploy
+        working-directory: deploy-workbench
+        run: ./deploy.sh
+
+      # Bedrock model access is not a Pulumi resource, so it cannot ride in
+      # deploy.sh; see the header of the script for why none exists. Without
+      # this step the script would be something a human had to remember, which
+      # is the failure it was written to prevent: enablement half-done reads
+      # as an intermittent AccessDenied rather than as missing setup.
+      #
+      # After the apply on purpose. Enablement does not depend on anything in
+      # the stack, but a failed apply is a reason to stop rather than to carry
+      # on mutating the account.
+      #
+      # It makes the second hop itself, assuming pulumi-deploy exactly as
+      # index.ts does, so the first-hop credentials restored above are all it
+      # needs.
+      #
+      # Idempotent, so running it on every workbench deploy is a handful of
+      # availability reads once the models are entitled. It exits non-zero
+      # when a model still needs its terms accepted in the console, which will
+      # hold this workflow red until someone does it. That is deliberate: a
+      # green deploy over a half-enabled account is the exact state this whole
+      # step exists to make impossible.
+      #
+      # Worth naming, since merging now does it automatically: creating an
+      # agreement accepts that model provider's terms on GoodParty's behalf.
+      # The reviewed model list in the script is where that consent lives.
+      - name: Enable Bedrock models
+        run: APPLY=1 npm run script enable-bedrock-models

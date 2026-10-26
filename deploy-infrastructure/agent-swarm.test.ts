@@ -56,6 +56,22 @@ describe("delegate swarm host files", () => {
     }
   });
 
+  // The upstream worker image ships a Node with known CVEs; the agents run
+  // the image up.sh builds from worker-patch/ instead.
+  it("runs every agent on the patched worker image", () => {
+    assert.ok(hostFiles().includes("worker-patch/Dockerfile"));
+    const compose = fs.readFileSync(
+      path.join(HOST_DIR, "docker-compose.yml"),
+      "utf8",
+    );
+    assert.ok(!compose.includes("ghcr.io/desplega-ai/agent-swarm-worker"));
+    assert.ok(
+      compose.includes(
+        'image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"',
+      ),
+    );
+  });
+
   it("puts the content hash in the command, so a file change reruns it", () => {
     const hash = hostFilesHash();
     assert.match(hash, /^[0-9a-f]{64}$/);

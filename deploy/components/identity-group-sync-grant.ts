@@ -47,6 +47,12 @@ export const GRANT_SESSION_NAME = "identity-group-sync";
 // returns (AWS SDK `GetGroupId`/`GetUserId` examples).
 const TARGET_GROUP_ARNS = [
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378",
+  // The `Approvers` group, the target of the `approvers-google` pair in
+  // `deploy-infrastructure/group-sync/config.ts`. Created out of band in the
+  // console like every other Identity Center group here, and named here as a
+  // literal for the same reason as the `Engineers` ARN above: there is no
+  // Pulumi resource to reference.
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e",
 ];
 
 // The user id and the returned membership id do not exist when the policy is

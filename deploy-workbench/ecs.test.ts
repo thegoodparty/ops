@@ -4,6 +4,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   AWS_REGION_ENV_NAME,
+  BIFROST_API_BASE_URL,
+  BIFROST_API_BASE_URL_ENV_NAME,
+  BIFROST_BOOTSTRAP_CONTAINER_NAME,
+  BIFROST_BOOTSTRAP_LOG_STREAM_PREFIX,
+  BIFROST_BOOTSTRAP_SECRET_KEYS,
   BIFROST_CLUSTER_NAME,
   BIFROST_CONTAINER_CPU,
   BIFROST_CONTAINER_MEMORY,
@@ -11,6 +16,7 @@ import {
   BIFROST_LOG_GROUP_NAME,
   BIFROST_LOG_RETENTION_DAYS,
   BIFROST_LOG_STREAM_PREFIX,
+  BIFROST_HEALTH_CHECK,
   BIFROST_SERVICE_NAME,
   BIFROST_TASK_FAMILY,
   DEPLOYMENT_MAXIMUM_PERCENT,
@@ -72,6 +78,32 @@ const FILL_SECRETS_SOURCE = fs.readFileSync(
   path.resolve(__dirname, "bifrost/fill-secrets.sh"),
   "utf8",
 );
+const BIFROST_CONFIG_SOURCE = fs.readFileSync(
+  path.resolve(__dirname, "bifrost/config.json"),
+  "utf8",
+);
+
+/**
+ * The `env.NAME` references in `bifrost/config.json`. Only the name is looked
+ * at; the test never resolves one and never sees a value.
+ */
+const configEnvReferences = (): string[] => {
+  const out: string[] = [];
+  const walk = (value: unknown): void => {
+    if (typeof value === "string") {
+      const match = /^env\.([A-Z][A-Z0-9_]*)$/.exec(value);
+      if (match) out.push(match[1]);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) walk(entry);
+    } else if (value && typeof value === "object") {
+      for (const entry of Object.values(value as Record<string, unknown>)) {
+        walk(entry);
+      }
+    }
+  };
+  walk(JSON.parse(BIFROST_CONFIG_SOURCE));
+  return out;
+};
 
 /**
  * The source of one named resource's constructor call, from its logical-name
@@ -121,7 +153,7 @@ const containerDefinitionBlock = (nameConstant: string): string => {
   assert.ok(start >= 0, `ecs.ts has no container named ${nameConstant}`);
   const rest = block.slice(start + 1);
   const next = rest.search(
-    /\n\s*name: (?:BIFROST_CONTAINER_NAME|OAUTH2_PROXY_CONTAINER_NAME),/,
+    /\n\s*name: (?:BIFROST_CONTAINER_NAME|OAUTH2_PROXY_CONTAINER_NAME|BIFROST_BOOTSTRAP_CONTAINER_NAME),/,
   );
   return next >= 0 ? rest.slice(0, next) : rest;
 };
@@ -346,6 +378,7 @@ describe("bifrost ecs", () => {
       "BIFROST_ENCRYPTION_KEY",
       "BIFROST_ADMIN_USERNAME",
       "BIFROST_ADMIN_PASSWORD",
+      "BIFROST_SETUP_TOKEN",
       "FIREWORKS_API_KEY",
     ]);
     assert.deepEqual([...OAUTH2_PROXY_SECRET_KEYS], [
@@ -360,7 +393,7 @@ describe("bifrost ecs", () => {
       );
     }
 
-    // The gateway container gets exactly its own four, by name, from its own
+    // The gateway container gets exactly its own five, by name, from its own
     // container; the sidecar gets its own three, from its own container. Each
     // container's secrets name its own secret container and never the other's.
     const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
@@ -382,6 +415,28 @@ describe("bifrost ecs", () => {
     assert.ok(
       !sidecar.includes("GATEWAY_SECRET_NAME"),
       "the sidecar must not receive the gateway's provider or admin secrets",
+    );
+  });
+
+  it("injects every secret config.json resolves from the environment", () => {
+    // The hole this closes: a name `fill-secrets.sh` writes and `config.json`
+    // resolves by `env.NAME`, but that the task definition never injects,
+    // resolves to nothing at runtime. Every reference in the file has to be one
+    // of the gateway container's own secrets here, which is the check the setup
+    // token's missing injection would have failed.
+    const referenced = configEnvReferences();
+    assert.ok(referenced.length > 0, "config.json references no env vars");
+    for (const name of referenced) {
+      assert.ok(
+        (GATEWAY_SECRET_KEYS as readonly string[]).includes(name),
+        `config.json resolves env.${name}, which the gateway container's secrets do not carry; the reference would resolve to nothing`,
+      );
+    }
+    // And the bootstrap token is one of them, so the claim path cannot quietly
+    // lose its injection again.
+    assert.ok(
+      referenced.includes("BIFROST_SETUP_TOKEN"),
+      "config.json no longer resolves env.BIFROST_SETUP_TOKEN",
     );
   });
 
@@ -590,6 +645,81 @@ describe("bifrost ecs", () => {
     assert.ok(sidecar.includes("essential: true"), sidecar);
   });
 
+  it("claims the deployment from a one-shot container after the gateway is healthy", () => {
+    // Item 11. Upstream's setup lock accepts one call while no admin account
+    // exists, and it has to come from inside the task: once oauth2-proxy
+    // fronts the gateway the ALB sends admin paths to Google first.
+    assert.equal(BIFROST_BOOTSTRAP_CONTAINER_NAME, "bifrost-bootstrap");
+    assert.equal(
+      BIFROST_BOOTSTRAP_LOG_STREAM_PREFIX,
+      "bifrost-bootstrap",
+      "the claim's output must be a filterable stream of its own",
+    );
+    assert.equal(BIFROST_API_BASE_URL, `http://127.0.0.1:${BIFROST_PORT}`);
+    assert.equal(BIFROST_API_BASE_URL_ENV_NAME, "BIFROST_API_BASE_URL");
+
+    // Exactly the three keys the claim reads, all of them already injected
+    // into the gateway container from the same secret; no new secret, and no
+    // provider or encryption key anywhere near it.
+    assert.deepEqual([...BIFROST_BOOTSTRAP_SECRET_KEYS], [
+      "BIFROST_SETUP_TOKEN",
+      "BIFROST_ADMIN_USERNAME",
+      "BIFROST_ADMIN_PASSWORD",
+    ]);
+    for (const key of BIFROST_BOOTSTRAP_SECRET_KEYS) {
+      assert.ok(
+        (GATEWAY_SECRET_KEYS as readonly string[]).includes(key),
+        `${key} is not one of the gateway container's injected secrets`,
+      );
+    }
+    for (const key of ["FIREWORKS_API_KEY", "BIFROST_ENCRYPTION_KEY"]) {
+      assert.ok(
+        !(BIFROST_BOOTSTRAP_SECRET_KEYS as readonly string[]).includes(key),
+        `the claim must not receive ${key}`,
+      );
+    }
+
+    const bootstrap = containerDefinitionBlock(
+      "BIFROST_BOOTSTRAP_CONTAINER_NAME",
+    );
+    assert.ok(bootstrap.includes("image: resolvedBootstrapImage"), bootstrap);
+    assert.ok(
+      bootstrap.includes("essential: false"),
+      "a claim that cannot run must not take the gateway down with it",
+    );
+    assert.ok(bootstrap.includes("dependsOn"), bootstrap);
+    assert.ok(
+      bootstrap.includes('condition: "HEALTHY"'),
+      "the claim must wait for a gateway that finished loading, not just a started process",
+    );
+    assert.ok(
+      bootstrap.includes("BIFROST_BOOTSTRAP_SECRET_KEYS.map"),
+      bootstrap,
+    );
+    assert.ok(
+      bootstrap.includes("secretReference(GATEWAY_SECRET_NAME, key)"),
+      bootstrap,
+    );
+    assert.ok(!bootstrap.includes("PG_PASSWORD_ENV_NAME"), bootstrap);
+    assert.ok(!bootstrap.includes("OAUTH2_PROXY_SECRET_NAME"), bootstrap);
+    // No reservation: the other two containers sum to the task exactly, and
+    // this one lives for seconds. A `cpu:`/`memory:` here is the sum exceeding
+    // the task at apply time.
+    assert.ok(!bootstrap.includes("cpu: "), bootstrap);
+    assert.ok(!bootstrap.includes("memory: "), bootstrap);
+
+    // ECS's `dependsOn: HEALTHY` needs an ECS health check; the image's own
+    // Dockerfile HEALTHCHECK is invisible to Fargate.
+    const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(gateway.includes("healthCheck: BIFROST_HEALTH_CHECK"), gateway);
+    assert.deepEqual(BIFROST_HEALTH_CHECK.command, [
+      "CMD-SHELL",
+      `wget -q -O /dev/null ${BIFROST_API_BASE_URL}/health || exit 1`,
+    ]);
+    assert.ok(BIFROST_HEALTH_CHECK.retries >= 3);
+    assert.ok(BIFROST_HEALTH_CHECK.startPeriod >= 15);
+  });
+
   it("gives the sidecar the plan's Google settings, derived not copied", () => {
     assert.equal(OAUTH2_PROXY_ENVIRONMENT.OAUTH2_PROXY_PROVIDER, "google");
     assert.equal(
@@ -687,6 +817,10 @@ describe("bifrost ecs", () => {
     assert.ok(
       builder.includes("resolvedOauth2ProxyImage"),
       "the sidecar image must be resolved through pulumi.all too",
+    );
+    assert.ok(
+      builder.includes("resolvedBootstrapImage"),
+      "the claim image must be resolved through pulumi.all too",
     );
     assert.ok(
       !builder.includes('"awslogs-group": logGroup.name'),
@@ -794,6 +928,12 @@ describe("bifrost ecs", () => {
         "oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl",
       ),
       "index.ts does not pass the derived oauth2-proxy repository to the task definition",
+    );
+    assert.ok(
+      INDEX_SOURCE.includes(
+        "bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl",
+      ),
+      "index.ts does not pass the derived bootstrap repository; the claim container's image URI would be built from an undefined repository",
     );
     assert.ok(
       INDEX_SOURCE.includes("export const bifrostLogGroupName"),

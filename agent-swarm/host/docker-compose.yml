@@ -60,8 +60,12 @@ x-worker-env: &worker-env
   AWS_CONFIG_FILE: /etc/delegate-swarm/aws-config
   AWS_SDK_LOAD_CONFIG: "1"
 
+# Built by up.sh from worker-patch/ on top of the upstream worker image. The
+# tag changes with the version or the patch, which is what makes compose
+# recreate the agents; an unchanged tag is not rebuilt.
 x-worker-base: &worker-base
-  image: "ghcr.io/desplega-ai/agent-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}"
+  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-1.171.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
+  pull_policy: never
   entrypoint: *agent-entrypoint
   platform: linux/amd64
   stop_grace_period: 60s
@@ -93,6 +97,9 @@ services:
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
+    # If the host still runs out of memory, the kernel kills an agent's build
+    # before the API that holds the Slack socket.
+    oom_score_adj: -500
     depends_on:
       tei:
         condition: service_started
@@ -165,6 +172,15 @@ services:
       AGENT_NAME: delegate
       TEMPLATE_ID: official/lead
       MODEL_OVERRIDE: ${LEAD_MODEL_OVERRIDE}
+      # The default is 2. Background triggers (ClickUp comments, schedules)
+      # can hold both slots for long stretches and queue Slack mentions behind
+      # them; most lead tasks are short model calls, not builds.
+      MAX_CONCURRENT_TASKS: "10"
+    # Without caps one agent's build fills the 32 GB host, the kernel drops
+    # its file cache, and the single-threaded API stalls on disk for minutes.
+    # A capped agent is OOM-killed inside its own container instead.
+    mem_limit: 8g
+    memswap_limit: 8g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
@@ -179,6 +195,8 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/coder
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    mem_limit: 12g
+    memswap_limit: 12g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
@@ -193,6 +211,8 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/reviewer
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
+    mem_limit: 6g
+    memswap_limit: 6g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs

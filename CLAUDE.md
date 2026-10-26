@@ -32,6 +32,13 @@ whole suite with `npm test`.
 **Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
 "test plan" section, no Co-Authored-By.
 
+**Nobody holds standing AWS admin.** `AdministratorAccess` comes only from
+membership in the `Admins` group, which is granted for 1 to 4 hours by
+`/breakglass` in Slack and approved in `#sensitive-access-requests`. A step
+that needs an admin session is a human running `/breakglass` first, never a
+request for a standing grant. How it works:
+[`docs/sheriff.md`](./docs/sheriff.md).
+
 **Plans and step status.** A `docs/` file with a numbered implementation plan
 is a spec, frozen when it merged: do not edit its checklist to record progress.
 Status is derived from the PRs that name the step, so an implementation PR
