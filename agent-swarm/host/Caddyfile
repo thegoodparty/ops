@@ -1,7 +1,7 @@
 # delegate-swarm.infra.goodparty.org: serve the self-built dashboard SPA from
 # /srv/ui and reverse-proxy every API path to the api container.
 #
-# API prefixes (agent-swarm v1.171.0):
+# API prefixes (agent-swarm v2.6.0):
 #   /api/*          every REST route (src/http/*.ts: path: "/api/...")
 #   /p/*            public page views  (src/http/pages-public.ts:54,75)
 #   /@swarm/*       page SDK + proxy    (src/http/page-proxy.ts:37, realtime.ts)
