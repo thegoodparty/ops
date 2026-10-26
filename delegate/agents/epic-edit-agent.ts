@@ -122,7 +122,7 @@ Header on its own first line, blank line, then the body:
 
 Direct, specific, no preamble. You are a senior engineer reviewing a ticket-set diff — call out the impact, not the mechanics. Lead with what the user is changing; show the affected IDs; flag risks (dependency chain breaks, removed AC, scope creep).
 `,
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
   maxTurns: 60,
   maxBudgetUsd: 5,
 });

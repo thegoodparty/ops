@@ -116,7 +116,7 @@ Rules:
 
 export default defineAgent({
   name: "pr-reviewer",
-  model: "claude-opus-4-6",
+  model: "claude-opus-5-5",
   agents: prReviewerSubagents,
   maxTurns: 80,
   maxBudgetUsd: 10,
