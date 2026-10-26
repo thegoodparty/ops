@@ -151,10 +151,13 @@ const APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e";
  * The second entry is the `Engineering Admin` Workspace group
  * (`eng-admin@goodparty.org`) mirroring the `Approvers` Identity Center group,
  * as a parallel sync: same id shape (`<target>-google`), same cap, same alert
- * threshold, same allowlist. It ships `dry-run` because that is "Adding a pair"
- * step 4 -- every pair starts there, and a reviewed dry-run diff is what
- * justifies flipping it to `apply`, exactly as the first pair did in PR #351.
- * The flip is a separate reviewed change; nothing here writes until it lands.
+ * threshold, same allowlist. It shipped `dry-run` first, per "Adding a pair"
+ * step 4, and was flipped to `apply` by "Rollout" step 5 once its dry-run diff
+ * was reviewed (2026-10-26, PR #376), exactly as the first pair was in PR
+ * #351. That dry run reported 5 source members, 0 target members,
+ * `toCreate: 0`, `wouldAdd: 5`, `wouldRemove: 0`, no skipped or failed
+ * members and `removalCapTripped: false`, so the first apply is those 5
+ * additions into an empty group and nothing else.
  *
  * The cap and alert threshold are the plan's defaults (`maxCount: 5`,
  * `maxFraction: 0.1`, `removalAlertThreshold: 0`), still placeholders for the
@@ -177,7 +180,7 @@ export const SYNC_PAIRS: readonly SyncPair[] = [
     id: "approvers-google",
     sourceGroupEmail: "eng-admin@goodparty.org",
     targetGroupId: APPROVERS_GROUP_ID, // Approvers
-    mode: "dry-run",
+    mode: "apply",
     removalCap: { maxCount: 5, maxFraction: 0.1 },
     allowlist: ["@goodparty.org"],
     removalAlertThreshold: 0,

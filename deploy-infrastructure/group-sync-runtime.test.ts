@@ -111,16 +111,17 @@ describe("the configured sync pair", () => {
     });
   });
 
-  it("adds the eng-admin@ Workspace group into Approvers, starting in dry-run", () => {
+  it("applies the eng-admin@ Workspace group into Approvers after its reviewed dry run", () => {
     // The second pair is a parallel copy of the first: same id shape, same cap,
-    // same allowlist. It starts in `dry-run` because that is "Adding a pair"
-    // step 4, and it is pinned here so flipping it to `apply` -- or changing
-    // its source, target or allowlist -- is a reviewed change to this test.
+    // same allowlist. It shipped `dry-run` because that is "Adding a pair" step
+    // 4, its dry run was reviewed, and this is the reviewed change that flips it
+    // to `apply`. It is pinned here so flipping it back -- or changing its
+    // source, target or allowlist -- is a reviewed change to this test.
     assert.deepEqual(pairById("approvers-google"), {
       id: "approvers-google",
       sourceGroupEmail: "eng-admin@goodparty.org",
       targetGroupId: APPROVERS_GROUP_ID,
-      mode: "dry-run",
+      mode: "apply",
       removalCap: { maxCount: 5, maxFraction: 0.1 },
       allowlist: ["@goodparty.org"],
       removalAlertThreshold: 0,
@@ -876,6 +877,7 @@ const handlerDeps = (options: {
   calls?: string[];
   identity?: IdentityDirectory;
   metrics?: Metrics;
+  pages?: DirectoryMemberPage[];
 }) => {
   const calls = options.calls ?? [];
   const log = memoryLogger();
@@ -890,7 +892,9 @@ const handlerDeps = (options: {
       },
       buildDirectory: async () =>
         fakeDirectory({
-          pages: [{ members: [member("alice@goodparty.org", "USER")] }],
+          pages: options.pages ?? [
+            { members: [member("alice@goodparty.org", "USER")] },
+          ],
           calls,
         }),
       buildIdentity: async () =>
@@ -1001,39 +1005,46 @@ describe("the invocation", () => {
     assert.match(String(aborted?.fields.detail), /not-a-pair/);
   });
 
-  it("runs the configured pair from the SSM value in its configured mode", async () => {
+  it("runs the configured pairs from the SSM value in their configured mode", async () => {
     const calls: string[] = [];
     const metrics = memoryMetrics();
-    const { deps } = handlerDeps({ calls, metrics: metrics.metrics });
+    const alice = { members: [member("alice@goodparty.org", "USER")] };
+    // One page per source group. The fake directory pages across every pair in
+    // an invocation, so the second pair needs its own page to see the member.
+    const { deps } = handlerDeps({
+      calls,
+      metrics: metrics.metrics,
+      pages: [alice, alice],
+    });
     const outcomes = await handle({ action: "sync" }, deps);
 
-    // Both configured pairs run, in config order. The second one is `dry-run`,
-    // so the write assertions below stay the first pair's alone.
+    // Both configured pairs run, in config order, and both are `apply`, so each
+    // one's diff reaches the write path. The dry-run path is covered separately
+    // above; this test is what would fail if a mode in the config stopped
+    // matching the mode the handler acts on.
     assert.deepEqual(
       outcomes.map((outcome) => outcome.pairId),
       ["engineers-google", "approvers-google"],
     );
-    const outcome = outcomes.find(
-      (candidate) => candidate.pairId === "engineers-google",
-    );
-    assert.ok(outcome);
-    assert.equal(outcome.aborted, null);
-    assert.equal(outcome.counts.wouldAdd, 1);
-    // The configured pair is `apply`, so the diff reaches the write path. The
-    // dry-run path is covered separately above; this test is what would fail if
-    // the mode in the config stopped matching the mode the handler acts on.
-    assert.equal(outcome.counts.added, 1);
+    for (const outcome of outcomes) {
+      assert.equal(outcome.aborted, null);
+      assert.equal(outcome.counts.wouldAdd, 1);
+      assert.equal(outcome.counts.added, 1);
+    }
+    // One create and one membership per pair, the same fixture member in each
+    // pair's own target group.
     assert.deepEqual(writes(calls), [
       "CreateUser:alice@goodparty.org",
       "CreateGroupMembership:u-alice",
+      "CreateUser:alice@goodparty.org",
+      "CreateGroupMembership:u-alice",
     ]);
-    assert.equal(
-      metricValues(
-        metrics.records as never,
-        "engineers-google",
-      ).get(METRIC_NAMES.success),
-      1,
-    );
+    for (const pairId of ["engineers-google", "approvers-google"]) {
+      assert.equal(
+        metricValues(metrics.records as never, pairId).get(METRIC_NAMES.success),
+        1,
+      );
+    }
   });
 
   it("restricts a manual invocation to the one pair it names", async () => {
