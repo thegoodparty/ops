@@ -404,9 +404,16 @@ export const GATEWAY_PLAIN_ENV_NAMES = [
  * 14's teams and virtual key names have room; past 4 KiB this needs
  * `tier: "Advanced"` explicitly, because the provider would otherwise fail the
  * apply rather than truncate.
+ *
+ * The leading slash is not decoration: SSM rejects a hierarchical name that is
+ * not fully qualified, so `PutParameter` fails with "Parameter name must be a
+ * fully qualified name" on anything shaped like `bifrost/config`. The ARN it
+ * resolves to is still `...:parameter/bifrost/config`.
+ * `deploy-infrastructure/group-sync-lambda.ts` (`GROUP_SYNC_PARAMETER_NAME`)
+ * is the repo's other one and is written the same way.
  */
 export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
-export const BIFROST_CONFIG_PARAMETER_NAME = "bifrost/config";
+export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
 
 /** Where upstream's own container reads it from, and `APP_DIR` in its image. */
 export const BIFROST_APP_DIR = "/app/data";

@@ -103,7 +103,7 @@ on a name the task definition does not inject.
 
 **How it reaches the container (item 10's second half).**
 `deploy-workbench/ecs.ts` reads this file at deploy time, stores it in the SSM
-parameter `bifrost/config`, injects it as `BIFROST_CONFIG`, and overrides the
+parameter `/bifrost/config`, injects it as `BIFROST_CONFIG`, and overrides the
 gateway container's entry point with upstream's documented ECS shape: write
 the variable to `/app/data/config.json`, then `exec /app/docker-entrypoint.sh
 /app/main`, so the image's own entry point is still PID 1 and the app-dir

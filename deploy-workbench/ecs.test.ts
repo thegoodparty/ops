@@ -964,7 +964,15 @@ describe("bifrost ecs", () => {
     // survived a task replacement), inference auth not enforced, and the
     // governance block inert.
     assert.equal(BIFROST_CONFIG_ENV_NAME, "BIFROST_CONFIG");
-    assert.equal(BIFROST_CONFIG_PARAMETER_NAME, "bifrost/config");
+    assert.equal(BIFROST_CONFIG_PARAMETER_NAME, "/bifrost/config");
+    // SSM rejects a hierarchical name that is not fully qualified, and the
+    // rejection is a ValidationException at apply time rather than a preview
+    // diff, so the leading slash is pinned here rather than discovered in a
+    // deploy.
+    assert.ok(
+      BIFROST_CONFIG_PARAMETER_NAME.startsWith("/"),
+      "an SSM parameter name containing a slash must be fully qualified",
+    );
 
     // The parameter's value is the repo's own file, read at deploy time, so
     // the deployed configuration is the reviewed one and cannot drift.
