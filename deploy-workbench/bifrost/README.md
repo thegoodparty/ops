@@ -8,12 +8,13 @@ holds the gateway's repo-owned configuration and the two sidecar-specific
 files that belong in review:
 
 - `config.json` — the non-secret Bifrost configuration (phase 2 item 10):
-  providers, client settings and the `governance` block. See
+  both stores, providers, client settings and the `governance` block. See
   "`config.json`" below.
 - `config.test.ts` — the checks that keep `config.json` honest: valid JSON,
-  both providers, every `env.` reference filled by `fill-secrets.sh`, no
-  credential literal, and Bedrock's model list matching
-  `utils/bedrock-models.ts` (the list the task role's IAM is built from).
+  both providers, both stores in Postgres, every `env.` reference a name the
+  deployment actually provides, no credential literal, and Bedrock's model
+  list matching `utils/bedrock-models.ts` (the list the task role's IAM is
+  built from).
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -42,6 +43,15 @@ against `transports/config.schema.json` at the pinned upstream tag
 `maximhq/bifrost:v2.3.0` (`deploy-workbench/bifrost-image.ts`), not the docs at
 a later tag. It holds:
 
+- **The stores.** `config_store` and `logs_store` both point at the RDS
+  instance from `deploy-workbench/rds.ts` (`type: "postgres"`, `ssl_mode:
+  "require"`), which is what makes gateway state — the admin account, virtual
+  keys, budgets, request logs — survive a task replacement. With no
+  `config_store` Bifrost creates a SQLite file inside the container, and every
+  deploy takes it with it. The connection fields are `env.` references to the
+  task definition's `PG_*` values rather than a connection string spelled in
+  this file, and `logs_store.retention_days` is explicit (90) because the
+  upstream default prunes nothing.
 - **Providers.** `fireworks`, with its key read from `env.FIREWORKS_API_KEY`
   and an explicit model allowlist (not `*`), and `bedrock`, whose key carries
   no credential at all: Bifrost inherits the ECS **task role** through the AWS
@@ -61,11 +71,11 @@ a later tag. It holds:
   `transports/bifrost-http/lib/config.go` reads it at boot, hashes the
   password and writes the admin account to the config store, so once this file
   is injected the account exists and dashboard auth is active from the first
-  start. That is why those two keys stay generated: they are the credential
-  the injected file provisions the account with, and the login automation uses
-  for `/api` — the setup token is not a substitute. It is also why the block is
-  **not** the bootstrap path — see "The first admin account" below for the
-  window in which no admin account exists yet. The `engineering` team, its
+  start — which is why the claim container is a no-op from the first start of
+  a task with `BIFROST_CONFIG` (see "The first admin account" below). That is
+  why those two keys stay generated: they are the credential the injected file
+  provisions the account with, and the login automation uses for `/api` — the
+  setup token is not a substitute. The `engineering` team, its
   budget and the first virtual keys are **item 14** and are deliberately
   absent, not empty: under `source_of_truth: "config.json"` a present-but-empty
   section would prune rows created later.
@@ -81,34 +91,48 @@ a later tag. It holds:
   left alone; an empty one prunes.
 
 **What is injected by env.** No secret is in the file. Every credential is an
-`env.NAME` reference, and the names are exactly the keys
-`fill-secrets.sh` writes: `BIFROST_ENCRYPTION_KEY`,
-`BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD`, `BIFROST_SETUP_TOKEN` and
-`FIREWORKS_API_KEY` from `bifrost/gateway`. Bedrock has no entry because its
-credential is the role. `config.test.ts` parses the script's key arrays and
-fails on a reference to any name the script does not populate, and
-`deploy-workbench/ecs.test.ts` fails on a reference the task definition does not
-inject either.
+`env.NAME` reference, and the names come from two places: the five keys in
+`bifrost/gateway` that `fill-secrets.sh` writes
+(`BIFROST_ENCRYPTION_KEY`, `BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD`,
+`BIFROST_SETUP_TOKEN`, `FIREWORKS_API_KEY`), and the task definition's own
+environment and RDS-managed password entry for the Postgres connection
+(`PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE`, `PG_PASSWORD`). Bedrock has no
+entry because its credential is the role. `config.test.ts` fails on a
+reference to a name neither provides, and `deploy-workbench/ecs.test.ts` fails
+on a name the task definition does not inject.
 
-**Not yet wired.** Pulumi storing this file as an SSM SecureString and
-injecting it as `BIFROST_CONFIG`, with the container entrypoint writing it to
-`/app/data/config.json`, is the other half of item 10 and arrives in its own
-PR; it edits the ECS task definition, which
-[#343](https://github.com/thegoodparty/ops/pull/343) currently owns. Two
-things follow from that, and neither is fixed here:
+**How it reaches the container (item 10's second half).**
+`deploy-workbench/ecs.ts` reads this file at deploy time, stores it in the SSM
+parameter `bifrost/config`, injects it as `BIFROST_CONFIG`, and overrides the
+gateway container's entry point with upstream's documented ECS shape: write
+the variable to `/app/data/config.json`, then `exec /app/docker-entrypoint.sh
+/app/main`, so the image's own entry point is still PID 1 and the app-dir
+checks and signal handling are unchanged. A task with no `BIFROST_CONFIG`
+exits instead of starting on Bifrost's built-in defaults — which is the state
+this replaced: `"config file not found at path: /app/data/config.json,
+initializing with default values"`, a container-local SQLite config store, and
+inference auth not enforced.
 
-- Nothing reads `config.json` until then, so changing this file alone changes
-  no running gateway. The setup token is the exception: Bifrost also reads it
-  from the `BIFROST_SETUP_TOKEN` environment variable, which
-  `deploy-workbench/ecs.ts` already injects from `bifrost/gateway`, so the
-  claim container works before this file is wired at all.
-- `config_store` and `logs_store` are absent. Their host, port, user and
-  database are Pulumi outputs of `rds.ts`, not secrets, and no env name for
-  them exists yet; the gateway therefore falls back to its local SQLite store
-  until the injection PR adds the Postgres pair (and the task-definition env
-  that carries the non-password half, alongside the `PG_PASSWORD` secret that
-  is already injected). **Do not deploy this file as the gateway's complete
-  configuration.**
+The parameter is a plain `String`, not the plan's `SecureString`. The file holds
+no secret by construction (the test above enforces it), so encryption would buy
+nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
+the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
+`kms` lookup that a `preview` would then need permission to run. Standard tier
+holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's teams
+and virtual key names, and past that it needs `tier: "Advanced"` rather than a
+silent truncation.
+
+Two consequences worth knowing before a deploy:
+
+- The stores are now the RDS instance (`config_store` and `logs_store`,
+  `type: "postgres"`), so gateway state survives a task replacement. Until
+  this landed, every deploy took the admin account with it and the dashboard
+  went back to the setup page.
+- `client.enforce_auth_on_inference: true` becomes effective with the same
+  apply, and item 14's virtual keys do not exist yet, so inference refuses
+  everything until they do. That is the plan's phase A order ("inference
+  succeeds with a virtual key and fails without one"), not a defect — but the
+  two items have to land close together.
 
 ## The image
 
@@ -280,9 +304,9 @@ that reason — the setup page kept asking for the token because no admin accoun
 ever existed. The script now raises that one field to the smallest value the
 write path accepts (`CLAIM_LOG_RETENTION_DAYS`) and leaves every other value
 alone; the repo's real retention is `config.json`'s 90 days, and the file is
-authoritative for it once item 10's injection lands. Nothing else in the echoed
-payload needs correcting: the validations that run before this one (including
-the first-admin password policy) had already passed.
+authoritative for it now that item 10's injection is wired. Nothing else in the
+echoed payload needs correcting: the validations that run before this one
+(including the first-admin password policy) had already passed.
 
 It runs inside the task, against `127.0.0.1:8080`, because once item 9's
 oauth2-proxy is in front of the gateway the ALB sends every admin path to
@@ -340,14 +364,17 @@ Bifrost's plugin interface also has an authentication hook that could accept
 oauth2-proxy's identity header instead, which is available but neither built
 nor planned here.
 
-When item 10's `BIFROST_CONFIG` injection lands, the file's
-`governance.auth_config` provisions the same admin account at boot, which makes
-the claim container a no-op from the first start. Both paths use the generated
-`BIFROST_ADMIN_USERNAME` / `BIFROST_ADMIN_PASSWORD` pair; neither is a reason
-to remove the setup token.
+`governance.auth_config` in the injected file provisions the same admin
+account at boot, which makes the claim container a no-op from the first start
+of a task that has `BIFROST_CONFIG` — and because the config store is now the
+RDS instance, that account outlives every deploy. The claim container is still
+the path for a store that has no account and no injected config: it runs on
+every task start, and a restore into an empty store heals itself. Both paths
+use the generated `BIFROST_ADMIN_USERNAME` / `BIFROST_ADMIN_PASSWORD` pair;
+neither is a reason to remove the setup token.
 
 Until both Google values are present, `bifrost/oauth2-proxy` holds one of three
 credentials. The task definition carries all three, so the ECS agent will not
 start the task until they are written (phase 2 item 11); the admin surface
 stays disabled rather than partially configured, and nothing serves traffic
-before item 10 and item 12 either way.
+before item 12 proves it either way.

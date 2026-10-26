@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-models";
+import { PG_PASSWORD_ENV_NAME, GATEWAY_PLAIN_ENV_NAMES } from "../ecs";
 import { BIFROST_HOSTNAME } from "../ingress";
 import { REGION } from "../network";
 
@@ -47,12 +48,21 @@ type ProviderKey = {
 
 type ProviderConfig = { keys: ProviderKey[] };
 
+type PostgresStore = {
+  enabled?: boolean;
+  type?: string;
+  config?: Record<string, unknown>;
+  retention_days?: number;
+};
+
 type Config = {
   $schema?: string;
   source_of_truth?: string;
   encryption_key?: string;
   setup_token?: string;
   client?: Record<string, unknown>;
+  config_store?: PostgresStore;
+  logs_store?: PostgresStore;
   providers?: Record<string, ProviderConfig>;
   governance?: {
     auth_config?: Record<string, unknown>;
@@ -190,18 +200,22 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("references every credential by an env name fill-secrets.sh actually fills", () => {
+  it("references every credential by a name the deployment actually provides", () => {
     const config = loadConfig();
     const filled = new Set([
       ...fillSecretsArray("HUMAN_KEYS"),
       ...fillSecretsArray("REQUIRED_KEYS"),
+      // The task definition's own environment and its RDS-managed password
+      // entry, which are provided by `ecs.ts` rather than by the filler.
+      ...GATEWAY_PLAIN_ENV_NAMES,
+      PG_PASSWORD_ENV_NAME,
     ]);
     const referenced = envReferences(config);
     assert.ok(referenced.length > 0, "config.json references no env vars");
     for (const name of referenced) {
       assert.ok(
         filled.has(name),
-        `env.${name} is not a key fill-secrets.sh writes; the reference would resolve to nothing`,
+        `env.${name} is not a name the deployment provides (neither fill-secrets.sh nor the task definition); the reference would resolve to nothing`,
       );
     }
 
@@ -344,6 +358,44 @@ describe("bifrost config.json", () => {
       ),
       "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
     );
+  });
+
+  it("keeps both stores in the RDS instance, not in the container", () => {
+    // The reason the admin account kept disappearing: with no `config_store`
+    // the gateway creates a SQLite file inside the container, and a task
+    // replacement - every deploy - takes it with it. Phase 2 item 10 puts both
+    // stores in item 7's Postgres instance, which is the one durable piece of
+    // state this deployment has.
+    const config = loadConfig();
+    for (const name of ["config_store", "logs_store"] as const) {
+      const store = config[name];
+      assert.ok(store, `config.json has no ${name}`);
+      assert.equal(store.enabled, true, `${name} is disabled`);
+      assert.equal(store.type, "postgres", `${name} is not Postgres`);
+      const connection = store.config;
+      assert.ok(connection, `${name} has no config`);
+      // Every connection field is a reference: the values live in the task
+      // definition, sourced from rds.ts, so a connection string cannot drift
+      // in a JSON file nobody diffs against the database.
+      assert.equal(connection.host, "env.PG_HOST");
+      assert.equal(connection.port, "env.PG_PORT");
+      assert.equal(connection.user, "env.PG_USER");
+      assert.equal(connection.password, "env.PG_PASSWORD");
+      assert.equal(connection.db_name, "env.PG_DATABASE");
+      // The instance is private and in the same VPC, but RDS still requires
+      // TLS for the master credential; `require` is the plan's value.
+      assert.equal(connection.ssl_mode, "require");
+      // A connection string must not be spelled as a literal.
+      for (const field of ["host", "user", "password", "db_name"]) {
+        assert.ok(
+          String(connection[field]).startsWith("env."),
+          `${name}.config.${field} is a literal; it belongs in the task definition`,
+        );
+      }
+    }
+    // Retention is explicit rather than defaulted, per "Persistence, backup and
+    // upgrade": a log store that never prunes is the one value certainly wrong.
+    assert.equal(config.logs_store?.retention_days, 90);
   });
 
   it("turns on the client controls the plan calls data-boundary controls", () => {
