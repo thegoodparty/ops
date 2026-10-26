@@ -8,11 +8,19 @@ sessions.
 
 ## Progress
 
-One step at a time, one pull request per step, with the same conventions as
-[`workbench-account.md`](./workbench-account.md): statuses are `todo`,
-`doing (session, date)` and `done (date, evidence)`; claim a step by pushing
-the status change **before** starting; name the session, not the model; check
-`git branch --show-current` before committing.
+One step at a time, one pull request per step. The checklist below was complete
+when this document merged, and it is a historical record rather than a status: it is kept as the record of
+what was run and how it was verified, frozen at merge, and it is not updated.
+A step's status is now derived from the pull requests that name it, with the
+`Plan:` and `Step:` lines in their bodies, as "Progress" in
+[`workbench-account.md`](./workbench-account.md) sets out and decision 11 of
+[`plan-gated-merges.md`](./plan-gated-merges.md) decides: a merged PR naming the
+step is `done` with its merge date and PR link as the evidence, an open PR is
+`doing` with its author and open date, and a step with neither is `todo`. The
+claim/push convention this preamble used to cite, and the advice to check
+`git branch --show-current` before committing that came with it, are gone, and
+so is its rule that `who` name the session rather than the model: `who` is the
+PR author.
 
 Ordering matters. Any step that grants a permission must merge **and finish
 applying** before the step that uses it, per "Apply ordering between

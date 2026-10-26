@@ -20,11 +20,28 @@ wherever they fit.
 
 ## Progress
 
-One step at a time, one pull request per step, with the conventions
-[`workbench-account.md`](./workbench-account.md) sets: statuses are `todo`,
-`doing (session, date)` and `done (date, evidence)`; claim a step by pushing
-the status change **before** starting; name the session, not the model; check
-`git branch --show-current` before committing.
+One step at a time, one pull request per step. A step's status is derived from
+the pull requests that name it, not written here: a merged PR naming the step
+is `done` with its merge date and PR link as the evidence, an open PR naming it
+is `doing` with its author and open date, and a step with neither is `todo`,
+whether it never had a PR or its only one was closed unmerged. The convention
+is spelled out under "Progress" in
+[`workbench-account.md`](./workbench-account.md) and decided in decision 11 of
+[`plan-gated-merges.md`](./plan-gated-merges.md). A pull request names them in
+its body, each on its own line:
+
+```
+Plan: docs/deploy-role-trust.md
+Step: 4
+```
+
+The `Step:` line is deliberately not part of the merge gate. The checklist
+below keeps the statuses and evidence it was written with, and is not updated:
+where one of them reads `doing` it is the record of a claim under the old
+convention, not a derived status, and a step whose PRs are all closed or absent
+reads `todo` however its entry below is worded. The claim/push convention this
+preamble used to cite, and its rule that `who` name the session rather than the
+model, retire with it: `who` is now the PR author.
 
 Ordering matters, and in the same way it matters in the other two plans. A
 step that grants a permission must merge **and finish applying** before the

@@ -13,12 +13,18 @@ there are the rules this plan is staged against. They are not repeated here.
 
 ## Progress
 
-One step at a time, one pull request per step. Statuses are `todo`,
-`doing (who, date)`, and `done (date, evidence)`. Evidence is a commit SHA for
-in-repo work, or an AWS case number or resource id for work done outside git.
-
-Claim a step by setting it to `doing` and pushing that change **before**
-starting the work, not after. Make `who` name the *session*, not the model.
+One step at a time, one pull request per step. The checklist below was complete
+when this document merged, and it is a historical record rather than a status:
+it is kept as the record of what was run and how it was verified, frozen at
+merge, and it is not updated. A step's status is now derived from the pull
+requests that name it, with the
+`Plan:` and `Step:` lines in their bodies, as "Progress" in
+[`workbench-account.md`](./workbench-account.md) sets out and decision 11 of
+[`plan-gated-merges.md`](./plan-gated-merges.md) decides: a merged PR naming the
+step is `done` with its merge date and PR link as the evidence, an open PR is
+`doing` with its author and open date, and a step with neither is `todo`. The
+claim/push convention this preamble used to cite is gone, and with it the rule
+that `who` name the session rather than the model: `who` is the PR author.
 
 - [x] 1. Create and verify the `aws-infrastructure@goodparty.org` group alias:
       done (2026-10-05, jeff, group created and confirmed in session; not
