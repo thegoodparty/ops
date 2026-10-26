@@ -215,6 +215,51 @@ export const TLS_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06";
  */
 export const ALB_IDLE_TIMEOUT_SECONDS = 3600;
 
+/**
+ * How long a deregistered task keeps draining before ECS stops it.
+ *
+ * The provider's default is 300 seconds, and on this service that delay is not
+ * a drain window but most of an outage. The service is stop-before-start
+ * (`ecs.ts`'s `DEPLOYMENT_MINIMUM_HEALTHY_PERCENT`), so when an update starts
+ * ECS deregisters the only task immediately and then waits out this delay
+ * before stopping it, while the ALB has no healthy target to forward to.
+ *
+ * The config apply on 2026-10-26 measured it end to end: the apply finished at
+ * 21:27:36Z, the old task was deregistered then, the ALB answered 503 from
+ * that moment, the old task finally stopped at 21:33:16Z, the replacement
+ * launched at 21:34:21Z, finished its first boot (store migrations) 23s later,
+ * and the endpoint was healthy again at 21:35:13Z. About seven and a half
+ * minutes, of which the 300s delay is the largest single term.
+ *
+ * 30 seconds keeps a drain window for ordinary requests and removes four and a
+ * half minutes of hard 503 per deploy. It does mean an in-flight streaming
+ * response longer than 30s is cut when its task is being replaced, which is a
+ * real cost for a model gateway; it is accepted here because the endpoint
+ * serves no production traffic yet and the alternative - a rolling update -
+ * would run two Bifrost instances against one database, which the service
+ * deliberately does not do. Revisit both decisions together when the gateway
+ * starts serving a harness, rather than lengthening this one.
+ */
+export const TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS = 30;
+
+/**
+ * The target groups' health check timing, pinned instead of defaulted.
+ *
+ * The defaults (`interval` 30s, `healthyThreshold` 3, `unhealthyThreshold` 3)
+ * mean a replacement task that is already answering takes a further 60 to 90
+ * seconds to be declared healthy, doubling the length of the gap that starts at
+ * deregistration. Ten-second checks with two successes and three failures
+ * declare a booting task healthy in about 20 seconds while still requiring
+ * three consecutive failures to pull a serving one out of rotation.
+ *
+ * Both health check paths are local and cheap (`/health` on the gateway,
+ * `/ping` on the sidecar), so the shorter interval costs nothing worth counting.
+ */
+export const TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS = 10;
+export const TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS = 5;
+export const TARGET_GROUP_HEALTHY_THRESHOLD = 2;
+export const TARGET_GROUP_UNHEALTHY_THRESHOLD = 3;
+
 export const createBifrostIngress = (args: {
   provider: aws.Provider;
   /** The workbench zone, phase 0 item 2; validation and the alias live in it. */
@@ -256,10 +301,16 @@ export const createBifrostIngress = (args: {
           // Fargate tasks are registered by IP; see the type comment above.
           targetType: "ip",
           vpcId: network.vpc.id,
+          // Both values are pinned rather than defaulted; see the constants.
+          deregistrationDelay: TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS,
           healthCheck: {
             path: spec.healthCheckPath,
             protocol: "HTTP",
             matcher: "200",
+            interval: TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
+            timeout: TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
+            healthyThreshold: TARGET_GROUP_HEALTHY_THRESHOLD,
+            unhealthyThreshold: TARGET_GROUP_UNHEALTHY_THRESHOLD,
           },
           tags: { Name: spec.name },
         },

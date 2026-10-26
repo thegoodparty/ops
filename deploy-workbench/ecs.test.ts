@@ -782,7 +782,9 @@ describe("bifrost ecs", () => {
       `wget -q -O /dev/null ${BIFROST_API_BASE_URL}/health || exit 1`,
     ]);
     assert.ok(BIFROST_HEALTH_CHECK.retries >= 3);
-    assert.ok(BIFROST_HEALTH_CHECK.startPeriod >= 15);
+    // The first boot after a config change migrates the store: 23.1s was
+    // measured, so the start period has to leave room for a slower one.
+    assert.equal(BIFROST_HEALTH_CHECK.startPeriod, 90);
   });
 
   it("gives the sidecar the plan's Google settings, derived not copied", () => {

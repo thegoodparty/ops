@@ -129,6 +129,13 @@ export const OAUTH2_PROXY_CONTAINER_NAME = "oauth2-proxy";
  * already makes everywhere else — a task replacement is a short outage — and
  * it is the only shape that keeps the single-node invariant true during a
  * deploy.
+ *
+ * That "short" gap is set by two things outside this module, and on 2026-10-26
+ * it was seven and a half minutes: the target groups' deregistration delay
+ * (300s by default) and their health check timing, both pinned in
+ * `ingress.ts`. Reducing them is the fix for the outage shape; it does not
+ * make the gap zero. Removing it entirely means the rolling update above, and
+ * that needs an answer for two instances racing the store migrations first.
  */
 export const DEPLOYMENT_MINIMUM_HEALTHY_PERCENT = 0;
 export const DEPLOYMENT_MAXIMUM_PERCENT = 100;
@@ -301,7 +308,13 @@ export const BIFROST_API_BASE_URL = `http://127.0.0.1:${BIFROST_PORT}`;
  * The values are generous on purpose: this is a Go process that loads its
  * config store on start, and a start period that is too short would restart a
  * healthy task mid-boot. Three failures at 15s intervals is the same
- * order of magnitude the upstream Dockerfile uses.
+ * order of magnitude the upstream Dockerfile uses, and the start period is 90
+ * seconds because the first boot after a config change runs the store's
+ * migrations: the 2026-10-26 apply measured 23.1s ("Time spent in Bifrost
+ * server bootstrap") against an empty RDS, and the 30 seconds this used to be
+ * left about seven seconds of margin before a slow boot was reported
+ * unhealthy. A task that is slow because it is migrating is not a task to
+ * restart.
  */
 export const BIFROST_HEALTH_CHECK: {
   command: string[];
@@ -317,7 +330,7 @@ export const BIFROST_HEALTH_CHECK: {
   interval: 15,
   timeout: 5,
   retries: 3,
-  startPeriod: 30,
+  startPeriod: 90,
 };
 
 /**
