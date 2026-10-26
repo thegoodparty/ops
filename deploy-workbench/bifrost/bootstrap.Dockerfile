@@ -12,10 +12,15 @@
 # image's own Alpine repositories at build time; nothing is pulled at task
 # start.
 #
-# The base runs as 1000:0 and the package install is the only reason to be
-# root. The `FROM` pin is duplicated from `deploy-workbench/bootstrap-image.ts`
-# and `bootstrap-image.test.ts` fails if the two, or the workflow's repository
-# and tag, drift. Build context is this directory:
+# The base runs as 1000:0 and root is needed for the package install and for
+# the one chmod below: `COPY` lays its files down as 0:0 whatever the active
+# `USER` is, so a chmod issued after the drop back to 1000:0 is a chmod by a
+# non-owner and fails with "Operation not permitted". Drop the privilege only
+# once nothing left to run needs it.
+#
+# The `FROM` pin is duplicated from `deploy-workbench/bootstrap-image.ts` and
+# `bootstrap-image.test.ts` fails if the two, or the workflow's repository and
+# tag, drift. Build context is this directory:
 #
 #   docker build --platform linux/amd64 \
 #     -f deploy-workbench/bifrost/bootstrap.Dockerfile deploy-workbench/bifrost
@@ -24,10 +29,12 @@ FROM maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8f
 
 USER root
 RUN apk add --no-cache curl jq
-USER 1000:0
 
 COPY bootstrap.sh /bifrost-bootstrap/bootstrap.sh
 RUN chmod 0555 /bifrost-bootstrap/bootstrap.sh
+
+# Nothing below here needs root: the claim runs as the base image's own user.
+USER 1000:0
 
 # /bin/sh, not the script directly: the base image's CMD is replaced rather
 # than inherited, so the container runs the claim and then exits.
