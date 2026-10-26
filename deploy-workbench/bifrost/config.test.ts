@@ -3,17 +3,27 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-models";
+import {
+  PG_HOST_ENV_NAME,
+  PG_PASSWORD_ENV_NAME,
+  PG_PORT_ENV_NAME,
+  PG_USER_ENV_NAME,
+} from "../ecs";
 import { BIFROST_HOSTNAME } from "../ingress";
 import { REGION } from "../network";
+import { DATABASE_NAME } from "../rds";
 
 /**
  * The non-secret Bifrost configuration, checked against the properties a
  * review is actually about. Phase 2 item 10 of `docs/bifrost-gateway.md`.
  *
- * The file is the authoring half of item 10: the other half, Pulumi storing it
- * as an SSM SecureString and injecting it as `BIFROST_CONFIG`, edits the ECS
- * task definition and lands separately. Until it does, nothing reads this
- * file, which is why the test can be strict about shape without a deploy.
+ * This file is the authoring half of item 10. The deployed half is
+ * `../bifrost-config.ts`, which reads this file's bytes into the SSM parameter
+ * the task injects as `BIFROST_CONFIG`, and `../bifrost-config.test.ts`, which
+ * asserts the values that reach the gateway are valid rather than merely
+ * present. The two are separate because they answer different questions: this
+ * one is "is the file the configuration we meant to write", and that one is
+ * "is what we deploy from it something the running gateway accepts".
  *
  * The upstream schema is `transports/config.schema.json` at the pinned
  * `maximhq/bifrost` tag (`v2.3.0`, `deploy-workbench/bifrost-image.ts`), not
@@ -47,6 +57,13 @@ type ProviderKey = {
 
 type ProviderConfig = { keys: ProviderKey[] };
 
+type StoreConfig = {
+  enabled?: boolean;
+  type?: string;
+  retention_days?: unknown;
+  config?: Record<string, unknown>;
+};
+
 type Config = {
   $schema?: string;
   source_of_truth?: string;
@@ -54,6 +71,8 @@ type Config = {
   setup_token?: string;
   client?: Record<string, unknown>;
   providers?: Record<string, ProviderConfig>;
+  config_store?: StoreConfig;
+  logs_store?: StoreConfig;
   governance?: {
     auth_config?: Record<string, unknown>;
     virtual_keys?: unknown;
@@ -190,18 +209,29 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("references every credential by an env name fill-secrets.sh actually fills", () => {
+  it("resolves every env reference from something the deployment fills", () => {
     const config = loadConfig();
     const filled = new Set([
       ...fillSecretsArray("HUMAN_KEYS"),
       ...fillSecretsArray("REQUIRED_KEYS"),
     ]);
+    // The store connection's non-secret half reaches the container from the
+    // task environment (`ecs.ts`, built from `rds.ts`'s outputs), and the
+    // password comes from the RDS-managed secret rather than from
+    // fill-secrets.sh. Everything else has to be a key that script writes.
+    const fromTaskEnvironment = new Set([
+      PG_HOST_ENV_NAME,
+      PG_PORT_ENV_NAME,
+      PG_USER_ENV_NAME,
+    ]);
     const referenced = envReferences(config);
     assert.ok(referenced.length > 0, "config.json references no env vars");
     for (const name of referenced) {
       assert.ok(
-        filled.has(name),
-        `env.${name} is not a key fill-secrets.sh writes; the reference would resolve to nothing`,
+        filled.has(name) ||
+          fromTaskEnvironment.has(name) ||
+          name === PG_PASSWORD_ENV_NAME,
+        `env.${name} is not provided by the deployment; the reference would resolve to nothing`,
       );
     }
 
@@ -223,6 +253,60 @@ describe("bifrost config.json", () => {
     assert.equal(config.encryption_key, "env.BIFROST_ENCRYPTION_KEY");
   });
 
+  it("keeps both Bifrost stores in the RDS instance", () => {
+    // "State: RDS Postgres": config_store holds providers, virtual keys, teams
+    // and budgets; logs_store holds the request metadata. Upstream's fallback
+    // for an omitted section is a local SQLite file, which on Fargate lives
+    // and dies with the task, so both sections have to be present and
+    // explicit rather than left to that default.
+    const config = loadConfig();
+    for (const name of ["config_store", "logs_store"] as const) {
+      const store = config[name];
+      assert.ok(store, `config.json has no ${name}`);
+      assert.equal(store.enabled, true, `${name} must be enabled`);
+      assert.equal(store.type, "postgres", `${name} must be Postgres`);
+      const storeConfig = store.config;
+      assert.ok(storeConfig, `${name} has no config block`);
+      // Non-secret connection values are env references, resolved by the
+      // process from the task definition's environment; the password is a
+      // reference to the RDS-managed secret the task already injects.
+      assert.equal(storeConfig.host, `env.${PG_HOST_ENV_NAME}`);
+      assert.equal(storeConfig.port, `env.${PG_PORT_ENV_NAME}`);
+      assert.equal(storeConfig.user, `env.${PG_USER_ENV_NAME}`);
+      assert.equal(storeConfig.password, `env.${PG_PASSWORD_ENV_NAME}`);
+      // The database name is not secret and comes from the instance RDS
+      // created, so a change there has to be a change in both places.
+      assert.equal(storeConfig.db_name, DATABASE_NAME);
+      // RDS Postgres accepts TLS; requiring it is the plan's setting.
+      assert.equal(storeConfig.ssl_mode, "require");
+    }
+  });
+
+  it("sets both retention values the same, and to a value the API accepts", () => {
+    // `client.log_retention_days` is the cleanup job's window and is what
+    // `PUT /api/config` validates (`log_retention_days must be at least 1` at
+    // the pinned tag); `logs_store.retention_days` is the store's own purge
+    // window, whose valid range starts at 0. A gateway whose stored value is
+    // 0 cannot be claimed, which is the outage this test exists to catch.
+    const config = loadConfig();
+    const client = config.client as Record<string, unknown>;
+    assert.ok(client, "config.json has no client block");
+    assert.equal(typeof client.log_retention_days, "number");
+    assert.ok(Number.isInteger(client.log_retention_days));
+    assert.ok(
+      (client.log_retention_days as number) >= 1,
+      "a value below 1 makes PUT /api/config fail with a 400",
+    );
+    const logsStore = config.logs_store;
+    assert.ok(logsStore, "config.json has no logs_store");
+    assert.equal(typeof logsStore.retention_days, "number");
+    assert.equal(
+      logsStore.retention_days,
+      client.log_retention_days,
+      "the store's retention must match the cleanup window",
+    );
+  });
+
   it("contains no literal that looks like a key or a token", () => {
     noSecretLiteral(loadConfig());
   });
@@ -233,8 +317,10 @@ describe("bifrost config.json", () => {
     // `vault.path`), and `resolveSetupToken` in
     // `transports/bifrost-http/lib/config.go` falls back to the
     // `BIFROST_SETUP_TOKEN` environment variable. Both point at the same
-    // Secrets Manager key, so the claim works whether or not item 10's
-    // `BIFROST_CONFIG` injection has landed yet.
+    // Secrets Manager key, so the claim still works on a restored or rebuilt
+    // task before the config store has an admin account, and item 10's
+    // `BIFROST_CONFIG` makes the file's `governance.auth_config` provision one
+    // at boot so the claim becomes a no-op.
     //
     // Without it, a fresh instance with no admin account answers every /api
     // call with 403 and its setup page cannot be completed by anyone: the
@@ -353,7 +439,8 @@ describe("bifrost config.json", () => {
     // to a provider key is worse than no gateway.
     assert.equal(client.enforce_auth_on_inference, true);
     // Content logging is off, and the per-request header cannot turn it back
-    // on. Metadata logging and its retention stay explicit.
+    // on. Metadata logging and its retention stay explicit; the retention
+    // value itself is pinned with the store's in the retention test above.
     assert.equal(client.disable_content_logging, true);
     assert.equal(client.allow_per_request_content_storage_override, false);
     assert.equal(client.enable_logging, true);

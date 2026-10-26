@@ -393,17 +393,25 @@ third holds secret values:
    This is the same project that already holds the account's budget and
    Bedrock logging configuration in `deploy-workbench/index.ts`.
 2. **Bifrost's own configuration is a file in the repo.** A non-secret
-   `config.json` lives under `deploy-workbench/` (for example
-   `deploy-workbench/bifrost/config.json`) and holds the providers, the
-   client settings, and the `governance` block — teams, budgets and virtual
-   keys — with an `env.` reference everywhere a secret would otherwise be.
-   Pulumi stores it as an SSM SecureString (or Secrets Manager entry) and
-   injects it as `BIFROST_CONFIG`; the container entrypoint writes it to
-   `/app/data/config.json`, which is the shape the upstream ECS guide
-   documents. A change to it is a reviewed PR, not a console edit.
-   `source_of_truth: "config.json"` makes the file authoritative for the
-   sections it declares, so a redeploy converges to the repo instead of
-   preserving UI drift; the upstream "missing vs empty" caveat in
+   `config.json` lives under `deploy-workbench/` (`deploy-workbench/bifrost/config.json`)
+   and holds the stores, the providers, the client settings, and the
+   `governance` block — teams, budgets and virtual keys — with an `env.`
+   reference everywhere a secret would otherwise be. Pulumi stores it as a
+   **plain SSM `String` parameter** and injects it as `BIFROST_CONFIG`; the
+   container entrypoint writes it to `/app/data/config.json`, which is the
+   shape the upstream ECS guide documents. `String` rather than
+   `SecureString` on purpose: the file is committed in git, so its contents
+   are already visible to everyone in the organisation. Encrypting the
+   deployed copy protects nothing and hides the running configuration from
+   the reviewers who would diff it, which makes drift invisible and a config
+   change unreviewable. Secret material does not live here at all — it is in
+   Secrets Manager and referenced by `env.` name (see 3 below), and the
+   database password reaches the task through `secrets`, never through the
+   parameter or the container's `environment`. A change to the file is a
+   reviewed PR, not a console edit. `source_of_truth: "config.json"` makes
+   the file authoritative for the sections it declares, so a redeploy
+   converges to the repo instead of preserving UI drift; the upstream
+   "missing vs empty" caveat in
    `docs/deployment-guides/config-json/source-of-truth.mdx` is the thing to
    watch (an omitted section is left alone, an empty one prunes).
 3. **Secrets are in Secrets Manager, written out of band.** Provider keys
@@ -517,8 +525,13 @@ Virtual keys are Bifrost's primary governance entity
   on for one request. Upstream is explicit that the layers compose and that a
   key with `false` overrides the global setting
   (`docs/features/observability/content-logging.mdx`).
-- **Retention.** Set `logs_store.retention_days` explicitly (90 days is a
-  reasonable first value) rather than accepting the default. The account's
+- **Retention.** Set the retention explicitly rather than accepting the
+  default. There are two settings at the pinned tag and they are not
+  interchangeable: `client.log_retention_days` is the cleanup job's window and
+  is the one `PUT /api/config` validates (`log_retention_days must be at least
+  1`), while `logs_store.retention_days` is the store's own purge window (and
+  accepts `0` to disable it). `deploy-workbench/bifrost/config.json` sets both
+  to 90 days, so there is one retention story rather than two. The account's
   Bedrock invocation log uses 365 days because it is the durable
   cost-attribution record; the gateway log is an operational and budget
   record, and 90 days covers a budget cycle. Raise it, or offload to object
@@ -851,11 +864,89 @@ network or a permission can land before the item that creates it.
 
 **Phase 2 — the gateway itself**
 
-10. Commit the non-secret `config.json` under `deploy-workbench/` with
+10. ~~Commit the non-secret `config.json` under `deploy-workbench/` with
     providers, client settings and the `governance` block, using `env.`
     references; have Pulumi store it as an SSM SecureString and inject it as
     `BIFROST_CONFIG`. Set `source_of_truth: "config.json"` for the sections
-    the repo owns.
+    the repo owns.~~ **Done** in `deploy-workbench/bifrost/config.json`,
+    `deploy-workbench/bifrost-config.ts`, `deploy-workbench/ecs.ts` and
+    `deploy-workbench/index.ts`.
+
+    The parameter is `/bifrost/config`, a plain SSM **`String`** whose value
+    is the committed file's bytes. The first half of this item landed the file;
+    this half adds `config_store`, `logs_store`, the parameter, and the
+    injection, which is what makes the gateway claimable.
+
+    What is wired:
+
+    - **The stores.** `config_store` and `logs_store` are both
+      `type: "postgres"`, `ssl_mode: "require"`, with `host`, `port`,
+      `user` and `password` as `env.PG_*` references. The values resolve
+      inside the container: Bifrost reads those fields as `SecretVar`s and
+      looks the names up in the process environment at load
+      (`framework/postgresconn/postgresconn.go`, `core/schemas/secretvar.go`
+      at the pinned tag). The task definition fills `PG_HOST` from
+      `database.address`, `PG_PORT` from `database.port` and `PG_USER` from
+      `rds.ts`'s `DATABASE_USERNAME` as ordinary environment entries;
+      `PG_PASSWORD` was already an ECS `secrets` entry against the
+      RDS-managed secret (item 8) and stays there. A missing variable resolves
+      to the empty string and fails startup's required-field validation, so a
+      miswiring fails closed rather than silently using SQLite.
+    - **The injection.** `BIFROST_CONFIG` is a `secrets` entry whose
+      `valueFrom` is the parameter's ARN — `secrets` because that is the only
+      place ECS accepts a `valueFrom`, not because the document is encrypted.
+      The gateway container overrides `entryPoint` to `/bin/sh -c` and a
+      `command` that writes the variable to `/app/data/config.json` and then
+      `exec`s the image's own `/app/docker-entrypoint.sh /app/main`. That
+      chain matters: the image entrypoint is what passes `-app-dir`,
+      `-port` and `-host` to the binary, and the file has to exist before the
+      binary reads it. The stock image does **not** read `BIFROST_CONFIG`
+      itself; upstream's ECS guide documents the same entrypoint override.
+      The write uses `printf '%s'` rather than the guide's `echo`, because
+      busybox `echo` interprets backslash escapes and would mangle JSON.
+    - **A config change rolls the task.** ECS resolves the parameter by ARN,
+      and that ARN does not change when the value does, so a config-only edit
+      would otherwise update SSM and leave the running task on the old file.
+      The container carries `BIFROST_CONFIG_SHA256`, the sha256 of the
+      deployed bytes, so every config change is a new task-definition revision
+      and a real deployment.
+    - **The IAM.** The execution role's second inline policy grants
+      `ssm:GetParameters` on the parameter's exact ARN and nothing else. No
+      `kms:Decrypt`: the parameter is a `String`, and even a `SecureString`
+      under `alias/aws/ssm` needs none, per the same reasoning recorded in
+      `docs/workbench-account.md`.
+
+    What the item got wrong, corrected here:
+
+    - **`SecureString` → `String`.** The plan said an SSM `SecureString` (or
+      Secrets Manager entry). That was reversed in review: the file is in git,
+      so the deployed parameter being encrypted hides the config from
+      reviewers and from a plain `aws ssm get-parameter` without protecting
+      anything. The decision is recorded in "Configuration as code" above.
+    - **The retention key was in the wrong place.** The plan's Retention bullet
+      says `logs_store.retention_days`; the value that made the gateway
+      unclaimable is `client.log_retention_days`. `PUT /api/config` rejects a
+      `ClientConfig.LogRetentionDays` below `1`
+      (`transports/bifrost-http/handlers/config.go` at the pinned tag), and the
+      claim container round-trips the server's own config, so the stored `0`
+      came back and the API refused it with
+      `log_retention_days must be at least 1`. `logs_store.retention_days` is
+      a different setting — the store's own purge window, whose valid range
+      starts at `0`. Both are now `90`, so the two retention windows agree;
+      `bifrost/config.test.ts` and `bifrost-config.test.ts` assert the numbers,
+      not the presence of a key. The value reaches the store because
+      `source_of_truth: "config.json"` with a present `client` section forces
+      the file's block over the stored row and persists it
+      (`loadClientConfig` in `transports/bifrost-http/lib/config.go`), so the
+      first boot after this lands replaces the stored `0` with `90` — which is
+      what makes the claim's round-trip valid rather than rejected.
+    - **The file as first committed had no stores.** With no `config_store`
+      section, Bifrost falls back to a SQLite file that lives and dies with
+      the task, so the first half of this item could not have been the
+      gateway's complete configuration. Both store sections are now present.
+
+    Nothing was deployed by this change; the claim fix reaches the live
+    gateway through the normal `deploy-workbench` apply after merge.
 11. Add the secret containers and the read grants, and write the secret
     values out of band (provider keys, `BIFROST_ENCRYPTION_KEY`, admin
     credential, `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,

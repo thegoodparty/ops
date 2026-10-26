@@ -11,8 +11,12 @@ import {
   BIFROST_BOOTSTRAP_SECRET_KEYS,
   BIFROST_CLUSTER_NAME,
   BIFROST_CONTAINER_CPU,
+  BIFROST_CONTAINER_ENVIRONMENT_NAMES,
   BIFROST_CONTAINER_MEMORY,
   BIFROST_CONTAINER_NAME,
+  BIFROST_CONTAINER_SECRET_NAMES,
+  BIFROST_CONFIG_COMMAND,
+  BIFROST_CONFIG_ENTRYPOINT,
   BIFROST_LOG_GROUP_NAME,
   BIFROST_LOG_RETENTION_DAYS,
   BIFROST_LOG_STREAM_PREFIX,
@@ -24,6 +28,7 @@ import {
   ECS_EXECUTION_MANAGED_POLICY_ARN,
   EXECUTION_ROLE_NAME,
   EXECUTION_SECRET_ACTIONS,
+  EXECUTION_SSM_ACTIONS,
   GATEWAY_SECRET_KEYS,
   GATEWAY_SECRET_NAME,
   OAUTH2_PROXY_CONTAINER_CPU,
@@ -32,12 +37,17 @@ import {
   OAUTH2_PROXY_ENVIRONMENT,
   OAUTH2_PROXY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_NAME,
+  PG_ENV_NAMES,
+  PG_HOST_ENV_NAME,
   PG_PASSWORD_ENV_NAME,
+  PG_PORT_ENV_NAME,
+  PG_USER_ENV_NAME,
   RDS_PASSWORD_JSON_KEY,
   TASK_BEDROCK_ACTIONS,
   TASK_CPU,
   TASK_MEMORY,
   TASK_ROLE_NAME,
+  executionRoleConfigPolicyDocument,
   executionRoleSecretsPolicyDocument,
   secretArnPattern,
   secretReference,
@@ -47,7 +57,15 @@ import { BIFROST_PORT, OAUTH2_PROXY_PORT, REGION } from "./network";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
+import {
+  BIFROST_CONFIG_CONTAINER_PATH,
+  BIFROST_CONFIG_ENV_NAME,
+  BIFROST_CONFIG_PARAMETER_NAME,
+  BIFROST_CONFIG_SHA256,
+  BIFROST_CONFIG_SHA256_ENV_NAME,
+} from "./bifrost-config";
 import { BIFROST_HOSTNAME } from "./ingress";
+import { DATABASE_NAME, DATABASE_USERNAME } from "./rds";
 import {
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_TAG,
@@ -285,9 +303,13 @@ describe("bifrost ecs", () => {
     ];
     const executionPolicy =
       executionRoleSecretsPolicyDocument(executionSecretArns);
+    // Item 10's second inline policy, granted the parameter's exact ARN.
+    const configPolicy = executionRoleConfigPolicyDocument(
+      `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter${BIFROST_CONFIG_PARAMETER_NAME}`,
+    );
     const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources());
 
-    for (const document of [executionPolicy, taskPolicy]) {
+    for (const document of [executionPolicy, configPolicy, taskPolicy]) {
       assert.equal(document.Version, "2012-10-17");
       for (const statement of document.Statement) {
         assert.equal(statement.Effect, "Allow");
@@ -418,25 +440,223 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("injects every secret config.json resolves from the environment", () => {
-    // The hole this closes: a name `fill-secrets.sh` writes and `config.json`
-    // resolves by `env.NAME`, but that the task definition never injects,
-    // resolves to nothing at runtime. Every reference in the file has to be one
-    // of the gateway container's own secrets here, which is the check the setup
-    // token's missing injection would have failed.
+  it("resolves every config.json env reference from the task definition", () => {
+    // The hole this closes: a name `config.json` resolves by `env.NAME`, but
+    // that the task definition never fills, resolves to nothing at runtime.
+    // Every reference has to be provided by one of three places: the gateway
+    // secret, the RDS-managed password secret, or the non-secret environment.
     const referenced = configEnvReferences();
     assert.ok(referenced.length > 0, "config.json references no env vars");
     for (const name of referenced) {
       assert.ok(
-        (GATEWAY_SECRET_KEYS as readonly string[]).includes(name),
-        `config.json resolves env.${name}, which the gateway container's secrets do not carry; the reference would resolve to nothing`,
+        (BIFROST_CONTAINER_SECRET_NAMES as readonly string[]).includes(name) ||
+          (BIFROST_CONTAINER_ENVIRONMENT_NAMES as readonly string[]).includes(
+            name,
+          ),
+        `config.json resolves env.${name}, which neither the gateway container's secrets nor its environment provide; the reference would resolve to nothing`,
       );
     }
-    // And the bootstrap token is one of them, so the claim path cannot quietly
-    // lose its injection again.
+    // The store's non-secret half is new in item 10, so pin it by name; a
+    // rename here without the config change is a gateway that boots with no
+    // database.
+    for (const name of [
+      PG_HOST_ENV_NAME,
+      PG_PORT_ENV_NAME,
+      PG_USER_ENV_NAME,
+      PG_PASSWORD_ENV_NAME,
+    ]) {
+      assert.ok(
+        referenced.includes(name),
+        `config.json no longer resolves env.${name}`,
+      );
+    }
+    // And the bootstrap token is still one of them, so the claim path cannot
+    // quietly lose its injection again.
     assert.ok(
       referenced.includes("BIFROST_SETUP_TOKEN"),
       "config.json no longer resolves env.BIFROST_SETUP_TOKEN",
+    );
+  });
+
+  it("writes the deployed BIFROST_CONFIG to the file Bifrost reads", () => {
+    // Bifrost reads configuration from a file, and ECS injects a parameter as
+    // an environment variable, so the container writes the value and then
+    // execs the image's own entrypoint. This is upstream's ECS-guide shape
+    // (`docs/deployment-guides/ecs.mdx` at the pinned tag).
+    assert.equal(BIFROST_CONFIG_ENV_NAME, "BIFROST_CONFIG");
+    assert.equal(BIFROST_CONFIG_CONTAINER_PATH, "/app/data/config.json");
+    assert.deepEqual(BIFROST_CONFIG_ENTRYPOINT, ["/bin/sh", "-c"]);
+    assert.equal(BIFROST_CONFIG_COMMAND.length, 1);
+    const command = BIFROST_CONFIG_COMMAND[0];
+    // Writes the value, fails closed when it is absent, and keeps the image's
+    // entrypoint in the chain: that script is what passes `-app-dir` and the
+    // bind host/port to the binary.
+    assert.ok(
+      command.includes(`printf '%s' "$BIFROST_CONFIG" > ${BIFROST_CONFIG_CONTAINER_PATH}`),
+      command,
+    );
+    assert.ok(command.includes("exit 1"), command);
+    assert.ok(
+      command.includes("exec /app/docker-entrypoint.sh /app/main"),
+      "the override must exec the image's own entrypoint, not replace it",
+    );
+
+    const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(gateway.includes("entryPoint: BIFROST_CONFIG_ENTRYPOINT"), gateway);
+    assert.ok(gateway.includes("command: BIFROST_CONFIG_COMMAND"), gateway);
+    // The parameter reaches the container through `secrets` (the only place
+    // ECS accepts a valueFrom); it is a plain String in SSM, so this is the
+    // injection mechanism, not a claim that the document is encrypted.
+    assert.ok(
+      gateway.includes("name: BIFROST_CONFIG_ENV_NAME,"),
+      gateway,
+    );
+    assert.ok(
+      gateway.includes("valueFrom: resolvedConfigParameterArn"),
+      gateway,
+    );
+    assert.equal(BIFROST_CONFIG_PARAMETER_NAME, "/bifrost/config");
+    // A config-only change updates the parameter's value and nothing else ECS
+    // watches, so the task definition carries a hash of the deployed bytes to
+    // make the change a new revision and roll the task.
+    assert.equal(BIFROST_CONFIG_SHA256_ENV_NAME, "BIFROST_CONFIG_SHA256");
+    assert.ok(gateway.includes("name: BIFROST_CONFIG_SHA256_ENV_NAME,"), gateway);
+    assert.ok(gateway.includes("value: BIFROST_CONFIG_SHA256 }"), gateway);
+    assert.equal(typeof BIFROST_CONFIG_SHA256, "string");
+    assert.equal(BIFROST_CONFIG_SHA256.length, 64);
+  });
+
+  it("puts every config.json env reference in the right kind of injection", () => {
+    // `environment` is readable in the task definition and the preview, so a
+    // credential there is a credential in Pulumi state. Every credential-shaped
+    // name must be in `secrets`; the plaintext environment is exactly the five
+    // non-secret values item 10 needs, and nothing else.
+    assert.deepEqual(
+      [...PG_ENV_NAMES],
+      [PG_HOST_ENV_NAME, PG_PORT_ENV_NAME, PG_USER_ENV_NAME],
+    );
+    assert.deepEqual(
+      [...BIFROST_CONTAINER_ENVIRONMENT_NAMES],
+      [
+        AWS_REGION_ENV_NAME,
+        BIFROST_CONFIG_SHA256_ENV_NAME,
+        PG_HOST_ENV_NAME,
+        PG_PORT_ENV_NAME,
+        PG_USER_ENV_NAME,
+      ],
+    );
+    // The one non-config credential in the list, and the config reference
+    // whose value is the parameter rather than an environment literal.
+    assert.ok(
+      (BIFROST_CONTAINER_SECRET_NAMES as readonly string[]).includes(
+        PG_PASSWORD_ENV_NAME,
+      ),
+    );
+    assert.ok(
+      (BIFROST_CONTAINER_SECRET_NAMES as readonly string[]).includes(
+        BIFROST_CONFIG_ENV_NAME,
+      ),
+    );
+    for (const key of GATEWAY_SECRET_KEYS) {
+      assert.ok(
+        (BIFROST_CONTAINER_SECRET_NAMES as readonly string[]).includes(key),
+        `${key} must be injected through secrets`,
+      );
+    }
+
+    const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    const environmentStart = gateway.indexOf("environment: [");
+    const secretsStart = gateway.indexOf("secrets: [");
+    assert.ok(environmentStart >= 0, gateway);
+    assert.ok(secretsStart > environmentStart, gateway);
+    const environment = gateway.slice(environmentStart, secretsStart);
+    const secrets = gateway.slice(secretsStart);
+
+    // Exactly the five plain values, in order, from the constants. The source
+    // names the constants, so this pins the order and the count; the values
+    // they resolve to are pinned by `BIFROST_CONTAINER_ENVIRONMENT_NAMES`
+    // above.
+    const plainNameConstants = [
+      ...environment.matchAll(/\{ name: ([A-Z0-9_]+), value:/g),
+    ].map((match) => match[1]);
+    assert.deepEqual(plainNameConstants, [
+      "AWS_REGION_ENV_NAME",
+      "BIFROST_CONFIG_SHA256_ENV_NAME",
+      "PG_HOST_ENV_NAME",
+      "PG_PORT_ENV_NAME",
+      "PG_USER_ENV_NAME",
+    ]);
+    // No credential-shaped name is in `environment` at all.
+    for (const credential of BIFROST_CONTAINER_SECRET_NAMES) {
+      assert.ok(
+        !environment.includes(`name: ${credential},`),
+        `${credential} must not be an environment value: it would be spelled into the task definition`,
+      );
+    }
+    // And the values are the database's own outputs, not copies.
+    assert.ok(
+      environment.includes(
+        "{ name: PG_HOST_ENV_NAME, value: resolvedDatabaseAddress },",
+      ),
+      environment,
+    );
+    assert.ok(
+      environment.includes(
+        "{ name: PG_PORT_ENV_NAME, value: resolvedDatabasePort },",
+      ),
+      environment,
+    );
+    assert.ok(
+      environment.includes(
+        "{ name: PG_USER_ENV_NAME, value: DATABASE_USERNAME },",
+      ),
+      environment,
+    );
+    assert.equal(DATABASE_NAME, "bifrost");
+    assert.equal(DATABASE_USERNAME, "bifrost");
+
+    // The password's value comes from the RDS secret, by key, and the config
+    // from the parameter's ARN. Neither is written into the definition.
+    assert.ok(
+      secrets.includes(
+        "valueFrom: `${databaseSecretArn}:${RDS_PASSWORD_JSON_KEY}::`",
+      ),
+      secrets,
+    );
+    assert.ok(
+      secrets.includes("valueFrom: resolvedConfigParameterArn"),
+      secrets,
+    );
+  });
+
+  it("lets the execution role read the one config parameter, and nothing wider", () => {
+    // `ssm:GetParameters`, plural: that is the API the ECS agent calls to
+    // resolve a `secrets` entry. Only `GetParameter` reads as correct and
+    // fails at task start. No `kms:Decrypt`: the parameter is a plain String,
+    // and even a SecureString under `alias/aws/ssm` needs none (its key policy
+    // admits the account through ssm).
+    assert.deepEqual([...EXECUTION_SSM_ACTIONS], ["ssm:GetParameters"]);
+    const parameterArn = `arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter${BIFROST_CONFIG_PARAMETER_NAME}`;
+    const policy = executionRoleConfigPolicyDocument(parameterArn);
+    assert.equal(policy.Version, "2012-10-17");
+    assert.deepEqual(
+      policy.Statement.flatMap((statement) => statement.Action),
+      ["ssm:GetParameters"],
+    );
+    assert.deepEqual(
+      policy.Statement.flatMap((statement) => statement.Resource),
+      [parameterArn],
+    );
+    // The role attaches the document and passes the parameter's own ARN, so
+    // the grant cannot drift from the parameter the task reads.
+    const executionRole = resourceBlock("bifrostExecutionRole");
+    assert.ok(
+      executionRole.includes("executionRoleConfigPolicyDocument(parameterArn)"),
+      executionRole,
+    );
+    assert.ok(
+      executionRole.includes("configParameter.arn.apply"),
+      executionRole,
     );
   });
 
@@ -462,8 +682,10 @@ describe("bifrost ecs", () => {
 
   it("injects the RDS-managed master password item 7 handed over", () => {
     // rds.ts: "The secret's ARN is returned below for item 8 to inject as the
-    // task's `PG_PASSWORD`". Only the password; host, port, user and database
-    // belong to config.json in item 10.
+    // task's `PG_PASSWORD`". Item 10 added the non-secret half — host, port
+    // and user as `environment`, and `db_name` as a literal in config.json —
+    // but the password stays here, in `secrets`, so its value never appears in
+    // the task definition or a preview.
     assert.equal(RDS_PASSWORD_JSON_KEY, "password");
     assert.equal(PG_PASSWORD_ENV_NAME, "PG_PASSWORD");
     const block = containerBlock();
@@ -893,9 +1115,11 @@ describe("bifrost ecs", () => {
     assert.match(OAUTH2_PROXY_TAG, /^v7\.15\.5-[0-9a-f]{12}$/);
   });
 
-  it("takes its one plain environment variable from the network module", () => {
-    // The Bedrock provider resolves a region from the environment; everything
-    // else is BIFROST_CONFIG in item 10.
+  it("takes its plain environment from the network, the database and the config", () => {
+    // The Bedrock provider resolves a region from the environment; the config
+    // hash rolls the task when the file changes; the store's host, port and
+    // user come from RDS's own outputs. Everything credential-shaped is in
+    // `secrets`, asserted separately.
     assert.equal(AWS_REGION_ENV_NAME, "AWS_REGION");
     const block = containerBlock();
     assert.ok(
@@ -903,8 +1127,16 @@ describe("bifrost ecs", () => {
       block,
     );
     assert.ok(
-      !block.includes("BIFROST_CONFIG"),
-      "BIFROST_CONFIG is item 10 and must not appear here yet",
+      block.includes('{ name: PG_HOST_ENV_NAME, value: resolvedDatabaseAddress }'),
+      block,
+    );
+    assert.ok(
+      block.includes('{ name: PG_PORT_ENV_NAME, value: resolvedDatabasePort }'),
+      block,
+    );
+    assert.ok(
+      block.includes('{ name: PG_USER_ENV_NAME, value: DATABASE_USERNAME }'),
+      block,
     );
   });
 
@@ -919,6 +1151,14 @@ describe("bifrost ecs", () => {
         `index.ts does not pass ${arg} to createBifrostEcs`,
       );
     }
+    assert.ok(
+      INDEX_SOURCE.includes("createBifrostConfigParameter({ provider })"),
+      "index.ts does not create the BIFROST_CONFIG SSM parameter",
+    );
+    assert.ok(
+      INDEX_SOURCE.includes("configParameter: bifrostConfigParameter,"),
+      "index.ts does not pass the config parameter to the task definition",
+    );
     assert.ok(
       INDEX_SOURCE.includes("repositoryUrl: bifrostRepository.repositoryUrl"),
       "index.ts does not pass the mirrored repository to the task definition",

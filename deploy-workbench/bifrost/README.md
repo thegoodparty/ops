@@ -8,12 +8,14 @@ holds the gateway's repo-owned configuration and the two sidecar-specific
 files that belong in review:
 
 - `config.json` — the non-secret Bifrost configuration (phase 2 item 10):
-  providers, client settings and the `governance` block. See
-  "`config.json`" below.
+  stores, providers, client settings and the `governance` block. Pulumi
+  deploys it from `deploy-workbench/bifrost-config.ts`. See "`config.json`"
+  below.
 - `config.test.ts` — the checks that keep `config.json` honest: valid JSON,
-  both providers, every `env.` reference filled by `fill-secrets.sh`, no
-  credential literal, and Bedrock's model list matching
-  `utils/bedrock-models.ts` (the list the task role's IAM is built from).
+  both providers and both Postgres stores, every `env.` reference provided by
+  the deployment, no credential literal, the retention values, and Bedrock's
+  model list matching `utils/bedrock-models.ts` (the list the task role's IAM
+  is built from).
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -42,6 +44,21 @@ against `transports/config.schema.json` at the pinned upstream tag
 `maximhq/bifrost:v2.3.0` (`deploy-workbench/bifrost-image.ts`), not the docs at
 a later tag. It holds:
 
+- **The stores.** `config_store` and `logs_store` are both Postgres, on the
+  RDS instance item 7 created, with `ssl_mode: "require"`. Their `host`,
+  `port`, `user` and `password` are `env.PG_*` references: Bifrost resolves the
+  names from its process environment at load, the task definition fills
+  `PG_HOST`/`PG_PORT`/`PG_USER` from `rds.ts`'s outputs and
+  `DATABASE_USERNAME`, and `PG_PASSWORD` arrives through ECS `secrets` from
+  the RDS-managed secret. `db_name` is the literal `bifrost`, which the test
+  checks against `DATABASE_NAME` so the two cannot drift. A missing variable
+  resolves to the empty string and fails startup validation, so a miswiring
+  fails closed rather than quietly falling back to SQLite.
+- **Retention.** `client.log_retention_days` and `logs_store.retention_days`
+  are both 90. They are different settings at the pinned tag: the first is the
+  cleanup job's window and the one `PUT /api/config` validates (a stored `0`
+  is the bug that left the gateway unclaimable), the second is the store's own
+  purge window. Both are asserted as numbers, not as key names.
 - **Providers.** `fireworks`, with its key read from `env.FIREWORKS_API_KEY`
   and an explicit model allowlist (not `*`), and `bedrock`, whose key carries
   no credential at all: Bifrost inherits the ECS **task role** through the AWS
@@ -81,34 +98,37 @@ a later tag. It holds:
   left alone; an empty one prunes.
 
 **What is injected by env.** No secret is in the file. Every credential is an
-`env.NAME` reference, and the names are exactly the keys
-`fill-secrets.sh` writes: `BIFROST_ENCRYPTION_KEY`,
-`BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD`, `BIFROST_SETUP_TOKEN` and
-`FIREWORKS_API_KEY` from `bifrost/gateway`. Bedrock has no entry because its
-credential is the role. `config.test.ts` parses the script's key arrays and
-fails on a reference to any name the script does not populate, and
-`deploy-workbench/ecs.test.ts` fails on a reference the task definition does not
-inject either.
+`env.NAME` reference; the five from `bifrost/gateway` are
+`BIFROST_ENCRYPTION_KEY`, `BIFROST_ADMIN_USERNAME`,
+`BIFROST_ADMIN_PASSWORD`, `BIFROST_SETUP_TOKEN` and `FIREWORKS_API_KEY`.
+Bedrock has no entry because its credential is the role. The store's
+non-secret half is `PG_HOST`/`PG_PORT`/`PG_USER` from the task's environment,
+and `PG_PASSWORD` is the RDS-managed secret the task already injects.
+`config.test.ts` fails on a reference nothing provides, and
+`deploy-workbench/ecs.test.ts` fails if a credential reaches the container
+through `environment` instead of `secrets`.
 
-**Not yet wired.** Pulumi storing this file as an SSM SecureString and
-injecting it as `BIFROST_CONFIG`, with the container entrypoint writing it to
-`/app/data/config.json`, is the other half of item 10 and arrives in its own
-PR; it edits the ECS task definition, which
-[#343](https://github.com/thegoodparty/ops/pull/343) currently owns. Two
-things follow from that, and neither is fixed here:
+**How it is deployed.** `deploy-workbench/bifrost-config.ts` reads this file's
+bytes into the SSM parameter `/bifrost/config`, a plain **`String`** rather
+than a `SecureString`: the file is in git, so encrypting the deployed copy
+would only hide production's configuration from the reviewers who diff it.
+The task definition injects the parameter as `BIFROST_CONFIG` (through
+`secrets`, the only place ECS accepts a `valueFrom`) and overrides the
+container entrypoint to write it to `/app/data/config.json` before exec'ing
+the image's own entrypoint. The stock image does not read `BIFROST_CONFIG`
+itself; this is upstream's ECS-guide shape. A `BIFROST_CONFIG_SHA256`
+environment value makes a config edit a new task-definition revision, because
+an ARN does not change when the parameter's value does.
 
-- Nothing reads `config.json` until then, so changing this file alone changes
-  no running gateway. The setup token is the exception: Bifrost also reads it
-  from the `BIFROST_SETUP_TOKEN` environment variable, which
-  `deploy-workbench/ecs.ts` already injects from `bifrost/gateway`, so the
-  claim container works before this file is wired at all.
-- `config_store` and `logs_store` are absent. Their host, port, user and
-  database are Pulumi outputs of `rds.ts`, not secrets, and no env name for
-  them exists yet; the gateway therefore falls back to its local SQLite store
-  until the injection PR adds the Postgres pair (and the task-definition env
-  that carries the non-password half, alongside the `PG_PASSWORD` secret that
-  is already injected). **Do not deploy this file as the gateway's complete
-  configuration.**
+Read the deployed config with one command (it is not encrypted):
+
+```sh
+AWS_PROFILE=<profile> aws ssm get-parameter --name /bifrost/config \
+  --region us-west-2 --query Parameter.Value --output text | jq .
+```
+
+A change to this file is therefore a reviewed PR that reaches the running
+gateway on the next `deploy-workbench` apply, not a console edit.
 
 ## The image
 
@@ -327,14 +347,14 @@ Bifrost's plugin interface also has an authentication hook that could accept
 oauth2-proxy's identity header instead, which is available but neither built
 nor planned here.
 
-When item 10's `BIFROST_CONFIG` injection lands, the file's
+Now that item 10 injects `BIFROST_CONFIG`, the file's
 `governance.auth_config` provisions the same admin account at boot, which makes
-the claim container a no-op from the first start. Both paths use the generated
-`BIFROST_ADMIN_USERNAME` / `BIFROST_ADMIN_PASSWORD` pair; neither is a reason
-to remove the setup token.
+the claim container a no-op from the first start on a fresh deployment. Both
+paths use the generated `BIFROST_ADMIN_USERNAME` / `BIFROST_ADMIN_PASSWORD`
+pair; neither is a reason to remove the setup token.
 
 Until both Google values are present, `bifrost/oauth2-proxy` holds one of three
 credentials. The task definition carries all three, so the ECS agent will not
 start the task until they are written (phase 2 item 11); the admin surface
-stays disabled rather than partially configured, and nothing serves traffic
-before item 10 and item 12 either way.
+stays disabled rather than partially configured, and nothing serves inference
+until item 12 proves it through the ALB either way.

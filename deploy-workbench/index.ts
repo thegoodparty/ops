@@ -15,6 +15,10 @@ import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 import { createBifrostBootstrapRepository } from "./bootstrap-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
+import {
+  BIFROST_CONFIG_PARAMETER_NAME,
+  createBifrostConfigParameter,
+} from "./bifrost-config";
 import { createBifrostEcs } from "./ecs";
 
 /**
@@ -482,10 +486,11 @@ export const bifrostAlbDnsName = ingress.loadBalancer.dnsName;
 // Nothing consumes it yet beyond the injected password. The ECS task
 // definition's `secrets` injection and its read grant on
 // `bifrostDatabaseSecretArn` are item 8's; `config.json`'s store settings are
-// item 10, so this item's apply creates an instance and leaves it otherwise
-// idle. That is deliberate: the store is the plan's one expensive irreversible
-// resource, and creating it before the task that uses it means a failed first
-// boot is a task problem rather than a database one.
+// item 10's, and they resolve their host, port and user from the task
+// environment built from this instance's outputs. That is deliberate: the
+// store is the plan's one expensive irreversible resource, and creating it
+// before the task that uses it means a failed first boot is a task problem
+// rather than a database one.
 const database = createBifrostDatabase({ provider, network });
 
 /**
@@ -496,6 +501,26 @@ export const bifrostDatabaseSecretArn = database.secretArn;
 
 /** Where Bifrost's `config_store`/`logs_store` will point (item 8). */
 export const bifrostDatabaseEndpoint = database.endpoint;
+
+// ---------------------------------------------------------------------------
+// The gateway's configuration.
+//
+// The deployed half of phase 2 item 10 of docs/bifrost-gateway.md: the SSM
+// parameter whose value is the committed `bifrost/config.json`, injected into
+// the task as `BIFROST_CONFIG` and written to `/app/data/config.json` by the
+// container entrypoint.
+//
+// A plain `String`, deliberately. The document is committed in git, so its
+// contents are already org-visible; encrypting the deployed copy would only
+// hide the config production is running from the reviewers who would diff it.
+// Every credential in it is an `env.` reference into Secrets Manager, and the
+// database password stays in the task's `secrets` block — see
+// `bifrost-config.ts` for the full reasoning and `bifrost/config.test.ts` for
+// the check that no literal secret is in the file.
+const bifrostConfigParameter = createBifrostConfigParameter({ provider });
+
+/** The parameter's name, for a human reading `pulumi stack output`. */
+export const bifrostConfigParameterName = BIFROST_CONFIG_PARAMETER_NAME;
 
 // ---------------------------------------------------------------------------
 // The gateway's compute.
@@ -513,9 +538,10 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 // The sidecar (oauth2-proxy on 4180) and the service's registration in both
 // target groups are item 9's, with the listener rules that make the groups
 // attachable; the ingress object is passed in below for exactly that reason.
-// `BIFROST_CONFIG` and the rest of the runtime configuration are item 10, so the
-// container cannot answer `/health` honestly until then. That is the plan's
-// staging, not a defect here.
+// `BIFROST_CONFIG` and the store connection's non-secret half are item 10's,
+// and they arrive through `configParameter` and the database outputs below. The
+// container now answers `/health` honestly; the plan's staging ("the container
+// cannot answer `/health` until then") ends here.
 //
 // The two secret containers (`bifrost/gateway`, `bifrost/oauth2-proxy`) are
 // **not** Pulumi resources. They were created out of band by
@@ -529,6 +555,7 @@ const ecs = createBifrostEcs({
   network,
   database,
   ingress,
+  configParameter: bifrostConfigParameter,
   repositoryUrl: bifrostRepository.repositoryUrl,
   oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl,
   bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl,

@@ -54,6 +54,31 @@
       ]
     }
   },
+  "config_store": {
+    "enabled": true,
+    "type": "postgres",
+    "config": {
+      "host": "env.PG_HOST",
+      "port": "env.PG_PORT",
+      "user": "env.PG_USER",
+      "password": "env.PG_PASSWORD",
+      "db_name": "bifrost",
+      "ssl_mode": "require"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "postgres",
+    "retention_days": 90,
+    "config": {
+      "host": "env.PG_HOST",
+      "port": "env.PG_PORT",
+      "user": "env.PG_USER",
+      "password": "env.PG_PASSWORD",
+      "db_name": "bifrost",
+      "ssl_mode": "require"
+    }
+  },
   "governance": {
     "auth_config": {
       "is_enabled": true,
