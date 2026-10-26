@@ -3,16 +3,45 @@ import { z } from "zod";
 import { defineAgent } from "../framework";
 import { GIT_TOOL_NAMES } from "../review/git-tool";
 import { promptDiff } from "../review/prompt-diff";
-import { ReviewOutputSchema, type Bundle } from "../review/schema";
+import {
+  FindingSchema,
+  PlanConsistencySchema,
+  type Bundle,
+} from "../review/schema";
 import { prReviewerSubagents } from "./pr-reviewer-subagents";
 
-export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(ReviewOutputSchema, { target: "draft-7" });
+// The Anthropic API requires a tool input_schema to be `type: "object"` with no
+// top-level oneOf/anyOf, and StructuredOutput is a tool. So the model sees one
+// flat object; ReviewOutputSchema (the discriminated union) still validates what
+// comes back in review/run.ts, which enforces the per-status required fields.
+const ReviewModelOutputSchema = z.object({
+  status: z.enum(["complete", "failed"]),
+  findings: z
+    .array(FindingSchema)
+    .optional()
+    .describe('Required when status is "complete"; may be empty.'),
+  summary: z
+    .string()
+    .optional()
+    .describe('Required when status is "complete".'),
+  planConsistency: PlanConsistencySchema.optional(),
+  reason: z.string().optional().describe('Required when status is "failed".'),
+});
+
+export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(
+  ReviewModelOutputSchema,
+  {
+    target: "draft-7",
+  },
+);
 
 // Author-controlled text, and model output that processed it, cannot be
 // allowed to close its own wrapper.
-const escapeText = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const escapeText = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
 const escapeAttr = (s: string) => escapeText(s).replace(/"/g, "&quot;");
-const untrusted = (text: string) => `<untrusted>${escapeText(text)}</untrusted>`;
+const untrusted = (text: string) =>
+  `<untrusted>${escapeText(text)}</untrusted>`;
 
 // Code cannot be XML-escaped without changing what the agent reads, so the
 // diff element is closed by a tag carrying a per-run token the author cannot
@@ -124,7 +153,14 @@ export default defineAgent({
   // final answer through; restricting `tools` without it leaves the model no
   // way to return structured_output and it falls back to prose.
   tools: ["Read", "Grep", "Glob", "Task", "StructuredOutput"],
-  allowedTools: ["Read", "Grep", "Glob", "Task", "StructuredOutput", ...GIT_TOOL_NAMES],
+  allowedTools: [
+    "Read",
+    "Grep",
+    "Glob",
+    "Task",
+    "StructuredOutput",
+    ...GIT_TOOL_NAMES,
+  ],
   outputFormat: { type: "json_schema", schema: REVIEW_OUTPUT_JSON_SCHEMA },
   systemPrompt: `You are the PR-review orchestrator for GoodParty's engineering team. You receive a <bundle> in your user message and emit a single JSON object matching ReviewOutputSchema. You have no network access and no GitHub token — a deterministic layer built your input and will post the result.
 
