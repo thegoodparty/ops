@@ -156,6 +156,14 @@ describe("buildReviewPrompt with a plan", () => {
 });
 
 describe("REVIEW_OUTPUT_JSON_SCHEMA", () => {
+  it("declares draft-07, not 2020-12, which the bundled CLI cannot resolve", () => {
+    const meta = (REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>)["$schema"];
+    assert.ok(
+      meta === undefined || /draft-07/.test(String(meta)),
+      `unresolvable $schema: ${String(meta)}`,
+    );
+  });
+
   it("is a plain object (JSON Schema)", () => {
     assert.equal(typeof REVIEW_OUTPUT_JSON_SCHEMA, "object");
     assert.notEqual(REVIEW_OUTPUT_JSON_SCHEMA, null);
