@@ -2,6 +2,7 @@
   "$schema": "https://www.getbifrost.ai/schema",
   "source_of_truth": "config.json",
   "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
+  "setup_token": "env.BIFROST_SETUP_TOKEN",
   "client": {
     "enable_logging": true,
     "disable_content_logging": true,

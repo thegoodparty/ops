@@ -72,6 +72,13 @@ env:
   # module by the same test.
   OAUTH2_PROXY_REPOSITORY: bifrost-oauth2-proxy
   OAUTH2_PROXY_UPSTREAM_TAG: v7.15.5
+  # The derived one-shot image that claims a fresh deployment (phase 2 item 11).
+  # The repository name is duplicated from `deploy-workbench/bootstrap-image.ts`
+  # because Actions cannot import a TypeScript module, and
+  # `bootstrap-image.test.ts` fails if they drift. The tag is not a literal: the
+  # build step derives it from the committed claim script and Dockerfile, the
+  # same two files the module hashes in that order.
+  BIFROST_BOOTSTRAP_REPOSITORY: bifrost-bootstrap
 
 jobs:
   deploy:
@@ -235,4 +242,39 @@ jobs:
             exit 0
           fi
           docker build --platform linux/amd64 -t "$image_uri" deploy-workbench/bifrost
+          docker push "$image_uri"
+
+      # Build and push the derived bootstrap image that claims a fresh
+      # deployment: the one-shot container that creates the first admin account
+      # from inside the task (phase 2 item 11). It is derived from the same
+      # pinned Bifrost release plus curl and jq, because the Alpine runtime
+      # ships neither and the claim has to round-trip the live config.
+      #
+      # The tag is content-addressed over both committed inputs, so a change to
+      # the script or the Dockerfile is a new tag and a push, while a re-run
+      # with neither changed skips. The digest is `cat` in the same order the
+      # module hashes them, with nothing between the two files.
+      #
+      # This runs after the apply, like the mirror and the sidecar build above:
+      # Pulumi creates the repository, the workflow fills it. The first run
+      # after this lands therefore needs the step to finish before the service
+      # can start a task, which is the same ordering the oauth2-proxy image
+      # already has.
+      - name: Build and push the derived bootstrap image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          bootstrap_digest="$(cat deploy-workbench/bifrost/bootstrap.sh deploy-workbench/bifrost/bootstrap.Dockerfile | sha256sum | cut -c1-12)"
+          image_tag="${BIFROST_TAG}-${bootstrap_digest}"
+          image_uri="${ECR_REGISTRY}/${BIFROST_BOOTSTRAP_REPOSITORY}:${image_tag}"
+          if aws ecr describe-images \
+              --repository-name "$BIFROST_BOOTSTRAP_REPOSITORY" \
+              --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
+            echo "bifrost-bootstrap:$image_tag is already built; nothing to do."
+            exit 0
+          fi
+          docker build --platform linux/amd64 \
+            -f deploy-workbench/bifrost/bootstrap.Dockerfile \
+            -t "$image_uri" deploy-workbench/bifrost
           docker push "$image_uri"

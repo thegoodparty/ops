@@ -12,6 +12,7 @@ import {
 } from "./bifrost-image";
 import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
+import { createBifrostBootstrapRepository } from "./bootstrap-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
 import { createBifrostEcs } from "./ecs";
@@ -413,6 +414,25 @@ const oauth2ProxyRepository = createOauth2ProxyRepository({ provider });
 export const oauth2ProxyRepositoryUrl = oauth2ProxyRepository.repositoryUrl;
 
 // ---------------------------------------------------------------------------
+// The ECR repository the derived bootstrap image is built into.
+//
+// The automation half of phase 2 item 11 of `docs/bifrost-gateway.md`: the
+// one-shot container that creates the first admin account from inside the
+// task, so a fresh deploy needs no human claim. Derived from the same pinned
+// Bifrost release plus curl and jq; the build and push live in
+// `.github/workflows/deploy-workbench.yml`, and the pin and the
+// content-addressed tag are documented in `bootstrap-image.ts`. A third
+// repository for the same reason as the oauth2-proxy one: ours and rebuilt
+// when the claim changes, not an upstream release pulled by digest.
+const bifrostBootstrapRepository = createBifrostBootstrapRepository({
+  provider,
+});
+
+/** The push target, for a human reading `pulumi stack output`. */
+export const bifrostBootstrapRepositoryUrl =
+  bifrostBootstrapRepository.repositoryUrl;
+
+// ---------------------------------------------------------------------------
 // The network the gateway runs in.
 //
 // Phase 1 item 5 of docs/bifrost-gateway.md: the VPC, its public and private
@@ -511,6 +531,7 @@ const ecs = createBifrostEcs({
   ingress,
   repositoryUrl: bifrostRepository.repositoryUrl,
   oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl,
+  bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl,
 });
 
 /** The service's task family, for a human reading `pulumi stack output`. */
