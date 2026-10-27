@@ -56,6 +56,18 @@ For each case, clones the target repo at `bundle.headSha`, runs the agent exactl
 
 Each replay is a full agent run — budget roughly $1–5 per case depending on diff size.
 
+### Cache main's results
+
+`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<agentsTree>/<suite>/<caseId>/run-<n>.json`, where `<agentsTree>` is `git rev-parse HEAD:delegate/agents` on main. It changes only when reviewer code does, so unrelated merges keep the cache warm, and any change under `delegate/agents/` starts a fresh full replay. The key does not cover `delegate/framework/`, `delegate/review/run.ts` or the SDK version, which the replay also runs: after changing those, comment `delegate eval` once from a PR that touches `delegate/agents/`, or bump the cache by editing an agent file, to get a fresh baseline. A pairwise result is stored as `run-1`.
+
+```sh
+npm run review:eval -- cache pull --suite core --tree <agentsTree> --out ./results-main
+# replay as usual into the same directory: cases with a result file are skipped
+npm run review:eval -- cache push --suite core --tree <agentsTree> --out ./results-main
+```
+
+Use `--layout runs` for the expected suite's `<case>/run-<n>.json` directories. Push uploads only results that pull did not bring down, skips any that errored (an errored replay is retried next eval), and never overwrites a key. The eval role can write `eval-cache/*` and nothing else in the bucket. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 case(s); N already had results`.
+
 ### Judge two sets of results
 
 ```sh
@@ -104,13 +116,13 @@ Nine cases with a known right answer, listed in `expected/manifest.json`. Each i
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time. The job also replays main's agent on the same cases, from the cache when main's `delegate/agents/` is unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` (`cases[].main.runsPassed` of `cases[].main.runs`) for the merge gate to read. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
 
 ```sh
-npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect]
+npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` and the report to `<out>/report.md`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
 
 A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
 

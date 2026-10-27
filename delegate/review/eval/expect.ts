@@ -206,7 +206,36 @@ const describeExpect = (e: Expect): string => {
   return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
 };
 
-export const renderExpectReport = (reports: CaseReport[], variant: string): string => {
+export interface Baseline {
+  variant: string;
+  reports: CaseReport[];
+}
+
+const runsPassed = (r: CaseReport | undefined) =>
+  r ? `${r.scores.filter((s) => s.pass).length}/${r.scores.length}` : "n/a";
+
+// The per-case baseline as data, for the merge gate to read without parsing
+// the markdown. `main` is null when a case has no baseline entry.
+export const renderExpectJson = (reports: CaseReport[], variant: string, baseline?: Baseline): string =>
+  JSON.stringify(
+    {
+      variant,
+      baselineVariant: baseline?.variant ?? null,
+      cases: reports.map((r) => {
+        const base = baseline?.reports.find((b) => b.c.id === r.c.id);
+        return {
+          id: r.c.id,
+          runs: r.scores.length,
+          runsPassed: r.scores.filter((s) => s.pass).length,
+          main: base ? { runs: base.scores.length, runsPassed: base.scores.filter((s) => s.pass).length } : null,
+        };
+      }),
+    },
+    null,
+    2,
+  );
+
+export const renderExpectReport = (reports: CaseReport[], variant: string, baseline?: Baseline): string => {
   const casePasses = reports.filter((r) => r.scores.length > 0 && r.scores.every((s) => s.pass)).length;
   const money = (costs: (number | null)[]) => {
     const known = costs.filter((c): c is number => c !== null);
@@ -217,12 +246,15 @@ export const renderExpectReport = (reports: CaseReport[], variant: string): stri
     "",
     `**${casePasses}/${reports.length} cases passed** on \`${variant}\`. A case passes only when every run gets the expected result.`,
     "",
-    "| Case | Expected | Runs passed | Avg cost |",
-    "| --- | --- | --- | --- |",
-    ...reports.map(
-      (r) =>
-        `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${r.scores.filter((s) => s.pass).length}/${r.scores.length} | ${money(r.costs)} |`,
-    ),
+    baseline
+      ? `| Case | Expected | Runs passed | Main runs passed (\`${baseline.variant}\`) | Avg cost |`
+      : "| Case | Expected | Runs passed | Avg cost |",
+    baseline ? "| --- | --- | --- | --- | --- |" : "| --- | --- | --- | --- |",
+    ...reports.map((r) => {
+      const passed = `${r.scores.filter((s) => s.pass).length}/${r.scores.length}`;
+      const main = baseline ? ` ${runsPassed(baseline.reports.find((b) => b.c.id === r.c.id))} |` : "";
+      return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${passed} |${main} ${money(r.costs)} |`;
+    }),
     "",
     "<details><summary>Every run</summary>",
     "",
@@ -290,6 +322,10 @@ const main = async () => {
     const worker = async () => {
       while (next < tasks.length) {
         const { c, run } = tasks[next++];
+        // A result already on disk (pulled from the cache, or from an earlier
+        // run) stands; an errored one is retried.
+        const existing = join(out, c.id, `run-${run}.json`);
+        if (existsSync(existing) && !(JSON.parse(readFileSync(existing, "utf-8")) as Result).error) continue;
         const result = await replayCase(
           records.get(c.id)!,
           { workDir: join(workDir, `run-${run}`), variant },
@@ -306,8 +342,13 @@ const main = async () => {
   }
 
   if (mode === "score" || mode === "all") {
-    const report = renderExpectReport(scoreDir(cases, out), variant ?? "unknown");
+    const baseline = flags.baseline
+      ? { variant: flags["baseline-variant"] ?? "main", reports: scoreDir(cases, resolve(flags.baseline)) }
+      : undefined;
+    const reports = scoreDir(cases, out);
+    const report = renderExpectReport(reports, variant ?? "unknown", baseline);
     writeFileSync(join(out, "report.md"), report);
+    writeFileSync(join(out, "report.json"), renderExpectJson(reports, variant ?? "unknown", baseline));
     console.log(report);
   }
 };

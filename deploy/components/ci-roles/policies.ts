@@ -483,6 +483,14 @@ export const githubActionsDelegateEval: PolicyDocument = {
       Action: "s3:ListBucket",
       Resource: "arn:aws:s3:::delegate-reviews",
     },
+    // Main's replay results, cached per agent version. Production review
+    // records under reviews/ stay read-only to this role.
+    {
+      Sid: "DelegateEvalCacheWrite",
+      Effect: "Allow",
+      Action: "s3:PutObject",
+      Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
+    },
   ],
 };
 
