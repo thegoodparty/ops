@@ -30,7 +30,11 @@ import {
   IDENTITY_STORE_ID,
   MANAGEMENT_ACCOUNT_ID,
 } from "../../utils/accounts";
-import { ADMINS_GROUP_ID, ENGINEERS_GROUP_ID } from "./config";
+import {
+  ADMINS_GROUP_ID,
+  APPROVERS_GROUP_ID,
+  ENGINEERS_GROUP_ID,
+} from "./config";
 
 export const REGION = "us-west-2";
 
@@ -121,6 +125,67 @@ export const isEngineersMember = async (
   );
 };
 
+/**
+ * Whether the user is a member of `Approvers`, the decision-time gate.
+ *
+ * Checked live on every click rather than against a mirrored copy: approval
+ * authority is effective admin, so revocation should take effect on the next
+ * click rather than after a sync.
+ */
+export const isApproversMember = async (
+  client: IdentitystoreClient,
+  identityStoreUserId: string,
+): Promise<boolean> => {
+  const result = await client.send(
+    new IsMemberInGroupsCommand({
+      IdentityStoreId: IDENTITY_STORE_ID,
+      GroupIds: [APPROVERS_GROUP_ID],
+      MemberId: { UserId: identityStoreUserId },
+    }),
+  );
+  return (
+    result.Results?.find((entry) => entry.GroupId === APPROVERS_GROUP_ID)
+      ?.MembershipExists === true
+  );
+};
+
+/**
+ * The outcome of resolving a clicking Slack user against the `Approvers`
+ * group. A typed result rather than a boolean so every deny path keeps its own
+ * message and an Identity Store failure is distinguishable from "not a
+ * member". The handler fails closed on `error`.
+ */
+export type ApproverLookup =
+  | { status: "member"; identityStoreUserId: string }
+  | { status: "not-member"; identityStoreUserId: string }
+  | { status: "no-user" }
+  | { status: "error" };
+
+/**
+ * Resolves an email to the `Approvers` membership answer, live.
+ *
+ * A miss from `GetUserId` is `no-user`; `IsMemberInGroups` returning false is
+ * `not-member`; anything thrown by either call (assume-role failure included,
+ * at the caller) is `error`, which the caller treats as a refusal. There is no
+ * negative cache, so a membership granted after a failed click works on the
+ * next one.
+ */
+export const lookupApprover = async (
+  client: IdentitystoreClient,
+  email: string,
+): Promise<ApproverLookup> => {
+  try {
+    const identityStoreUserId = await lookupIdentityStoreUserId(client, email);
+    if (!identityStoreUserId) return { status: "no-user" };
+    const member = await isApproversMember(client, identityStoreUserId);
+    return member
+      ? { status: "member", identityStoreUserId }
+      : { status: "not-member", identityStoreUserId };
+  } catch (err) {
+    console.error("approver lookup failed", err);
+    return { status: "error" };
+  }
+};
 /**
  * The `Admins` membership of a user, or null when they are not a member.
  *

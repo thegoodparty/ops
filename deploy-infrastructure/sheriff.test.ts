@@ -4,7 +4,10 @@ import { createHmac } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ConditionalCheckFailedException } from "@aws-sdk/client-dynamodb";
-import { ConflictException } from "@aws-sdk/client-identitystore";
+import {
+  ConflictException,
+  ResourceNotFoundException,
+} from "@aws-sdk/client-identitystore";
 import {
   ConflictException as SchedulerConflictException,
   ResourceNotFoundException as SchedulerResourceNotFoundException,
@@ -35,7 +38,7 @@ import {
 } from "./sheriff-lambda";
 import {
   ADMINS_GROUP_ID,
-  APPROVER_SLACK_USER_IDS,
+  APPROVERS_GROUP_ID,
   DURATION_OPTIONS,
   ENGINEERS_GROUP_ID,
   MAX_DURATION_SECONDS,
@@ -56,16 +59,17 @@ import {
 import {
   activeGrantDecision,
   activePk,
+  approverErrorMessage,
   decodeSlackPayload,
   durationSecondsFor,
   eligibilityErrorMessage,
+  evaluateApprover,
   evaluateDecision,
   evaluateEligibility,
   expiryScheduleName,
   grantExpiresAt,
   grantSk,
   scheduleAtExpression,
-  isApprover,
   isHttpUrl,
   rateLimitExceeded,
   ratePk,
@@ -85,6 +89,7 @@ import {
 import { createScheduler } from "./sheriff/scheduler";
 import {
   createAdminsMembership,
+  lookupApprover,
   resolveAdminsMembershipId,
 } from "./sheriff/identity";
 import { createStore } from "./sheriff/store";
@@ -440,10 +445,22 @@ describe("scheduled revocation infrastructure", () => {
 });
 
 describe("break-glass config", () => {
-  it("pins the hardcoded approver list", () => {
-    assert.deepEqual(
-      [...APPROVER_SLACK_USER_IDS],
-      ["U0BMU0DPS9Y", "U09HGPTHHAT", "UKP6FPANN", "U09T5BQQUTH"],
+  it("pins the Approvers decision-time gate group", () => {
+    assert.equal(APPROVERS_GROUP_ID, "e841e310-0051-7062-2ea4-9905d12f345e");
+  });
+
+  // The Approvers id is a literal duplicated from the group-sync config, which
+  // owns the `approvers-google` pair. Read that source so the two cannot drift
+  // silently, the way the sheriff-grant test pins the Admins id. A change to
+  // the synced group in either file fails this.
+  it("mirrors the Approvers group id in the group-sync config", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "group-sync/config.ts"),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e"/,
     );
   });
 
@@ -535,23 +552,140 @@ describe("expiry schedule naming", () => {
 });
 
 describe("approvers", () => {
-  it("accepts only the hardcoded list", () => {
-    assert.equal(isApprover(APPROVER_SLACK_USER_IDS[0]), true);
-    assert.equal(isApprover("USOMEONEELSE"), false);
+  const base = {
+    slackEmail: "approver@goodparty.org",
+    identityStoreUserId: "user-approver",
+    isApproversMember: true,
+  };
+
+  it("accepts a live Approvers member with a resolvable Identity Center user", () => {
+    assert.deepEqual(evaluateApprover(base), {
+      ok: true,
+      email: "approver@goodparty.org",
+      identityStoreUserId: "user-approver",
+    });
+  });
+
+  it("refuses a clicker who is not in the Approvers group", () => {
+    const result = evaluateApprover({ ...base, isApproversMember: false });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "not-approver");
+    assert.match(
+      approverErrorMessage("not-approver", "approver@goodparty.org"),
+      /Approvers group/,
+    );
+  });
+
+  it("refuses when Slack has no email, with its own message", () => {
+    const result = evaluateApprover({ ...base, slackEmail: undefined });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "no-slack-email");
+    assert.match(approverErrorMessage("no-slack-email"), /email address/);
+  });
+
+  it("refuses when no Identity Center user matches the email, naming it", () => {
+    const result = evaluateApprover({
+      ...base,
+      identityStoreUserId: undefined,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "no-identity-user");
+    assert.match(
+      approverErrorMessage("no-identity-user", "approver@goodparty.org"),
+      /approver@goodparty\.org/,
+    );
+  });
+
+  it("fails closed and explicitly when Identity Store cannot answer", () => {
+    // Even a resolved member is refused if the live check errored: an outage
+    // must never read as an approval.
+    const result = evaluateApprover({ ...base, identityStoreError: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "identity-store-error");
+    assert.match(
+      approverErrorMessage("identity-store-error"),
+      /no access was granted/i,
+    );
+  });
+
+  it("treats a missing membership result as not an approver", () => {
+    const result = evaluateApprover({
+      ...base,
+      isApproversMember: undefined,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "not-approver");
+  });
+
+  it("gives the four failure modes distinct messages", () => {
+    const messages = [
+      approverErrorMessage("no-slack-email"),
+      approverErrorMessage("no-identity-user", "a@b.c"),
+      approverErrorMessage("not-approver", "a@b.c"),
+      approverErrorMessage("identity-store-error"),
+    ];
+    assert.equal(new Set(messages).size, 4);
+    for (const message of messages) {
+      assert.match(message, /refused|not a member/);
+    }
+  });
+});
+
+describe("lookupApprover", () => {
+  const fakeClient = (send: (command: any) => Promise<unknown>) =>
+    ({ send }) as any;
+
+  it("returns member with the resolved user id", async () => {
+    const client = fakeClient(async (command) => {
+      if (command.constructor.name === "GetUserIdCommand") {
+        return { UserId: "user-1" };
+      }
+      return {
+        Results: [{ GroupId: APPROVERS_GROUP_ID, MembershipExists: true }],
+      };
+    });
+    assert.deepEqual(await lookupApprover(client, "a@goodparty.org"), {
+      status: "member",
+      identityStoreUserId: "user-1",
+    });
+  });
+
+  it("returns not-member when the group check is false", async () => {
+    const client = fakeClient(async (command) => {
+      if (command.constructor.name === "GetUserIdCommand") {
+        return { UserId: "user-1" };
+      }
+      return {
+        Results: [{ GroupId: APPROVERS_GROUP_ID, MembershipExists: false }],
+      };
+    });
+    assert.deepEqual(await lookupApprover(client, "a@goodparty.org"), {
+      status: "not-member",
+      identityStoreUserId: "user-1",
+    });
+  });
+
+  it("returns no-user when GetUserId finds nothing", async () => {
+    const client = fakeClient(async () => {
+      throw new ResourceNotFoundException({ message: "missing", $metadata: {} });
+    });
+    assert.deepEqual(await lookupApprover(client, "a@goodparty.org"), {
+      status: "no-user",
+    });
+  });
+
+  it("returns error on an Identity Store failure instead of throwing", async () => {
+    const client = fakeClient(async () => {
+      throw new Error("throttled");
+    });
+    assert.deepEqual(await lookupApprover(client, "a@goodparty.org"), {
+      status: "error",
+    });
   });
 });
 
 describe("evaluateDecision", () => {
-  const approver = APPROVER_SLACK_USER_IDS[0];
-
-  it("refuses a clicker who is not an approver", () => {
-    const result = evaluateDecision({
-      request: record(),
-      clickerSlackId: "UNOTANAPPROVER",
-    });
-    assert.equal(result.ok, false);
-    assert.match(result.ok ? "" : result.reason, /not an approver/);
-  });
+  const approver = "UAPPROVER";
 
   it("refuses the requester even if they are an approver", () => {
     const result = evaluateDecision({
