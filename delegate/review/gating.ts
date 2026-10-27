@@ -187,25 +187,34 @@ const globBody = (pattern: string): string => {
 };
 
 const compilePattern = (raw: string): RegExp | undefined => {
-  let pattern = raw.endsWith("/") ? raw.slice(0, -1) : raw;
+  const directory = raw.endsWith("/");
+  let pattern = directory ? raw.slice(0, -1) : raw;
   // A slash anywhere but the end anchors the pattern to the repository root;
   // otherwise it matches at any depth, the way .gitignore does.
   const anchored = pattern.startsWith("/") || pattern.includes("/");
   if (pattern.startsWith("/")) pattern = pattern.slice(1);
   if (!pattern) return undefined;
-  // A pattern that matches a *directory* covers everything beneath it, with or
-  // without the trailing slash: GitHub's own example has `/apps/github` (no
-  // slash) own that subdirectory, and `/deploy/components/iam @gp` has to win
-  // over a broader `/deploy/components/` opt-out. A pattern whose last segment
-  // is a single-level wildcard does not: `docs/*` matches
-  // `docs/getting-started.md` but not `docs/build-app/troubleshooting.md`, per
-  // GitHub's `CODEOWNERS` documentation, and suffixing it would widen an
-  // opt-out past what GitHub grants and hand the bot authority it does not
-  // have. A literal path beneath a matched *file* cannot exist, so the suffix
-  // is only ever wrong in the wildcard case, which is why that is the one it
-  // is skipped for. `**` already matches every depth, so it needs no suffix.
+  // A pattern that matches a *directory* covers everything beneath it. A
+  // trailing slash makes the pattern directory-only and therefore always
+  // descends: `/build/logs/` owns that directory "and any of its
+  // subdirectories", and so does `/apps/*/`, because the directories it
+  // matches are directories. Without the slash, a literal name still covers
+  // its subtree -- GitHub's example has `/apps/github` own that subdirectory --
+  // but a single-level wildcard does not: `docs/*` matches
+  // `docs/getting-started.md` and not `docs/build-app/troubleshooting.md`, per
+  // GitHub's `CODEOWNERS` documentation. Suffixing that case would widen an
+  // opt-out past what GitHub grants. `**` already matches every depth, so it
+  // needs no suffix either.
   const last = pattern.slice(pattern.lastIndexOf("/") + 1);
-  const suffix = /[*?]/.test(last) && last !== "**" ? "" : "(?:/.*)?";
+  const suffix = directory
+    ? // A directory-only pattern matches directories, and every changed path is
+      // a file, so it has to require a descendant: `/build/logs/` covers files
+      // below it, and `/apps/*/` matches `apps/team/x.ts` but not the file
+      // `apps/x.ts`.
+      "/.*"
+    : /[*?]/.test(last) && last !== "**"
+      ? ""
+      : "(?:/.*)?";
   const body = globBody(pattern);
   return anchored ? new RegExp(`^${body}${suffix}$`) : new RegExp(`(?:^|/)${body}${suffix}$`);
 };

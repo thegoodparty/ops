@@ -229,6 +229,20 @@ docs/*
     assert.equal(resolveOwnership(p, "apps/github/x.ts"), "owned");
   });
 
+  it("lets a wildcard directory rule descend, because a trailing slash is directory-only", () => {
+    // `/apps/*/` matches directories directly under `apps`, and a matched
+    // directory covers its contents, exactly like `/build/logs/` in GitHub's
+    // examples. Without this the owned rule matches nothing, the path falls
+    // through to the broader opt-out, and the authority check fails open. It is
+    // directory-only, so it does not match a file directly under `apps`.
+    const p = parseCodeowners(`* @gp
+/apps/
+/apps/*/ @gp
+`);
+    assert.equal(resolveOwnership(p, "apps/team/x.ts"), "owned");
+    assert.equal(resolveOwnership(p, "apps/x.ts"), "unowned");
+  });
+
   it("reports a path no pattern matches instead of calling it unowned", () => {
     const p = parseCodeowners(`docs/ @gp\n`);
     assert.equal(resolveOwnership(p, "delegate/review/gates.ts"), "unmatched");
