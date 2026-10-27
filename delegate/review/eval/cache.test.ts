@@ -113,6 +113,22 @@ test("push never overwrites an existing key", async () => {
   assert.equal(objects[`${PREFIX}case-a/run-1.json`], original);
 });
 
+test("push treats a racing put (409 ConditionalRequestConflict) as already cached", async () => {
+  const client = {
+    send: async () => {
+      throw Object.assign(new Error("conflict"), {
+        name: "ConditionalRequestConflict",
+        $metadata: { httpStatusCode: 409 },
+      });
+    },
+  } as unknown as S3Client;
+  const dir = tmp();
+  writeFileSync(join(dir, "case-a.json"), ok("case-a"));
+  const summary = await pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
+  assert.deepEqual(summary.skippedExisting, ["case-a.json"]);
+  assert.deepEqual(summary.pushed, []);
+});
+
 test("push does not cache an errored replay", async () => {
   const { client, puts } = fakeS3({});
   const dir = tmp();

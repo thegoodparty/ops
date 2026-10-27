@@ -484,12 +484,15 @@ export const githubActionsDelegateEval: PolicyDocument = {
       Resource: "arn:aws:s3:::delegate-reviews",
     },
     // Main's replay results, cached per agent version. Production review
-    // records under reviews/ stay read-only to this role.
+    // records under reviews/ stay read-only to this role. The condition
+    // requires If-None-Match, so S3 itself refuses to overwrite an entry.
+    // (Multipart uploads carry no such header and are refused too.)
     {
       Sid: "DelegateEvalCacheWrite",
       Effect: "Allow",
       Action: "s3:PutObject",
       Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
+      Condition: { Null: { "s3:if-none-match": "false" } },
     },
   ],
 };

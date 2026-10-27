@@ -101,7 +101,14 @@ export const pullCache = async (opts: CacheOptions, client: S3Client = new S3Cli
 
 const isAlreadyExists = (err: unknown): boolean => {
   const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-  return e.name === "PreconditionFailed" || e.$metadata?.httpStatusCode === 412;
+  // 412 when the key exists; 409 when another If-None-Match put on the same new
+  // key is still in flight, as two evals racing after a cache-busting merge are.
+  return (
+    e.name === "PreconditionFailed" ||
+    e.name === "ConditionalRequestConflict" ||
+    e.$metadata?.httpStatusCode === 412 ||
+    e.$metadata?.httpStatusCode === 409
+  );
 };
 
 // A result is cached only when the replay finished with a review. An error, or

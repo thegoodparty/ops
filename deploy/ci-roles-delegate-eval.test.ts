@@ -82,6 +82,13 @@ describe("githubActionsDelegateEval", () => {
     assert.equal(writers[0].Resource, "arn:aws:s3:::delegate-reviews/eval-cache/*");
   });
 
+  it("requires If-None-Match on every cache write, so S3 refuses an overwrite", () => {
+    const writer = githubActionsDelegateEval.Statement.find((s) =>
+      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes("s3:PutObject"),
+    );
+    assert.deepEqual(writer?.Condition, { Null: { "s3:if-none-match": "false" } });
+  });
+
   it("grants no write or delete action beyond PutObject", () => {
     const writes = actions().filter((a) => /Put|Delete|Replicate|Restore|Abort/.test(a));
     assert.deepEqual(writes, ["s3:PutObject"]);
