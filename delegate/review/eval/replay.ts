@@ -7,6 +7,7 @@ import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
+import { parseDiffAnchors, placeFindings } from "../anchors";
 import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
 import { createGitTool } from "../git-tool";
@@ -59,6 +60,7 @@ export interface Result {
 export const replayGating = (
   bundle: Bundle,
   output: Extract<ReviewOutput, { status: "complete" }>,
+  unparseableCount = 0,
 ): ResultGating | undefined => {
   if (!isGatedRepo(bundle.repo)) return undefined;
   // The last matching pattern wins, so listing each changed path after the `*`
@@ -76,7 +78,12 @@ export const replayGating = (
         ? { path: bundle.plan.path, blobSha: bundle.plan.blobSha }
         : undefined,
   });
-  const decision = decide(output, { gating });
+  // The same blockers production passes: a dropped finding or one that cannot
+  // be anchored to a diff line still counts against an approval, even though
+  // the eval scores the gate's event rather than the inline comments.
+  const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
+  const unplaceableCount = placed.filter((p) => "unplaceable" in p).length;
+  const decision = decide(output, { unparseableCount, unplaceableCount, gating });
   return {
     mode: gating.mode,
     verdict: decision.verdict,
@@ -229,7 +236,9 @@ export const replayCase = async (
   }
 
   const gating =
-    parsed.output.status === "complete" ? replayGating(bundle, parsed.output) : undefined;
+    parsed.output.status === "complete"
+      ? replayGating(bundle, parsed.output, parsed.droppedFindingCount)
+      : undefined;
   return makeResult(parsed.output, agentResult.costUsd ?? null, undefined, gating);
 };
 

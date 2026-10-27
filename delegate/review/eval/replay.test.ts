@@ -188,6 +188,42 @@ test("replayCase records no gating verdict for a repo that has not adopted gatin
   assert.equal(result.gating, undefined);
 });
 
+test("replayCase keeps a finding that cannot be anchored a blocker in the gate", async () => {
+  const record = makeRecord({ bundle: gatedBundle() });
+  const output = {
+    status: "complete" as const,
+    findings: [
+      {
+        path: "deploy/components/webhooks.ts",
+        line: 1,
+        body: "bug",
+        category: "bugs" as const,
+        confidence: "high" as const,
+      },
+    ],
+    summary: "one finding",
+    planConsistency: { verdict: "consistent" as const, reasoning: "because" },
+  };
+  const findingAgent: RunAgentImpl = async () => ({
+    agent: "pr-reviewer",
+    output: JSON.stringify(output),
+    durationMs: 10,
+    costUsd: 0.01,
+    structuredOutput: output,
+  });
+
+  const result = await replayCase(
+    record,
+    { workDir: tmpDir(), variant: "v1" },
+    findingAgent,
+    fakeCheckout,
+  );
+
+  assert.equal(result.gating?.verdict, "comment");
+  assert.equal(result.gating?.wouldApprove, false);
+  assert.deepEqual(result.gating?.gates, ["unplaceable_findings"]);
+});
+
 test("replayCase returns an error result when checkout throws", async () => {
   const record = makeRecord();
   const workDir = tmpDir();
