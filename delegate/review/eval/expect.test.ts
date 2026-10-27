@@ -12,6 +12,7 @@ import {
   renderExpectJson,
   renderExpectReport,
   scoreRun,
+  selectCases,
 } from "./expect";
 import type { Expect } from "./expect";
 import type { ExpectedCase } from "./expect";
@@ -100,6 +101,53 @@ test("the manifest rejects an unknown answer or verdict, and a consistency case 
     () => readManifest(write("unknown.json", [{ ...c, expect: { verdict: "flag" } }])),
     "flag is not an expectation type until step 5",
   );
+});
+
+test("a manifest entry missing split, source or kind, or with a bad value, is rejected", () => {
+  const dir = mkdtempSync(join(tmpdir(), "expect-labels-"));
+  const parse = (entry: unknown) => {
+    const path = join(dir, "m.json");
+    writeFileSync(path, JSON.stringify([entry]));
+    return readManifest(path);
+  };
+  const full = readManifest(MANIFEST)[0];
+  assert.equal(parse(full)[0].id, full.id);
+  for (const field of ["split", "source", "kind"] as const) {
+    const { [field]: _dropped, ...without } = full;
+    assert.throws(() => parse(without), new RegExp(field));
+    assert.throws(() => parse({ ...full, [field]: "bogus" }), new RegExp(field));
+  }
+});
+
+test("the checked-in manifest holds out a third, with block and approve on both sides", () => {
+  const cases = readManifest(MANIFEST);
+  assert.equal(cases.length, 9);
+  const holdout = selectCases(cases, { split: "holdout" });
+  assert.equal(holdout.length, 3);
+  for (const split of ["tune", "holdout"]) {
+    const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
+    assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
+  }
+});
+
+test("selectCases filters by split and case, and returns everything with no filter", () => {
+  const cases = readManifest(MANIFEST);
+  assert.equal(selectCases(cases, {}).length, cases.length);
+  const tune = selectCases(cases, { split: "tune" });
+  const holdout = selectCases(cases, { split: "holdout" });
+  assert.equal(tune.length + holdout.length, cases.length);
+  assert.ok(holdout.every((c) => c.split === "holdout"));
+  const one = holdout[0];
+  assert.deepEqual(selectCases(cases, { case: one.id, split: "holdout" }), [one]);
+  assert.deepEqual(selectCases(cases, { case: one.id, split: "tune" }), []);
+  assert.throws(() => selectCases(cases, { split: "dev" }));
+});
+
+test("scoreDir with a holdout filter scores only holdout cases", () => {
+  const out = mkdtempSync(join(tmpdir(), "expect-split-"));
+  const holdout = selectCases(readManifest(MANIFEST), { split: "holdout" });
+  const reports = scoreDir(holdout, out);
+  assert.deepEqual(reports.map((r) => r.c.id), holdout.map((c) => c.id));
 });
 
 const withConsistency = (

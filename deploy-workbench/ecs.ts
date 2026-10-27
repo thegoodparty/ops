@@ -12,7 +12,12 @@ import {
   OAUTH2_PROXY_PORT,
   REGION,
 } from "./network";
-import { BIFROST_HOSTNAME } from "./ingress";
+import {
+  BIFROST_HOSTNAME,
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
+  TARGET_GROUP_HEALTHY_THRESHOLD,
+} from "./ingress";
 import type { BifrostIngress } from "./ingress";
 import {
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
@@ -129,6 +134,13 @@ export const OAUTH2_PROXY_CONTAINER_NAME = "oauth2-proxy";
  * already makes everywhere else — a task replacement is a short outage — and
  * it is the only shape that keeps the single-node invariant true during a
  * deploy.
+ *
+ * That "short" gap is set by two things outside this module, and on 2026-10-26
+ * it was seven and a half minutes: the target groups' deregistration delay
+ * (300s by default) and their health check timing, both pinned in
+ * `ingress.ts`. Reducing them is the fix for the outage shape; it does not
+ * make the gap zero. Removing it entirely means the rolling update above, and
+ * that needs an answer for two instances racing the store migrations first.
  */
 export const DEPLOYMENT_MINIMUM_HEALTHY_PERCENT = 0;
 export const DEPLOYMENT_MAXIMUM_PERCENT = 100;
@@ -301,7 +313,19 @@ export const BIFROST_API_BASE_URL = `http://127.0.0.1:${BIFROST_PORT}`;
  * The values are generous on purpose: this is a Go process that loads its
  * config store on start, and a start period that is too short would restart a
  * healthy task mid-boot. Three failures at 15s intervals is the same
- * order of magnitude the upstream Dockerfile uses.
+ * order of magnitude the upstream Dockerfile uses, and the start period is 90
+ * seconds because the first boot after a config change runs the store's
+ * migrations: the 2026-10-26 apply measured 23.1s ("Time spent in Bifrost
+ * server bootstrap") against an empty RDS, and the 30 seconds this used to be
+ * left about seven seconds of margin before a slow boot was reported
+ * unhealthy. A task that is slow because it is migrating is not a task to
+ * restart.
+ *
+ * This is only half of that guarantee. It governs the container-level check,
+ * which ECS acts on, and says nothing about the ALB's target-group check, which
+ * ECS also acts on and which starts failing well before this start period has
+ * run out; see `BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS` below, which is the
+ * other half.
  */
 export const BIFROST_HEALTH_CHECK: {
   command: string[];
@@ -317,8 +341,72 @@ export const BIFROST_HEALTH_CHECK: {
   interval: 15,
   timeout: 5,
   retries: 3,
-  startPeriod: 30,
+  startPeriod: 90,
 };
+
+/**
+ * How long ECS ignores a new task whose ALB health checks have not passed yet:
+ * the service's `healthCheckGracePeriodSeconds`, and the reason `ingress.ts`
+ * can keep the target-group timing short without turning a slow boot into a
+ * replacement loop.
+ *
+ * The two checks measure the same boot from opposite sides, and ECS starts the
+ * clock at `RUNNING` rather than when the process answers. So the ALB check on
+ * a replacement task fails for the whole of the boot: Bifrost's `/health` is
+ * served by the process, which is inside the store migrations for the first
+ * ~23 seconds and longer on a slow one. With the pinned `unhealthyThreshold: 3`
+ * at a 10-second interval the target group declares the target unhealthy about
+ * twenty to thirty seconds in, and with ECS's default grace period of 0 the
+ * service acts on that immediately: it stops the task and starts another. The
+ * container's `startPeriod: 90` cannot prevent that, because it governs only
+ * the container-level check. Since the service is stop-before-start with
+ * `desiredCount: 1`, the replacement starts the same migrations again from the
+ * beginning — a replacement loop with an empty gateway, which is worse than
+ * the gap this deployment is accepted to have.
+ *
+ * The value is derived, not guessed, from the longest boot the deployment
+ * already says it will tolerate. That is the container check's whole tolerance,
+ * not just its start period: failures are ignored for `startPeriod`, and after
+ * it the check still allows `retries` consecutive failures `interval` apart
+ * before it calls the task unhealthy, so a boot that ends at 90 + 3 * 15 = 135
+ * seconds is one the container check would still have called healthy. A grace
+ * period that expired at the start period alone would let the ALB replace that
+ * task anyway, which is the loop again, one boot length further out. So:
+ *
+ *   startPeriod               90
+ *   retries * interval        + 3 * 15 = 45  (the failures after it)
+ *   one ALB check in flight   + 5            (its timeout)
+ *   two ALB interval ticks    + 2 * 10 = 20  (the two successes)
+ *   = 160 seconds
+ *
+ * The ALB terms are there because ECS starts the grace clock at `RUNNING`,
+ * before the process answers, while the two successes that promote the target
+ * only begin once it does: the container check can call a task healthy at 135
+ * seconds while the ALB still needs its two checks after that. The tests hold
+ * the value to this sum and above the target group's own unhealthy window.
+ *
+ * 160 seconds is also the point of diminishing returns: lengthening it further
+ * would tolerate a boot the container check has already given up on, and the
+ * grace period is what bounds how long a genuinely broken task is left in place
+ * before ECS replaces it.
+ *
+ * The cost is one-sided. The grace period suppresses ECS's reaction to failing
+ * load balancer health checks; it does not change the health checks, the
+ * target's state or the traffic, so a task that recovers inside it is promoted
+ * by the ALB after the usual two successes and nothing waits 160 seconds. A
+ * task that is genuinely broken is left in place for up to 160 seconds per
+ * attempt instead of ~30 before ECS replaces it. The gateway answers 503 in both
+ * cases, so that is slower failure detection with the same outage shape, and it
+ * is the trade for never restarting a task that is merely migrating.
+ * `deploy-workbench/scripts/verify-service.ts` is what turns a service that
+ * never converges into a red deploy run (600s default), so the slower detection
+ * is bounded and visible.
+ */
+export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
+  BIFROST_HEALTH_CHECK.startPeriod +
+  BIFROST_HEALTH_CHECK.interval * BIFROST_HEALTH_CHECK.retries +
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS +
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS * TARGET_GROUP_HEALTHY_THRESHOLD;
 
 /**
  * The RDS-managed master password, injected as the task's `PG_PASSWORD`.
@@ -1135,6 +1223,10 @@ export const createBifrostEcs = (args: {
    * ECS's defaults would run two tasks at once during an update; see the
    * constants above. This is not autoscaling and not a second task: it caps a
    * deployment at the one instance OSS Bifrost supports.
+   *
+   * `healthCheckGracePeriodSeconds` is set for the same reason: the provider
+   * default is 0, which lets the ALB's target-group check replace a task while
+   * it is still running its store migrations. See the constant.
    */
   const service = new aws.ecs.Service(
     "bifrostService",
@@ -1163,6 +1255,7 @@ export const createBifrostEcs = (args: {
       // constants above for why they are not the defaults.
       deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
       deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT,
+      healthCheckGracePeriodSeconds: BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
       networkConfiguration: {
         subnets: network.privateSubnetIds,
         securityGroups: [network.taskSecurityGroup.id],

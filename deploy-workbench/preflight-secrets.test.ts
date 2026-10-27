@@ -70,9 +70,48 @@ describe("parseSecretReference", () => {
       },
     );
   });
+  it("refuses an SSM parameter ARN rather than reading its service segment as the secret", () => {
+    // The gateway's `BIFROST_CONFIG` is an SSM parameter carried in the same
+    // `secrets` list. Splitting it as if it were a Secrets Manager reference
+    // yields { secretId: "arn", key: "us-west-2" }, and the deploy then fails
+    // on a get-secret-value for a secret named `arn`.
+    assert.throws(
+      () =>
+        parseSecretReference(
+          `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/bifrost/config`,
+        ),
+      /not a Secrets Manager key reference/i,
+    );
+  });
 });
 
 describe("extractRequiredSecretReferences", () => {
+  it("skips an SSM parameter and still compares the real secrets beside it", () => {
+    // The task definition as the workbench stack actually synthesizes it:
+    // item 10's `BIFROST_CONFIG` from `/bifrost/config` sits in the same
+    // `secrets` list as the Secrets Manager entries. The parameter is Pulumi's
+    // own resource, so it is not a key-presence question.
+    const preview = previewWith(
+      containerDefinitions([
+        {
+          name: "BIFROST_CONFIG",
+          valueFrom: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/bifrost/config`,
+        },
+        {
+          name: "PG_PASSWORD",
+          valueFrom: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf:password::`,
+        },
+      ]),
+    );
+
+    assert.deepEqual(extractRequiredSecretReferences(preview), [
+      {
+        secretId: "bifrost-db-AbCdEf",
+        secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf`,
+        key: "password",
+      },
+    ]);
+  });
   it("derives every key from the task definition Pulumi will deploy", () => {
     const preview = previewWith(
       containerDefinitions([
