@@ -142,6 +142,22 @@ Every case, and every scenario in `scenarios.json`, carries three required label
 
 A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
 
+### Dispatched run (`delegate-eval-run.yml`)
+
+Measures a candidate branch without a PR, for the hill-climb loop. Always dispatch it from main; the first job refuses any other ref, and every role it uses pins the file on main:
+
+```sh
+gh workflow run delegate-eval-run.yml --ref main -f mode=dry-run -f branch=<branch> -f run_id=<id>
+```
+
+Inputs: `mode` (`dry-run` is the default and spends nothing; `inner` replays the given tune `cases` once each; `tune` gates the tune cases with 3 runs; `gate` gates every case with 3 runs and reruns), `branch`, `run_id` (`^[a-z0-9-]{1,64}$`, keys the budget), `cases` (inner only, tune case ids), `targets` (tune and gate, tune case ids that must pass every run; they come from the dispatch, never from the branch), `budget_usd` (default 150).
+
+The candidate is main's tree with `delegate/agents/pr-reviewer.ts` and `delegate/agents/pr-reviewer-subagents.ts` taken from the branch. The run fails before any replay if the branch changes any other file, so the branch's eval code, manifests, scoring, workflows and dependencies are never used; replay is the only step that runs the branch's files, and scoring, the gate, the budget and the ledger run in jobs of main's code. Main's baseline comes from the eval cache, replayed and pushed through `delegate-eval-cache-push.yml` when missing; its cost is not charged to the run id.
+
+Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (red when the gate fails) and download the artifact `eval-run-<run_id>-<mode>-<attempt>`: `gate.json` (tune and gate; `pass`, `regressions`, `targetsMissed`, `costRatio`, `cases` for tune cases, and `holdout: { total, passed, regressions }` as counts only), `report.md`, `meta.json`, and the results of tune cases. Holdout results never leave the job, and in `gate` mode the replay logs are withheld.
+
+**Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
+
 ## Cost expectations
 
 - **Replay**: each replay is a full `claude-opus-5-5` agent run. Budget $1–5 per replay, two per side per case in `delegate eval`; a 20-case corpus costs roughly $40–200 for the PR side depending on diff complexity.

@@ -1,9 +1,11 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
 import { pullCache, pushCache, replayKey } from "./cache";
 import type { CacheLayout } from "./cache";
-import { SplitSchema } from "./expect";
+import { SplitSchema, readManifest as readExpectedManifest, selectCases } from "./expect";
+import { disallowedChanges, parseIds, publishRun, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
+import { ModeSchema, addEntry, chargedUsd, checkBudget, estimateUsd, readLedger, sumResultCosts } from "./ledger";
 import { loadRunResults, replayAll, resultFromRecord } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
 import { summarize, renderMarkdown, renderPrComment } from "./report";
@@ -43,6 +45,12 @@ const usage = () => {
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
       "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--replays 1] [--force] [--split tune|holdout --manifest <scenarios.json>]",
       "  review:eval cache key | cache pull|push --suite <name> --key <replay-key> --out <dir> [--layout flat|runs]",
+      "  review:eval ledger check --run-id <id> --mode dry-run|inner|tune|gate --budget <usd> --manifest <expected/manifest.json> [--cases <ids>]",
+      "  review:eval ledger sum --results <dir>[,<dir>] --out <cost.json>",
+      "  review:eval ledger add --run-id <id> --mode <m> --budget <usd> --branch-sha <sha> --cost-file <cost.json> --estimate-usd <usd> --gh-run-id <n> --gh-run-attempt <n>",
+      "  review:eval dispatch validate --manifest <expected/manifest.json>   (reads MODE BRANCH RUN_ID BUDGET CASES TARGETS from the environment)",
+      "  review:eval dispatch allowlist --raw <git-diff-raw.txt>",
+      "  review:eval dispatch publish --manifest <expected/manifest.json> --in <dir> --out <dir>",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
   );
@@ -137,6 +145,126 @@ const main = async () => {
       );
     }
     return;
+  }
+
+  if (command === "ledger") {
+    const subcommand = argv[1];
+    const flags = parseFlags(argv.slice(2));
+    const need = (key: string): string => {
+      const v = flag(flags, key);
+      if (!v) { console.error(`--${key} is required`); process.exit(1); }
+      return v;
+    };
+    if (subcommand === "check") {
+      const mode = ModeSchema.parse(need("mode"));
+      const runId = need("run-id");
+      const manifest = readExpectedManifest(need("manifest"));
+      const counts = {
+        inner: parseIds(flag(flags, "cases") ?? "").length,
+        tune: selectCases(manifest, { split: "tune" }).length,
+        gate: manifest.length,
+      };
+      const entries = await readLedger(runId);
+      const budget = Number(need("budget"));
+      if (mode === "dry-run") {
+        const state = checkBudget(entries, budget, 0);
+        console.error(
+          `Ledger for ${runId}: $${state.spentUsd} spent of $${state.budgetUsd}, $${state.remainingUsd} left, ${entries.length} entr${entries.length === 1 ? "y" : "ies"}.`,
+        );
+        console.error(
+          `Estimates: inner $${estimateUsd("inner", counts.inner)} for ${counts.inner} case(s), tune $${estimateUsd("tune", counts.tune)} for ${counts.tune} case(s), gate $${estimateUsd("gate", counts.gate)} for ${counts.gate} case(s).`,
+        );
+        console.log(0);
+        return;
+      }
+      const check = checkBudget(entries, budget, estimateUsd(mode, counts[mode]));
+      console.error(
+        `${mode}: estimate $${check.estimateUsd}, $${check.spentUsd} already spent of $${check.budgetUsd}, $${check.remainingUsd} left.`,
+      );
+      if (!check.ok) {
+        console.error(`::error::${mode} would pass the $${check.budgetUsd} budget for run ${runId}; nothing was replayed.`);
+        process.exit(1);
+      }
+      console.log(check.estimateUsd);
+      return;
+    }
+    if (subcommand === "sum") {
+      const total = sumResultCosts(need("results").split(","));
+      writeFileSync(need("out"), JSON.stringify(total));
+      console.error(`Candidate cost $${total.costUsd} over ${total.runs} run(s)`);
+      return;
+    }
+    if (subcommand === "add") {
+      let reported: number | null = null;
+      try {
+        reported = (JSON.parse(readFileSync(need("cost-file"), "utf-8")) as { costUsd: number }).costUsd;
+      } catch {
+        console.error("No readable cost file; charging the estimate");
+      }
+      const costUsd = chargedUsd(reported, Number(need("estimate-usd")));
+      const written = await addEntry(need("run-id"), {
+        mode: ModeSchema.parse(need("mode")),
+        costUsd,
+        budgetUsd: Number(need("budget")),
+        at: new Date().toISOString(),
+        ghRunId: need("gh-run-id"),
+        ghRunAttempt: need("gh-run-attempt"),
+        branchSha: need("branch-sha"),
+      });
+      console.error(written ? `Recorded $${costUsd} against ${need("run-id")}` : "Entry already recorded");
+      return;
+    }
+    usage();
+  }
+
+  if (command === "dispatch") {
+    const subcommand = argv[1];
+    const flags = parseFlags(argv.slice(2));
+    const manifestPath = flag(flags, "manifest");
+    if (subcommand === "validate") {
+      if (!manifestPath) { console.error("--manifest is required"); process.exit(1); }
+      const env = (key: string) => process.env[key] ?? "";
+      const mode = ModeSchema.safeParse(env("MODE"));
+      const manifest = readExpectedManifest(manifestPath);
+      const cases = parseIds(env("CASES"));
+      const targets = parseIds(env("TARGETS"));
+      const errors = [
+        mode.success ? null : "mode must be dry-run, inner, tune or gate",
+        validateBranch(env("BRANCH")),
+        validateRunId(env("RUN_ID")),
+        validateBudget(env("BUDGET")),
+        validateIds("cases", cases, manifest, "tune"),
+        validateIds("targets", targets, manifest, "tune"),
+        mode.success && mode.data === "inner" && cases.length === 0 ? "inner needs cases" : null,
+        mode.success && mode.data !== "inner" && cases.length > 0 ? "cases applies to inner only" : null,
+        mode.success && (mode.data === "inner" || mode.data === "dry-run") && targets.length > 0
+          ? "targets applies to tune and gate only"
+          : null,
+      ].filter((e): e is string => e !== null);
+      if (errors.length > 0) {
+        for (const e of errors) console.error(`::error::${e}`);
+        process.exit(1);
+      }
+      return;
+    }
+    if (subcommand === "allowlist") {
+      const raw = flag(flags, "raw");
+      if (!raw) { console.error("--raw is required"); process.exit(1); }
+      const bad = disallowedChanges(readFileSync(raw, "utf-8"));
+      if (bad.length > 0) {
+        console.error(`::error::The branch changes files outside the two reviewer files: ${bad.join(", ")}`);
+        process.exit(1);
+      }
+      return;
+    }
+    if (subcommand === "publish") {
+      const inDir = flag(flags, "in");
+      const out = flag(flags, "out");
+      if (!manifestPath || !inDir || !out) { console.error("--manifest, --in and --out are required"); process.exit(1); }
+      publishRun(readExpectedManifest(manifestPath), inDir, out);
+      return;
+    }
+    usage();
   }
 
   if (command === "replay") {

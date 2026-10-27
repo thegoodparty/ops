@@ -427,7 +427,7 @@ const OPS_MAIN_SUBJECT = "repo:thegoodparty/ops:ref:refs/heads/main";
  * condition, and the old policy admits them too. The ordering rule in
  * docs/workbench-account.md is about *widening*.
  */
-const opsWorkflowTrust = (workflowFile: string): TrustPolicyDocument => ({
+const opsWorkflowTrust = (...workflowFiles: string[]): TrustPolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
     {
@@ -440,7 +440,10 @@ const opsWorkflowTrust = (workflowFile: string): TrustPolicyDocument => ({
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
           "token.actions.githubusercontent.com:sub": OPS_MAIN_SUBJECT,
-          "token.actions.githubusercontent.com:job_workflow_ref": `thegoodparty/ops/.github/workflows/${workflowFile}@refs/heads/main`,
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            workflowFiles.length === 1
+              ? `thegoodparty/ops/.github/workflows/${workflowFiles[0]}@refs/heads/main`
+              : workflowFiles.map((f) => `thegoodparty/ops/.github/workflows/${f}@refs/heads/main`),
         },
       },
     },
@@ -466,7 +469,13 @@ export const githubActionsInfrastructureDeployTrust = opsWorkflowTrust(
   "deploy-infrastructure.yml",
 );
 
-export const githubActionsDelegateEvalTrust = opsWorkflowTrust("delegate-eval.yml");
+// The read-only eval role, for the comment-triggered eval and the dispatched
+// one. A list under StringEquals is an OR, and both files are main-only, so
+// this widens the role to a second workflow that holds the same read access.
+export const githubActionsDelegateEvalTrust = opsWorkflowTrust(
+  "delegate-eval.yml",
+  "delegate-eval-run.yml",
+);
 
 // The one credential that can write the eval cache, kept off the role above
 // because every job in delegate-eval.yml can assume that one, including the
@@ -476,6 +485,33 @@ export const githubActionsDelegateEvalTrust = opsWorkflowTrust("delegate-eval.ym
 export const githubActionsDelegateEvalCachePushTrust = opsWorkflowTrust(
   "delegate-eval-cache-push.yml",
 );
+
+// The hill-climb budget ledger's writer. Kept off the read role and off the
+// cache-push role: delegate-eval-run.yml runs candidate code, so it must not
+// be able to assume a role that writes spend records, and the cache-push role
+// reaches the whole of eval-cache/. A called workflow presents its own file as
+// the `job_workflow_ref`, so only delegate-eval-ledger.yml, which runs main's
+// code over a cost file main's scoring job made, can assume this one.
+export const githubActionsDelegateEvalLedgerTrust = opsWorkflowTrust(
+  "delegate-eval-ledger.yml",
+);
+
+// One new object per measured dispatch under the ledger prefix, and nothing
+// else. Requiring If-None-Match means an entry can be created but never
+// replaced, so the role cannot lower a run's recorded spend. It has no delete
+// and no read.
+export const githubActionsDelegateEvalLedger: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "DelegateEvalLedgerAppend",
+      Effect: "Allow",
+      Action: "s3:PutObject",
+      Resource: "arn:aws:s3:::delegate-reviews/eval-cache/ledger/*",
+      Condition: { Null: { "s3:if-none-match": "false" } },
+    },
+  ],
+};
 
 // Main's replay results, cached per replay key. Production review records
 // under reviews/ are not writable. The condition requires If-None-Match, so S3

@@ -1,0 +1,669 @@
+name: Delegate eval run
+
+# Measures one candidate branch of the delegate reviewer without a PR, for the
+# hill-climb loop. Dispatch it only with `--ref main`:
+#   gh workflow run delegate-eval-run.yml --ref main -f mode=dry-run -f branch=<b> -f run_id=<id>
+# A workflow_dispatch runs the file at the ref it is given, so dispatching a
+# candidate branch would let its author edit the thing that measures it. Every
+# credentialled role pins this file on main, and the first job refuses any
+# other ref.
+#
+# The candidate is main's tree with exactly two files taken from the branch:
+# the reviewer's prompts. The branch is refused if it changes anything else, so
+# its own eval code, manifests, scoring, workflows and dependencies are never
+# used. Replay is the only step that runs the branch's files; scoring, gating,
+# the budget and the ledger run in jobs of main's code.
+#
+# Credentials, as in delegate-eval.yml: every job here that assumes a role
+# assumes the read-only eval role. The two writers are reusable workflows
+# (delegate-eval-cache-push.yml, delegate-eval-ledger.yml) whose roles trust
+# only their own file, so no job in this file can assume them, candidate-code
+# jobs included. Each job asks for `id-token: write` only if it assumes a role.
+#
+# Nothing is posted to GitHub. Callers wait with `gh run watch <id> --exit-status`
+# and download the artifact `eval-run-<run_id>-<mode>-<attempt>`, whose gate.json
+# has the verdict. Holdout cases appear in it only as counts, and in gate mode
+# the replay logs are withheld and no holdout id is put in a step input or
+# output, so holdout outcomes never reach a job log. The intermediate artifacts
+# (baseline, cand-results, cand-rerun) hold raw results for every case, holdout
+# included, as in delegate-eval.yml: they are readable by anyone who can read
+# the repo, and the manifest that names the holdout cases is in the repo too.
+# Do not re-run failed jobs of a dispatch; dispatch again, so the budget is
+# checked again.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: dry-run prints the plan and spends nothing; inner replays given tune cases once; tune gates the tune cases; gate gates every case
+        type: choice
+        options: [dry-run, inner, tune, gate]
+        default: dry-run
+      branch:
+        description: Candidate branch in this repo
+        type: string
+        required: true
+      run_id:
+        description: Hill-climb run id, which the budget ledger is keyed by
+        type: string
+        required: true
+      cases:
+        description: Tune case ids, comma separated (inner only)
+        type: string
+        default: ""
+      targets:
+        description: Tune case ids that must pass every run (tune and gate)
+        type: string
+        default: ""
+      budget_usd:
+        description: Most the run id may spend in total; a later dispatch cannot raise it
+        type: string
+        default: "150"
+
+# One measurement per run id at a time, so a dispatch checks the ledger only
+# after the previous one has recorded its cost.
+concurrency:
+  group: delegate-eval-run-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Main's code only. Validates, applies the file allowlist, checks the budget
+  # and prints the plan; a dry run ends here.
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      measure: ${{ steps.plan.outputs.measure }}
+      estimate: ${{ steps.plan.outputs.estimate }}
+      cand_files_id: ${{ steps.upload-files.outputs.artifact-id }}
+      branch_sha: ${{ steps.branch.outputs.branch_sha }}
+      sha7: ${{ steps.branch.outputs.sha7 }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # Every input reaches the shell as an environment variable, never as
+      # template substitution into a script.
+      - name: Validate inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          BRANCH: ${{ inputs.branch }}
+          RUN_ID: ${{ inputs.run_id }}
+          CASES: ${{ inputs.cases }}
+          TARGETS: ${{ inputs.targets }}
+          BUDGET: ${{ inputs.budget_usd }}
+        run: npm run -s review:eval -- dispatch validate --manifest delegate/review/eval/expected/manifest.json
+
+      # The sha is resolved once here and every later job uses it, so the
+      # branch moving mid-run cannot change what was checked.
+      - name: Check the branch changes only the reviewer files
+        id: branch
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/${BRANCH}:refs/remotes/origin/candidate"
+          branch_sha=$(git rev-parse refs/remotes/origin/candidate)
+          base=$(git merge-base HEAD "$branch_sha")
+          git diff --raw --no-renames "$base" "$branch_sha" > "$RUNNER_TEMP/raw-diff.txt"
+          npm run -s review:eval -- dispatch allowlist --raw "$RUNNER_TEMP/raw-diff.txt"
+          echo "branch_sha=${branch_sha}" >> "$GITHUB_OUTPUT"
+          echo "sha7=${branch_sha:0:7}" >> "$GITHUB_OUTPUT"
+          {
+            echo "branch ${BRANCH} at ${branch_sha}, merge base ${base}, main at ${GITHUB_SHA}"
+            git diff --stat --no-renames "$base" "$branch_sha"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Check the budget
+        id: plan
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.run_id }}
+          CASES: ${{ inputs.cases }}
+          BUDGET: ${{ inputs.budget_usd }}
+        run: |
+          estimate=$(npm run -s review:eval -- ledger check \
+            --run-id "$RUN_ID" --mode "$MODE" --budget "$BUDGET" --cases "$CASES" \
+            --manifest delegate/review/eval/expected/manifest.json)
+          echo "estimate=${estimate}" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" = dry-run ]; then echo "measure=false" >> "$GITHUB_OUTPUT"; else echo "measure=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Collect the candidate's reviewer files
+        if: steps.plan.outputs.measure == 'true'
+        env:
+          BRANCH_SHA: ${{ steps.branch.outputs.branch_sha }}
+        run: |
+          for f in delegate/agents/pr-reviewer.ts delegate/agents/pr-reviewer-subagents.ts; do
+            mkdir -p "cand-files/$(dirname "$f")"
+            git show "${BRANCH_SHA}:${f}" > "cand-files/${f}"
+          done
+
+      - name: Upload the candidate's reviewer files
+        id: upload-files
+        if: steps.plan.outputs.measure == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cand-files-${{ github.run_attempt }}
+          path: ./cand-files/
+
+  # Main's side of the gate. Runs only main's code. Replays (or pulls from the
+  # cache) main's answers to the cases the mode measures; the cache is written
+  # by the cache-push job below.
+  main-baseline:
+    needs: prepare
+    if: needs.prepare.outputs.measure == 'true' && (inputs.mode == 'tune' || inputs.mode == 'gate')
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      replay_key: ${{ steps.cache.outputs.replay_key }}
+      suite: ${{ steps.cache.outputs.suite }}
+      results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Pull main's expected-result cache
+        id: cache
+        env:
+          REVIEW_BUCKET: delegate-reviews
+        run: |
+          replay_key=$(npm run -s review:eval -- cache key)
+          cases_tree=$(git rev-parse HEAD:delegate/review/eval/expected)
+          echo "replay_key=${replay_key}" >> "$GITHUB_OUTPUT"
+          echo "suite=expected-${cases_tree:0:12}" >> "$GITHUB_OUTPUT"
+          npm run -s review:eval -- cache pull \
+            --suite "expected-${cases_tree:0:12}" \
+            --key "$replay_key" \
+            --layout runs \
+            --out ./baseline
+
+      - name: Replay main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          gh auth setup-git
+          args=(--mode replay --runs 3 --concurrency 5 --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main")
+          if [ "$MODE" = tune ]; then
+            npm run -s review:expect -- "${args[@]}" --split tune
+          else
+            # The replay prints each case id with its outcome, and gate mode
+            # runs holdout cases, so the log is withheld.
+            npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay.log" 2>&1 \
+              || { echo "::error::Main's replay failed; its log is withheld in gate mode."; exit 1; }
+          fi
+
+      # Uploaded even when the replay failed, so the good runs still reach the
+      # cache. Hidden files are included for the pulled-results marker.
+      - name: Upload main's results
+        id: upload-results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-${{ github.run_attempt }}
+          path: ./baseline/
+          include-hidden-files: true
+
+  # The only writer of the cache.
+  main-cache-push:
+    needs: main-baseline
+    if: always() && needs.main-baseline.outputs.results_artifact_id != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-cache-push.yml
+    with:
+      artifact-id: ${{ needs.main-baseline.outputs.results_artifact_id }}
+      replay-key: ${{ needs.main-baseline.outputs.replay_key }}
+      suite: ${{ needs.main-baseline.outputs.suite }}
+      layout: runs
+      main-sha: ${{ github.sha }}
+
+  # The only job that runs the candidate's files, with the read-only eval role.
+  candidate:
+    needs: prepare
+    if: needs.prepare.outputs.measure == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # After the install, over main's tree: the two files and nothing else.
+      - name: Apply the candidate's reviewer files
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.cand_files_id }}
+          path: .
+          merge-multiple: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Replay the candidate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MODE: ${{ inputs.mode }}
+          CASES: ${{ inputs.cases }}
+          SHA7: ${{ needs.prepare.outputs.sha7 }}
+        run: |
+          gh auth setup-git
+          args=(--mode replay --concurrency 5 --variant "cand-${SHA7}" --out ./cand --work-dir "$RUNNER_TEMP/work-cand")
+          case "$MODE" in
+            inner) npm run -s review:expect -- "${args[@]}" --runs 1 --case "$CASES" ;;
+            tune) npm run -s review:expect -- "${args[@]}" --runs 3 --split tune ;;
+            *)
+              # Gate mode runs holdout cases, so the log is withheld.
+              npm run -s review:expect -- "${args[@]}" --runs 3 > "$RUNNER_TEMP/replay.log" 2>&1 \
+                || { echo "::error::The candidate's replay failed; its log is withheld in gate mode."; exit 1; }
+              ;;
+          esac
+
+      - name: Upload the candidate's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cand-results-${{ github.run_attempt }}
+          path: ./cand/
+
+  # First gate pass, with main's code and no AWS credentials. A case main
+  # passes 3/3 that drops below it comes back as a rerun id.
+  gate:
+    needs: [prepare, main-baseline, candidate]
+    if: inputs.mode == 'tune' || inputs.mode == 'gate'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      has_rerun: ${{ steps.gate.outputs.has_rerun }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download main's results
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.main-baseline.outputs.results_artifact_id }}
+          path: ./baseline
+          merge-multiple: true
+
+      - name: Download the candidate's results
+        uses: actions/download-artifact@v4
+        with:
+          name: cand-results-${{ github.run_attempt }}
+          path: ./cand
+
+      # The targets come from the dispatch, validated against main's manifest,
+      # never from a file on the branch.
+      - name: Gate, first pass
+        id: gate
+        env:
+          MODE: ${{ inputs.mode }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+          npm run -s review:expect -- \
+            --mode gate --runs 3 "${split[@]}" \
+            --base ./baseline --targets "$TARGETS" \
+            --out ./cand > /dev/null 2>&1
+          # The ids go in a file, not a step output: in gate mode they can name
+          # holdout cases, and step inputs and outputs are printed in the log.
+          mkdir rerun
+          jq -r '.rerun | join(",")' ./cand/gate.json > ./rerun/ids.txt
+          if [ -s ./rerun/ids.txt ]; then echo "has_rerun=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Upload the rerun ids
+        uses: actions/upload-artifact@v4
+        with:
+          name: rerun-ids-${{ github.run_attempt }}
+          path: ./rerun/
+
+  # Runs the candidate's files, with the read-only eval role. Replays only the
+  # cases the first pass flagged, as runs 4 to 6.
+  candidate-rerun:
+    needs: [prepare, gate]
+    if: needs.gate.outputs.has_rerun == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Apply the candidate's reviewer files
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.cand_files_id }}
+          path: .
+          merge-multiple: true
+
+      # Re-assumed here, so the first pass's session length does not limit a
+      # long gate.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Download the rerun ids
+        uses: actions/download-artifact@v4
+        with:
+          name: rerun-ids-${{ github.run_attempt }}
+          path: ./rerun
+
+      - name: Rerun flagged cases
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MODE: ${{ inputs.mode }}
+          SHA7: ${{ needs.prepare.outputs.sha7 }}
+        run: |
+          gh auth setup-git
+          RERUN_IDS=$(cat ./rerun/ids.txt)
+          args=(--mode replay --case "$RERUN_IDS" --runs 3 --from-run 4 --concurrency 5 --variant "cand-${SHA7}" --out ./cand-rerun --work-dir "$RUNNER_TEMP/work-rerun")
+          if [ "$MODE" = tune ]; then
+            npm run -s review:expect -- "${args[@]}"
+          else
+            npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay.log" 2>&1 \
+              || { echo "::error::The rerun failed; its log is withheld in gate mode."; exit 1; }
+          fi
+
+      - name: Upload the candidate's rerun results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cand-rerun-${{ github.run_attempt }}
+          path: ./cand-rerun/
+
+  # Sums what the candidate cost, whether or not the run got as far as a
+  # verdict, so a failed or cancelled run is still charged. Main's code, no AWS
+  # credentials; the ledger job below records it.
+  cost:
+    needs: [prepare, candidate, candidate-rerun]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.measure == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download the candidate's results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cand-results-${{ github.run_attempt }}
+          path: ./cand
+
+      - name: Download the candidate's rerun results
+        if: needs.candidate-rerun.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cand-rerun-${{ github.run_attempt }}
+          path: ./cand-rerun
+
+      - name: Sum the cost
+        run: |
+          mkdir cost
+          npm run -s review:eval -- ledger sum --results ./cand,./cand-rerun --out ./cost/cost.json
+
+      # A name the candidate's jobs never see, so it cannot upload one first and
+      # make this upload fail.
+      - name: Name the cost artifact
+        id: name
+        run: echo "name=cost-$(cat /proc/sys/kernel/random/uuid)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the cost file
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ./cost/
+
+  ledger:
+    needs: [prepare, cost]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.measure == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-ledger.yml
+    with:
+      artifact-id: ${{ needs.cost.outputs.artifact_id }}
+      estimate-usd: ${{ needs.prepare.outputs.estimate }}
+      run-id: ${{ inputs.run_id }}
+      mode: ${{ inputs.mode }}
+      budget-usd: ${{ inputs.budget_usd }}
+      branch-sha: ${{ needs.prepare.outputs.branch_sha }}
+      main-sha: ${{ github.sha }}
+
+  # Scores with main's code, so the branch cannot change the cases or the
+  # scoring it is graded on. No AWS credentials. Goes red when the gate fails,
+  # after the artifact is uploaded.
+  score:
+    needs: [prepare, main-baseline, gate, candidate, candidate-rerun]
+    if: |
+      !cancelled() && needs.prepare.outputs.measure == 'true' &&
+      (inputs.mode == 'inner' && needs.candidate.result == 'success' ||
+       inputs.mode != 'inner' && needs.gate.result == 'success')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download the candidate's results
+        uses: actions/download-artifact@v4
+        with:
+          name: cand-results-${{ github.run_attempt }}
+          path: ./cand
+
+      # Merges into the same directory as runs 4 to 6. A failed rerun leaves
+      # no artifact, and the final gate counts those runs as failed.
+      - name: Download the candidate's rerun results
+        if: needs.candidate-rerun.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cand-rerun-${{ github.run_attempt }}
+          path: ./cand
+
+      - name: Download main's results
+        if: inputs.mode != 'inner'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.main-baseline.outputs.results_artifact_id }}
+          path: ./baseline
+          merge-multiple: true
+
+      - name: Score
+        id: score
+        continue-on-error: true
+        env:
+          MODE: ${{ inputs.mode }}
+          CASES: ${{ inputs.cases }}
+          TARGETS: ${{ inputs.targets }}
+          SHA7: ${{ needs.prepare.outputs.sha7 }}
+        run: |
+          if [ "$MODE" = inner ]; then
+            npm run -s review:expect -- --mode score --runs 1 --case "$CASES" --variant "cand-${SHA7}" --out ./cand
+          else
+            split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+            # Not printed: the gate report names holdout counts and the log is readable.
+            npm run -s review:expect -- \
+              --mode gate --final true --runs 3 "${split[@]}" \
+              --variant "cand-${SHA7}" --baseline-variant "main-${GITHUB_SHA:0:7}" \
+              --base ./baseline --targets "$TARGETS" \
+              --out ./cand > /dev/null 2>&1
+          fi
+
+      - name: Build the artifact
+        if: always()
+        env:
+          MODE: ${{ inputs.mode }}
+          RUN_ID: ${{ inputs.run_id }}
+          BRANCH: ${{ inputs.branch }}
+          BRANCH_SHA: ${{ needs.prepare.outputs.branch_sha }}
+        run: |
+          npm run -s review:eval -- dispatch publish \
+            --manifest delegate/review/eval/expected/manifest.json --in ./cand --out ./publish
+          jq -n --arg mode "$MODE" --arg runId "$RUN_ID" --arg branch "$BRANCH" \
+            --arg branchSha "$BRANCH_SHA" --arg mainSha "$GITHUB_SHA" \
+            '{ mode: $mode, runId: $runId, branch: $branch, branchSha: $branchSha, mainSha: $mainSha }' > ./publish/meta.json
+          if [ -f ./publish/gate.json ]; then
+            jq -r '"gate: " + (if .pass then "pass" else "fail" end) + ", regressions: " + (.regressions | join(",")) + ", targets missed: " + (.targetsMissed | join(",")) + ", cost ratio: " + (.costRatio | tostring) + ", holdout passed " + (.holdout.passed | tostring) + " of " + (.holdout.total | tostring) + " with " + (.holdout.regressions | tostring) + " regression(s)"' ./publish/gate.json | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-run-${{ inputs.run_id }}-${{ inputs.mode }}-${{ github.run_attempt }}
+          path: ./publish/
+
+      - name: Fail if the gate failed
+        if: steps.score.outcome == 'failure'
+        run: exit 1

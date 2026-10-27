@@ -16,6 +16,8 @@ import {
   githubActionsDelegateEvalTrust,
   githubActionsDelegateEvalCachePush,
   githubActionsDelegateEvalCachePushTrust,
+  githubActionsDelegateEvalLedger,
+  githubActionsDelegateEvalLedgerTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -227,7 +229,7 @@ export const createCiRoles = () => {
   const delegateEvalRole = new aws.iam.Role("githubActionsDelegateEval", {
     name: "github-actions-delegate-eval",
     description:
-      "PR-comment eval runs for the delegate pr-reviewer. Assumed only by delegate-eval.yml on thegoodparty/ops main.",
+      "Read-only eval runs for the delegate pr-reviewer. Assumed only by delegate-eval.yml and delegate-eval-run.yml on thegoodparty/ops main.",
     assumeRolePolicy: JSON.stringify(githubActionsDelegateEvalTrust),
     maxSessionDuration: 3600,
   });
@@ -252,6 +254,20 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsDelegateEvalCachePush),
   });
 
+  const delegateEvalLedgerRole = new aws.iam.Role("githubActionsDelegateEvalLedger", {
+    name: "github-actions-delegate-eval-ledger",
+    description:
+      "Appends hill-climb spend records under eval-cache/ledger/. Assumed only by delegate-eval-ledger.yml on thegoodparty/ops main; no job that runs candidate code can assume it.",
+    assumeRolePolicy: JSON.stringify(githubActionsDelegateEvalLedgerTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsDelegateEvalLedgerPolicy", {
+    name: "DelegateEvalLedger",
+    role: delegateEvalLedgerRole.id,
+    policy: JSON.stringify(githubActionsDelegateEvalLedger),
+  });
+
   return {
     deployRole,
     deployPolicy,
@@ -262,5 +278,6 @@ export const createCiRoles = () => {
     planRole,
     delegateEvalRole,
     delegateEvalCachePushRole,
+    delegateEvalLedgerRole,
   };
 };
