@@ -67,12 +67,26 @@ describe("derived oauth2-proxy image pin", () => {
   // build reproducible; the module carries the pin the Dockerfile and the
   // workflow must agree with. A partial bump that touched only one of them
   // would otherwise look applied while the image came from somewhere else.
-  it("pins the same upstream reference the Dockerfile builds from", () => {
+  //
+  // There are two `FROM` lines on the upstream image -- the config check and the
+  // runtime stage -- and both have to be the pinned reference: a floating one in
+  // either place is an image built from something other than the reviewed pin.
+  it("pins the same upstream reference on every stage the Dockerfile builds from", () => {
     const dockerfile = fs.readFileSync(DOCKERFILE, "utf8");
+    const upstreamFroms = dockerfile
+      .split("\n")
+      .filter((line) => line.startsWith("FROM ") && line.includes("oauth2-proxy"));
     assert.ok(
-      dockerfile.includes(`FROM ${OAUTH2_PROXY_UPSTREAM_IMAGE}`),
-      "bifrost/Dockerfile's FROM drifted from OAUTH2_PROXY_UPSTREAM_IMAGE in oauth2-proxy-image.ts",
+      upstreamFroms.length >= 2,
+      `expected the config-check and runtime stages to both name the upstream image, found ${upstreamFroms.length}`,
     );
+    for (const line of upstreamFroms) {
+      assert.ok(
+        line === `FROM ${OAUTH2_PROXY_UPSTREAM_IMAGE}` ||
+          line === `FROM ${OAUTH2_PROXY_UPSTREAM_IMAGE} AS alpha-config-check`,
+        `bifrost/Dockerfile's \`${line}\` drifted from OAUTH2_PROXY_UPSTREAM_IMAGE in oauth2-proxy-image.ts`,
+      );
+    }
   });
 
   it("bakes the allowlist to the path the sidecar reads", () => {
@@ -211,9 +225,9 @@ describe("derived oauth2-proxy image pin", () => {
 
   it("bakes the alpha configuration the sidecar's flag names", () => {
     // The alpha file is what carries `injectRequestHeaders`, so it has to be in
-    // the image, at the path `ecs.ts` passes to `--alpha-config`. A COPY that
-    // wrote it somewhere else would leave oauth2-proxy failing to start with a
-    // missing file (fail closed, but a pointless outage).
+    // the image, at the path `ecs.ts` passes to `--alpha-config`. It is copied
+    // from the stage that ran `--config-test` over it, so the file that ships is
+    // the file the pinned release accepted.
     assert.equal(
       OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH,
       "/etc/oauth2-proxy/alpha-config.yaml",
@@ -221,9 +235,54 @@ describe("derived oauth2-proxy image pin", () => {
     const dockerfile = fs.readFileSync(DOCKERFILE, "utf8");
     assert.ok(
       dockerfile.includes(
+        `COPY --from=alpha-config-check ${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH} ${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
+      ),
+      `the derived image must COPY the validated alpha-config.yaml to ${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
+    );
+  });
+
+  // The alpha structure may change between minor releases, and the failure mode
+  // at this tag is at container start rather than at build time. This stage is
+  // what turns a bump that renames a key into a failed image build: a task drain
+  // followed by a sidecar that will not start is the outage it prevents.
+  it("fails the image build when the pinned release rejects the alpha configuration", () => {
+    const dockerfile = fs.readFileSync(DOCKERFILE, "utf8");
+
+    const start = dockerfile.indexOf("AS alpha-config-check");
+    assert.ok(start >= 0, "the Dockerfile has no alpha-config-check stage");
+    const rest = dockerfile.slice(start);
+    const stage = rest.slice(0, rest.indexOf("\nFROM "));
+
+    assert.ok(
+      stage.includes(
         `COPY alpha-config.yaml ${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
       ),
-      `the derived image must COPY alpha-config.yaml to ${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
+      "the check stage must validate the committed alpha-config.yaml",
+    );
+    // `--config-test` is what loads the alpha file through the same loader the
+    // server uses and exits non-zero on an unknown or removed key.
+    assert.ok(
+      stage.includes(
+        `RUN ["/bin/oauth2-proxy", "--alpha-config=${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}", "--config-test"]`,
+      ),
+      "the check stage must run oauth2-proxy --config-test over the baked alpha config",
+    );
+    // It needs the values the alpha file and the core options resolve by name,
+    // and they have to be dummies: nothing real is baked into the image.
+    for (const name of [
+      "OAUTH2_PROXY_CLIENT_ID",
+      "OAUTH2_PROXY_CLIENT_SECRET",
+      "OAUTH2_PROXY_COOKIE_SECRET",
+      "OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE",
+      "OAUTH2_PROXY_REDIRECT_URL",
+      "OAUTH2_PROXY_WHITELIST_DOMAINS",
+      "BIFROST_ADMIN_AUTHORIZATION",
+    ]) {
+      assert.ok(stage.includes(name), `the check stage does not set ${name}`);
+    }
+    assert.ok(
+      stage.includes("build-time-config-check-not-a-real-client-secret"),
+      "the check stage's client secret must be an obvious dummy",
     );
   });
 

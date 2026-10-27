@@ -185,6 +185,12 @@ who passed the Google gate should not then meet Bifrost's own login:
   non-zero when either key is missing, and refuses to start the proxy without
   `--alpha-config`, so a task that cannot inject the credential never serves
   the admin surface. Its own Go tests run during the image build.
+- A second stage runs `oauth2-proxy --config-test` over the baked alpha file
+  with dummy values, and the runtime image copies the file from that stage. The
+  alpha structure may change between minor releases, and at the pinned tag an
+  unknown key is an error at container start — after the running task has been
+  drained. The build failing instead is the cheaper failure, and it is what a
+  future digest bump runs into.
 
 `deploy-workbench/oauth2-proxy-image.ts` is the single source of truth for the
 upstream pin and the ECR repository, and

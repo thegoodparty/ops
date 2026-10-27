@@ -417,8 +417,13 @@ structure may change between minor releases (upstream's own warning, and the
 flag's help text). The pin is what contains that — the digest in
 `deploy-workbench/bifrost/Dockerfile` and `oauth2-proxy-image.ts` — and the
 image tag is content-addressed over the allowlist, the Dockerfile, the alpha
-file and the wrapper, so no input can change under a fixed tag. If a bump does
-change the alpha schema, the rollback is to drop `OAUTH2_PROXY_COMMAND` (the
+file and the wrapper, so no input can change under a fixed tag. The image build
+also runs `oauth2-proxy --config-test` over the baked alpha file in a stage of
+its own, with dummy values, so a bump that renames or removes a key fails the
+build rather than the deploy: at this tag an unknown alpha key is an error at
+container start (`ErrorUnused` in `pkg/apis/options/load.go`), which would
+drain the running task and then refuse to start the new one. If something does
+get through, the rollback is to drop `OAUTH2_PROXY_COMMAND` (the
 `--alpha-config` flag) and revert the image pin to the previous content tag:
 the sidecar comes back up on its environment-variable configuration with no
 injection, and the shared admin password prompt returns. That is a working
