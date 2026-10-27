@@ -15,6 +15,7 @@ import {
 import { BIFROST_HOSTNAME } from "./ingress";
 import type { BifrostIngress } from "./ingress";
 import {
+  OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH,
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_TAG,
 } from "./oauth2-proxy-image";
@@ -36,9 +37,11 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   task-execution policy plus read on the task's secrets) and the separate
  *   task role (the Bedrock model list and nothing else).
  * - Owns since item 9: the oauth2-proxy sidecar, its three `OAUTH2_PROXY_*`
- *   secret references, and the service's two `loadBalancers` entries. The
- *   rules that make those target groups attachable are `ingress.ts`'s; this
- *   file takes the ingress object and depends on its listener rules, because
+ *   secret references plus the two `bifrost/gateway` keys the header injection
+ *   is computed from, the `--alpha-config` flag that turns that injection on,
+ *   and the service's two `loadBalancers` entries. The rules that make those
+ *   target groups attachable are `ingress.ts`'s; this file takes the ingress
+ *   object and depends on its listener rules, because
  *   ECS's `CreateService` rejects a target group that no listener or listener
  *   rule references (`InvalidParameterException: The target group with
  *   targetGroupArn ... does not have an associated load balancer`). That was
@@ -48,10 +51,11 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   groups or the database. Those are items 5, 6 and 7, and this file consumes
  *   their exports rather than declaring a second copy of any of them. In
  *   particular there is no target group, listener or security group here.
- * - Does not own: the derived oauth2-proxy image or the allowlist baked into
- *   it. `oauth2-proxy-image.ts` pins the image and
- *   `bifrost/allowed-emails.txt` is the list; this file only names the tag and
- *   the container path the image writes the list to.
+ * - Does not own: the derived oauth2-proxy image, the allowlist baked into it
+ *   or the alpha configuration that injects Bifrost's admin credential.
+ *   `oauth2-proxy-image.ts` pins the image, `bifrost/allowed-emails.txt` is the
+ *   list and `bifrost/alpha-config.yaml` is the injection; this file only names
+ *   the tag, the container paths and the `--alpha-config` flag that loads it.
  * - Does not own: `config.json` itself. That file is item 10's, in
  *   `bifrost/config.json`, and is the deployment's declarative configuration;
  *   this module only stores it and gets it into the container.
@@ -250,6 +254,44 @@ export const OAUTH2_PROXY_SECRET_KEYS = [
   "OAUTH2_PROXY_CLIENT_ID",
   "OAUTH2_PROXY_CLIENT_SECRET",
   "OAUTH2_PROXY_COOKIE_SECRET",
+] as const;
+
+/**
+ * The two `bifrost/gateway` keys the sidecar reads, and the reason it reads
+ * them: the entrypoint wrapper in the derived image turns them into the
+ * `Authorization` header the baked alpha configuration injects upstream
+ * (`deploy-workbench/bifrost/entrypoint.go`), so a human who passed the Google
+ * gate does not meet Bifrost's own login as a second prompt.
+ *
+ * They are the same two keys the gateway container and the claim container
+ * already get, read from the same secret, so this adds a consumer and no new
+ * secret. The values are not copied: the header is computed at container start
+ * from whatever the secret holds at that moment, which is what keeps it from
+ * drifting from the password Bifrost was provisioned with.
+ *
+ * DIFFERS from the previous shape, which deliberately gave the sidecar nothing
+ * from `bifrost/gateway`. That separation is gone by construction: the sidecar
+ * is the component that now holds the admin Basic credential. It still gets no
+ * provider key, no encryption key, no setup token and nothing from the database.
+ */
+export const OAUTH2_PROXY_INJECTED_SECRET_KEYS = [
+  "BIFROST_ADMIN_USERNAME",
+  "BIFROST_ADMIN_PASSWORD",
+] as const;
+
+/**
+ * The sidecar's command: the one flag that makes its baked alpha configuration
+ * load.
+ *
+ * It is here rather than in the image's `CMD` so the flag is part of the task
+ * definition, where `ecs.test.ts` can pin it against the path the Dockerfile
+ * writes. The alpha configuration is not optional: without it oauth2-proxy
+ * ignores `injectRequestHeaders`, and the admin surface quietly reverts to the
+ * shared password prompt. The image's entrypoint wrapper refuses to start the
+ * proxy when this flag is absent, which is the fail-closed half of it.
+ */
+export const OAUTH2_PROXY_COMMAND = [
+  `--alpha-config=${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
 ] as const;
 
 /**
@@ -472,23 +514,34 @@ export const BIFROST_CONTAINER_COMMAND = [
 ] as const;
 
 /**
- * The sidecar's non-secret configuration, as a table rather than a list of
- * literals in the container definition so the test can pin every value.
+ * The sidecar's non-secret configuration that is *not* in the alpha
+ * configuration file, as a table rather than a list of literals in the
+ * container definition so the test can pin every value.
  *
  * The settings follow `agent-swarm/host/docker-compose.yml`'s `oauth2-proxy`
- * service, which is the working precedent in this repo, with the two
- * differences the plan names:
+ * service, which is the working precedent in this repo, with these differences:
  *
- * - `OAUTH2_PROXY_UPSTREAMS` is Bifrost in the same task, not `static://202`:
- *   the swarm's Caddy forwards and oauth2-proxy only gates, while here the
- *   proxy is the reverse proxy for the admin surface. The two containers share
- *   the task network namespace, so `127.0.0.1` is Bifrost with no hop back
- *   through the ALB. The port comes from `network.ts`, the same constant the
- *   Bifrost container publishes and the security group admits.
+ * - The sidecar runs with `--alpha-config` (`OAUTH2_PROXY_COMMAND`), because
+ *   injecting Bifrost's admin credential is only expressible there. That moves
+ *   three settings out of this table and into
+ *   `bifrost/alpha-config.yaml`: the provider (`OAUTH2_PROXY_PROVIDER`), the
+ *   upstream (`OAUTH2_PROXY_UPSTREAMS`, Bifrost in the same task rather than
+ *   the swarm's `static://202`, since here the proxy is the reverse proxy) and
+ *   the listen address (`OAUTH2_PROXY_HTTP_ADDRESS`). At v7.15.5 those flags
+ *   are *removed* when alpha configuration is used — an edit that leaves them
+ *   here would be silently ignored, not rejected — so they are gone from this
+ *   table on purpose rather than by omission.
+ * - `OAUTH2_PROXY_SET_XAUTHREQUEST` and `OAUTH2_PROXY_PASS_USER_HEADERS` are
+ *   gone for the same reason: both are removed options under alpha
+ *   configuration, and their replacements are `injectResponseHeaders` and
+ *   `injectRequestHeaders` entries, which this deployment does not need. Bifrost
+ *   does not read `X-Forwarded-User` or `X-Auth-Request-User`; the only header
+ *   it needs is the `Authorization` one the alpha configuration injects.
  * - `OAUTH2_PROXY_REDIRECT_URL` and `OAUTH2_PROXY_WHITELIST_DOMAINS` are this
  *   gateway's hostname, derived from `ingress.ts` rather than spelled again,
  *   so a hostname change cannot leave the Google callback pointing at the old
- *   name.
+ *   name. They stay here: both survived into the core option set and still
+ *   load from `OAUTH2_PROXY_*` with alpha configuration.
  *
  * The allowlist path is the constant the derived image's `Dockerfile` writes
  * to (`oauth2-proxy-image.ts`), not a literal here: a mismatch is a proxy that
@@ -499,19 +552,14 @@ export const BIFROST_CONTAINER_COMMAND = [
  * swarm's compose file uses, not a boolean ECS would reject.
  */
 export const OAUTH2_PROXY_ENVIRONMENT: Readonly<Record<string, string>> = {
-  OAUTH2_PROXY_PROVIDER: "google",
   OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE:
     OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_REDIRECT_URL: `https://${BIFROST_HOSTNAME}/oauth2/callback`,
-  OAUTH2_PROXY_HTTP_ADDRESS: `0.0.0.0:${OAUTH2_PROXY_PORT}`,
   OAUTH2_PROXY_REVERSE_PROXY: "true",
-  OAUTH2_PROXY_UPSTREAMS: `http://127.0.0.1:${BIFROST_PORT}`,
   OAUTH2_PROXY_COOKIE_SECURE: "true",
   OAUTH2_PROXY_COOKIE_SAMESITE: "lax",
   OAUTH2_PROXY_COOKIE_EXPIRE: "168h",
   OAUTH2_PROXY_COOKIE_REFRESH: "1h",
-  OAUTH2_PROXY_SET_XAUTHREQUEST: "true",
-  OAUTH2_PROXY_PASS_USER_HEADERS: "true",
   OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true",
   OAUTH2_PROXY_WHITELIST_DOMAINS: BIFROST_HOSTNAME,
 };
@@ -884,12 +932,13 @@ export const createBifrostEcs = (args: {
    *   `BIFROST_CONFIG` from the SSM parameter; see the module header for why
    *   nothing here reads Secrets Manager. Bifrost gets `bifrost/gateway`'s five,
    *   `PG_PASSWORD` and `BIFROST_CONFIG`; the sidecar gets
-   *   `bifrost/oauth2-proxy`'s three and nothing else, so neither container
-   *   sees the other's credentials. The ECS agent resolves every entry before
-   *   the container starts, so a key listed here and absent from the secret is
-   *   a task that never starts: `fill-secrets.sh` has to write
-   *   `BIFROST_SETUP_TOKEN` before a task definition naming it deploys, exactly
-   *   as it already has to write the sidecar's three.
+   *   `bifrost/oauth2-proxy`'s three plus `bifrost/gateway`'s admin username and
+   *   password, which its entrypoint turns into the injected Basic header. It
+   *   gets no provider key, no encryption key and no setup token. The ECS agent
+   *   resolves every entry before the container starts, so a key listed here and
+   *   absent from the secret is a task that never starts: `fill-secrets.sh` has
+   *   to write `BIFROST_SETUP_TOKEN` before a task definition naming it deploys,
+   *   exactly as it already has to write the sidecar's three and the admin pair.
    * - The environment carries `AWS_REGION`, because the Bedrock provider needs
    *   a region (the delegate sets `AWS_DEFAULT_REGION` for the same reason),
    *   and the four non-secret Postgres values `config.json` resolves by name.
@@ -1013,6 +1062,12 @@ export const createBifrostEcs = (args: {
           // not depend on this flag: the ALB has no rule that sends an admin
           // path to Bifrost at all.
           essential: true,
+          // The image's entrypoint is the wrapper (`bifrost/entrypoint.go`),
+          // which is why there is no `entryPoint` override here: the wrapper
+          // computes the Basic credential from the two secrets below and then
+          // execs oauth2-proxy. This argument is the alpha configuration that
+          // carries the header injection.
+          command: [...OAUTH2_PROXY_COMMAND],
           portMappings: [
             {
               containerPort: OAUTH2_PROXY_PORT,
@@ -1023,10 +1078,20 @@ export const createBifrostEcs = (args: {
           environment: Object.entries(OAUTH2_PROXY_ENVIRONMENT).map(
             ([name, value]) => ({ name, value }),
           ),
-          secrets: OAUTH2_PROXY_SECRET_KEYS.map((key) => ({
-            name: key,
-            valueFrom: secretReference(OAUTH2_PROXY_SECRET_NAME, key),
-          })),
+          secrets: [
+            ...OAUTH2_PROXY_SECRET_KEYS.map((key) => ({
+              name: key,
+              valueFrom: secretReference(OAUTH2_PROXY_SECRET_NAME, key),
+            })),
+            // The admin pair the entrypoint wrapper encodes into the header
+            // oauth2-proxy injects upstream. Read from `bifrost/gateway`, the
+            // same keys the gateway container gets, so what the sidecar
+            // forwards cannot drift from what Bifrost was provisioned with.
+            ...OAUTH2_PROXY_INJECTED_SECRET_KEYS.map((key) => ({
+              name: key,
+              valueFrom: secretReference(GATEWAY_SECRET_NAME, key),
+            })),
+          ],
           logConfiguration: {
             logDriver: "awslogs",
             options: {

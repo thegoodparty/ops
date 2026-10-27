@@ -20,8 +20,18 @@ files that belong in review:
   revoking access is a PR to this file. The list is deliberately **separate**
   from the Identity Center `Admins` group, which `sheriff` mutates at runtime,
   so the two are expected to drift. The owner is **jagoda for now**.
-- `Dockerfile` — a one-line derivative of the stock oauth2-proxy image that
-  bakes the allowlist in.
+- `Dockerfile` — the derivative of the stock oauth2-proxy image: it bakes the
+  allowlist in, bakes the alpha configuration in, and builds the static
+  entrypoint wrapper in a stage of its own.
+- `alpha-config.yaml` — oauth2-proxy's alpha configuration, loaded with
+  `--alpha-config`: the Google provider, the upstream, the listen address and
+  the `injectRequestHeaders` entry that adds Bifrost's admin Basic credential
+  to every proxied request. See "The image" below.
+- `entrypoint.go`, `entrypoint_test.go`, `go.mod` — the wrapper that computes
+  that credential at container start from `BIFROST_ADMIN_USERNAME` and
+  `BIFROST_ADMIN_PASSWORD`, and the tests that pin its fail-closed behaviour.
+  Go rather than a shell script because the runtime image has no shell; the
+  tests run during the image build.
 - `bootstrap.sh` and `bootstrap.Dockerfile` — the one-shot claim container
   (phase 2 item 11): the script that creates the first admin account from
   inside the task, and the derivative of the pinned Bifrost image that gives it
@@ -31,9 +41,12 @@ files that belong in review:
 The ECS task definition, the sidecar container and the ALB routing rules are
 the other half of phase 1 item 9 and live in `deploy-workbench/ecs.ts` and
 `deploy-workbench/ingress.ts`: the task runs this image on 4180 with the three
-`OAUTH2_PROXY_*` secrets and the settings from the plan's "Protecting the admin
-surface", and the HTTPS listener sends `/oauth2/*` and the admin paths to it.
-Those secrets are written to Secrets Manager out of band (phase 2 item 11) with
+`OAUTH2_PROXY_*` secrets, the two `bifrost/gateway` keys the injected header is
+computed from, and the `--alpha-config` flag that carries the injection, while
+the settings alpha configuration did not absorb stay as `OAUTH2_PROXY_*`
+environment variables. The HTTPS listener sends `/oauth2/*` and the admin paths
+to the sidecar; inference and `/metrics` still go straight to Bifrost. Those
+secrets are written to Secrets Manager out of band (phase 2 item 11) with
 `fill-secrets.sh`, never committed; see "Secrets" below.
 
 ## `config.json` (phase 2 item 10)
@@ -151,15 +164,38 @@ The stock oauth2-proxy image has no inline email-list flag — the only form is
 allowlist reaches the container as a file in a derived image. The `FROM` pins
 the same digest `agent-swarm/host/docker-compose.yml` uses.
 
+The image does two more things, both of them for the same reason — that a human
+who passed the Google gate should not then meet Bifrost's own login:
+
+- `alpha-config.yaml` is oauth2-proxy's alpha configuration, baked at
+  `/etc/oauth2-proxy/alpha-config.yaml` and loaded with `--alpha-config` (the
+  flag lives in `deploy-workbench/ecs.ts`, `OAUTH2_PROXY_COMMAND`). It carries
+  the Google provider, the upstream and the listen address — all of which are
+  *removed* options when alpha configuration is used — and, in
+  `injectRequestHeaders`, the `Authorization` header that satisfies Bifrost's
+  admin login. The value comes from `secretSource.fromEnv:
+  BIFROST_ADMIN_AUTHORIZATION`, and `PreserveRequestValue` stays at its default
+  false, so a client's own `Authorization` header is stripped before ours is
+  set.
+- `entrypoint.go` is the wrapper that computes that value. The runtime image is
+  `gcr.io/distroless/static:nonroot`, which has no shell and no coreutils, so
+  the wrapper is a small static Go binary built in a stage of its own; it
+  encodes `base64(admin_username:admin_password)` from the two keys the task
+  injects from `bifrost/gateway`, exports it, and execs oauth2-proxy. It exits
+  non-zero when either key is missing, and refuses to start the proxy without
+  `--alpha-config`, so a task that cannot inject the credential never serves
+  the admin surface. Its own Go tests run during the image build.
+
 `deploy-workbench/oauth2-proxy-image.ts` is the single source of truth for the
 upstream pin and the ECR repository, and
 `deploy-workbench/oauth2-proxy-image.test.ts` fails if the Dockerfile, the
 workflow and the module drift. CI builds and pushes the image to the
 `bifrost-oauth2-proxy` repository in the workbench account on every workbench
-change, tagged `v7.15.5-<first 12 hex of the allowlist sha256>` so the tag
-changes when and only when the list does. Pulumi will reference it by digest
-(phase 1). The repository is immutable, so a re-push of an existing tag is
-skipped rather than rejected.
+change, tagged `v7.15.5-<first 12 hex of the sha256 over the image's committed
+inputs>` — the allowlist, the Dockerfile, `alpha-config.yaml`, the wrapper and
+its test, and its `go.mod` — so the tag changes when and only when the image's
+content does. Pulumi will reference it by digest (phase 1). The repository is
+immutable, so a re-push of an existing tag is skipped rather than rejected.
 
 Build it locally (no push, no ECR credentials needed):
 
@@ -185,11 +221,32 @@ them as `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET` and
 `OAUTH2_PROXY_COOKIE_SECRET`; it carries all three or none, and the deploy fails
 closed if the admin surface is enabled without them.
 
-The rest of the sidecar's configuration — `OAUTH2_PROXY_UPSTREAMS:
-http://127.0.0.1:8080`, the cookie settings, the whitelist domain and the
-redirect URL — follows `agent-swarm/host/docker-compose.yml` and is recorded in
-"Protecting the admin surface" in the plan. The OSS admin username/password
-stays as the second layer inside oauth2-proxy.
+The rest of the sidecar's configuration follows
+`agent-swarm/host/docker-compose.yml` and is recorded in "Protecting the admin
+surface" in the plan. The settings alpha configuration removed — the provider,
+the upstream and the listen address — are in `alpha-config.yaml`; the cookie
+settings, the whitelist domain, the redirect URL, the allowlist path and
+`reverse-proxy` survive into the core option set and are still environment
+variables in `deploy-workbench/ecs.ts`.
+
+**The OSS admin credential is injected, not typed.** Bifrost's dashboard auth
+stays on and `/metrics` stays on Bifrost's own basic auth; what changed is that
+nobody meets that login. The wrapper described under "The image" computes the
+credential at container start from the same `bifrost/gateway` values the
+gateway itself uses, so there is no second copy to rotate and nothing that can
+drift from the password Bifrost was provisioned with. Two consequences worth
+knowing:
+
+- The sidecar now reads `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`
+  from `bifrost/gateway`, which it deliberately did not before. It still gets
+  no provider key, no encryption key, no setup token and nothing from the
+  database.
+- The injection is alpha configuration, which upstream may reshape between
+  minor releases. The image digest and the content-addressed tag are the
+  containment; the rollback is to drop the `--alpha-config` flag and revert the
+  image pin, which brings the sidecar back with no injection and the shared
+  admin password prompt back with it. That is a working state rather than an
+  outage — Google SSO and the allowlist still gate the surface.
 
 ## Secrets (phase 2 item 11)
 
@@ -366,13 +423,19 @@ the management API signs in as the admin account — `BIFROST_ADMIN_USERNAME` /
 `BIFROST_ADMIN_PASSWORD` via `POST /api/session/login` — or uses a scoped key
 for inference; the setup token is not a substitute for those two keys.
 
-**One login after the Google gate.** OSS dashboard auth accepts HTTP Basic, a
-Bearer session token or the session cookie, and has no trusted-header mode, so
-a human who passes oauth2-proxy's Google gate still meets Bifrost's own login
-with the admin credential above. Enterprise SSO removes that second login;
-Bifrost's plugin interface also has an authentication hook that could accept
-oauth2-proxy's identity header instead, which is available but neither built
-nor planned here.
+**One login, and it is Google.** The only prompt a human meets is Google SSO
+plus the committed allowlist; oauth2-proxy then injects Bifrost's admin
+credential upstream, so the OSS login is answered by the proxy rather than by a
+person. What that does **not** buy is per-person identity: every allowlisted
+address acts as the same Bifrost admin, and Bifrost's own records cannot tell
+them apart. Enterprise SSO is what separates them. A plugin cannot stand in for
+it at this tag, which an earlier version of this section claimed it could: the
+plugin interfaces at `v2.3.0` are LLM, MCP, A2A, HTTP-transport and
+observability (`core/schemas/plugin.go` in the Bifrost source), with no hook on
+the dashboard or management auth path, and the shared-object loader uses Go's
+`plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
+pinned image's statically linked `/app/main`. The plugin route is therefore not
+available here, not merely unbuilt.
 
 `governance.auth_config` in the injected file provisions the same admin
 account at boot, which makes the claim container a no-op from the first start
