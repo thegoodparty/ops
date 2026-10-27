@@ -8,6 +8,7 @@ import {
 import { z } from "zod";
 import { ReviewRecordSchema, isLockKey } from "../schema";
 import type { ReviewRecord } from "../schema";
+import { KindSchema, SourceSchema, SplitSchema } from "./expect";
 
 const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 
@@ -123,6 +124,9 @@ export const ScenarioSchema = z.object({
   suite: z.string().regex(/^[a-z0-9-]+$/),
   key: z.string().startsWith("reviews/").endsWith(".json"),
   tests: z.string().min(1),
+  split: SplitSchema,
+  source: SourceSchema,
+  kind: KindSchema,
 });
 export type Scenario = z.infer<typeof ScenarioSchema>;
 
@@ -141,12 +145,17 @@ export const scenarioNames = (scenarios: Scenario[]): Map<string, string> =>
 // shrinks is the moving-corpus problem this replaces.
 export const loadScenarios = async (
   scenarios: Scenario[],
-  opts: { suite?: string } = {},
+  opts: { suite?: string; split?: string } = {},
   client: S3Client = new S3Client({}),
 ): Promise<{ scenario: Scenario; record: ReviewRecord }[]> => {
-  const selected = opts.suite ? scenarios.filter((s) => s.suite === opts.suite) : scenarios;
+  const split = opts.split === undefined ? undefined : SplitSchema.parse(opts.split);
+  const selected = scenarios.filter(
+    (s) => (!opts.suite || s.suite === opts.suite) && (!split || s.split === split),
+  );
   if (selected.length === 0) {
-    throw new Error(`no scenarios${opts.suite ? ` in suite "${opts.suite}"` : ""}`);
+    throw new Error(
+      `no scenarios${opts.suite ? ` in suite "${opts.suite}"` : ""}${split ? ` in split "${split}"` : ""}`,
+    );
   }
   const loaded: { scenario: Scenario; record: ReviewRecord }[] = [];
   for (const scenario of selected) {

@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
+import { SplitSchema } from "./expect";
 import { replayAll, resultFromRecord } from "./replay";
 import type { Result } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
@@ -41,10 +42,10 @@ const usage = () => {
   console.error(
     [
       "Usage:",
-      "  review:eval cases scenarios --manifest <scenarios.json> --out <dir> [--suite <name>]",
+      "  review:eval cases scenarios --manifest <scenarios.json> --out <dir> [--suite <name>] [--split tune|holdout]",
       "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>] [--only-complete]",
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
-      "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--force]",
+      "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--force] [--split tune|holdout --manifest <scenarios.json>]",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
   );
@@ -60,7 +61,7 @@ const main = async () => {
     const manifest = flag(flags, "manifest");
     const out = flag(flags, "out");
     if (!manifest || !out) { console.error("--manifest and --out are required"); process.exit(1); }
-    const loaded = await loadScenarios(readManifest(manifest), { suite: flag(flags, "suite") });
+    const loaded = await loadScenarios(readManifest(manifest), { suite: flag(flags, "suite"), split: flag(flags, "split") });
     saveCases(loaded.map((l) => l.record), out);
     for (const { scenario, record } of loaded) {
       console.error(`  ${scenario.id} (${scenario.suite}) ${record.repo}#${record.prNumber} ${record.runId}`);
@@ -123,7 +124,15 @@ const main = async () => {
     const workDir = flag(flags, "work-dir") ?? "/tmp/review-eval";
     const force = boolFlag(flags, "force");
 
-    const records = await loadCases({ from: casesFrom });
+    let records = await loadCases({ from: casesFrom });
+    const splitFlag = flag(flags, "split");
+    if (splitFlag) {
+      const split = SplitSchema.parse(splitFlag);
+      const manifest = flag(flags, "manifest");
+      if (!manifest) { console.error("--split needs --manifest <scenarios.json>"); process.exit(1); }
+      const inSplit = scenarioNames(readManifest(manifest).filter((s) => s.split === split));
+      records = records.filter((r) => inSplit.has(r.runId));
+    }
     console.error(`Replaying ${records.length} case(s) with concurrency ${concurrency}...`);
     const results = await replayAll(records, { out, variant, workDir, force }, { concurrency });
     const errors = results.filter((r) => r.error);

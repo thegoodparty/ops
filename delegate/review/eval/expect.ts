@@ -42,6 +42,13 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
 ]);
 export type Expect = z.infer<typeof ExpectSchema>;
 
+// `split` keeps tuning honest: a holdout case is never shown to whoever tunes
+// the prompt. `source` is where the label came from; `kind` is the failure the
+// case tests. All three are required so a new case cannot skip labeling.
+export const SplitSchema = z.enum(["tune", "holdout"]);
+export const SourceSchema = z.enum(["simulated", "production-caught", "production-missed", "refuted"]);
+export const KindSchema = z.enum(["bug", "false-finding", "scale", "architecture"]);
+
 // A case is either a recorded production run (key, in S3) or a simulated PR
 // (bundle, a file next to the manifest) whose head commit is rebuilt locally
 // by applying its diff to the base.
@@ -52,6 +59,9 @@ const ExpectedCaseSchema = z
     bundle: z.string().endsWith(".json").optional(),
     expect: ExpectSchema,
     tests: z.string().min(1),
+    split: SplitSchema,
+    source: SourceSchema,
+    kind: KindSchema,
   })
   .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
@@ -62,6 +72,14 @@ export const ManifestSchema = z
 
 export const readManifest = (path: string): ExpectedCase[] =>
   ManifestSchema.parse(JSON.parse(readFileSync(path, "utf-8")));
+
+export const selectCases = (
+  all: ExpectedCase[],
+  filter: { case?: string; split?: string },
+): ExpectedCase[] => {
+  const split = filter.split === undefined ? undefined : SplitSchema.parse(filter.split);
+  return all.filter((c) => (!filter.case || c.id === filter.case) && (!split || c.split === split));
+};
 
 export const readBundleFile = (manifestPath: string, file: string): Bundle =>
   BundleSchema.parse(JSON.parse(readFileSync(join(dirname(manifestPath), file), "utf-8")));
@@ -273,8 +291,10 @@ const main = async () => {
   const variant = flags.variant;
 
   const all = readManifest(manifestPath);
-  const cases = flags.case ? all.filter((c) => c.id === flags.case) : all;
-  if (cases.length === 0) throw new Error(`no case named ${flags.case}`);
+  const cases = selectCases(all, { case: flags.case, split: flags.split });
+  if (cases.length === 0) {
+    throw new Error(`no case matches${flags.case ? ` --case ${flags.case}` : ""}${flags.split ? ` --split ${flags.split}` : ""}`);
+  }
 
   if (mode === "replay" || mode === "all") {
     const client = new S3Client({});
