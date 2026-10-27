@@ -58,12 +58,12 @@ Each replay is a full agent run — budget roughly $1–5 per case depending on 
 
 ### Cache main's results
 
-`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<agentsTree>/<suite>/<caseId>/run-<n>.json`, where `<agentsTree>` is `git rev-parse HEAD:delegate/agents` on main. It changes only when reviewer code does, so unrelated merges keep the cache warm, and any change under `delegate/agents/` starts a fresh full replay. The key does not cover `delegate/framework/`, `delegate/review/run.ts` or the SDK version, which the replay also runs: after changing those, comment `delegate eval` once from a PR that touches `delegate/agents/`, or bump the cache by editing an agent file, to get a fresh baseline. A pairwise result is stored as `run-1`.
+`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<replayKey>/<suite>/<caseId>/run-<n>.json`, where `<replayKey>` is `cache key`: a hash of the git tree ids of `delegate/agents`, `delegate/framework`, `delegate/review` and `package-lock.json` on main, which is everything main's replay executes. Unrelated merges keep the cache warm; a change to any of those starts a fresh full replay (an eval-code edit under `delegate/review` costs a replay, never a stale baseline). A pairwise result is stored as `run-1`.
 
 ```sh
-npm run review:eval -- cache pull --suite core --tree <agentsTree> --out ./results-main
+npm run review:eval -- cache pull --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 # replay as usual into the same directory: cases with a result file are skipped
-npm run review:eval -- cache push --suite core --tree <agentsTree> --out ./results-main
+npm run review:eval -- cache push --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 ```
 
 Use `--layout runs` for the expected suite's `<case>/run-<n>.json` directories. Push uploads only results that pull did not bring down, skips any that errored (an errored replay is retried next eval), and never overwrites a key. The eval role can write `eval-cache/*` and nothing else in the bucket. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 case(s); N already had results`.
@@ -116,7 +116,7 @@ Nine cases with a known right answer, listed in `expected/manifest.json`. Each i
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time. The job also replays main's agent on the same cases, from the cache when main's `delegate/agents/` is unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` (`cases[].main.runsPassed` of `cases[].main.runs`) for the merge gate to read. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` (`cases[].main.runsPassed` of `cases[].main.runs`) for the merge gate to read. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
 
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]

@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
-import { pullCache, pushCache } from "./cache";
+import { pullCache, pushCache, replayKey } from "./cache";
 import type { CacheLayout } from "./cache";
 import { replayAll, resultFromRecord } from "./replay";
 import type { Result } from "./replay";
@@ -47,7 +47,7 @@ const usage = () => {
       "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>] [--only-complete]",
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
       "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--force]",
-      "  review:eval cache pull|push --suite <name> --tree <agents-tree-sha> --out <dir> [--layout flat|runs]",
+      "  review:eval cache key | cache pull|push --suite <name> --key <replay-key> --out <dir> [--layout flat|runs]",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
   );
@@ -118,22 +118,26 @@ const main = async () => {
 
   if (command === "cache") {
     const subcommand = argv[1];
+    if (subcommand === "key") {
+      console.log(replayKey(process.cwd()));
+      return;
+    }
     if (subcommand !== "pull" && subcommand !== "push") usage();
     const flags = parseFlags(argv.slice(2));
     const suite = flag(flags, "suite");
-    const tree = flag(flags, "tree");
+    const key = flag(flags, "key");
     const dir = flag(flags, "out");
     const layout = flag(flags, "layout") ?? "flat";
-    if (!suite || !tree || !dir) { console.error("--suite, --tree and --out are required"); process.exit(1); }
+    if (!suite || !key || !dir) { console.error("--suite, --key and --out are required"); process.exit(1); }
     if (layout !== "flat" && layout !== "runs") { console.error("--layout must be flat or runs"); process.exit(1); }
-    const opts = { suite, tree, dir, layout: layout as CacheLayout };
+    const opts = { suite, key, dir, layout: layout as CacheLayout };
     if (subcommand === "pull") {
       const pulled = await pullCache(opts);
-      console.error(`Pulled ${pulled.length} cached result(s) for ${suite} at agents tree ${tree}`);
+      console.error(`Pulled ${pulled.length} cached result(s) for ${suite} at replay key ${key}`);
     } else {
       const s = await pushCache(opts);
       console.error(
-        `Pushed ${s.pushed.length} result(s) for ${suite} at agents tree ${tree} ` +
+        `Pushed ${s.pushed.length} result(s) for ${suite} at replay key ${key} ` +
           `(skipped ${s.skippedPulled.length} pulled, ${s.skippedErrored.length} errored, ${s.skippedExisting.length} already cached)`,
       );
     }

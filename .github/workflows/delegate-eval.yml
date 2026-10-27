@@ -123,21 +123,21 @@ jobs:
             --out ./eval/cases \
             --suite "$SUITE"
 
-      # Main's results are cached in S3 per git tree of main's delegate/agents/,
-      # so they are replayed only when reviewer code changed (or a scenario is
-      # new). Pulled results land in results-main, and replay skips any case
-      # that already has a result file there.
+      # Main's results are cached in S3 by a replay key (a hash of main's
+      # agents, framework, review code and lockfile), so they are replayed only
+      # when those changed or a scenario is new. Pulled results land in
+      # results-main, and replay skips any case that already has a result file.
       - name: Pull main's eval cache
         id: cache
         env:
           REVIEW_BUCKET: delegate-reviews
           SUITE: ${{ steps.parse.outputs.suite }}
         run: |
-          agents_tree=$(git rev-parse HEAD:delegate/agents)
-          echo "agents_tree=${agents_tree}" >> "$GITHUB_OUTPUT"
+          replay_key=$(npm run -s review:eval -- cache key)
+          echo "replay_key=${replay_key}" >> "$GITHUB_OUTPUT"
           npm run -s review:eval -- cache pull \
             --suite "$SUITE" \
-            --tree "$agents_tree" \
+            --key "$replay_key" \
             --out ./eval/results-main
 
       # Both sides are replayed on the same scenarios: what production posted
@@ -151,7 +151,7 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SUITE: ${{ steps.parse.outputs.suite }}
-          AGENTS_TREE: ${{ steps.cache.outputs.agents_tree }}
+          REPLAY_KEY: ${{ steps.cache.outputs.replay_key }}
         run: |
           # gh clones with the app token, but the follow-up git fetch of the
           # recorded sha needs it too, or private repos fail to check out.
@@ -179,7 +179,7 @@ jobs:
           # rest are good and the failed cases are retried next eval.
           npm run -s review:eval -- cache push \
             --suite "$SUITE" \
-            --tree "$AGENTS_TREE" \
+            --key "$REPLAY_KEY" \
             --out ./eval/results-main
           if [ $main_status -ne 0 ] || [ $pr_status -ne 0 ]; then exit 1; fi
 
@@ -305,7 +305,7 @@ jobs:
           owner: thegoodparty
 
       # Main's answers to the same cases are the baseline each case is read
-      # against. They are cached per git tree of main's delegate/agents/, and
+      # against. They are cached by the same replay key, and
       # also keyed on the tree of the expected/ directory, so a changed case
       # definition never reuses an answer to the old one.
       - name: Pull main's expected-result cache
@@ -313,14 +313,14 @@ jobs:
         env:
           REVIEW_BUCKET: delegate-reviews
         run: |
-          agents_tree=$(git rev-parse HEAD:delegate/agents)
+          replay_key=$(npm run -s review:eval -- cache key)
           cases_tree=$(git rev-parse HEAD:delegate/review/eval/expected)
-          echo "agents_tree=${agents_tree}" >> "$GITHUB_OUTPUT"
+          echo "replay_key=${replay_key}" >> "$GITHUB_OUTPUT"
           echo "suite=expected-${cases_tree:0:12}" >> "$GITHUB_OUTPUT"
           echo "main_sha7=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
           npm run -s review:eval -- cache pull \
             --suite "expected-${cases_tree:0:12}" \
-            --tree "$agents_tree" \
+            --key "$replay_key" \
             --layout runs \
             --out ./eval-expected-main
 
@@ -332,7 +332,7 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           SUITE: ${{ steps.cache.outputs.suite }}
-          AGENTS_TREE: ${{ steps.cache.outputs.agents_tree }}
+          REPLAY_KEY: ${{ steps.cache.outputs.replay_key }}
         run: |
           gh auth setup-git
           npm run -s review:expect -- \
@@ -359,7 +359,7 @@ jobs:
           # rest are good and the failed runs are retried next eval.
           npm run -s review:eval -- cache push \
             --suite "$SUITE" \
-            --tree "$AGENTS_TREE" \
+            --key "$REPLAY_KEY" \
             --layout runs \
             --out ./eval-expected-main
           if [ $main_status -ne 0 ] || [ $pr_status -ne 0 ]; then exit 1; fi

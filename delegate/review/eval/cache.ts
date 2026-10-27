@@ -1,11 +1,12 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import type { Result } from "./replay";
 
-// Main's replay results, keyed by the git tree sha of main's delegate/agents/.
-// The tree changes only when reviewer code does, so unrelated merges keep the
-// cache warm. The bucket is the review bucket; the eval role may write only
+// Main's replay results, keyed by a hash of everything main's replay executes
+// that can change its output. Unrelated merges leave it alone, so the cache
+// stays warm. The bucket is the review bucket; the eval role may write only
 // under this prefix.
 const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 const CACHE_ROOT = "eval-cache/main";
@@ -19,8 +20,20 @@ export const PULLED_MARKER = ".cache-pulled";
 // are <suite>/<caseId>/run-<n>.json, with the single pairwise result as run-1.
 export type CacheLayout = "flat" | "runs";
 
-export const cachePrefix = (tree: string, suite: string): string =>
-  `${CACHE_ROOT}/${tree}/${suite}/`;
+// The agent, the framework and review code it runs through, and the pinned
+// SDK. The whole review tree is hashed, so an eval-code edit costs a replay
+// but a stale baseline is never served.
+const REPLAY_INPUTS = ["delegate/agents", "delegate/framework", "delegate/review", "package-lock.json"];
+
+export const replayKey = (repoDir: string): string => {
+  const git = (args: string[], input?: string) =>
+    execFileSync("git", args, { cwd: repoDir, input, encoding: "utf-8", timeout: 30_000 }).trim();
+  const ids = git(["rev-parse", ...REPLAY_INPUTS.map((p) => `HEAD:${p}`)]);
+  return git(["hash-object", "--stdin"], `${ids}\n`);
+};
+
+export const cachePrefix = (replayKey: string, suite: string): string =>
+  `${CACHE_ROOT}/${replayKey}/${suite}/`;
 
 const toRemote = (layout: CacheLayout, local: string): string | null => {
   if (layout === "runs") return /^[^/]+\/run-\d+\.json$/.test(local) ? local : null;
@@ -56,14 +69,14 @@ const readBody = async (body: unknown): Promise<string> => {
 };
 
 export interface CacheOptions {
-  tree: string;
+  key: string;
   suite: string;
   layout: CacheLayout;
   dir: string;
 }
 
 export const pullCache = async (opts: CacheOptions, client: S3Client = new S3Client({})): Promise<string[]> => {
-  const prefix = cachePrefix(opts.tree, opts.suite);
+  const prefix = cachePrefix(opts.key, opts.suite);
   const pulled: string[] = [];
   let token: string | undefined;
   do {
@@ -102,7 +115,7 @@ export interface PushSummary {
 // it is never cached. If-None-Match makes an existing key a no-op, so two evals
 // racing on the same tree can't overwrite each other.
 export const pushCache = async (opts: CacheOptions, client: S3Client = new S3Client({})): Promise<PushSummary> => {
-  const prefix = cachePrefix(opts.tree, opts.suite);
+  const prefix = cachePrefix(opts.key, opts.suite);
   const pulled = readPulled(opts.dir);
   const summary: PushSummary = { pushed: [], skippedPulled: [], skippedErrored: [], skippedExisting: [] };
   for (const local of localFiles(opts.layout, opts.dir)) {

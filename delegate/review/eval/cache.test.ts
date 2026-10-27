@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import type { S3Client } from "@aws-sdk/client-s3";
-import { cachePrefix, pullCache, pushCache } from "./cache";
+import { execFileSync } from "node:child_process";
+import { cachePrefix, pullCache, pushCache, replayKey } from "./cache";
 
-const TREE = "abc123";
-const PREFIX = `eval-cache/main/${TREE}/core/`;
+const KEY = "abc123";
+const PREFIX = `eval-cache/main/${KEY}/core/`;
 
 const tmp = () => mkdtempSync(join(tmpdir(), "eval-cache-"));
 
@@ -49,7 +50,7 @@ const fakeS3 = (objects: Record<string, string>) => {
 const ok = (id: string) => JSON.stringify({ caseId: id, error: undefined, costUsd: 1 });
 const errored = (id: string) => JSON.stringify({ caseId: id, error: "agent threw: boom", costUsd: null });
 
-test("cachePrefix is keyed on the agents tree and the suite", () => {
+test("cachePrefix is keyed on the replay key and the suite", () => {
   assert.equal(cachePrefix("t1", "expected"), "eval-cache/main/t1/expected/");
   assert.notEqual(cachePrefix("t1", "core"), cachePrefix("t2", "core"));
 });
@@ -61,7 +62,7 @@ test("pull writes flat results where replay looks for them", async () => {
     [`eval-cache/main/other/core/case-c/run-1.json`]: ok("case-c"),
   });
   const dir = tmp();
-  const pulled = await pullCache({ tree: TREE, suite: "core", layout: "flat", dir }, client);
+  const pulled = await pullCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
   assert.deepEqual(pulled.sort(), ["case-a.json", "case-b.json"]);
   assert.equal(readFileSync(join(dir, "case-a.json"), "utf-8"), ok("case-a"));
   assert.equal(existsSync(join(dir, "case-c.json")), false);
@@ -73,21 +74,21 @@ test("pull writes the runs layout as <case>/run-<n>.json", async () => {
     [`${PREFIX}case-a/run-3.json`]: ok("case-a"),
   });
   const dir = tmp();
-  await pullCache({ tree: TREE, suite: "core", layout: "runs", dir }, client);
+  await pullCache({ key: KEY, suite: "core", layout: "runs", dir }, client);
   assert.equal(existsSync(join(dir, "case-a", "run-1.json")), true);
   assert.equal(existsSync(join(dir, "case-a", "run-3.json")), true);
 });
 
 test("pull from an empty prefix succeeds and pulls nothing", async () => {
   const { client } = fakeS3({});
-  const pulled = await pullCache({ tree: TREE, suite: "core", layout: "flat", dir: tmp() }, client);
+  const pulled = await pullCache({ key: KEY, suite: "core", layout: "flat", dir: tmp() }, client);
   assert.deepEqual(pulled, []);
 });
 
 test("push uploads new results and skips the ones that were pulled", async () => {
   const { client, puts } = fakeS3({ [`${PREFIX}case-a/run-1.json`]: ok("case-a") });
   const dir = tmp();
-  const opts = { tree: TREE, suite: "core", layout: "flat" as const, dir };
+  const opts = { key: KEY, suite: "core", layout: "flat" as const, dir };
   await pullCache(opts, client);
   writeFileSync(join(dir, "case-b.json"), ok("case-b"));
 
@@ -103,7 +104,7 @@ test("push never overwrites an existing key", async () => {
   const original = objects[`${PREFIX}case-a/run-1.json`];
   writeFileSync(join(dir, "case-a.json"), JSON.stringify({ caseId: "case-a", costUsd: 99 }));
 
-  const summary = await pushCache({ tree: TREE, suite: "core", layout: "flat", dir }, client);
+  const summary = await pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
   assert.deepEqual(summary.skippedExisting, ["case-a.json"]);
   assert.deepEqual(summary.pushed, []);
   assert.equal(objects[`${PREFIX}case-a/run-1.json`], original);
@@ -115,7 +116,7 @@ test("push does not cache an errored replay", async () => {
   writeFileSync(join(dir, "case-a.json"), errored("case-a"));
   writeFileSync(join(dir, "case-b.json"), ok("case-b"));
 
-  const summary = await pushCache({ tree: TREE, suite: "core", layout: "flat", dir }, client);
+  const summary = await pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
   assert.deepEqual(summary.skippedErrored, ["case-a.json"]);
   assert.deepEqual(puts, [`${PREFIX}case-b/run-1.json`]);
 });
@@ -128,7 +129,7 @@ test("push in the runs layout caches the good run and retries the errored one", 
   writeFileSync(join(dir, "case-a", "run-2.json"), errored("case-a"));
   writeFileSync(join(dir, "report.md"), "not a result");
 
-  await pushCache({ tree: TREE, suite: "core", layout: "runs", dir }, client);
+  await pushCache({ key: KEY, suite: "core", layout: "runs", dir }, client);
   assert.deepEqual(puts, [`${PREFIX}case-a/run-1.json`]);
 });
 
@@ -140,5 +141,39 @@ test("push surfaces a real S3 failure instead of treating it as already cached",
   } as unknown as S3Client;
   const dir = tmp();
   writeFileSync(join(dir, "case-a.json"), ok("case-a"));
-  await assert.rejects(pushCache({ tree: TREE, suite: "core", layout: "flat", dir }, client), /denied/);
+  await assert.rejects(pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client), /denied/);
+});
+
+test("the replay key changes when any input main's replay executes changes", () => {
+  const repo = tmp();
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", ...args], {
+      cwd: repo,
+      stdio: "pipe",
+    });
+  const write = (path: string, body: string) => {
+    mkdirSync(join(repo, path, ".."), { recursive: true });
+    writeFileSync(join(repo, path), body);
+  };
+  const inputs = ["delegate/agents/a.ts", "delegate/framework/f.ts", "delegate/review/r.ts", "package-lock.json"];
+  git("init", "-q");
+  for (const f of inputs) write(f, "v1");
+  write("README.md", "v1");
+  const commit = () => {
+    git("add", "-A");
+    git("commit", "-q", "-m", "c");
+    return replayKey(repo);
+  };
+  const base = commit();
+
+  write("README.md", "v2");
+  assert.equal(commit(), base, "an unrelated file must keep the cache warm");
+
+  let previous = base;
+  for (const f of inputs) {
+    write(f, "v2");
+    const next = commit();
+    assert.notEqual(next, previous, `${f} must change the key`);
+    previous = next;
+  }
 });
