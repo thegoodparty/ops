@@ -2,33 +2,33 @@
  * Policy inputs for the break-glass tool, step 4 ("approval wired to a real
  * grant") of `docs/sheriff.md`.
  *
- * The approver list is deliberately hard-coded in the tool's code rather than a
- * resource in AWS; it changes only by a reviewed PR. "Approval policy" settles
- * this: no Identity Store approver group and no Slack mirror. One approver per
- * request, and the approver must not be the requester.
+ * Approval authority is membership in the `Approvers` Identity Center group,
+ * resolved live at decision time exactly the way the requester is resolved at
+ * request time: Slack `users.info` email -> `identitystore:GetUserId` on
+ * `emails.value` -> `identitystore:IsMemberInGroups` against the `Approvers`
+ * group id. There is no hard-coded Slack id list and no mirrored copy in
+ * DynamoDB or SSM, so there is no sync lag and revocation takes effect on the
+ * next click. "Approval policy" in `docs/sheriff.md` records that decision, the
+ * group it replaces, and the security trade-off it accepts.
  *
- * The requester mapping is no longer hard-coded. Open question 3 was settled by
- * the engineer in favour of resolving the requester at request time from their
- * Slack email (`users.info` -> `identitystore:GetUserId` on
- * `emails.value`), gated on membership in the `Engineers` Identity Store group.
- * That is why the `sheriff-grant` role's inline policy now carries
- * `GetUserId` and `IsMemberInGroups`; see `deploy/components/sheriff-grant.ts`.
- *
- * The list is deliberately short and hard-coded: changed only by a reviewed PR,
- * per "Approval policy" in `docs/sheriff.md`.
+ * The requester mapping is resolved the same way, gated on the `Engineers`
+ * group. That is why the `sheriff-grant` role's inline policy carries
+ * `GetUserId` and `IsMemberInGroups` scoped to both gate groups; see
+ * `deploy/components/sheriff-grant.ts`.
  */
 import { IDENTITY_STORE_ID } from "../../utils/accounts";
 
 /**
- * The hardcoded approver list. One approver per request, and the approver must
- * not be the requester. Adding or removing an approver is a reviewed PR.
+ * The `Approvers` Identity Store group id, mirrored from
+ * `deploy-infrastructure/group-sync/config.ts`, where the `approvers-google`
+ * pair mirrors the `Engineering Admin` Workspace group
+ * (`eng-admin@goodparty.org`) into it. A literal for the same reason the
+ * `Engineers` id is one: it is a stable Identity Center id recorded from the
+ * group as it exists in AWS, and group existence is not Pulumi's business here.
+ * `deploy/sheriff-grant.test.ts` and `deploy-infrastructure/sheriff.test.ts`
+ * read the group-sync literal so the two cannot drift silently.
  */
-export const APPROVER_SLACK_USER_IDS: readonly string[] = [
-  "U0BMU0DPS9Y", // Jeff Jagoda (jeff@goodparty.org)
-  "U09HGPTHHAT", // Swain Molster (swain@goodparty.org)
-  "UKP6FPANN", // Tomer Almog (tomer@goodparty.org)
-  "U09T5BQQUTH", // Dan Ball (dan@goodparty.org)
-];
+export const APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e";
 
 /**
  * The `Admins` Identity Store group id, mirrored from

@@ -229,6 +229,9 @@ export const createWorker = (config: WorkerConfig) => {
         environment: [
           { name: "AWS_DEFAULT_REGION", value: "us-west-2" },
           { name: "REVIEW_BUCKET", value: "delegate-reviews" },
+          // Shadow mode: compute the full gating decision, record it, and post
+          // COMMENT regardless, so no merge outcome can change (decision 13).
+          { name: "DELEGATE_GATING_MODE", value: "shadow" },
           // The image tag is the ops commit; the review record stores it as
           // agentVersion so evals can name the variant that produced a review.
           { name: "AGENT_VERSION", value: config.imageUri.split(":").pop() ?? "unknown" },

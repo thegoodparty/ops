@@ -80,6 +80,38 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
     };
   };
 
+  // One file at a ref, through the contents API. The review checkout is a
+  // depth-50 clone at the PR head, so `main` is not reliably present locally
+  // (delegate/worker/entrypoint.ts) and the base ref has to be read from
+  // GitHub. A 404 is "no such file at that ref" and returns undefined; anything
+  // else throws, because an unreadable file is not the same as an absent one
+  // and this helper must not turn a permissions problem into an empty plan.
+  const getFileAtRef = async (
+    repo: string,
+    path: string,
+    ref: string,
+  ): Promise<{ blobSha: string; text: string } | undefined> => {
+    const url = `${BASE_URL}/repos/${repo}/contents/${encodeURI(path)}?ref=${encodeURIComponent(ref)}`;
+    const res = await fetchImpl(url, { method: "GET", headers: baseHeaders });
+    if (res.status === 404) return undefined;
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`GET ${url} → ${res.status}: ${text.slice(0, 300)}`);
+    }
+    const data = (await res.json()) as {
+      sha: string;
+      content?: string;
+      encoding?: string;
+    };
+    if (data.encoding !== "base64" || typeof data.content !== "string") {
+      throw new Error(`GET ${url} → unsupported contents encoding: ${data.encoding ?? "none"}`);
+    }
+    return {
+      blobSha: data.sha,
+      text: Buffer.from(data.content, "base64").toString("utf-8"),
+    };
+  };
+
   const getMergeBase = async (repo: string, base: string, head: string): Promise<string> => {
     const res = await doFetch("GET", `${BASE_URL}/repos/${repo}/compare/${base}...${head}`);
     const data = (await res.json()) as { merge_base_commit: { sha: string } };
@@ -296,6 +328,7 @@ export const createGitHub = (token: string, fetchImpl: FetchFn = fetch) => {
 
   return {
     getPull,
+    getFileAtRef,
     postIssueComment,
     getMergeBase,
     getHeadSha,

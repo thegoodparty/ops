@@ -3,8 +3,118 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agentEnv, latestCompletedRecord, parseReviewOutput, pathGuardHook } from "./run";
+import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
 import type { ReviewRecord } from "./schema";
+
+test("gatingFor defaults to off and cannot be loosened by a bad value", () => {
+  // `off` is the default in code (decision 13), so a missing or misspelled
+  // variable cannot make the bot more able to merge.
+  for (const env of [{}, { DELEGATE_GATING_MODE: "" }, { DELEGATE_GATING_MODE: "on" }]) {
+    assert.deepEqual(gatingFor("thegoodparty/ops", env), { active: false, mode: "off" });
+  }
+});
+
+test("gatingFor reads the mode and the repo's adoption together", () => {
+  assert.deepEqual(gatingFor("thegoodparty/ops", { DELEGATE_GATING_MODE: "shadow" }), {
+    active: true,
+    mode: "shadow",
+  });
+  assert.deepEqual(gatingFor("thegoodparty/ops", { DELEGATE_GATING_MODE: "enforce" }), {
+    active: true,
+    mode: "enforce",
+  });
+  // A repo that has not adopted gating keeps today's behaviour even under
+  // `enforce`: no plan fetch, no CODEOWNERS read, no verdict change.
+  assert.deepEqual(gatingFor("thegoodparty/omni", { DELEGATE_GATING_MODE: "enforce" }), {
+    active: false,
+    mode: "enforce",
+  });
+});
+
+test("statusForRecord is unchanged for an ungated comment", () => {
+  const record = { action: "commented", gates: [], findings: [{}, {}] } as unknown as ReviewRecord;
+  assert.deepEqual(statusForRecord(record), {
+    state: "success",
+    description: "Commented: 2 finding(s)",
+    targetUrl: undefined,
+  });
+});
+
+test("statusForRecord says what a gated comment was gated on", () => {
+  const record = {
+    action: "commented",
+    gates: ["touches_docs"],
+    findings: [],
+    gating: { mode: "enforce", flags: ["touches_docs"], baseRef: "main", binding: {}, authority: { checked: true, ownedPaths: [], reason: "" } },
+  } as unknown as ReviewRecord;
+  assert.equal(statusForRecord(record).description, "Commented: touches_docs");
+});
+
+test("statusForRecord reports a shadow run as what it would have done", () => {
+  const base = {
+    action: "commented",
+    gates: [],
+    findings: [],
+    gating: { mode: "shadow", flags: [], baseRef: "main", binding: {}, authority: { checked: true, ownedPaths: [], reason: "" } },
+  } as unknown as ReviewRecord;
+  assert.equal(statusForRecord(base).description, "Shadow: would approve");
+  const flagged = {
+    ...base,
+    gates: ["inconsistent"],
+    gating: { ...base.gating!, flags: ["inconsistent"] },
+  } as unknown as ReviewRecord;
+  assert.equal(statusForRecord(flagged).description, "Shadow: would comment (inconsistent)");
+});
+
+test("statusForRecord never claims a shadow would approve around unparseable findings", () => {
+  // Unparseable findings are a blocker but not a gating flag: they live on
+  // `gates`, and `wouldApprove` is false for them. A record with no findings
+  // and no `gating.flags` is not therefore a would-approve.
+  const base = {
+    action: "commented",
+    gates: ["unparseable_findings"],
+    findings: [],
+    gating: { mode: "shadow", flags: [], baseRef: "main", binding: {}, authority: { checked: true, ownedPaths: [], reason: "" } },
+  } as unknown as ReviewRecord;
+  assert.equal(
+    statusForRecord(base).description,
+    "Shadow: would comment (unparseable_findings)",
+  );
+  assert.equal(
+    statusForRecord({ ...base, gating: { ...base.gating!, mode: "enforce" } } as unknown as ReviewRecord)
+      .description,
+    "Commented: unparseable_findings",
+  );
+});
+
+test("statusForRecord says why when every finding could not be posted", () => {
+  // A finding on a path outside the diff blocks the verdict but is never in
+  // `record.findings`; a gated record names it on `gates` instead, so the
+  // status cannot read as an approval the gate did not make.
+  const base = {
+    action: "commented",
+    gates: ["unplaceable_findings"],
+    findings: [],
+    gating: { mode: "shadow", flags: [], baseRef: "main", binding: {}, authority: { checked: true, ownedPaths: [], reason: "" } },
+  } as unknown as ReviewRecord;
+  assert.equal(
+    statusForRecord(base).description,
+    "Shadow: would comment (unplaceable_findings)",
+  );
+});
+
+// The bug this pins: `statusForRecord` knew what a gated comment was gated on,
+// but the terminal status re-derived its own "Commented: N finding(s)" string,
+// so the description a reader actually sees never mentioned the gate. One
+// source, asked by every path that reports the outcome.
+test("the terminal status is rendered by statusForRecord", () => {
+  const source = readFileSync(join(__dirname, "run.ts"), "utf-8");
+  const marker = source.indexOf("terminal status failed");
+  assert.ok(marker > 0, "expected the terminal status call");
+  const call = source.slice(source.lastIndexOf("postStatus", marker), marker);
+  assert.match(call, /statusForRecord\(record/);
+  assert.equal(source.includes("Commented: ${findingCount}"), false);
+});
 
 test("agentEnv strips every credential the worker holds", () => {
   const env = agentEnv({

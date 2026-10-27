@@ -13,7 +13,8 @@
     "build": "tsc && esbuild delegate/lambdas/handler.ts --bundle --platform=node --target=node22 --outfile=dist/lambda/handler.js",
     "test": "tsx --test 'delegate/framework/*.test.ts' 'delegate/lambdas/*.test.ts' 'delegate/review/*.test.ts' 'delegate/review/eval/*.test.ts' 'delegate/agents/*.test.ts' 'delegate/worker/*.test.ts' 'deploy/*.test.ts' 'deploy-workbench/*.test.ts' 'deploy-workbench/bifrost/*.test.ts' 'deploy-infrastructure/*.test.ts'",
     "review:eval": "tsx delegate/review/eval/cli.ts",
-    "review:expect": "tsx delegate/review/eval/expect.ts"
+    "review:expect": "tsx delegate/review/eval/expect.ts",
+    "review:mine": "tsx delegate/review/eval/mine.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.310",

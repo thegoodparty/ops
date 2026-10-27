@@ -29,7 +29,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
-**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes.
+**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs, gating? }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes. `gating` is the gate's outcome (`{ mode, verdict, gates, wouldApprove }`) and is present only for a repo that has adopted gating: the agent's `output` cannot tell a flag from an ordinary comment, because both are a complete review with no findings.
 
 ## Commands
 
@@ -113,7 +113,11 @@ cat report.md
 
 ## Expected-result suite
 
-Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. The two plan cases use the third expectation type, `{ "verdict": "consistency", "consistency": "consistent" | "inconsistent" | "unclear" }`, which scores the model's own `planConsistency` answer: step 1 of `docs/plan-gated-merges.md` ships no gate to turn that answer into an approval or a comment, so the answer is the whole case. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR. Every case runs several times, and a case passes only when every run does.
+Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+
+The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
+
+Replay runs the gate in `enforce` for a repo on `gating.ts`'s adoption list, which is what makes an approval reachable, and treats the bundle's changed paths as de-owned: a bundle carries no `CODEOWNERS`, so the deterministic authority cases are asserted in `delegate/review/gating.test.ts` rather than replayed. A repo that has not adopted gating records no verdict and keeps the findings-only outcome. The standalone `{ "verdict": "consistency", "consistency": ... }` expectation remains for cases that must be scored on the model's answer alone. Every case runs several times, and a case passes only when every run does.
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
@@ -136,7 +140,7 @@ Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has 
 - `pass` is true only with no `regressions`, `rerun` or `targetsMissed`. The exit code is non-zero only with `--final true` and `pass` false.
 - `gate.json`: `{ regressions, rerun, targetsMissed, costRatio, costOver, pass, cases: [{ id, split, mainPassed, mainCompleted, flaky, candPassed, candRuns, outcome }] }`. Main's flake rate for a case is `mainPassed/mainCompleted`; `flaky` is true when that is strictly between 0 and 1.
 
-The report lists tune cases with the candidate's and main's pass counts and shows holdout only as `passed X of Y, regressions: N`. `gate.json` and `report.json` still name holdout ids, so they stay in the workflow artifact and are not posted. `delegate eval` on a PR passes no `--targets`; the hill-climb dispatch (ticket 07) supplies them, from main's side, never from PR files. In the workflow, `expected-gate` runs the first pass, `expected-rerun` (PR code, read-only eval role) replays only the flagged cases, and `expected-score` merges the runs, gates with `--final true`, posts the comment and goes red on failure.
+The report lists tune cases with the candidate's and main's pass counts and shows holdout only as `passed X of Y, regressions: N`. `gate.json` and `report.json` still name holdout ids, so they stay in the workflow artifact and are not posted. `delegate eval` on a PR passes no `--targets`; the hill-climb dispatch (ticket 07) supplies them, from main's side, never from PR files. In the workflow, `expected-gate` runs the first pass, `expected-rerun` (PR code, read-only eval role) replays only the flagged cases, and `expected-score` merges only `run-4` to `run-6` from the rerun, gates with `--final true`, posts the gate report (never the score report, which names holdout cases) and goes red on failure.
 
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 
@@ -157,6 +161,19 @@ The candidate is main's tree with `delegate/agents/pr-reviewer.ts` and `delegate
 Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (red when the gate fails) and download the artifact `eval-run-<run_id>-<mode>-<attempt>`: `gate.json` (tune and gate; `pass`, `regressions`, `targetsMissed`, `costRatio`, `cases` for tune cases, and `holdout: { total, passed, regressions }` as counts only), `report.md`, `meta.json`, and the results of tune cases. Holdout results never leave the job, and in `gate` mode the replay logs are withheld.
 
 **Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
+
+## Mining candidate cases
+
+```sh
+npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 --out candidates.jsonl
+```
+
+Read-only. Walks every page of `REVIEW_BUCKET`, keeps the latest non-`eval` record per head sha, and proposes cases for a human to confirm. Needs S3 read access and `gh` auth. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--out` (stdout if omitted).
+
+- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, key, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
+- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, key, repo, pr, findings, replies, mergedSha }`.
+
+Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and many real misses need a running system to see, so a person labels each one.
 
 ## Cost expectations
 
