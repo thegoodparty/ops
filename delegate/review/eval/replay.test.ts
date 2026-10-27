@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { replayCase, replayAll, resultFromRecord } from "./replay";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
-import type { ReviewRecord } from "../schema";
+import type { Bundle, ReviewRecord } from "../schema";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
   runId: randomUUID(),
@@ -61,6 +61,46 @@ const fakeRunAgent: RunAgentImpl = async (_config, _prompt, _overrides) => ({
   structuredOutput: { status: "complete", findings: [], summary: "ok from fake" },
 });
 
+// A simulated PR in a gated repo, carrying the plan the model is judged
+// against. The bundle shape is what step 1 put on the two plan cases.
+const gatedBundle = (overrides: Partial<Bundle> = {}): Bundle => ({
+  repo: "thegoodparty/ops",
+  prNumber: 99001,
+  baseRef: "main",
+  baseSha: "aaaaaa",
+  headSha: "bbbbbb",
+  author: "delegate-eval",
+  title: "Raise the delegate webhook timeout",
+  body: "Plan: docs/example-webhook-timeout.md",
+  diff: "diff --git a/deploy/components/webhooks.ts b/deploy/components/webhooks.ts\n",
+  changedFiles: ["deploy/components/webhooks.ts"],
+  priorFindings: [],
+  plan: {
+    path: "docs/example-webhook-timeout.md",
+    blobSha: "1c7ac96f062c9263697f7208056f9941e4dc499a",
+    text: "# Delegate webhook timeout\n",
+  },
+  ...overrides,
+});
+
+const answeringAgent =
+  (verdict: "consistent" | "inconsistent" | "unclear"): RunAgentImpl =>
+  async () => {
+    const structuredOutput = {
+      status: "complete" as const,
+      findings: [],
+      summary: "ok from fake",
+      planConsistency: { verdict, reasoning: "because" },
+    };
+    return {
+      agent: "pr-reviewer",
+      output: JSON.stringify(structuredOutput),
+      durationMs: 100,
+      costUsd: 0.01,
+      structuredOutput,
+    };
+  };
+
 test("replayCase returns a result with the correct caseId", async () => {
   const record = makeRecord();
   const workDir = tmpDir();
@@ -93,6 +133,59 @@ test("replayCase returns a successful output from the fake agent", async () => {
   assert.ok(!result.error, `unexpected error: ${result.error}`);
   assert.ok(result.output !== null);
   assert.equal(result.output?.status, "complete");
+});
+
+test("replayCase records the gate's approval for a gated repo", async () => {
+  const record = makeRecord({ bundle: gatedBundle() });
+
+  const result = await replayCase(
+    record,
+    { workDir: tmpDir(), variant: "v1" },
+    answeringAgent("consistent"),
+    fakeCheckout,
+  );
+
+  assert.deepEqual(result.gating, {
+    mode: "enforce",
+    verdict: "approve",
+    gates: [],
+    wouldApprove: true,
+  });
+});
+
+test("replayCase records the flag the agent's output cannot distinguish from a comment", async () => {
+  const record = makeRecord({ bundle: gatedBundle() });
+
+  const result = await replayCase(
+    record,
+    { workDir: tmpDir(), variant: "v1" },
+    answeringAgent("inconsistent"),
+    fakeCheckout,
+  );
+
+  // Same shape as a clean review: a complete output with no findings. Only the
+  // gating verdict says the review event was a comment, and why.
+  assert.equal(result.output?.status, "complete");
+  assert.deepEqual(result.output?.findings, []);
+  assert.deepEqual(result.gating, {
+    mode: "enforce",
+    verdict: "comment",
+    gates: ["inconsistent"],
+    wouldApprove: false,
+  });
+});
+
+test("replayCase records no gating verdict for a repo that has not adopted gating", async () => {
+  const record = makeRecord({ bundle: gatedBundle({ repo: "thegoodparty/omni" }) });
+
+  const result = await replayCase(
+    record,
+    { workDir: tmpDir(), variant: "v1" },
+    answeringAgent("consistent"),
+    fakeCheckout,
+  );
+
+  assert.equal(result.gating, undefined);
 });
 
 test("replayCase returns an error result when checkout throws", async () => {

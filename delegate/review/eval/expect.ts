@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { dirname, join, resolve } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
+import { GATING_FLAG_REASON, isGatedRepo, type GatingFlag } from "../gating";
 import { BundleSchema, FindingSchema, ReviewRecordSchema } from "../schema";
 import type { Bundle, ReviewRecord } from "../schema";
 import { replayCase } from "./replay";
@@ -17,13 +18,22 @@ const DEFAULT_MANIFEST = join(__dirname, "expected", "manifest.json");
 
 const ConsistencySchema = z.enum(["consistent", "inconsistent", "unclear"]);
 
-// One expectation type per case. `approve` and `block` score a merge outcome;
-// `consistency` scores the model's own `planConsistency` answer, for the plan
-// cases that run before the gate exists (step 1 of `docs/plan-gated-merges.md`).
-// An outcome case may also carry `consistency` as a diagnostic: when it does,
-// the model's answer has to be right as well, which is how a wrong outcome is
-// attributed to the model rather than to the gate. `flag` joins these in
-// step 5.
+// A flag names the gate that fired, so the vocabulary is `gating.ts`'s and not
+// free text: a renamed flag breaks the manifest parse here instead of quietly
+// never matching a result.
+const GateNameSchema = z.custom<GatingFlag>(
+  (v) => typeof v === "string" && v in GATING_FLAG_REASON,
+  "not a gating flag name",
+);
+
+// One expectation type per case. `approve`, `block` and `flag` score a merge
+// outcome; `consistency` scores the model's own `planConsistency` answer, and
+// is kept for cases that run before the gate exists (step 1 of
+// `docs/plan-gated-merges.md`). `flag` is the third outcome: the review event
+// is a comment and the named gate fired. An outcome case may also carry
+// `consistency` as a diagnostic: when it does, the model's answer has to be
+// right as well, which is how a wrong outcome is attributed to the model
+// rather than to the gate.
 const ExpectSchema = z.discriminatedUnion("verdict", [
   z.strictObject({
     verdict: z.literal("approve"),
@@ -33,6 +43,11 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
     verdict: z.literal("block"),
     paths: z.array(z.string().min(1)).min(1),
     categories: z.array(FindingSchema.shape.category).optional(),
+    consistency: ConsistencySchema.optional(),
+  }),
+  z.strictObject({
+    verdict: z.literal("flag"),
+    reason: GateNameSchema,
     consistency: ConsistencySchema.optional(),
   }),
   z.strictObject({
@@ -184,12 +199,34 @@ export const scoreRun = (expect: Expect, result: Result): RunScore => {
 
   const findings = result.output.findings;
   const listed = findings.map((f) => `${f.path}:${f.line} [${f.category}]`).join(", ");
+  const gating = result.gating;
   let outcome: RunScore;
-  if (expect.verdict === "approve") {
-    outcome =
-      findings.length === 0
-        ? { pass: true, outcome: "approved" }
-        : { pass: false, outcome: `blocked: ${listed}` };
+  if (expect.verdict === "flag") {
+    // A flag is a comment plus a named reason. The agent's output cannot tell
+    // the two apart, which is what `result.gating` is for; no gating verdict
+    // is a failure rather than an assumption of innocence.
+    if (gating === undefined) {
+      outcome = { pass: false, outcome: "no gating verdict" };
+    } else if (gating.verdict !== "comment") {
+      outcome = { pass: false, outcome: "approved (expected a flag)" };
+    } else if (!gating.gates.includes(expect.reason)) {
+      const fired = gating.gates.join(", ") || "no gate";
+      outcome = { pass: false, outcome: `commented: ${fired} (expected ${expect.reason})` };
+    } else {
+      outcome = { pass: true, outcome: `flagged: ${expect.reason}` };
+    }
+  } else if (expect.verdict === "approve") {
+    if (isGatedRepo(result.repo) && gating === undefined) {
+      outcome = { pass: false, outcome: "no gating verdict" };
+    } else if (gating !== undefined && gating.verdict !== "approve") {
+      const fired = gating.gates.join(", ") || "no findings";
+      outcome = { pass: false, outcome: `commented: ${fired}` };
+    } else {
+      outcome =
+        findings.length === 0
+          ? { pass: true, outcome: "approved" }
+          : { pass: false, outcome: `blocked: ${listed}` };
+    }
   } else if (findings.length === 0) {
     outcome = { pass: false, outcome: "approved" };
   } else {
@@ -220,6 +257,7 @@ const describeExpect = (e: Expect): string => {
   if (e.verdict === "consistency") return `planConsistency: ${e.consistency}`;
   const diagnostic = e.consistency ? ` (diagnostic: planConsistency: ${e.consistency})` : "";
   if (e.verdict === "approve") return `approve${diagnostic}`;
+  if (e.verdict === "flag") return `flag \`${e.reason}\`${diagnostic}`;
   const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
   return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
 };
