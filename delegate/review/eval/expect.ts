@@ -5,6 +5,7 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
 import { BundleSchema, FindingSchema, ReviewRecordSchema } from "../schema";
 import type { Bundle, ReviewRecord } from "../schema";
+import { isCacheable } from "./cache";
 import { replayCase } from "./replay";
 import type { CheckoutFn, Result } from "./replay";
 
@@ -141,6 +142,8 @@ const loadRecord = async (
 export interface RunScore {
   pass: boolean;
   outcome: string;
+  // No review came back, so the run says nothing about the agent either way.
+  errored?: boolean;
 }
 
 const describeAnswer = (answer: string | undefined, expected: string): string =>
@@ -151,7 +154,7 @@ const describeAnswer = (answer: string | undefined, expected: string): string =>
 export const scoreRun = (expect: Expect, result: Result): RunScore => {
   if (result.error || !result.output || result.output.status !== "complete") {
     const reason = result.error ?? (result.output?.status === "failed" ? result.output.reason : "no output");
-    return { pass: false, outcome: `no review: ${reason.slice(0, 200)}` };
+    return { pass: false, outcome: `no review: ${reason.slice(0, 200)}`, errored: true };
   }
   const answer = result.output.planConsistency?.verdict;
 
@@ -208,14 +211,32 @@ const describeExpect = (e: Expect): string => {
 
 export interface Baseline {
   variant: string;
+  // How many runs each case was meant to get, so a missing run is visible.
+  runs: number;
   reports: CaseReport[];
 }
 
-const runsPassed = (r: CaseReport | undefined) =>
-  r ? `${r.scores.filter((s) => s.pass).length}/${r.scores.length}` : "n/a";
+// A run that errored or never happened is not a failure of the agent, so it
+// stays out of the pass rate and is reported as unfinished.
+const baselineCounts = (b: Baseline, r: CaseReport | undefined) => {
+  const done = (r?.scores ?? []).filter((s) => !s.errored);
+  return {
+    runs: b.runs,
+    completed: done.length,
+    runsPassed: done.filter((s) => s.pass).length,
+    unfinished: b.runs - done.length,
+  };
+};
+
+const describeBaseline = (b: Baseline, r: CaseReport | undefined): string => {
+  const c = baselineCounts(b, r);
+  const rate = c.completed === 0 ? "n/a" : `${c.runsPassed}/${c.completed}`;
+  return c.unfinished === 0 ? rate : `${rate} (${c.unfinished} of ${c.runs} runs unfinished)`;
+};
 
 // The per-case baseline as data, for the merge gate to read without parsing
-// the markdown. `main` is null when a case has no baseline entry.
+// the markdown. `main` is null only when no baseline was given; a case whose
+// main runs errored or never ran has runs unfinished, not a pass or a fail.
 export const renderExpectJson = (reports: CaseReport[], variant: string, baseline?: Baseline): string =>
   JSON.stringify(
     {
@@ -227,7 +248,7 @@ export const renderExpectJson = (reports: CaseReport[], variant: string, baselin
           id: r.c.id,
           runs: r.scores.length,
           runsPassed: r.scores.filter((s) => s.pass).length,
-          main: base ? { runs: base.scores.length, runsPassed: base.scores.filter((s) => s.pass).length } : null,
+          main: baseline ? baselineCounts(baseline, base) : null,
         };
       }),
     },
@@ -252,7 +273,7 @@ export const renderExpectReport = (reports: CaseReport[], variant: string, basel
     baseline ? "| --- | --- | --- | --- | --- |" : "| --- | --- | --- | --- |",
     ...reports.map((r) => {
       const passed = `${r.scores.filter((s) => s.pass).length}/${r.scores.length}`;
-      const main = baseline ? ` ${runsPassed(baseline.reports.find((b) => b.c.id === r.c.id))} |` : "";
+      const main = baseline ? ` ${describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id))} |` : "";
       return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${passed} |${main} ${money(r.costs)} |`;
     }),
     "",
@@ -323,9 +344,9 @@ const main = async () => {
       while (next < tasks.length) {
         const { c, run } = tasks[next++];
         // A result already on disk (pulled from the cache, or from an earlier
-        // run) stands; an errored one is retried.
+        // run) stands; an errored or failed one is retried.
         const existing = join(out, c.id, `run-${run}.json`);
-        if (existsSync(existing) && !(JSON.parse(readFileSync(existing, "utf-8")) as Result).error) continue;
+        if (existsSync(existing) && isCacheable(JSON.parse(readFileSync(existing, "utf-8")) as Result)) continue;
         const result = await replayCase(
           records.get(c.id)!,
           { workDir: join(workDir, `run-${run}`), variant },
@@ -343,7 +364,7 @@ const main = async () => {
 
   if (mode === "score" || mode === "all") {
     const baseline = flags.baseline
-      ? { variant: flags["baseline-variant"] ?? "main", reports: scoreDir(cases, resolve(flags.baseline)) }
+      ? { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.baseline)) }
       : undefined;
     const reports = scoreDir(cases, out);
     const report = renderExpectReport(reports, variant ?? "unknown", baseline);

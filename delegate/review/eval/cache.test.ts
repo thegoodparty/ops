@@ -47,8 +47,11 @@ const fakeS3 = (objects: Record<string, string>) => {
   return { client, objects, puts };
 };
 
-const ok = (id: string) => JSON.stringify({ caseId: id, error: undefined, costUsd: 1 });
-const errored = (id: string) => JSON.stringify({ caseId: id, error: "agent threw: boom", costUsd: null });
+const ok = (id: string) =>
+  JSON.stringify({ caseId: id, output: { status: "complete", findings: [], summary: "s" }, costUsd: 1 });
+const errored = (id: string) => JSON.stringify({ caseId: id, output: null, error: "agent threw: boom", costUsd: null });
+const failedOutput = (id: string) =>
+  JSON.stringify({ caseId: id, output: { status: "failed", reason: "no json" }, costUsd: 1 });
 
 test("cachePrefix is keyed on the replay key and the suite", () => {
   assert.equal(cachePrefix("t1", "expected"), "eval-cache/main/t1/expected/");
@@ -102,7 +105,7 @@ test("push never overwrites an existing key", async () => {
   const { client, objects } = fakeS3({ [`${PREFIX}case-a/run-1.json`]: ok("case-a") });
   const dir = tmp();
   const original = objects[`${PREFIX}case-a/run-1.json`];
-  writeFileSync(join(dir, "case-a.json"), JSON.stringify({ caseId: "case-a", costUsd: 99 }));
+  writeFileSync(join(dir, "case-a.json"), JSON.stringify({ ...JSON.parse(ok("case-a")), costUsd: 99 }));
 
   const summary = await pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
   assert.deepEqual(summary.skippedExisting, ["case-a.json"]);
@@ -119,6 +122,27 @@ test("push does not cache an errored replay", async () => {
   const summary = await pushCache({ key: KEY, suite: "core", layout: "flat", dir }, client);
   assert.deepEqual(summary.skippedErrored, ["case-a.json"]);
   assert.deepEqual(puts, [`${PREFIX}case-b/run-1.json`]);
+});
+
+test("both layouts skip errored and failed results the same way", async () => {
+  for (const layout of ["flat", "runs"] as const) {
+    const { client, puts } = fakeS3({});
+    const dir = tmp();
+    const file = (id: string, body: string) => {
+      if (layout === "flat") return writeFileSync(join(dir, `${id}.json`), body);
+      mkdirSync(join(dir, id), { recursive: true });
+      writeFileSync(join(dir, id, "run-1.json"), body);
+    };
+    file("good", ok("good"));
+    file("threw", errored("threw"));
+    file("failed", failedOutput("failed"));
+
+    const summary = await pushCache({ key: KEY, suite: "core", layout, dir }, client);
+    assert.deepEqual(puts, [`${PREFIX}good/run-1.json`], layout);
+    assert.deepEqual(summary.skippedErrored.sort(), layout === "flat"
+      ? ["failed.json", "threw.json"]
+      : ["failed/run-1.json", "threw/run-1.json"], layout);
+  }
 });
 
 test("push in the runs layout caches the good run and retries the errored one", async () => {

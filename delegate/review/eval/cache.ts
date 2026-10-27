@@ -104,6 +104,13 @@ const isAlreadyExists = (err: unknown): boolean => {
   return e.name === "PreconditionFailed" || e.$metadata?.httpStatusCode === 412;
 };
 
+// A result is cached only when the replay finished with a review. An error, or
+// an output that reports `failed`, counts as a failed run and is retried on the
+// next eval. Both layouts and the expected replay's skip-existing check use
+// this one rule.
+export const isCacheable = (result: Result): boolean =>
+  !result.error && result.output?.status === "complete";
+
 export interface PushSummary {
   pushed: string[];
   skippedPulled: string[];
@@ -111,8 +118,9 @@ export interface PushSummary {
   skippedExisting: string[];
 }
 
-// An errored replay counts as a failed run and is retried on the next eval, so
-// it is never cached. If-None-Match makes an existing key a no-op, so two evals
+// Uncacheable results are never uploaded (see isCacheable), so a case that is
+// partly done caches the runs that finished and the rest are retried.
+// If-None-Match makes an existing key a no-op, so two evals
 // racing on the same tree can't overwrite each other.
 export const pushCache = async (opts: CacheOptions, client: S3Client = new S3Client({})): Promise<PushSummary> => {
   const prefix = cachePrefix(opts.key, opts.suite);
@@ -124,7 +132,7 @@ export const pushCache = async (opts: CacheOptions, client: S3Client = new S3Cli
       continue;
     }
     const body = readFileSync(join(opts.dir, local), "utf-8");
-    if ((JSON.parse(body) as Result).error) {
+    if (!isCacheable(JSON.parse(body) as Result)) {
       summary.skippedErrored.push(local);
       continue;
     }
