@@ -208,6 +208,27 @@ docs/
     assert.equal(resolveOwnership(p, "deploy/components/iam-x.ts"), "unmatched");
   });
 
+  it("does not let a single-level wildcard opt-out cover nested paths", () => {
+    // GitHub's `CODEOWNERS` docs: `docs/*` matches `docs/getting-started.md`
+    // but not `docs/build-app/troubleshooting.md`. Suffixing it would make the
+    // opt-out broader than GitHub and drop a path GitHub owns out of
+    // `ownedPaths`, which is the fail-open direction.
+    const p = parseCodeowners(`* @gp
+docs/*
+`);
+    assert.equal(resolveOwnership(p, "docs/getting-started.md"), "unowned");
+    assert.equal(resolveOwnership(p, "docs/build-app/troubleshooting.md"), "owned");
+  });
+
+  it("lets a literal directory rule reclaim a subtree from a broader opt-out", () => {
+    // GitHub's own example: `/apps/ @octocat` then `/apps/github @doctocat`,
+    // where the subdirectory has its own owner.
+    const p = parseCodeowners(`/apps/ @gp
+/apps/github @gp
+`);
+    assert.equal(resolveOwnership(p, "apps/github/x.ts"), "owned");
+  });
+
   it("reports a path no pattern matches instead of calling it unowned", () => {
     const p = parseCodeowners(`docs/ @gp\n`);
     assert.equal(resolveOwnership(p, "delegate/review/gates.ts"), "unmatched");
