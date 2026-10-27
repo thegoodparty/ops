@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   commitSyntheticHead,
+  computeGate,
   scoreDir,
   readBundleFile,
   readManifest,
@@ -14,7 +15,7 @@ import {
   scoreRun,
   selectCases,
 } from "./expect";
-import type { Expect } from "./expect";
+import type { Expect, RunScore } from "./expect";
 import type { ExpectedCase } from "./expect";
 import type { Result } from "./replay";
 import type { Bundle, Finding } from "../schema";
@@ -394,4 +395,116 @@ test("without a baseline the report keeps its original columns", () => {
   const pr = [{ c: cases[0], scores: [{ pass: true, outcome: "x" }], costs: [1] }];
   assert.doesNotMatch(renderExpectReport(pr, "v"), /Main runs passed/);
   assert.equal(JSON.parse(renderExpectJson(pr, "v")).cases[0].main, null);
+});
+
+const P = { pass: true, outcome: "x" };
+const F = { pass: false, outcome: "approved" };
+const runsOf = (...passes: boolean[]) => passes.map((p) => (p ? P : F));
+const gateCases = () => {
+  const all = readManifest(MANIFEST);
+  return { tune: all.find((c) => c.split === "tune")!, holdout: all.find((c) => c.split === "holdout")! };
+};
+const mkReport = (c: ExpectedCase, scores: RunScore[], cost = 1) => ({
+  c,
+  scores,
+  costs: scores.map(() => cost),
+});
+const mkBase = (reports: ReturnType<typeof mkReport>[]) => ({ variant: "main-abc", runs: 3, reports });
+
+test("gate: main 3/3 and candidate 3/3 passes", () => {
+  const { tune } = gateCases();
+  const g = computeGate([mkReport(tune, runsOf(true, true, true))], mkBase([mkReport(tune, runsOf(true, true, true))]), [], false);
+  assert.equal(g.pass, true);
+  assert.deepEqual([g.regressions, g.rerun, g.targetsMissed], [[], [], []]);
+});
+
+test("gate: a drop to 2/3 asks for a rerun, then 5 of 6 passes and 4 of 6 is a regression", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true))]);
+  const first = computeGate([mkReport(tune, runsOf(true, true, false))], base, [], false);
+  assert.deepEqual(first.rerun, [tune.id]);
+  assert.equal(first.pass, false);
+
+  const five = computeGate([mkReport(tune, runsOf(true, true, false, true, true, true))], base, [], true);
+  assert.deepEqual([five.rerun, five.regressions, five.pass], [[], [], true]);
+
+  const four = computeGate([mkReport(tune, runsOf(true, true, false, true, false, true))], base, [], true);
+  assert.deepEqual([four.rerun, four.regressions, four.pass], [[], [tune.id], false]);
+});
+
+test("gate: a final pass with the rerun missing counts the drop as a regression", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true))]);
+  const g = computeGate([mkReport(tune, runsOf(true, true, false))], base, [], true);
+  assert.deepEqual([g.rerun, g.regressions], [[], [tune.id]]);
+});
+
+test("gate: a case main did not pass 3/3 cannot regress, and unfinished main runs do not count as passes", () => {
+  const { tune, holdout } = gateCases();
+  const base = mkBase([
+    mkReport(tune, runsOf(true, false, false)),
+    mkReport(holdout, [P, P, { pass: false, outcome: "no review", errored: true }]),
+  ]);
+  const g = computeGate(
+    [mkReport(tune, runsOf(false, false, false)), mkReport(holdout, runsOf(false, false, false))],
+    base,
+    [],
+    false,
+  );
+  assert.deepEqual(g.cases.map((c) => c.outcome), ["not-held", "not-held"]);
+  assert.equal(g.pass, true);
+});
+
+test("gate: a target below 3/3 fails, and an unknown target id does too", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(false, false, false))]);
+  const two = computeGate([mkReport(tune, runsOf(true, true, false))], base, [tune.id, "nope"], false);
+  assert.deepEqual(two.targetsMissed, [tune.id, "nope"]);
+  assert.equal(two.pass, false);
+  const ok = computeGate([mkReport(tune, runsOf(true, true, true))], base, [tune.id], false);
+  assert.deepEqual([ok.targetsMissed, ok.pass], [[], true]);
+});
+
+test("gate: cost over 110% of main is flagged but does not fail the gate", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true), 1)]);
+  const over = computeGate([mkReport(tune, runsOf(true, true, true), 1.2)], base, [], false);
+  assert.equal(over.costRatio, 1.2);
+  assert.deepEqual([over.costOver, over.pass], [true, true]);
+  const at = computeGate([mkReport(tune, runsOf(true, true, true), 1.1)], base, [], false);
+  assert.equal(at.costOver, false);
+});
+
+test("gate: refuses a baseline with no completed runs", () => {
+  const { tune } = gateCases();
+  assert.throws(
+    () => computeGate([mkReport(tune, runsOf(true, true, true))], mkBase([mkReport(tune, [])]), [], false),
+    /no completed runs/,
+  );
+});
+
+test("gate report shows main beside every tune case and holdout only as an aggregate", () => {
+  const { tune, holdout } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, false, true)), mkReport(holdout, runsOf(true, true, true))]);
+  const reports = [mkReport(tune, runsOf(true, true, true)), mkReport(holdout, runsOf(false, false, false))];
+  const gate = computeGate(reports, base, [], false);
+  const md = renderExpectReport(reports, "pr-abc", base, gate);
+  assert.match(md, new RegExp(`${tune.id} \\|[^\\n]*\\| 3/3 \\| 2/3 \\(flaky\\) \\|`));
+  assert.match(md, /Holdout: passed 0 of 1, regressions: 0\./);
+  assert.doesNotMatch(md, new RegExp(holdout.id));
+  assert.doesNotMatch(md, new RegExp(holdout.tests.slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("gate report flags cost over the limit", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true), 1)]);
+  const reports = [mkReport(tune, runsOf(true, true, true), 1.5)];
+  const md = renderExpectReport(reports, "v", base, computeGate(reports, base, [], false));
+  assert.match(md, /Cost vs main: 150%, needs justification in the PR body\./);
+});
+
+test("selectCases takes a comma-separated list of ids", () => {
+  const all = readManifest(MANIFEST);
+  const ids = [all[0].id, all[2].id];
+  assert.deepEqual(selectCases(all, { case: ids.join(",") }).map((c) => c.id), ids);
 });

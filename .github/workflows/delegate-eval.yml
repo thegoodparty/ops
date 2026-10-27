@@ -576,6 +576,127 @@ jobs:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected/
 
+  # First gate pass, with main's code and no AWS credentials. A case main
+  # passes 3/3 that drops below it comes back as a rerun id.
+  expected-gate:
+    permissions:
+      contents: read
+    needs: [prepare, expected-main, expected-pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      rerun: ${{ steps.gate.outputs.rerun }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download main's results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected-main
+
+      - name: Download PR results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected
+
+      - name: Gate, first pass
+        id: gate
+        run: |
+          npm run -s review:expect -- \
+            --mode gate \
+            --runs 3 \
+            --base ./eval-expected-main \
+            --out ./eval-expected > /dev/null
+          echo "rerun=$(jq -r '.rerun | join(",")' ./eval-expected/gate.json)" >> "$GITHUB_OUTPUT"
+
+  # Executes the PR's code, with the read-only eval role. Replays only the
+  # cases the first gate pass flagged, as runs 4 to 6.
+  expected-rerun:
+    permissions:
+      contents: read
+      id-token: write
+    needs: [prepare, expected-gate]
+    if: needs.expected-gate.outputs.rerun != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main (cases and scoring)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - name: Checkout PR head (agent under test)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: pr/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps (pr)
+        run: npm ci
+        working-directory: pr/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      - name: Rerun flagged cases
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RERUN_IDS: ${{ needs.expected-gate.outputs.rerun }}
+        run: |
+          gh auth setup-git
+          cd pr && npm run -s review:expect -- \
+            --mode replay \
+            --manifest ../delegate/review/eval/expected/manifest.json \
+            --case "$RERUN_IDS" \
+            --runs 3 \
+            --from-run 4 \
+            --concurrency 5 \
+            --variant pr-${{ needs.prepare.outputs.sha7 }} \
+            --out ../eval-expected-rerun \
+            --work-dir ${{ runner.temp }}/work-expected-rerun
+
+      - name: Upload PR rerun results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-expected-rerun-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected-rerun/
+
   # Scores with main's code, so a PR cannot change the cases or the scoring it
   # is graded on. No AWS credentials.
   expected-score:
@@ -583,7 +704,8 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    needs: [prepare, expected-main, expected-pr]
+    needs: [prepare, expected-main, expected-gate, expected-rerun]
+    if: ${{ !cancelled() && needs.expected-gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -613,6 +735,16 @@ jobs:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected
 
+      # Merges into the same directory as runs 4 to 6. A failed rerun leaves
+      # no artifact, and the final gate counts those runs as failed.
+      - name: Download PR rerun results
+        if: needs.expected-rerun.result != 'skipped'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-expected-rerun-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected
+
       - name: Score against main's expectations
         run: |
           npm run -s review:expect -- \
@@ -622,6 +754,22 @@ jobs:
             --baseline ./eval-expected-main \
             --baseline-variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --out ./eval-expected
+
+      # The gate's report replaces the score report in the comment, so holdout
+      # cases appear only as an aggregate. Exits non-zero when the gate fails,
+      # after the comment is posted.
+      - name: Gate, final pass
+        id: gate
+        continue-on-error: true
+        run: |
+          npm run -s review:expect -- \
+            --mode gate \
+            --final true \
+            --runs 3 \
+            --variant pr-${{ needs.prepare.outputs.sha7 }} \
+            --baseline-variant main-${{ needs.prepare.outputs.main_sha7 }} \
+            --base ./eval-expected-main \
+            --out ./eval-expected > /dev/null
 
       - name: Post or update PR comment
         env:
@@ -646,6 +794,10 @@ jobs:
           path: |
             ./eval-expected/
             ./eval-expected-main/
+
+      - name: Fail if the gate failed
+        if: steps.gate.outcome == 'failure'
+        run: exit 1
 
   finish:
     permissions:
