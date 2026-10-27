@@ -3,132 +3,198 @@
     "id": "omni-2453-proposal-key-race",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2453/570a21b9b52760ff2723a5dfd2e4ee1e15dc7e2a/487b6d68-81c9-43c7-86d9-d8797c750c80.json",
-    "tests": "Large PR (300 KB diff). A read-then-write on proposalKey races two creates into a 500; one production run on this commit caught it, another approved. The author fixed it."
+    "tests": "Large PR (300 KB diff). A read-then-write on proposalKey races two creates into a 500; one production run on this commit caught it, another approved. The author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "scale"
   },
   {
     "id": "omni-2679-starlette-background-task",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2679/5f578185d37c6b1203d2dbe7d6ea290d847c5336/fea3cd6a-fdc5-4a6f-ab2e-caf7d3831bd4.json",
-    "tests": "Production flagged a sync background task as blocking the event loop. Starlette runs sync background tasks in a threadpool; the author refuted it. Nothing to block."
+    "tests": "Production flagged a sync background task as blocking the event loop. Starlette runs sync background tasks in a threadpool; the author refuted it. Nothing to block.",
+    "split": "holdout",
+    "source": "refuted",
+    "kind": "false-finding"
   },
   {
     "id": "gp-data-platform-1162-zip-leading-zeros",
     "suite": "core",
     "key": "reviews/thegoodparty/gp-data-platform/1162/21b2eb051e088edd1e3fce1d5e78a4eafdf82e2d/f07d0497-a816-41ca-865d-4678d0ae9ce6.json",
-    "tests": "dbt re-review with one prior. Production claimed ZIP+4 suffixes lose leading zeros; the author showed the column is a string. Nothing to block."
+    "tests": "dbt re-review with one prior. Production claimed ZIP+4 suffixes lose leading zeros; the author showed the column is a string. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
   },
   {
     "id": "omni-2655-last-attempt-strands-purchase",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2655/f2bc49315f79776fe6df218f70d190bbca08d6a4/9f369914-b9f2-4ce7-9ef0-64641cd0af1f.json",
-    "tests": "Small money-path change. A transient Vercel error on the last poll attempt strands a paid domain purchase. Production caught it; the author fixed it."
+    "tests": "Small money-path change. A transient Vercel error on the last poll attempt strands a paid domain purchase. Production caught it; the author fixed it.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "omni-2709-double-counted-respondents",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2709/2422994771e73ba6a83df5b5dabef90cffce0eba/0325844b-2bc6-4a76-9488-3260480c7055.json",
-    "tests": "Medium Serve PR. A person who replied to two sends is counted twice per channel. Production caught it; the author fixed it."
+    "tests": "Medium Serve PR. A person who replied to two sends is counted twice per channel. Production caught it; the author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "ops-255-workflow-shell-injection",
     "suite": "core",
     "key": "reviews/thegoodparty/ops/255/001c91aa4fb86cd67ef9a608c44561af4efa5d3c/b9135a59-0e87-4809-aa14-d118b4cda961.json",
-    "tests": "A GitHub Actions workflow interpolates a PR comment body into a shell script. Production caught the injection; the author fixed it."
+    "tests": "A GitHub Actions workflow interpolates a PR comment body into a shell script. Production caught the injection; the author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "gp-marketing-418-takedown-bypass",
     "suite": "core",
     "key": "reviews/thegoodparty/gp-marketing/418/0a3de96118647b8ab37d3f08a0ac87f617db7c7f/491aeff1-f137-4da6-be1b-63da7fd96335.json",
-    "tests": "A person's own profile photo overrides a takedown on two card types. Production raised both; the author fixed both."
+    "tests": "A person's own profile photo overrides a takedown on two card types. Production raised both; the author fixed both.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "omni-2474-dependabot-major-bump",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2474/2c8e9c8a2a58797740edef06532ca262ad6bd6ef/e61ff2af-81f9-4580-894c-af4ec3058707.json",
-    "tests": "Dependabot bumps maplibre-gl two majors in package.json only. Tests how a reviewer handles a dependency PR with almost no diff."
+    "tests": "Dependabot bumps maplibre-gl two majors in package.json only. Tests how a reviewer handles a dependency PR with almost no diff.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "false-finding"
   },
   {
     "id": "omni-2671-ecr-public-login",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2671/cdd3c4b92a0935d483401c143d3b8632add8c663/02447711-ad54-40aa-8383-9bdd0698af52.json",
-    "tests": "Bugbot called the ECR Public login region a High bug; amazon-ecr-login hardcodes us-east-1 for public logins. Production approved, correctly."
+    "tests": "Bugbot called the ECR Public login region a High bug; amazon-ecr-login hardcodes us-east-1 for public logins. Production approved, correctly.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
   },
   {
     "id": "omni-2701-docs-addition",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2701/9612f1b93db46801942028f39520fa85f7edc124/be011a3f-6d49-4ac0-898d-b704a9199496.json",
-    "tests": "Docs-only: where agent experiment runs can work. Production approved."
+    "tests": "Docs-only: where agent experiment runs can work. Production approved.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "false-finding"
   },
   {
     "id": "omni-2522-two-priors-fixed",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2522/58c350cf4033d763bc22e3f63971a8f9e4070cab/53d94fca-63d1-422d-92fb-49755fba5310.json",
-    "tests": "Re-review after the author fixed both prior findings (SUPERSEDED missing from an exclusion and its test). Production approved."
+    "tests": "Re-review after the author fixed both prior findings (SUPERSEDED missing from an exclusion and its test). Production approved.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "false-finding"
   },
   {
     "id": "omni-2506-greeting-without-name",
     "suite": "core",
     "key": "reviews/thegoodparty/omni/2506/ac655866365f12f62492372a5f9e165b47afacc6/e2ab1506-64d7-4fe7-88c2-1aa75ddb5ce0.json",
-    "tests": "The CRM entry to the Campaign Manager greets every user without their first name. Production caught it; the author fixed it."
+    "tests": "The CRM entry to the Campaign Manager greets every user without their first name. Production caught it; the author fixed it.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "ops-302-mangled-prior-id",
     "suite": "re-review",
     "key": "reviews/thegoodparty/ops/302/95e56b588aa5164a15bf2bdafc1e9dcdf1525fb7/9e71d934-004e-424e-9dca-4e20607206bd.json",
-    "tests": "Two prior findings. Production failed: the model mangled a prior finding's UUID and the whole output failed the schema."
+    "tests": "Two prior findings. Production failed: the model mangled a prior finding's UUID and the whole output failed the schema.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   },
   {
     "id": "ops-302-two-priors-still-open",
     "suite": "re-review",
     "key": "reviews/thegoodparty/ops/302/d60a9f001e8a66edc872f34d9c55b4dd90ecd839/cd18e861-e283-4473-a032-89c47d200b43.json",
-    "tests": "Same two prior findings one push later. Production carried both forward onto their existing threads."
+    "tests": "Same two prior findings one push later. Production carried both forward onto their existing threads.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "ops-244-prose-instead-of-json",
     "suite": "re-review",
     "key": "reviews/thegoodparty/ops/244/1d0189a26dedca8c5d931b24716d8e9e5e5eab18/6edf2540-a868-412f-8f66-7096f5cf0d6f.json",
-    "tests": "One prior finding that was fixed. Production failed: the model ended on prose about the prior finding and returned no JSON."
+    "tests": "One prior finding that was fixed. Production failed: the model ended on prose about the prior finding and returned no JSON.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   },
   {
     "id": "omni-2461-prose-checking-prior",
     "suite": "re-review",
     "key": "reviews/thegoodparty/omni/2461/fcd958f8968c29b59b463c806f730d1e775bc4cc/aa6d0305-b93e-470f-9b4f-485aa471e76d.json",
-    "tests": "One prior test-coverage finding the push addressed. Production failed: the model stopped mid-check of the prior finding with no JSON."
+    "tests": "One prior test-coverage finding the push addressed. Production failed: the model stopped mid-check of the prior finding with no JSON.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   },
   {
     "id": "omni-2461-fenced-json",
     "suite": "re-review",
     "key": "reviews/thegoodparty/omni/2461/c64db394e89ccf9a56ff5713f774c14ca5ec7b37/ad9f53d4-6e74-45da-b5c9-51b3085f2b0a.json",
-    "tests": "One prior cross-file finding. Production failed: the model returned fenced JSON the parser could not use."
+    "tests": "One prior cross-file finding. Production failed: the model returned fenced JSON the parser could not use.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   },
   {
     "id": "omni-2581-three-priors-oversized-diff",
     "suite": "re-review",
     "key": "reviews/thegoodparty/omni/2581/43933503260aa4e51896030edc96fb8610c58adf/90e498b1-5717-41b6-99fe-ac8d6e5d27a1.json",
-    "tests": "Three prior findings across three files, all still open, on a diff too large to inline. Production carried all three."
+    "tests": "Three prior findings across three files, all still open, on a diff too large to inline. Production carried all three.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "scale"
   },
   {
     "id": "gp-data-platform-1181-one-carried-one-new",
     "suite": "re-review",
     "key": "reviews/thegoodparty/gp-data-platform/1181/dca8a8946b34a50ec60503af8e094c56cbf059c3/146f0f8c-d922-46d4-827f-f55807d7421b.json",
-    "tests": "Two prior findings in a dbt repo. Production carried one and raised one new finding."
+    "tests": "Two prior findings in a dbt repo. Production carried one and raised one new finding.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "omni-2655-one-fixed-one-open",
     "suite": "re-review",
     "key": "reviews/thegoodparty/omni/2655/54ce71a2728712b9731ba7ad54a2077330e47972/c91d44a8-3681-407e-8c29-456c846cf357.json",
-    "tests": "Two prior findings in different files. Production carried one and dropped the other as fixed."
+    "tests": "Two prior findings in different files. Production carried one and dropped the other as fixed.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
   },
   {
     "id": "gp-marketing-443-four-priors-all-fixed",
     "suite": "re-review",
     "key": "reviews/thegoodparty/gp-marketing/443/15c6566ce750888f5b1f926b5d01df3397fa0636/8593dfb3-9493-407e-831a-e70cae8d2af5.json",
-    "tests": "Four prior findings in one file, all fixed. Production approved with no findings."
+    "tests": "Four prior findings in one file, all fixed. Production approved with no findings.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "false-finding"
   },
   {
     "id": "ops-271-re-raised-without-link",
     "suite": "re-review",
     "key": "reviews/thegoodparty/ops/271/6a364d7c15ac22be026e8d6037cf52c713c9ff29/a81b8976-146b-4a54-af4e-4172bc2b25e6.json",
-    "tests": "One prior security finding the model raised again one line away without linking it, so production opened a duplicate thread."
+    "tests": "One prior security finding the model raised again one line away without linking it, so production opened a duplicate thread.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "bug"
   }
 ]
