@@ -72,6 +72,7 @@ const fixCommit = (overrides: Partial<FixCommit> = {}): FixCommit => ({
   sha: "81bc332479",
   subject: "Fix tag creation race",
   isMerge: false,
+  committedAt: "2026-10-08T00:00:00.000Z",
   files: [{ path: "src/tags.ts", patch: fixPatch }],
   ...overrides,
 });
@@ -224,7 +225,8 @@ test("mine reads merge info once per PR and honors --kind", async () => {
       prMergeCalls++;
       return { mergedAt: "2026-10-07T00:00:00.000Z", mergeSha: "mergesha" };
     },
-    commitsBetween: async () => [fixCommit()],
+    listCommits: async () => [fixCommit()],
+    commitFiles: async () => fixCommit().files,
     prFiles: async () => mergedFiles,
     prComments: async () => comments,
   };
@@ -243,9 +245,65 @@ test("mine reads merge info once per PR and honors --kind", async () => {
 test("mine skips PRs that never merged", async () => {
   const runners: Runners = {
     prMerge: async () => null,
-    commitsBetween: async () => assert.fail("no commits lookup for an unmerged PR"),
+    listCommits: async () => assert.fail("no commits lookup for an unmerged PR"),
+    commitFiles: async () => assert.fail("no commit hydration for an unmerged PR"),
     prFiles: async () => assert.fail("no files lookup for an unmerged PR"),
     prComments: async () => assert.fail("no comments lookup for an unmerged PR"),
   };
   assert.deepEqual(await mine([mined(makeRecord())], runners), []);
+});
+
+test("a finding on a context line surfaces when the merged diff left that line alone", () => {
+  const record = blocked(7);
+  record.findings[0].line = 10;
+  const found = refutedCandidate(mined(record), mergedFiles, comments, "mergesha");
+  assert.equal(found?.findings[0].line, 10);
+});
+
+test("a finding on a context line is excluded when the merged diff removed that line", () => {
+  const record = blocked(7);
+  record.findings[0].line = 10;
+  const changed = [{ path: "src/tags.ts", patch: "@@ -10,3 +10,3 @@\n-  const name = input.name\n+  const name = input.title\n   return name" }];
+  assert.equal(refutedCandidate(mined(record), changed, comments, "mergesha"), null);
+});
+
+test("each commit is hydrated at most once across overlapping windows", async () => {
+  const commit = (sha: string, committedAt: string) => ({ sha, subject: "Fix tag race", isMerge: false, committedAt });
+  const listed = [
+    commit("c1", "2026-10-08T00:00:00.000Z"),
+    commit("c2", "2026-10-12T00:00:00.000Z"),
+    commit("c3", "2026-10-30T00:00:00.000Z"),
+  ];
+  const mergedAtByPr: Record<number, string> = {
+    1: "2026-10-07T00:00:00.000Z",
+    2: "2026-10-10T00:00:00.000Z",
+    3: "2026-10-20T00:00:00.000Z",
+  };
+  const hydrations: string[] = [];
+  let listCalls = 0;
+  const runners: Runners = {
+    prMerge: async (_repo, pr) => ({ mergedAt: mergedAtByPr[pr], mergeSha: `m${pr}` }),
+    listCommits: async () => {
+      listCalls++;
+      return listed;
+    },
+    commitFiles: async (_repo, sha) => {
+      hydrations.push(sha);
+      return fixCommit().files;
+    },
+    prFiles: async () => [],
+    prComments: async () => [],
+  };
+  const records = [1, 2, 3].map((pr) =>
+    mined(makeRecord({ prNumber: pr, bundle: { ...makeRecord().bundle, prNumber: pr } })),
+  );
+
+  const found = await mine(records, runners);
+  assert.equal(listCalls, 1);
+  assert.deepEqual([...hydrations].sort(), ["c1", "c2", "c3"]);
+  // PR 1 sees c1 and c2, PR 2 sees c2, PR 3 sees c3 only.
+  assert.deepEqual(
+    found.map((c) => c.kind === "missed" && `${c.pr}:${c.fixCommit}`).sort(),
+    ["1:c1", "1:c2", "2:c2", "3:c3"],
+  );
 });

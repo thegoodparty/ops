@@ -28,10 +28,14 @@ export interface FixFile {
   patch: string;
 }
 
-export interface FixCommit {
+export interface CommitRef {
   sha: string;
   subject: string;
   isMerge: boolean;
+  committedAt: string;
+}
+
+export interface FixCommit extends CommitRef {
   files: FixFile[];
 }
 
@@ -45,7 +49,8 @@ export interface ReviewComment {
 // Injected so tests need no network. Real implementations shell out to gh.
 export interface Runners {
   prMerge: (repo: string, pr: number) => Promise<MergeInfo | null>;
-  commitsBetween: (repo: string, since: string, until: string) => Promise<FixCommit[]>;
+  listCommits: (repo: string, since: string, until: string) => Promise<CommitRef[]>;
+  commitFiles: (repo: string, sha: string) => Promise<FixFile[]>;
   prFiles: (repo: string, pr: number) => Promise<FixFile[]>;
   prComments: (repo: string, pr: number) => Promise<ReviewComment[]>;
 }
@@ -163,11 +168,12 @@ export const loadRecords = async (
   return selectRecords(raw);
 };
 
-// Hunk text of one file's patch: added and removed lines with their line
-// numbers on the new and old side respectively.
-export const patchLines = (patch: string): { added: Line[]; removed: Line[] } => {
+// Hunk text of one file's patch: added, removed and unchanged lines, numbered
+// on the new side (added, context) or the old side (removed).
+export const patchLines = (patch: string): { added: Line[]; removed: Line[]; context: Line[] } => {
   const added: Line[] = [];
   const removed: Line[] = [];
+  const context: Line[] = [];
   let oldLine = 0;
   let newLine = 0;
   for (const text of patch.split("\n")) {
@@ -180,11 +186,12 @@ export const patchLines = (patch: string): { added: Line[]; removed: Line[] } =>
     } else if (text.startsWith("-")) {
       removed.push({ line: oldLine++, text: text.slice(1) });
     } else if (text.startsWith(" ")) {
+      context.push({ line: newLine, text: text.slice(1) });
       oldLine++;
       newLine++;
     }
   }
-  return { added, removed };
+  return { added, removed, context };
 };
 
 // Splits a full unified diff into per-file hunk text, keyed by the new path.
@@ -286,11 +293,14 @@ export const refutedCandidate = (
   if (record.verdict !== "comment" || record.findings.length === 0) return null;
 
   const mergedAdded = new Map<string, Set<string>>();
+  const mergedRemoved = new Map<string, Set<string>>();
   for (const f of mergedFiles) {
-    mergedAdded.set(f.path, new Set(patchLines(f.patch).added.map((l) => l.text)));
+    const lines = patchLines(f.patch);
+    mergedAdded.set(f.path, new Set(lines.added.map((l) => l.text)));
+    mergedRemoved.set(f.path, new Set(lines.removed.map((l) => l.text)));
   }
-  const reviewedAdded = new Map<string, Line[]>();
-  for (const f of splitDiff(record.bundle.diff)) reviewedAdded.set(f.path, patchLines(f.patch).added);
+  const reviewed = new Map<string, { added: Line[]; context: Line[] }>();
+  for (const f of splitDiff(record.bundle.diff)) reviewed.set(f.path, patchLines(f.patch));
 
   const replies: string[] = [];
   for (const finding of record.findings) {
@@ -301,11 +311,16 @@ export const refutedCandidate = (
     replies.push(...reply.map((c) => c.body));
 
     const end = finding.endLine ?? finding.line;
-    const flagged = (reviewedAdded.get(finding.path) ?? []).filter(
-      (l) => l.line >= finding.line && l.line <= end,
-    );
-    const stillThere = mergedAdded.get(finding.path);
-    if (flagged.length === 0 || !stillThere || !flagged.every((l) => stillThere.has(l.text))) return null;
+    const inRange = (l: Line) => l.line >= finding.line && l.line <= end;
+    const lines = reviewed.get(finding.path);
+    const addedFlagged = (lines?.added ?? []).filter(inRange);
+    const contextFlagged = (lines?.context ?? []).filter(inRange);
+    if (addedFlagged.length + contextFlagged.length === 0) return null;
+    // A flagged context line is unchanged unless the merged diff removed it.
+    const stillAdded = mergedAdded.get(finding.path);
+    const removed = mergedRemoved.get(finding.path);
+    if (addedFlagged.length > 0 && (!stillAdded || !addedFlagged.every((l) => stillAdded.has(l.text)))) return null;
+    if (removed && contextFlagged.some((l) => removed.has(l.text))) return null;
   }
 
   return {
@@ -338,24 +353,62 @@ export const mine = async (
     return merges.get(id)!;
   };
 
-  const missed: MissedCandidate[] = [];
-  const refuted: RefutedCandidate[] = [];
+  const resolved: { mined: MinedRecord; merge: MergeInfo }[] = [];
   for (const mined of records) {
     const { repo, prNumber, verdict } = mined.record;
-    if (verdict === "approve" && opts.kind !== "refuted") {
-      const merge = await merged(repo, prNumber);
-      if (!merge) continue;
-      const until = new Date(new Date(merge.mergedAt).getTime() + FIX_WINDOW_MS).toISOString();
-      const commits = await runners.commitsBetween(repo, merge.mergedAt, until);
+    const wanted = verdict === "approve" ? opts.kind !== "refuted" : verdict === "comment" && opts.kind !== "missed";
+    if (!wanted) continue;
+    const merge = await merged(repo, prNumber);
+    if (merge) resolved.push({ mined, merge });
+  }
+
+  // One commit listing per repo over the whole span, and each commit is
+  // hydrated at most once however many windows it falls in.
+  const spans = new Map<string, { from: number; to: number }>();
+  for (const { mined, merge } of resolved) {
+    if (mined.record.verdict !== "approve") continue;
+    const at = new Date(merge.mergedAt).getTime();
+    const span = spans.get(mined.record.repo);
+    spans.set(mined.record.repo, {
+      from: Math.min(span?.from ?? at, at),
+      to: Math.max(span?.to ?? at, at + FIX_WINDOW_MS),
+    });
+  }
+  const listings = new Map<string, Promise<CommitRef[]>>();
+  const hydrated = new Map<string, Promise<FixFile[]>>();
+  const listing = (repo: string) => {
+    const span = spans.get(repo)!;
+    if (!listings.has(repo)) {
+      listings.set(repo, runners.listCommits(repo, new Date(span.from).toISOString(), new Date(span.to).toISOString()));
+    }
+    return listings.get(repo)!;
+  };
+  const files = (repo: string, sha: string) => {
+    const id = `${repo}/${sha}`;
+    if (!hydrated.has(id)) hydrated.set(id, runners.commitFiles(repo, sha));
+    return hydrated.get(id)!;
+  };
+
+  const missed: MissedCandidate[] = [];
+  const refuted: RefutedCandidate[] = [];
+  for (const { mined, merge } of resolved) {
+    const { repo, prNumber, verdict } = mined.record;
+    if (verdict === "approve") {
+      const from = new Date(merge.mergedAt).getTime();
+      const inWindow = (await listing(repo)).filter((c) => {
+        const at = new Date(c.committedAt).getTime();
+        return !c.isMerge && c.sha !== merge.mergeSha && at >= from && at <= from + FIX_WINDOW_MS;
+      });
+      const commits: FixCommit[] = await Promise.all(
+        inWindow.map(async (c) => ({ ...c, files: await files(repo, c.sha) })),
+      );
       missed.push(...missedCandidates(mined, commits, merge.mergeSha, words));
-    } else if (verdict === "comment" && opts.kind !== "missed") {
-      const merge = await merged(repo, prNumber);
-      if (!merge) continue;
-      const [files, comments] = await Promise.all([
+    } else {
+      const [mergedFiles, comments] = await Promise.all([
         runners.prFiles(repo, prNumber),
         runners.prComments(repo, prNumber),
       ]);
-      const found = refutedCandidate(mined, files, comments, merge.mergeSha);
+      const found = refutedCandidate(mined, mergedFiles, comments, merge.mergeSha);
       if (found) refuted.push(found);
     }
   }
@@ -372,7 +425,7 @@ const gh = async (args: string[]): Promise<string> => {
 
 interface RestCommit {
   sha: string;
-  commit: { message: string };
+  commit: { message: string; committer: { date: string } };
   parents: unknown[];
   files?: { filename: string; patch?: string }[];
 }
@@ -385,19 +438,20 @@ export const ghRunners: Runners = {
     };
     return out.mergedAt && out.mergeCommit ? { mergedAt: out.mergedAt, mergeSha: out.mergeCommit.oid } : null;
   },
-  commitsBetween: async (repo, since, until) => {
+  listCommits: async (repo, since, until) => {
     const list = JSON.parse(
       await gh(["api", "--paginate", "--slurp", `repos/${repo}/commits?since=${since}&until=${until}&per_page=100`]),
     ) as RestCommit[][];
-    return mapLimit(list.flat(), 8, async (c) => {
-      const full = JSON.parse(await gh(["api", `repos/${repo}/commits/${c.sha}`])) as RestCommit;
-      return {
-        sha: c.sha,
-        subject: c.commit.message.split("\n")[0],
-        isMerge: c.parents.length > 1,
-        files: (full.files ?? []).flatMap((f) => (f.patch ? [{ path: f.filename, patch: f.patch }] : [])),
-      };
-    });
+    return list.flat().map((c) => ({
+      sha: c.sha,
+      subject: c.commit.message.split("\n")[0],
+      isMerge: c.parents.length > 1,
+      committedAt: c.commit.committer.date,
+    }));
+  },
+  commitFiles: async (repo, sha) => {
+    const full = JSON.parse(await gh(["api", `repos/${repo}/commits/${sha}`])) as RestCommit;
+    return (full.files ?? []).flatMap((f) => (f.patch ? [{ path: f.filename, patch: f.patch }] : []));
   },
   prFiles: async (repo, pr) => {
     const files = JSON.parse(await gh(["api", "--paginate", "--slurp", `repos/${repo}/pulls/${pr}/files?per_page=100`])) as {
