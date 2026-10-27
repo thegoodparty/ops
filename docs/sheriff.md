@@ -31,9 +31,11 @@ and that decision is recorded.
    and paste an incident or ticket link. You must be in the `Engineers`
    Identity Center group to ask.
 2. The request posts to `#sensitive-access-requests`. An approver other than
-   you approves or denies it there. The approvers are
-   `APPROVER_SLACK_USER_IDS` in `deploy-infrastructure/sheriff/config.ts`, and
-   changing that list is a reviewed PR.
+   you approves or denies it there. An approver is anyone in the `Approvers`
+   Identity Center group, which the group-sync job mirrors from the
+   `Engineering Admin` Workspace group (`eng-admin@goodparty.org`). Their
+   membership is resolved live from Identity Center when they click, not from a
+   list in the code; see "Approval policy".
 3. Once approved, sign out of the AWS access portal and back in, then pick
    `AdministratorAccess`. One grant covers the management, workbench and
    infrastructure accounts. From the CLI, `aws sso login` with a profile whose
@@ -143,6 +145,7 @@ repo today.
 |---|---|---|
 | Identity Center is fully code-owned | `deploy/components/identity-center.ts`, applied by `github-actions-pulumi-deploy` (which holds `sso:*`) | The existing `administrator` permission set (shortened) and the existing `Admins` group and its three `AccountAssignment`s. No new resources. |
 | `Admins` already holds admin in all three accounts | `deploy/components/identity-center.ts`: `main`, `workbench` and `infrastructure` all map `Admins` to `administrator` | The escalation target itself. The grant is a group membership, not a new assignment. |
+| The `Approvers` group is synced from a Workspace group | `deploy-infrastructure/group-sync/config.ts` (`approvers-google`) mirrors `eng-admin@goodparty.org` into it | The decision-time approver set, read live through `GetUserId` and `IsMemberInGroups` on each click. No list in this repo and no mirror to keep current. |
 | Slack signing and secret handling | `delegate/lambdas/verify.ts` (`verifySlackWebhook`), `delegate/lambdas/secrets.ts` (`getSecrets`) | The **code patterns** only. The deployed delegate function and its `DELEGATES` secret are not reused; see below. |
 | A cross-account assume into the management account | `deploy/components/delegate-swarm-prod-read.ts` (trust by account root plus a `PrincipalArn` condition), assumed from the infrastructure account in `deploy-infrastructure/agent-swarm.ts` | The `sheriff-grant` role is the same pattern with a much narrower policy. |
 | The infrastructure account and its guardrails | `deploy-infrastructure/`, the `Infrastructure` SCP in `deploy-org/policies.ts` | The new Lambda, DynamoDB, scheduler and alarms land there, under that SCP. |
@@ -231,9 +234,12 @@ Recorded so a reader of the diff is not confused by the review thread:
 - No `BreakGlass-<account>` groups. The existing `Admins` group is reused.
 - No per-account escalation. A single membership is global; see "Single global
   escalation" below.
-- No `BreakGlassApprovers` Identity Store group or Slack mirror. The approver
-  list is a hardcoded array of Slack user IDs in the tool's code; see "Approval
-  policy".
+- No `BreakGlassApprovers` Identity Store group and no Slack mirror. The first
+  revision checked a hardcoded array of Slack user IDs in the tool's code. That
+  is reversed: the approver set is now the existing `Approvers` Identity Center
+  group, resolved live at decision time (not the `BreakGlassApprovers` group
+  this revision rejected, and not a code list). See "Approval policy" for the
+  decision and the security trade-off it accepts.
 
 ### Option 2 (rejected): create and delete `AccountAssignment` on demand
 
@@ -302,7 +308,8 @@ both production and the organization's management account. SCPs do not apply to
 it, and it can create accounts and edit SCPs. An approved break-glass request is
 therefore effectively an organization-admin grant, and the human approval is the
 only thing standing between a request and that. That is the strongest argument
-for the approver checks (hardcoded list, not the requester), for the audit, and
+for the approver checks (the `Approvers` group at decision time, and the
+approver must not be the requester), for the audit, and
 for keeping the escalation rare. It is also why the first revision's per-account
 groups were attractive and why dropping them is a real change: they were a
 blast-radius control that this design gives up. The compensating controls are
@@ -375,8 +382,12 @@ gets `sts:AssumeRole` on exactly one ARN (`sheriff-grant`), plus DynamoDB,
 logs, scheduler and its own secret, and nothing else. It is still under the
 `Infrastructure` SCP.
 
-The **approver list** is a hardcoded array of Slack user IDs in the Lambda's
-code, changed only by a reviewed PR.
+The **approver set** is the `Approvers` Identity Center group, checked live on
+every click (`GetUserId` on the clicker's Slack email, then
+`IsMemberInGroups`), the same way the requester's `Engineers` membership is
+checked at submission. There is no list in the Lambda's code and no mirrored
+copy in DynamoDB or SSM, so there is no sync lag and a removed approver loses
+the ability to approve on their next click. See "Approval policy".
 
 **Two hard rules**, stated here so they are not lost in the detail:
 
@@ -413,9 +424,13 @@ code, changed only by a reviewed PR.
    interactivity as `application/x-www-form-urlencoded` with a `payload=<json>`
    field rather than the JSON body the delegate events route parses, so the
    route decodes that before reading the action.
-4. The handler re-verifies the Slack signature with the sheriff secret and
-   checks that the clicking user is on the hardcoded approver list **and** is
-   not the requester. Anyone else gets an ephemeral "not an approver".
+4. The handler re-verifies the Slack signature with the sheriff secret, then
+   resolves the clicking user live: `slack.users.info` for their Slack email,
+   `identitystore:GetUserId` on `emails.value`, and `IsMemberInGroups` against
+   the `Approvers` group, the same resolution the requester gate uses. They
+   must also not be the requester. Anyone else gets an ephemeral refusal, and
+   if Slack or Identity Store cannot answer, the decision is refused with an
+   explicit message rather than allowed (fail closed).
 5. On **Deny**: write `denied`, post the outcome to the channel, done.
 6. On **Approve**: enforce the remaining checks (duration within cap, per-user
    rate limit, request not already decided, and **no other active grant for the
@@ -510,7 +525,7 @@ already exists. It is the role that lets the tool add and remove memberships.
   `sheriff-grant-tool`) so CloudTrail records every assume under one
   distinguishable name rather than `AWS-Reserved-Session` or a random string.
 - **Inline policy, scoped by resource**, to the identity store id, the
-  `Admins` group id and the `Engineers` group id:
+  `Admins` group id, the `Engineers` group id and the `Approvers` group id:
   `identitystore:CreateGroupMembership`,
   `identitystore:DeleteGroupMembership`, `identitystore:ListGroupMemberships`,
   `identitystore:ListGroupMembershipsForMember`, plus step 4's
@@ -520,10 +535,11 @@ already exists. It is the role that lets the tool add and remove memberships.
   `MembershipId` of a pre-existing member when `CreateGroupMembership` returns
   `ConflictException` and of a `granting` record that the sweeper or the revoke
   handler recovers, and `ListGroupMemberships` is the sweeper's full-group scan.
-  `GetUserId` resolves the requester from their Slack email on `emails.value`,
-  and `IsMemberInGroups` is the `Engineers` gate. The exact resource ARN form is
+  `GetUserId` resolves a Slack email on `emails.value`, and
+  `IsMemberInGroups` is both membership gates: `Engineers` for the requester and
+  `Approvers` for the clicker. The exact resource ARN form is
   confirmed at implementation; the point is that it names the one identity
-  store and the two groups it acts on, not `*`.
+  store and the three groups it acts on, not `*`.
 
   Deliberately absent: `identitystore:DescribeGroup`,
   `identitystore:ListUsers` and `identitystore:DescribeUser`. No described
@@ -648,10 +664,37 @@ tool's own records are structured for export and retention from day one.
 
 ## Approval policy
 
-- **Who approves.** The approver list is a **hardcoded array of Slack user IDs
-  in the tool's code**, changed only by a reviewed PR. There is no Identity
-  Store approver group and no Slack mirror; a reviewed PR is a better control
-  than a self-service group, and it removes a resource. This is settled.
+- **Who approves.** Membership in the `Approvers` Identity Center group,
+  resolved live at decision time. The clicking user's Slack profile email is
+  mapped with `identitystore:GetUserId` on `emails.value` and checked with
+  `identitystore:IsMemberInGroups` against the `Approvers` group id, exactly as
+  the requester's `Engineers` membership is checked at submission. There is no
+  hardcoded Slack id list in the code and no mirrored copy in DynamoDB, SSM or
+  Slack: the directory is the source of truth, so there is no sync lag, no new
+  copy to keep current, and revoking someone from the group takes effect on
+  their next click. The group is the same `Approvers` group the group-sync job
+  mirrors from the `Engineering Admin` Workspace group
+  (`eng-admin@goodparty.org`); adding or removing an approver is a Workspace
+  group change, not a code change.
+- **Fail closed.** If Slack returns no email, no Identity Center user matches
+  it, `IsMemberInGroups` answers false, or Identity Store cannot answer at all,
+  the decision is refused with an explicit ephemeral message and nothing is
+  decided or granted. An Identity Store outage never reads as an approval.
+- **The decision this reverses, and its security trade-off.** The previous
+  policy was a hardcoded array of Slack user IDs, changed only by a reviewed
+  PR, and it was recorded here as settled because a reviewed PR is a stronger
+  control than self-service group membership. This PR reverses that
+  deliberately, which weakens that specific control and the trade-off is not
+  argued away. The `Approvers` group is synced from
+  `eng-admin@goodparty.org`, so whoever administers that Workspace group can
+  confer approval authority without a code review — and because approval
+  authority is the human gate on an org-admin grant, it is effectively admin
+  authority. The residual mitigations are: the approver must not be the
+  requester, every request and outcome is posted to the channel, and the audit
+  record and the grant record name the approver (their Slack id) alongside the
+  requester, reason and ticket. A notification when the sync job adds or
+  removes an approver would put group changes in front of the channel and is a
+  sensible follow-up; it is not part of this change.
 - **How many.** One approver per request, and the approver must not be the
   requester. For a global escalation that reaches the management account, a
   second approver is tempting, but review settled on one for now; two-person
@@ -837,8 +880,10 @@ The Progress list is the checklist; this is the detail behind each step.
    token in Secrets Manager in the infrastructure account, and a new Lambda in
    `deploy-infrastructure/`. Slash command, modal (duration, reason, ticket; no
    account), DynamoDB request records, the channel post and the button handler,
-   the hardcoded approver check, the state machine up to and including the
-   decision, but no `CreateGroupMembership`. The requester identity mapping is
+   the approver check (a hardcoded Slack id list at the time; since replaced by
+   the `Approvers` group, see "Approval policy"), the state machine up to and
+   including the decision, but no `CreateGroupMembership`. The requester
+   identity mapping is
    settled (open question 3) as a hard-coded Slack-to-Identity-Store map in the
    Lambda; step 4 replaces it with the email lookup. This is where the flow
    becomes reviewable by people who will never read the IAM policy. `done`.
@@ -898,7 +943,8 @@ For a reviewer checking the plan against the repo:
   `deploy-infrastructure/index.ts`.
 - `deploy-infrastructure/sheriff/` — the handler itself (`handler.ts`,
   `policy.ts`, `blocks.ts`, `store.ts`, `config.ts`, `identity.ts`), including
-  the hard-coded approver list and the `Engineers` gate group id.
+  the `Engineers` and `Approvers` gate group ids and the live approver
+  resolution.
 - `utils/accounts.ts` — `MANAGEMENT_ACCOUNT_ID`, `WORKBENCH_ACCOUNT_ID`,
   `INFRASTRUCTURE_ACCOUNT_ID`, and the pattern for recording the identity store
   id.
@@ -939,10 +985,11 @@ and are deliberately neither created by Pulumi nor committed:
    path. If you do create one by hand, expect the next apply to adopt it and
    diff only its description and tags against the declaration.
 
-3. **The approver list.** `deploy-infrastructure/sheriff/config.ts` holds the
-   approver Slack user ids, changed only by a reviewed PR per the approval
-   policy. The requester mapping is no longer a list: step 4 resolves the
-   requester from their Slack email and gates on the `Engineers` group.
+3. **Approvers.** There is nothing to list in this repo. Approval authority is
+   membership in the `Approvers` Identity Center group, which the group-sync
+   job mirrors from the `Engineering Admin` Workspace group
+   (`eng-admin@goodparty.org`). Add or remove an approver in that Workspace
+   group; no code change, Pulumi change or redeploy is involved.
 4. **The alarm email subscription.** The stack creates the `sheriff-alerts`
    SNS topic and subscribes `aws-infrastructure@goodparty.org`, but the
    subscription stays unconfirmed until someone accepts the AWS email. Until

@@ -21,7 +21,8 @@
  *   POST /interactivity  `view_submission`: resolve the requester, gate on
  *                        `Engineers`, write the request, then async-post the
  *                        approval message and return `clear`.
- *                        `block_actions`: check the clicker, then async-decide.
+ *                        `block_actions`: resolve the clicker against the
+ *                        `Approvers` group, then async-decide.
  *
  * The async events are:
  *
@@ -67,8 +68,10 @@ import {
   deleteAdminsMembership,
   isEngineersMember,
   listAdminsMemberships,
+  lookupApprover,
   lookupIdentityStoreUserId,
   resolveAdminsMembershipId,
+  type ApproverLookup,
 } from "./identity";
 import {
   createExpirySchedule,
@@ -77,9 +80,11 @@ import {
 import type { IdentitystoreClient } from "@aws-sdk/client-identitystore";
 import {
   activeGrantDecision,
+  approverErrorMessage,
   decodeSlackPayload,
   durationSecondsFor,
   eligibilityErrorMessage,
+  evaluateApproverLookup,
   evaluateDecision,
   evaluateEligibility,
   expiryScheduleName,
@@ -721,6 +726,40 @@ const handleBlockActions = async (
   const request = await getRequest(requestId);
   if (!request) {
     await ephemeral("That break-glass request no longer exists.");
+    return OK;
+  }
+
+  // The decision-time approver gate, resolved live from the `Approvers`
+  // Identity Center group on every click, the same way the requester is
+  // resolved from `Engineers` at submission. No mirrored list, so a removal
+  // takes effect on the next click. Fail closed: if Identity Store cannot
+  // answer, the click is refused with an explicit message and nothing is
+  // decided or granted.
+  let slackEmail: string | undefined;
+  try {
+    const info = await slack.users.info({ user: clickerSlackId });
+    slackEmail = info.user?.profile?.email ?? undefined;
+  } catch (err) {
+    console.error("users.info failed for the approver", err);
+  }
+
+  let lookup: ApproverLookup | null = null;
+  if (slackEmail) {
+    try {
+      const client = await assumeGrantRole();
+      lookup = await lookupApprover(client, slackEmail);
+    } catch (err) {
+      // AssumeRole failed, so Identity Store was never consulted. `lookup`
+      // stays null and the gate below refuses the decision.
+      console.error("approver lookup could not start", err);
+    }
+  }
+
+  const approver = evaluateApproverLookup({ slackEmail, lookup });
+  if (!approver.ok) {
+    await ephemeral(
+      approverErrorMessage(approver.failure, approver.email),
+    );
     return OK;
   }
 
