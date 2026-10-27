@@ -735,18 +735,31 @@ jobs:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected
 
-      # Merges into the same directory as runs 4 to 6. A failed rerun leaves
-      # no artifact, and the final gate counts those runs as failed.
+      # A failed rerun leaves no artifact, and the final gate counts those runs
+      # as failed.
       - name: Download PR rerun results
         if: needs.expected-rerun.result != 'skipped'
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: delegate-eval-expected-rerun-${{ needs.prepare.outputs.sha7 }}
-          path: ./eval-expected
+          path: ./eval-expected-rerun
+
+      # Only runs 4 to 6 are taken from the rerun: a PR harness that predates
+      # --from-run ignores it and writes run-1 to run-3, which would replace the
+      # first pass and let a lucky 3/3 rerun skip the 5-of-6 rule.
+      - name: Merge rerun results
+        run: |
+          if [ -d ./eval-expected-rerun ]; then
+            (cd ./eval-expected-rerun && find . -type f -regex '.*/run-[4-6]\.json') | while read -r f; do
+              mkdir -p "./eval-expected/$(dirname "$f")"
+              cp "./eval-expected-rerun/$f" "./eval-expected/$f"
+            done
+          fi
 
       - name: Score against main's expectations
         run: |
+          rm -f ./eval-expected/gate.json
           npm run -s review:expect -- \
             --mode score \
             --runs 3 \
@@ -756,8 +769,8 @@ jobs:
             --out ./eval-expected
 
       # The gate's report replaces the score report in the comment, so holdout
-      # cases appear only as an aggregate. Exits non-zero when the gate fails,
-      # after the comment is posted.
+      # cases appear only as an aggregate. Exits non-zero when the gate fails;
+      # the job fails after the comment is posted.
       - name: Gate, final pass
         id: gate
         continue-on-error: true
@@ -776,6 +789,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
         run: |
+          # The score report lists holdout cases; only the gate's report may be
+          # posted, and gate.json exists only once this job's gate has written it.
+          if [ ! -f ./eval-expected/gate.json ]; then
+            echo "The final gate did not produce a report; not posting the comment."
+            exit 1
+          fi
           body=$(printf '<!-- delegate-eval-expected -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
             "$(cat ./eval-expected/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
           existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
