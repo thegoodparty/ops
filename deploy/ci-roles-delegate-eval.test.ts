@@ -5,6 +5,8 @@ import {
   githubActionsDelegateEval,
   githubActionsDelegateEvalCachePushTrust,
   githubActionsDelegateEvalCachePush,
+  githubActionsDelegateEvalLedgerTrust,
+  githubActionsDelegateEvalLedger,
 } from "./components/ci-roles/policies";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
@@ -23,12 +25,12 @@ describe("githubActionsDelegateEvalTrust", () => {
     );
   });
 
-  it("is pinned to delegate-eval.yml workflow file", () => {
+  it("is pinned to the two eval workflow files on main, and no others", () => {
     const [statement] = githubActionsDelegateEvalTrust.Statement;
-    assert.equal(
-      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+    assert.deepEqual(statement.Condition.StringEquals?.[WORKFLOW_KEY], [
       "thegoodparty/ops/.github/workflows/delegate-eval.yml@refs/heads/main",
-    );
+      "thegoodparty/ops/.github/workflows/delegate-eval-run.yml@refs/heads/main",
+    ]);
   });
 
   it("requires the sts audience", () => {
@@ -143,5 +145,51 @@ describe("githubActionsDelegateEvalCachePush", () => {
         Condition: { Null: { "s3:if-none-match": "false" } },
       },
     ]);
+  });
+});
+
+describe("githubActionsDelegateEvalLedgerTrust", () => {
+  const [statement] = githubActionsDelegateEvalLedgerTrust.Statement;
+
+  it("has exactly one statement", () => {
+    assert.equal(githubActionsDelegateEvalLedgerTrust.Statement.length, 1);
+  });
+
+  it("is pinned to the ledger workflow alone on ops main", () => {
+    assert.equal(
+      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+      "thegoodparty/ops/.github/workflows/delegate-eval-ledger.yml@refs/heads/main",
+    );
+    assert.equal(
+      statement.Condition.StringEquals?.[SUBJECT_KEY],
+      "repo:thegoodparty/ops:ref:refs/heads/main",
+    );
+  });
+
+  it("does not trust a workflow that runs candidate code or the cache writer", () => {
+    const pinned = JSON.stringify(statement.Condition.StringEquals?.[WORKFLOW_KEY]);
+    assert.doesNotMatch(pinned, /delegate-eval\.yml|delegate-eval-run\.yml|cache-push/);
+  });
+});
+
+describe("githubActionsDelegateEvalLedger", () => {
+  it("is exactly a conditional PutObject on eval-cache/ledger/*", () => {
+    assert.deepEqual(githubActionsDelegateEvalLedger.Statement, [
+      {
+        Sid: "DelegateEvalLedgerAppend",
+        Effect: "Allow",
+        Action: "s3:PutObject",
+        Resource: "arn:aws:s3:::delegate-reviews/eval-cache/ledger/*",
+        Condition: { Null: { "s3:if-none-match": "false" } },
+      },
+    ]);
+  });
+});
+
+describe("no role a candidate-code workflow can assume writes", () => {
+  it("the dispatched workflow's trust list excludes the cache and ledger writers", () => {
+    const [statement] = githubActionsDelegateEvalTrust.Statement;
+    const pinned = JSON.stringify(statement.Condition.StringEquals?.[WORKFLOW_KEY]);
+    assert.doesNotMatch(pinned, /cache-push|ledger/);
   });
 });

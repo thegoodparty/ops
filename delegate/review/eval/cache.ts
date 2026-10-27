@@ -60,7 +60,7 @@ const readPulled = (dir: string): Set<string> => {
   return new Set(existsSync(marker) ? readFileSync(marker, "utf-8").split("\n").filter(Boolean) : []);
 };
 
-const readBody = async (body: unknown): Promise<string> => {
+export const readBody = async (body: unknown): Promise<string> => {
   const chunks: Buffer[] = [];
   for await (const chunk of body as AsyncIterable<Buffer>) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
@@ -99,7 +99,7 @@ export const pullCache = async (opts: CacheOptions, client: S3Client = new S3Cli
   return pulled;
 };
 
-const isAlreadyExists = (err: unknown): boolean => {
+export const isAlreadyExists = (err: unknown): boolean => {
   const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
   // 412 when the key exists; 409 when another If-None-Match put on the same new
   // key is still in flight, as two evals racing after a cache-busting merge are.

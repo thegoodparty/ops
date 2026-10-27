@@ -1,0 +1,97 @@
+name: Delegate eval ledger
+
+# Called by delegate-eval-run.yml. A job in a called workflow presents this
+# file as its job_workflow_ref, which is what the ledger role's trust accepts,
+# so no job in delegate-eval-run.yml can assume that role, including the jobs
+# that execute the candidate's code. It runs only main's code, over a cost file
+# that a main-only job summed from the candidate's results.
+on:
+  workflow_call:
+    inputs:
+      artifact-id:
+        description: Id of the artifact holding cost.json, empty when the cost job produced none
+        type: string
+        default: ""
+      estimate-usd:
+        description: The dispatch's estimate; a run is charged at least this
+        type: string
+        required: true
+      run-id:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+      budget-usd:
+        type: string
+        required: true
+      branch-sha:
+        type: string
+        required: true
+      main-sha:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.main-sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download the cost file
+        if: inputs.artifact-id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.artifact-id }}
+          path: ./cost
+          merge-multiple: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval-ledger
+          aws-region: us-west-2
+
+      # The candidate's code writes the costs the sum reads, so a missing,
+      # invalid or understated total must not let a run go unbilled: the entry
+      # is the larger of the reported cost and the estimate. An entry that
+      # already exists for this run attempt and mode is left alone.
+      - name: Record the spend
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          RUN_ID: ${{ inputs.run-id }}
+          MODE: ${{ inputs.mode }}
+          BUDGET_USD: ${{ inputs.budget-usd }}
+          BRANCH_SHA: ${{ inputs.branch-sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ESTIMATE_USD: ${{ inputs.estimate-usd }}
+        run: |
+          npm run -s review:eval -- ledger add \
+            --run-id "$RUN_ID" \
+            --mode "$MODE" \
+            --budget "$BUDGET_USD" \
+            --branch-sha "$BRANCH_SHA" \
+            --cost-file ./cost/cost.json \
+            --estimate-usd "$ESTIMATE_USD" \
+            --gh-run-id "$GH_RUN_ID" \
+            --gh-run-attempt "$GH_RUN_ATTEMPT"
