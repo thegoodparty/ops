@@ -141,17 +141,21 @@ export const statusForRecord = (
   if (record.action === "commented") {
     // A gated comment can carry no finding at all: the flag is the comment. In
     // shadow nothing is ever approved, so the status says what the gate would
-    // have done. Ungated records take the unchanged branch below.
+    // have done. The reasons come from `record.gates`, not `gating.flags`:
+    // `unparseable_findings` is a blocker that is not a gating flag, and an
+    // empty `gating.flags` beside it does not mean the gate would have
+    // approved. `wouldApprove` is false exactly when `gates` is non-empty.
+    // Ungated records take the unchanged branch below.
     const g = record.gating;
     if (g !== undefined && record.findings.length === 0) {
-      const flag = g.flags[0];
+      const reason = record.gates[0];
       const description =
         g.mode === "shadow"
-          ? flag
-            ? `Shadow: would comment (${flag})`
+          ? reason
+            ? `Shadow: would comment (${reason})`
             : "Shadow: would approve"
-          : flag
-            ? `Commented: ${flag}`
+          : reason
+            ? `Commented: ${reason}`
             : "Commented: no findings";
       return { state: "success", description, targetUrl };
     }
@@ -926,20 +930,14 @@ export const runReview = async (args: {
     }
   }
 
-  const findingCount = fresh.length + allCarried.length;
-  await github
-    .postStatus(repo, headSha, {
-      state: "success",
-      description:
-        decision.action === "approve"
-          ? tipMovedTo
-            ? "Approved, then dismissed: tip moved"
-            : "Approved"
-          : `Commented: ${findingCount} finding(s)`,
-      targetUrl: args.logsUrl,
-    })
-    .catch((err: unknown) => console.error("terminal status failed:", err));
-
+  // The record is built before the terminal status so the status can be
+  // rendered from it: `statusForRecord` already knows what a gated comment was
+  // gated on and what a shadow run would have done, and the terminal status is
+  // the description a reader actually sees on the check. Deriving it here
+  // instead is how a gated comment with no findings used to post
+  // "Commented: 0 finding(s)". A dismissed approval is the one case the helper
+  // cannot derive -- the dismissal is not part of the verdict -- so it is
+  // spelled out, exactly as before.
   const record = finish({
     output,
     verdict: decision.verdict,
@@ -951,6 +949,16 @@ export const runReview = async (args: {
     tipMovedTo,
     costUsd,
   });
+
+  await github
+    .postStatus(repo, headSha, {
+      ...statusForRecord(record, args.logsUrl),
+      ...(tipMovedTo !== undefined
+        ? { description: "Approved, then dismissed: tip moved" }
+        : {}),
+    })
+    .catch((err: unknown) => console.error("terminal status failed:", err));
+
   await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
 
   emit("review_posted", {
