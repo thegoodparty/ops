@@ -82,15 +82,36 @@ export const buildBundle = async (args: {
     { cwd: args.reviewDir, ...EXEC_OPTS },
   ).toString();
 
-  const changedFiles = execFileSync(
-    "git",
-    ["diff", "--name-only", mergeBase, "HEAD"],
-    { cwd: args.reviewDir, ...EXEC_OPTS },
-  )
-    .toString()
-    .trim()
-    .split("\n")
-    .filter(Boolean);
+  // The gate's authority check needs every path a PR touches, and
+  // `git diff --name-only` is lossy in two ways that can hide one from it:
+  // rename detection reports only the destination, so a file moved out of an
+  // owned tree never shows its source path; and without `-z` a non-ASCII path
+  // is C-quoted (`"docs/caf\303\251.md"`), so it fails a `docs/` prefix check.
+  // Neither is reachable while the mode is `off` and `*` owns everything, but
+  // the authority check is the one place that has to fail closed. Gated runs
+  // ask git for both sides and raw bytes, and use that list for the gate and
+  // for the bundle the model reads. Ungated runs keep the original invocation
+  // verbatim -- one call, same flags, same parsing -- which is part of what
+  // keeps `off` byte-identical, so the two are spelled out rather than one
+  // flag turned on for everybody.
+  const changedFiles = args.resolvePlan
+    ? execFileSync(
+        "git",
+        ["diff", "--name-only", "--no-renames", "-z", mergeBase, "HEAD"],
+        { cwd: args.reviewDir, ...EXEC_OPTS },
+      )
+        .toString()
+        .split("\0")
+        .filter(Boolean)
+    : execFileSync(
+        "git",
+        ["diff", "--name-only", mergeBase, "HEAD"],
+        { cwd: args.reviewDir, ...EXEC_OPTS },
+      )
+        .toString()
+        .trim()
+        .split("\n")
+        .filter(Boolean);
 
   // The plan is read once, here, and only when the gate asked for it. The
   // binding is parsed here to decide what to fetch; the gate itself re-derives

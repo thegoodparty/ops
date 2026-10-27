@@ -142,10 +142,11 @@ export const statusForRecord = (
     // A gated comment can carry no finding at all: the flag is the comment. In
     // shadow nothing is ever approved, so the status says what the gate would
     // have done. The reasons come from `record.gates`, not `gating.flags`:
-    // `unparseable_findings` is a blocker that is not a gating flag, and an
-    // empty `gating.flags` beside it does not mean the gate would have
-    // approved. `wouldApprove` is false exactly when `gates` is non-empty.
-    // Ungated records take the unchanged branch below.
+    // `unparseable_findings` and `unplaceable_findings` are blockers that are
+    // not gating flags, and an empty `gating.flags` beside one of them does not
+    // mean the gate would have approved. For a gated record `wouldApprove` is
+    // false exactly when `gates` is non-empty. Ungated records take the
+    // unchanged branch below.
     const g = record.gating;
     if (g !== undefined && record.findings.length === 0) {
       const reason = record.gates[0];
@@ -695,8 +696,20 @@ export const runReview = async (args: {
     return fail(output.reason, { output, costUsd });
   }
 
+  // Placement comes before the decision so a gated run can record the findings
+  // that cannot be posted. They block approval -- `decide` reads the model's
+  // findings -- but they never reach `record.findings`, and a status rendered
+  // from the record has to still say why the verdict was a comment.
+  const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
+
+  const dropped = placed.filter((p) => "unplaceable" in p).map((p) => p.finding);
+  for (const f of dropped) {
+    console.warn(`finding dropped, path not in diff: ${f.path}:${f.line}`);
+  }
+
   const decision = decide(output, {
     unparseableCount: parsed.droppedFindingCount,
+    unplaceableCount: dropped.length,
     ...(gating !== undefined ? { gating } : {}),
   });
   if (gating !== undefined && decision.gating !== undefined) {
@@ -708,12 +721,6 @@ export const runReview = async (args: {
       authority: gating.authority,
       flags: decision.gating.flags,
     };
-  }
-  const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
-
-  const dropped = placed.filter((p) => "unplaceable" in p).map((p) => p.finding);
-  for (const f of dropped) {
-    console.warn(`finding dropped, path not in diff: ${f.path}:${f.line}`);
   }
 
   // Identity is the harness's job. Reconcile each placeable finding to the

@@ -159,6 +159,9 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 // `CLAUDE.md`. That is the subset of .gitignore syntax `CODEOWNERS` actually
 // uses in this org; anything fancier falls through as a literal, which can
 // only fail to match, and a path that matches no pattern is treated as owned.
+// The dangerous direction is an owned pattern that under-matches while an
+// earlier opt-out still matches, which is what the unconditional directory
+// suffix in `compilePattern` prevents.
 const globBody = (pattern: string): string => {
   let re = "";
   for (let i = 0; i < pattern.length; i++) {
@@ -183,14 +186,20 @@ const globBody = (pattern: string): string => {
 };
 
 const compilePattern = (raw: string): RegExp | undefined => {
-  const directory = raw.endsWith("/");
-  let pattern = directory ? raw.slice(0, -1) : raw;
+  let pattern = raw.endsWith("/") ? raw.slice(0, -1) : raw;
   // A slash anywhere but the end anchors the pattern to the repository root;
   // otherwise it matches at any depth, the way .gitignore does.
   const anchored = pattern.startsWith("/") || pattern.includes("/");
   if (pattern.startsWith("/")) pattern = pattern.slice(1);
   if (!pattern) return undefined;
-  const suffix = directory ? "(?:/.*)?" : "";
+  // A pattern that matches a directory covers everything beneath it, with or
+  // without the trailing slash: `/deploy/components/iam @gp` owns the whole
+  // subtree in `CODEOWNERS`, and so does the opt-out `/deploy/`. Applying the
+  // suffix to every pattern is what lets a narrower owned rule after a broader
+  // opt-out win, and it cannot over-match a *file* pattern because a path
+  // beneath a file cannot exist. A pattern that under-matches is how authority
+  // fails open, so this direction is the safe one.
+  const suffix = "(?:/.*)?";
   const body = globBody(pattern);
   return anchored ? new RegExp(`^${body}${suffix}$`) : new RegExp(`(?:^|/)${body}${suffix}$`);
 };

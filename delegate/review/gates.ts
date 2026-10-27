@@ -49,6 +49,11 @@ export type DecisionGating = {
 // blocks approval exactly like a finding that could not be anchored does,
 // even though it cannot be posted. It never fails the review on its own.
 //
+// `unplaceableCount` is the number of findings whose path is not in the diff.
+// They block approval too, but they never reach `record.findings` (they cannot
+// be posted inline), so a gated record has to name them on `gates` or a status
+// rendered from that record would report an approval the verdict did not make.
+//
 // `gating` is the deterministic result from `gating.ts`. When it is absent the
 // gate did not run and this function is what it was before the gate existed.
 // When it is present, case 5 (the model's consistency answer) is folded in
@@ -56,17 +61,21 @@ export type DecisionGating = {
 // forced to a comment regardless of what the two halves add up to.
 export const decide = (
   output: Extract<ReviewOutput, { status: "complete" }>,
-  opts: { unparseableCount?: number; gating?: GatingResult } = {},
+  opts: { unparseableCount?: number; unplaceableCount?: number; gating?: GatingResult } = {},
 ): Decision => {
   const unparseable = (opts.unparseableCount ?? 0) > 0;
   const clean = output.findings.length === 0 && !unparseable;
-  const unparseableGates = unparseable ? ["unparseable_findings"] : [];
+  const blockers = unparseable ? ["unparseable_findings"] : [];
   const gating = opts.gating;
 
   if (gating === undefined) {
     const verdict: "approve" | "comment" = clean ? "approve" : "comment";
-    return { verdict, action: verdict, gates: unparseableGates };
+    return { verdict, action: verdict, gates: blockers };
   }
+
+  // Ungated records have never carried this, and `off` has to stay
+  // byte-identical, so the reason is recorded only when the gate is on.
+  if ((opts.unplaceableCount ?? 0) > 0) blockers.push("unplaceable_findings");
 
   const flags: GatingFlag[] = [...gating.flags];
   // Case 5 is asked only when a plan was put in front of the model. With no
@@ -84,7 +93,7 @@ export const decide = (
   return {
     verdict,
     action: verdict,
-    gates: [...unparseableGates, ...flags],
+    gates: [...blockers, ...flags],
     gating: {
       mode: gating.mode,
       wouldApprove,

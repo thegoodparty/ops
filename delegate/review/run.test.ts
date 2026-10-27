@@ -87,6 +87,22 @@ test("statusForRecord never claims a shadow would approve around unparseable fin
   );
 });
 
+test("statusForRecord says why when every finding could not be posted", () => {
+  // A finding on a path outside the diff blocks the verdict but is never in
+  // `record.findings`; a gated record names it on `gates` instead, so the
+  // status cannot read as an approval the gate did not make.
+  const base = {
+    action: "commented",
+    gates: ["unplaceable_findings"],
+    findings: [],
+    gating: { mode: "shadow", flags: [], baseRef: "main", binding: {}, authority: { checked: true, ownedPaths: [], reason: "" } },
+  } as unknown as ReviewRecord;
+  assert.equal(
+    statusForRecord(base).description,
+    "Shadow: would comment (unplaceable_findings)",
+  );
+});
+
 // The bug this pins: `statusForRecord` knew what a gated comment was gated on,
 // but the terminal status re-derived its own "Commented: N finding(s)" string,
 // so the description a reader actually sees never mentioned the gate. One

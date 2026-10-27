@@ -1,7 +1,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { buildBundle, priorFindingsFrom } from "./bundle";
@@ -310,5 +310,78 @@ describe("buildBundle plan resolution", () => {
     } as unknown as ReturnType<typeof createGitHub>;
     const bundle = await build(github, true);
     assert.equal(bundle.plan, undefined);
+  });
+});
+
+// The authority check reads `changedFiles`, so that list must not hide a path.
+// `git diff --name-only` reports only the destination of a rename and C-quotes
+// non-ASCII paths; both can hide a path from `touches_docs` and from the
+// ownership filter. Gated runs ask git for both sides and raw bytes. Ungated
+// runs keep the old invocation, because `off` has to stay byte-identical.
+describe("buildBundle changed paths for the authority check", () => {
+  let tempDir: string;
+  let baseSha: string;
+
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: tempDir, encoding: "utf8" }).trim();
+
+  before(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "bundle-rename-test-"));
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test User");
+    mkdirSync(join(tempDir, "docs"), { recursive: true });
+    mkdirSync(join(tempDir, "src"), { recursive: true });
+    writeFileSync(join(tempDir, "docs", "plan.md"), "# plan\n");
+    writeFileSync(join(tempDir, "docs", "café.md"), "# accent\n");
+    writeFileSync(join(tempDir, "src", "keep.ts"), "export const a = 1;\n");
+    git("add", ".");
+    git("commit", "-m", "base");
+    baseSha = git("rev-parse", "HEAD");
+
+    // A rename out of docs/ and an edit to a non-ASCII path: the first is
+    // reported only by its destination, the second is C-quoted.
+    execFileSync("git", ["mv", "docs/plan.md", "src/plan.md"], { cwd: tempDir });
+    writeFileSync(join(tempDir, "docs", "café.md"), "# accent, edited\n");
+    git("add", ".");
+    git("commit", "-m", "rename and edit");
+  });
+
+  after(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const build = (resolvePlan: boolean) =>
+    buildBundle({
+      repo: "thegoodparty/ops",
+      prNumber: 5,
+      reviewDir: tempDir,
+      github: {
+        getPull: async () => ({
+          headSha: "unused",
+          baseSha,
+          baseRef: "main",
+          title: "T",
+          body: "no plan",
+          author: "u",
+          isDraft: false,
+          changedFiles: [],
+        }),
+      } as unknown as ReturnType<typeof createGitHub>,
+      priorFindings: [],
+      resolvePlan,
+    });
+
+  it("keeps the pre-gate list when the gate is off", async () => {
+    const bundle = await build(false);
+    assert.deepEqual(bundle.changedFiles.sort(), ['"docs/caf\\303\\251.md"', "src/plan.md"].sort());
+  });
+
+  it("lists both sides of a rename and the raw path when the gate is on", async () => {
+    const bundle = await build(true);
+    assert.deepEqual(
+      bundle.changedFiles.sort(),
+      ["docs/café.md", "docs/plan.md", "src/plan.md"].sort(),
+    );
   });
 });

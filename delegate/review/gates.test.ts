@@ -201,4 +201,26 @@ describe("decide with the gate on", () => {
     );
     assert.deepEqual(d.gates, ["unparseable_findings", "touches_docs"]);
   });
+
+  it("records findings that could not be anchored, so the record explains the comment", () => {
+    // They block approval (`clean` reads the model's findings) but never reach
+    // `record.findings`, so without a gate reason a status rendered from the
+    // record would report an approval the verdict did not make.
+    const d = decide(
+      { status: "complete", findings: [finding], summary: "one bug", planConsistency: consistent },
+      { gating: clearGating, unplaceableCount: 1 },
+    );
+    assert.equal(d.verdict, "comment");
+    assert.deepEqual(d.gates, ["unplaceable_findings"]);
+    assert.equal(d.gating?.wouldApprove, false);
+  });
+
+  it("does not add the unplaceable reason to an ungated run", () => {
+    // `off` is a no-op, and an ungated `gates` array has never carried this.
+    const d = decide(
+      { status: "complete", findings: [finding], summary: "one bug" },
+      { unplaceableCount: 1 },
+    );
+    assert.deepEqual(d, { verdict: "comment", action: "comment", gates: [] });
+  });
 });

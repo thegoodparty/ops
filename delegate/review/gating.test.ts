@@ -186,6 +186,28 @@ docs/
     assert.equal(resolveOwnership(p, "delegate/CLAUDE.md.bak"), "unmatched");
   });
 
+  it("owns a subtree when a narrower owned rule follows a broader opt-out", () => {
+    // A pattern without a trailing slash still matches a directory and
+    // everything beneath it, so the owned rule has to win over the opt-out
+    // that already matched further up the path. Under-matching it here would
+    // report an owned path as unowned and hand the bot authority GitHub does
+    // not give it.
+    const p = parseCodeowners(`* @gp
+/deploy/components/
+/deploy/components/iam @gp
+`);
+    assert.equal(resolveOwnership(p, "deploy/components/iam/x.ts"), "owned");
+    assert.equal(resolveOwnership(p, "deploy/components/other.ts"), "unowned");
+  });
+
+  it("treats a no-trailing-slash directory pattern as covering its contents", () => {
+    const p = parseCodeowners(`/deploy/components/iam @gp
+`);
+    assert.equal(resolveOwnership(p, "deploy/components/iam/x.ts"), "owned");
+    assert.equal(resolveOwnership(p, "deploy/components/iam"), "owned");
+    assert.equal(resolveOwnership(p, "deploy/components/iam-x.ts"), "unmatched");
+  });
+
   it("reports a path no pattern matches instead of calling it unowned", () => {
     const p = parseCodeowners(`docs/ @gp\n`);
     assert.equal(resolveOwnership(p, "delegate/review/gates.ts"), "unmatched");
