@@ -12,10 +12,15 @@ import * as path from "node:path";
  * upstream release pulled verbatim. Bifrost OSS has no native OIDC, so the
  * admin surface is gated by oauth2-proxy, and the stock oauth2-proxy image has
  * no inline email-list flag: the allowlist has to reach the container as a
- * file. `deploy-workbench/bifrost/Dockerfile` is the one-line derivative that
- * bakes it in; this module is the single source of truth for the pin that the
- * Dockerfile and the workflow must agree with, and `oauth2-proxy-image.test.ts`
- * fails if any of the three drift.
+ * file. `deploy-workbench/bifrost/Dockerfile` is the derivative that bakes it
+ * in, and that adds the two things that keep a human from meeting Bifrost's own
+ * password prompt behind the Google gate: the alpha configuration that injects
+ * the admin credential upstream (`bifrost/alpha-config.yaml`) and the static
+ * entrypoint wrapper that computes that credential from the secrets the task
+ * already injects (`bifrost/entrypoint.go`). This module is the single source
+ * of truth for the pin and for the content digest that tags the image, and
+ * `oauth2-proxy-image.test.ts` fails if the Dockerfile, the workflow and this
+ * module drift.
  *
  * The upstream reference is the same digest `agent-swarm` runs
  * (`agent-swarm/host/docker-compose.yml`), so the admin surface here and the
@@ -71,25 +76,80 @@ export const OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH =
   "/etc/oauth2-proxy/allowed-emails.txt";
 
 /**
- * The first 12 hex characters of the allowlist's sha256.
+ * The path the Dockerfile bakes the alpha configuration to, and the one the
+ * sidecar's `--alpha-config` flag names (`OAUTH2_PROXY_COMMAND` in `ecs.ts`).
+ * `oauth2-proxy-image.test.ts` pins the Dockerfile side, the task definition
+ * side and the alpha config's own contents against this constant.
+ */
+export const OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH =
+  "/etc/oauth2-proxy/alpha-config.yaml";
+
+/**
+ * The environment variable the baked alpha configuration reads the injected
+ * `Authorization` header from, and the one the entrypoint wrapper exports
+ * (`deploy-workbench/bifrost/entrypoint.go`, `AuthorizationEnv`).
+ *
+ * It is set by the wrapper and by nothing else: if the task definition ever
+ * defined it, a stale value would be forwarded upstream instead of the live
+ * admin credential. `oauth2-proxy-image.test.ts` fails if the YAML, the Go
+ * wrapper and this constant disagree.
+ */
+export const OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV =
+  "BIFROST_ADMIN_AUTHORIZATION";
+
+/**
+ * The committed files the derived image is built from, in the order they are
+ * hashed: the allowlist, the Dockerfile, the alpha configuration and the
+ * entrypoint wrapper with its module and test.
+ *
+ * Relative to the repository root, because the CI step derives the same digest
+ * with `cat` over exactly this list (Actions cannot import this module), and a
+ * test fails if the two orders or the two lists disagree.
+ *
+ * The wrapper is in the list for the same reason the Dockerfile is: the image's
+ * content changes when any of them does, and the repository is immutable, so a
+ * file that is not hashed here is a change that cannot be pushed. The Go test
+ * file is included because a change to it changes what the build runs.
+ */
+export const OAUTH2_PROXY_CONTENT_INPUTS = [
+  "deploy-workbench/bifrost/allowed-emails.txt",
+  "deploy-workbench/bifrost/Dockerfile",
+  "deploy-workbench/bifrost/alpha-config.yaml",
+  "deploy-workbench/bifrost/entrypoint.go",
+  "deploy-workbench/bifrost/entrypoint_test.go",
+  "deploy-workbench/bifrost/go.mod",
+] as const;
+
+/** The repository root the inputs above are relative to. */
+export const OAUTH2_PROXY_REPOSITORY_ROOT = path.join(__dirname, "..");
+
+/**
+ * The first 12 hex characters of the sha256 over every build input, in the
+ * order above and with nothing between them.
  *
  * The tag is content-addressed rather than fixed at the upstream tag so that
- * the immutable repository accepts a new push when the list changes, and skips
- * a re-push when it has not. `deploy-workbench/bifrost/Dockerfile` is otherwise
- * unchanged between allowlist edits, so without this the second edit could not
- * be pushed at all.
+ * the immutable repository accepts a new push when the image's content
+ * changes, and skips a re-push when it has not. Until the header injection
+ * landed this hashed the allowlist alone; that stopped being the whole content
+ * when the Dockerfile grew a build stage, an alpha configuration and an
+ * entrypoint wrapper, and a tag that did not move would have meant a deploy
+ * naming an image without them.
  */
-export const OAUTH2_PROXY_ALLOWLIST_DIGEST = crypto
-  .createHash("sha256")
-  .update(fs.readFileSync(OAUTH2_PROXY_ALLOWLIST_PATH))
+export const OAUTH2_PROXY_CONTENT_DIGEST = OAUTH2_PROXY_CONTENT_INPUTS.reduce(
+  (hash, relativePath) =>
+    hash.update(
+      fs.readFileSync(path.join(OAUTH2_PROXY_REPOSITORY_ROOT, relativePath)),
+    ),
+  crypto.createHash("sha256"),
+)
   .digest("hex")
   .slice(0, 12);
 
 /**
  * The tag CI builds and pushes, and the tag the phase 1 task definition will
- * resolve to a digest. It changes when and only when the allowlist does.
+ * resolve to a digest. It changes when and only when the image's content does.
  */
-export const OAUTH2_PROXY_TAG = `${OAUTH2_PROXY_UPSTREAM_TAG}-${OAUTH2_PROXY_ALLOWLIST_DIGEST}`;
+export const OAUTH2_PROXY_TAG = `${OAUTH2_PROXY_UPSTREAM_TAG}-${OAUTH2_PROXY_CONTENT_DIGEST}`;
 
 /** The ECR image URI CI pushes, given the registry the ECR login returns. */
 export const oauth2ProxyImageUri = (registry: string): string =>
