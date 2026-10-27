@@ -82,7 +82,7 @@ npm run review:eval -- judge \
   --out report.md
 ```
 
-Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by default, not the agent's opus model, to blunt self-preference). Replay k of one side is judged only against replay k of the other, `--passes` times each with alternating order, so two replays per side give eight judgments per case. A majority of those mapped winners across both pairs determines the per-case verdict; pairs that disagree cancel into no decision. With `--manifest`, the report splits tune from holdout. Prints the markdown report to stdout and writes it to `--out` if given.
+Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by default, not the agent's opus model, to blunt self-preference). Replay k of one side is judged only against replay k of the other, `--passes` times each with alternating order, so two replays per side give eight judgments per case. A majority of those mapped winners across both pairs determines the per-case verdict; pairs that disagree cancel into no decision. With `--manifest`, the report splits tune from holdout. Writes the markdown report to `--out`; it is never printed, because it lists holdout cases and job logs are readable.
 
 ## Worked example — comparing main vs a branch
 

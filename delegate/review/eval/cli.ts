@@ -203,7 +203,7 @@ const main = async () => {
     const summary = summarize(verdicts);
     const report = renderMarkdown(summary, verdicts, { labelA, labelB, names, splits });
 
-    console.log(report);
+    // Not printed: the report lists holdout cases, and CI job logs are readable by whoever tunes.
     if (outFile) {
       writeFileSync(outFile, report);
       console.error(`Report written to ${outFile}`);
