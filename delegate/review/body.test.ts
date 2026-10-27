@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { renderBody, renderFailureBody } from "./body";
-import type { Decision } from "./gates";
+import type { Decision, DecisionGating } from "./gates";
 
 const approveDecision: Decision = { verdict: "approve", action: "approve", gates: [] };
 const commentDecision: Decision = { verdict: "comment", action: "comment", gates: [] };
@@ -65,6 +65,99 @@ describe("renderBody", () => {
 
   it("ends with the run footer", () => {
     assert.ok(renderBody(baseArgs).endsWith("_run 00000000-0000-0000-0000-000000000001 · abc1234_"));
+  });
+});
+
+describe("renderBody with the gate on", () => {
+  const plan = { path: "docs/plan-gated-merges.md", blobSha: "1c7ac96f062c9263697f7208056f9941e4dc499a" };
+  const gating = (over: Partial<DecisionGating>): DecisionGating => ({
+    mode: "enforce",
+    wouldApprove: false,
+    binding: { path: plan.path, step: 4 },
+    baseRef: "main",
+    plan,
+    flags: [],
+    ownedPaths: [],
+    ...over,
+  });
+  const gated = (g: DecisionGating): Decision => ({
+    verdict: g.mode === "enforce" && g.wouldApprove ? "approve" : "comment",
+    action: g.mode === "enforce" && g.wouldApprove ? "approve" : "comment",
+    gates: g.flags,
+    gating: g,
+  });
+
+  it("says nothing when the gate did not run", () => {
+    const body = renderBody(baseArgs);
+    assert.ok(!body.includes("Gate:"));
+    assert.ok(!body.includes("Shadow"));
+  });
+
+  it("an approval names the plan and the blob sha it was checked against", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ wouldApprove: true })),
+    });
+    assert.deepEqual(body.split("\n\n"), [
+      "**Recommendation: approve**",
+      "**Gate: approve** against `docs/plan-gated-merges.md` at `1c7ac96`." +
+        " Every changed path is unowned in `CODEOWNERS` on `main`, and the change is consistent with the plan.",
+      baseArgs.summary,
+      "_run 00000000-0000-0000-0000-000000000001 · abc1234_",
+    ]);
+  });
+
+  it("a flag says which case fired and why", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ flags: ["touches_docs"] })),
+    });
+    assert.ok(body.includes("**Gate: comment** against `docs/plan-gated-merges.md` at `1c7ac96`."));
+    assert.ok(
+      body.includes(
+        "Flags: `touches_docs`: the PR adds or changes something under `docs/`, so the spec and the work would move together.",
+      ),
+    );
+  });
+
+  it("names the owned paths when that is the flag", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({ flags: ["owned_paths"], ownedPaths: ["delegate/review/gating.ts", "deploy/index.ts"] }),
+      ),
+    });
+    assert.ok(body.includes("(delegate/review/gating.ts, deploy/index.ts)"));
+  });
+
+  it("says when a plan was never read", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ plan: undefined, binding: {}, flags: ["no_binding"] })),
+    });
+    assert.ok(body.includes("**Gate: comment** with no plan read."));
+    assert.ok(body.includes("`no_binding`"));
+  });
+
+  it("a shadow run says it would have approved, and that it cannot", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ mode: "shadow", wouldApprove: true })),
+    });
+    assert.ok(
+      body.includes("**Gate: shadow, would have approved** against `docs/plan-gated-merges.md` at `1c7ac96`."),
+    );
+    assert.ok(body.includes("Shadow mode records the decision and posts a comment, never an approval."));
+    assert.ok(body.startsWith("**Recommendation: comment**"));
+  });
+
+  it("a shadow run that would have flagged carries the reason too", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ mode: "shadow", flags: ["inconsistent"] })),
+    });
+    assert.ok(body.includes("**Gate: shadow, would have commented**"));
+    assert.ok(body.includes("Flags: `inconsistent`: the change is not consistent with the plan."));
   });
 });
 

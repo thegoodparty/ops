@@ -91,6 +91,38 @@ export const BundleSchema = z.object({
 });
 export type Bundle = z.infer<typeof BundleSchema>;
 
+// The gate's decision, recorded so a run is auditable after the fact and so a
+// `shadow` run is distinguishable from an `enforce` one. Every field is
+// optional or defaulted: a record written before the gate existed still parses
+// and still replays. `flags` is a list of stable names (`GatingFlag` in
+// `gating.ts`), not prose, because step 5 counts them.
+export const GatingSchema = z.object({
+  mode: z.enum(["off", "shadow", "enforce"]),
+  binding: z
+    .object({
+      path: z.string().optional(),
+      step: z.number().int().optional(),
+    })
+    .default({}),
+  baseRef: z.string(),
+  // Present only when the plan was read at `main` and is usable.
+  plan: z
+    .object({
+      path: z.string().min(1),
+      blobSha: z.string().min(1),
+    })
+    .optional(),
+  authority: z
+    .object({
+      checked: z.boolean(),
+      ownedPaths: z.array(z.string()),
+      reason: z.string(),
+    })
+    .default({ checked: false, ownedPaths: [], reason: "" }),
+  flags: z.array(z.string()).default([]),
+});
+export type Gating = z.infer<typeof GatingSchema>;
+
 export const PostedFindingSchema = FindingSchema.extend({
   id: z.string().uuid(),
   commentId: z.number().int().optional(),
@@ -118,6 +150,10 @@ export const ReviewRecordSchema = z.object({
   verdict: z.enum(["approve", "comment", "failed"]),
   action: z.enum(["approved", "commented", "failed", "skipped"]),
   gates: z.array(z.string()),
+  // Absent when the gate did not run: `DELEGATE_GATING_MODE=off` (the default)
+  // or a repo that has not adopted gating. Presence is what tells a reader the
+  // verdict was gated at all.
+  gating: GatingSchema.optional(),
   findings: z.array(PostedFindingSchema),
   droppedFindings: z.array(FindingSchema).default([]),
   reviewId: z.number().int().optional(),
