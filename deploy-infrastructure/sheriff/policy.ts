@@ -10,6 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 
+import type { ApproverLookup } from "./identity";
 import {
   DURATION_OPTIONS,
   MAX_DURATION_SECONDS,
@@ -194,6 +195,32 @@ export const evaluateApprover = (args: {
   }
   return { ok: true, email, identityStoreUserId: args.identityStoreUserId };
 };
+
+/**
+ * Maps the live lookup result onto the pure gate above.
+ *
+ * The mapping is separate from the handler so the one case that is easy to get
+ * wrong is tested: an Identity Store `error`, and a failed AssumeRole (a
+ * `null` lookup, before Identity Store is reached), must both surface as
+ * `identity-store-error`, which tells a real approver to retry. Folding either
+ * into `no-identity-user` would still refuse the decision, but would tell them
+ * their account is missing when the directory was simply unreachable.
+ */
+export const evaluateApproverLookup = (args: {
+  slackEmail: string | null | undefined;
+  lookup: ApproverLookup | null;
+}): ApproverResult =>
+  evaluateApprover({
+    slackEmail: args.slackEmail,
+    identityStoreUserId:
+      args.lookup && "identityStoreUserId" in args.lookup
+        ? args.lookup.identityStoreUserId
+        : undefined,
+    isApproversMember: args.lookup?.status === "member",
+    identityStoreError:
+      Boolean(args.slackEmail?.trim()) &&
+      (args.lookup === null || args.lookup.status === "error"),
+  });
 
 export const rateLimitExceeded = (count: number): boolean =>
   count > MAX_REQUESTS_PER_DAY;

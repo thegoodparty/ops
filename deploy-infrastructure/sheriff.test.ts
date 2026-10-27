@@ -64,6 +64,7 @@ import {
   durationSecondsFor,
   eligibilityErrorMessage,
   evaluateApprover,
+  evaluateApproverLookup,
   evaluateDecision,
   evaluateEligibility,
   expiryScheduleName,
@@ -681,6 +682,66 @@ describe("lookupApprover", () => {
     assert.deepEqual(await lookupApprover(client, "a@goodparty.org"), {
       status: "error",
     });
+  });
+});
+
+describe("evaluateApproverLookup", () => {
+  // The handler's mapping from the live lookup onto the gate. The error case is
+  // the one a reviewer caught: an Identity Store failure must not read as
+  // "no user", even though both refuse the decision.
+  it("maps a member lookup to an allow", () => {
+    assert.deepEqual(
+      evaluateApproverLookup({
+        slackEmail: "approver@goodparty.org",
+        lookup: { status: "member", identityStoreUserId: "user-1" },
+      }),
+      {
+        ok: true,
+        email: "approver@goodparty.org",
+        identityStoreUserId: "user-1",
+      },
+    );
+  });
+
+  it("maps not-member, no-user and error to their own failures", () => {
+    const base = { slackEmail: "approver@goodparty.org" };
+    const failures = [
+      evaluateApproverLookup({
+        ...base,
+        lookup: { status: "not-member", identityStoreUserId: "user-1" },
+      }),
+      evaluateApproverLookup({ ...base, lookup: { status: "no-user" } }),
+      evaluateApproverLookup({ ...base, lookup: { status: "error" } }),
+    ].map((result) => (result.ok ? "" : result.failure));
+    assert.deepEqual(failures, [
+      "not-approver",
+      "no-identity-user",
+      "identity-store-error",
+    ]);
+  });
+
+  it("treats an Identity Store error as an outage, not a missing user", () => {
+    const result = evaluateApproverLookup({
+      slackEmail: "approver@goodparty.org",
+      lookup: { status: "error" },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "identity-store-error");
+  });
+
+  it("treats a failed AssumeRole (null lookup) as an outage too", () => {
+    const result = evaluateApproverLookup({
+      slackEmail: "approver@goodparty.org",
+      lookup: null,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "identity-store-error");
+  });
+
+  it("reports no email before it reports an outage", () => {
+    const result = evaluateApproverLookup({ slackEmail: undefined, lookup: null });
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? "" : result.failure, "no-slack-email");
   });
 });
 

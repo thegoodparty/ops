@@ -84,7 +84,7 @@ import {
   decodeSlackPayload,
   durationSecondsFor,
   eligibilityErrorMessage,
-  evaluateApprover,
+  evaluateApproverLookup,
   evaluateDecision,
   evaluateEligibility,
   expiryScheduleName,
@@ -755,15 +755,7 @@ const handleBlockActions = async (
     }
   }
 
-  const approver = evaluateApprover({
-    slackEmail,
-    identityStoreUserId:
-      lookup && "identityStoreUserId" in lookup
-        ? lookup.identityStoreUserId
-        : undefined,
-    isApproversMember: lookup?.status === "member",
-    identityStoreError: Boolean(slackEmail) && lookup === null,
-  });
+  const approver = evaluateApproverLookup({ slackEmail, lookup });
   if (!approver.ok) {
     await ephemeral(
       approverErrorMessage(approver.failure, approver.email),
