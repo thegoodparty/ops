@@ -29,7 +29,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
-**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>.json` in the results directory as each replay completes.
+**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs, gating? }`. Stored as `<caseId>.json` in the results directory as each replay completes. `gating` is the gate's outcome (`{ mode, verdict, gates, wouldApprove }`) and is present only for a repo that has adopted gating: the agent's `output` cannot tell a flag from an ordinary comment, because both are a complete review with no findings.
 
 ## Commands
 
@@ -112,7 +112,11 @@ cat report.md
 
 ## Expected-result suite
 
-Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. The two plan cases use the third expectation type, `{ "verdict": "consistency", "consistency": "consistent" | "inconsistent" | "unclear" }`, which scores the model's own `planConsistency` answer: step 1 of `docs/plan-gated-merges.md` ships no gate to turn that answer into an approval or a comment, so the answer is the whole case. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR. Every case runs several times, and a case passes only when every run does.
+Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+
+The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
+
+Replay runs the gate in `enforce` for a repo on `gating.ts`'s adoption list, which is what makes an approval reachable, and treats the bundle's changed paths as de-owned: a bundle carries no `CODEOWNERS`, so the deterministic authority cases are asserted in `delegate/review/gating.test.ts` rather than replayed. A repo that has not adopted gating records no verdict and keeps the findings-only outcome. The standalone `{ "verdict": "consistency", "consistency": ... }` expectation remains for cases that must be scored on the model's answer alone. Every case runs several times, and a case passes only when every run does.
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 

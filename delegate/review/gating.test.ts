@@ -315,6 +315,22 @@ describe("evaluateGating", () => {
     }
   });
 
+  it("flags case 4: a PR touching the plan it implements", () => {
+    // The binding and the plan are otherwise valid, so the only reason this is
+    // a comment is that the spec and the work move together. That is the rule
+    // the bot must not be able to argue with, and it is broader than editing
+    // an unrelated plan.
+    const g = evaluateGating({
+      ...base,
+      body: "Plan: docs/plan-gated-merges.md\nStep: 5",
+      changedFiles: ["docs/plan-gated-merges.md", "deploy/components/webhooks.ts"],
+    });
+    assert.ok(g.flags.includes("touches_docs"));
+    assert.deepEqual(g.plan, base.plan);
+    // `docs/` is human-owned; the one unowned path in the fixture is `deploy/`.
+    assert.deepEqual(g.authority.ownedPaths, ["docs/plan-gated-merges.md"]);
+  });
+
   it("flags a CODEOWNERS with no * default as unverifiable authority", () => {
     const g = evaluateGating({ ...base, codeowners: "deploy/ @gp\n" });
     assert.ok(g.flags.includes("unverifiable_authority"));

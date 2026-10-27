@@ -7,10 +7,28 @@ import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
+import { parseDiffAnchors, placeFindings } from "../anchors";
+import { decide } from "../gates";
+import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
 import { createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
 import { agentEnv, parseReviewOutput, pathGuardHook } from "../run";
 import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
+
+// The gate's outcome for a replay, kept apart from the agent's output because
+// the output cannot tell a flag from an ordinary comment: both are a
+// `complete` review with no findings. The expected-result scorer reads this to
+// decide whether the review event was an approval or a comment, and which gate
+// fired.
+export interface ResultGating {
+  mode: GatingMode;
+  /** The review event the gate produced, under the mode below. */
+  verdict: "approve" | "comment";
+  /** Every reason the verdict was a comment: gating flags and blockers alike. */
+  gates: string[];
+  /** What the gate would have done with no mode in the way. */
+  wouldApprove: boolean;
+}
 
 export interface Result {
   caseId: string;
@@ -22,7 +40,57 @@ export interface Result {
   error?: string;
   costUsd: number | null;
   wallTimeMs: number;
+  /** Absent for a repo that has not adopted gating, which is every case but
+   *  the `ops` ones; also absent on a run that produced no complete review. */
+  gating?: ResultGating;
 }
+
+/**
+ * The gate's verdict for an eval replay. The corpus measures the model's one
+ * judgement (case 5 of `docs/plan-gated-merges.md`), so a replay runs the gate
+ * in `enforce` -- the mode an approval is reachable under -- and treats the
+ * bundle's changed paths as de-owned. The bundle carries no `CODEOWNERS`, and
+ * the deterministic authority cases are asserted in `gating.test.ts` rather
+ * than replayed, so deriving ownership here would only make every plan case a
+ * flag on a path that step 6 has not de-owned yet.
+ *
+ * A repo that has not adopted gating produces no verdict, exactly as in
+ * production: the eval must not invent a gate for `omni` or `gp-data-platform`.
+ */
+export const replayGating = (
+  bundle: Bundle,
+  output: Extract<ReviewOutput, { status: "complete" }>,
+  unparseableCount = 0,
+): ResultGating | undefined => {
+  if (!isGatedRepo(bundle.repo)) return undefined;
+  // The last matching pattern wins, so listing each changed path after the `*`
+  // default leaves exactly those paths unowned. An exact path is also safe as
+  // a pattern: `gating.ts` escapes the dots.
+  const codeowners = ["* @thegoodparty/gp-contrib", ...bundle.changedFiles].join("\n");
+  const gating = evaluateGating({
+    mode: "enforce",
+    body: bundle.body,
+    baseRef: bundle.baseRef,
+    changedFiles: bundle.changedFiles,
+    codeowners,
+    plan:
+      bundle.plan !== undefined
+        ? { path: bundle.plan.path, blobSha: bundle.plan.blobSha }
+        : undefined,
+  });
+  // The same blockers production passes: a dropped finding or one that cannot
+  // be anchored to a diff line still counts against an approval, even though
+  // the eval scores the gate's event rather than the inline comments.
+  const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
+  const unplaceableCount = placed.filter((p) => "unplaceable" in p).length;
+  const decision = decide(output, { unparseableCount, unplaceableCount, gating });
+  return {
+    mode: gating.mode,
+    verdict: decision.verdict,
+    gates: decision.gates,
+    wouldApprove: decision.gating?.wouldApprove ?? false,
+  };
+};
 
 export const resultFromRecord = (record: ReviewRecord): Result => ({
   caseId: record.runId,
@@ -109,6 +177,7 @@ export const replayCase = async (
     output: ReviewOutput | null,
     costUsd: number | null,
     error?: string,
+    gating?: ResultGating,
   ): Result => ({
     caseId,
     repo: bundle.repo,
@@ -119,6 +188,7 @@ export const replayCase = async (
     ...(error !== undefined ? { error } : {}),
     costUsd,
     wallTimeMs: Date.now() - startMs,
+    ...(gating !== undefined ? { gating } : {}),
   });
 
   try {
@@ -165,7 +235,11 @@ export const replayCase = async (
     return makeResult(null, agentResult.costUsd ?? null, parsed.error);
   }
 
-  return makeResult(parsed.output, agentResult.costUsd ?? null);
+  const gating =
+    parsed.output.status === "complete"
+      ? replayGating(bundle, parsed.output, parsed.droppedFindingCount)
+      : undefined;
+  return makeResult(parsed.output, agentResult.costUsd ?? null, undefined, gating);
 };
 
 export interface ReplayAllOptions {
