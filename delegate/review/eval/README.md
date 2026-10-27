@@ -158,6 +158,19 @@ Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (re
 
 **Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
 
+## Mining candidate cases
+
+```sh
+npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 --out candidates.jsonl
+```
+
+Read-only. Walks every page of `REVIEW_BUCKET`, keeps the latest non-`eval` record per head sha, and proposes cases for a human to confirm. Needs S3 read access and `gh` auth. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--out` (stdout if omitted).
+
+- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, key, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
+- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, key, repo, pr, findings, replies, mergedSha }`.
+
+Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and many real misses need a running system to see, so a person labels each one.
+
 ## Cost expectations
 
 - **Replay**: each replay is a full `claude-opus-5-5` agent run. Budget $1–5 per replay, two per side per case in `delegate eval`; a 20-case corpus costs roughly $40–200 for the PR side depending on diff complexity.
