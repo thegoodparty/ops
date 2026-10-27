@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
-import type { Result } from "./replay";
+import type { Result, RunResults } from "./replay";
 
 export const DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5";
 
@@ -88,6 +88,8 @@ export const createAnthropicJudgeModel = (
 
 export interface PassResult {
   order: "a=1,b=2" | "a=2,b=1";
+  // Which replay pair (replay k of each side) this pass judged.
+  replay?: number;
   winner: "a" | "b" | "tie";
   margin: string;
   deciding_criterion: string;
@@ -261,37 +263,41 @@ export const judgePair = async (args: {
   };
 };
 
+// Replay k of one side is judged only against replay k of the other, so a
+// case's verdict pools every pass of every pair: a majority of those passes
+// decides it, and pairs that disagree cancel into no decision.
 export const judgeAll = async (
   records: ReviewRecord[],
-  resultsA: Result[],
-  resultsB: Result[],
+  runsA: RunResults,
+  runsB: RunResults,
   model: JudgeModel,
   passes = 4,
   concurrency = 6,
 ): Promise<PairVerdict[]> => {
-  const aById = new Map(resultsA.map((r) => [r.caseId, r]));
-  const bById = new Map(resultsB.map((r) => [r.caseId, r]));
-
-  const pairs: { record: ReviewRecord; a: Result; b: Result }[] = [];
+  const pairs: { record: ReviewRecord; replay: number; a: Result; b: Result }[] = [];
   for (const record of records) {
-    const a = aById.get(record.runId);
-    const b = bById.get(record.runId);
-    if (!a || !b) {
+    const aRuns = runsA.get(record.runId);
+    const bRuns = runsB.get(record.runId);
+    const shared = [...(aRuns?.keys() ?? [])].filter((k) => bRuns?.has(k)).sort((x, y) => x - y);
+    if (shared.length === 0) {
       console.warn(
-        `judgeAll: skipping ${record.runId} (missing on ${!a ? "a" : "b"} side)`,
+        `judgeAll: skipping ${record.runId} (no replay present on both sides)`,
       );
       continue;
     }
-    pairs.push({ record, a, b });
+    for (const replay of shared) {
+      pairs.push({ record, replay, a: aRuns!.get(replay)!, b: bRuns!.get(replay)! });
+    }
   }
 
-  const verdicts: (PairVerdict | undefined)[] = new Array(pairs.length);
+  const pairVerdicts: PairVerdict[] = new Array(pairs.length);
   let index = 0;
   const worker = async () => {
     while (index < pairs.length) {
       const i = index++;
-      const { record, a, b } = pairs[i];
-      verdicts[i] = await judgePair({ record, a, b, model, passes });
+      const { record, replay, a, b } = pairs[i];
+      const verdict = await judgePair({ record, a, b, model, passes });
+      pairVerdicts[i] = { ...verdict, passes: verdict.passes.map((p) => ({ ...p, replay })) };
     }
   };
 
@@ -300,5 +306,10 @@ export const judgeAll = async (
     await Promise.all(Array.from({ length: workerCount }, () => worker()));
   }
 
-  return verdicts.filter((v): v is PairVerdict => v !== undefined);
+  const byCase = new Map<string, PairVerdict>();
+  for (const v of pairVerdicts) {
+    const prior = byCase.get(v.caseId);
+    byCase.set(v.caseId, prior ? { ...prior, passes: [...prior.passes, ...v.passes] } : v);
+  }
+  return [...byCase.values()].map((v) => ({ ...v, winner: deriveOverallWinner(v.passes) }));
 };

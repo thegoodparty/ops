@@ -7,11 +7,11 @@ Replay recorded production reviews against the agent code in any checkout and co
 Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval <suite>` (for example `delegate eval re-review`) to run another suite from `scenarios.json`. The workflow:
 
 1. Loads the suite's scenarios from `scenarios.json`: fixed production review records in S3, so every eval runs the same cases. If your PR changes `scenarios.json`, its copy is used.
-2. Replays every scenario twice in parallel, once with main's agent code and once with your PR head's.
-3. Judges the two sides pairwise and posts a single comment to the PR with two verdicts: **Quality** (Better / Worse / Can't tell, from the sign test over the judged pairs) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). Per-case results sit in a drop-down; every raw result is on the workflow run as an artifact.
+2. Replays every scenario twice per side in parallel (`--replays 2`): two replays with main's agent code and two with your PR head's.
+3. Judges the two sides pairwise and posts a single comment to the PR with three verdicts: **Quality (tune)** and **Quality (holdout)** (each Better / Worse / Can't tell, from the sign test over that split's judged cases) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). The holdout line shows only the verdict and counts. The drop-down lists tune cases only; every raw result and the full report, holdout cases included, are on the workflow run as artifacts.
 4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
-**Cost and time:** each replay is a full `claude-opus-5-5` agent run at roughly $1.50 per case, and both sides are replayed. The 12-case `core` suite takes about 20 minutes and costs around $36 in replay plus a few dollars for judging.
+**Cost and time:** each replay is a full `claude-opus-5-5` agent run at roughly $1.50, and each side runs every case twice, so the PR side costs about $3 per case. Main's side is cached, so it costs that only after a change to main's agents, framework or review code. The 12-case `core` suite takes about 40 minutes and costs around $36 for the PR side (and the same again for an uncached main) plus a few dollars for judging.
 
 **Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the S3 `key` of the record, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
 
@@ -29,7 +29,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
-**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>.json` in the results directory as each replay completes.
+**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes.
 
 ## Commands
 
@@ -48,25 +48,26 @@ npm run review:eval -- replay \
   --cases ./eval-cases \
   --out ./results-main \
   --variant main \
+  --replays 2 \
   --concurrency 3 \
   --work-dir /tmp/review-eval
 ```
 
-For each case, clones the target repo at `bundle.headSha`, runs the agent exactly as production does, and writes a `Result` JSON. Skips cases that already have a result file (use `--force` to re-run).
+For each case, clones the target repo at `bundle.headSha`, runs the agent exactly as production does, and writes a `Result` JSON per replay (`--replays`, default 1). Skips replays that already have a result file (use `--force` to re-run), so a case with one of two replays done replays only the second.
 
 Each replay is a full agent run — budget roughly $1–5 per case depending on diff size.
 
 ### Cache main's results
 
-`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<replayKey>/<suite>/<caseId>/run-<n>.json`, where `<replayKey>` is `cache key`: a hash of the git tree ids of `delegate/agents`, `delegate/framework`, `delegate/review` and `package-lock.json` on main, which is everything main's replay executes. Unrelated merges keep the cache warm; a change to any of those starts a fresh full replay (an eval-code edit under `delegate/review` costs a replay, never a stale baseline). A pairwise result is stored as `run-1`.
+`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<replayKey>/<suite>/<caseId>/run-<n>.json`, where `<replayKey>` is `cache key`: a hash of the git tree ids of `delegate/agents`, `delegate/framework`, `delegate/review` and `package-lock.json` on main, which is everything main's replay executes. Unrelated merges keep the cache warm; a change to any of those starts a fresh full replay (an eval-code edit under `delegate/review` costs a replay, never a stale baseline). Pairwise stores each replay as `run-<n>`, so a case has `run-1` and `run-2`.
 
 ```sh
-npm run review:eval -- cache pull --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
+npm run review:eval -- cache pull --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 # replay as usual into the same directory: cases with a result file are skipped
-npm run review:eval -- cache push --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
+npm run review:eval -- cache push --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 ```
 
-Use `--layout runs` for the expected suite's `<case>/run-<n>.json` directories. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, and a record under `reviews/` is written once, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 case(s); N already had results`.
+`--layout runs` is for `<case>/run-<n>.json` directories, which is what both the pairwise and the expected suites use; the default `flat` is one `<case>.json` per case. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, and a record under `reviews/` is written once, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 run(s); N already had results`.
 
 ### Judge two sets of results
 
@@ -81,7 +82,7 @@ npm run review:eval -- judge \
   --out report.md
 ```
 
-Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by default, not the agent's opus model, to blunt self-preference). Each case is judged `--passes` times with alternating order; a majority of mapped winners determines the per-case verdict. Prints the markdown report to stdout and writes it to `--out` if given.
+Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by default, not the agent's opus model, to blunt self-preference). Replay k of one side is judged only against replay k of the other, `--passes` times each with alternating order, so two replays per side give eight judgments per case. A majority of those mapped winners across both pairs determines the per-case verdict; pairs that disagree cancel into no decision. With `--manifest`, the report splits tune from holdout. Prints the markdown report to stdout and writes it to `--out` if given.
 
 ## Worked example — comparing main vs a branch
 
@@ -130,14 +131,15 @@ A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`)
 
 ## Cost expectations
 
-- **Replay**: each case is a full `claude-opus-5-5` agent run. Budget $1–5 per case; a 20-case corpus costs roughly $20–100 depending on diff complexity.
-- **Judge**: each pass is a short `claude-sonnet-5-5` call (one structured verdict). Budget a few cents per case per pass; 20 cases × 4 passes ≈ $0.50–2.
+- **Replay**: each replay is a full `claude-opus-5-5` agent run. Budget $1–5 per replay, two per side per case in `delegate eval`; a 20-case corpus costs roughly $40–200 for the PR side depending on diff complexity.
+- **Judge**: each pass is a short `claude-sonnet-5-5` call (one structured verdict). Budget a few cents per pass; 20 cases × 2 pairs × 4 passes ≈ $1–4.
 
 ## Statistical interpretation
 
-The report includes a two-sided binomial sign test (p=0.5, ties and unstable verdicts excluded). Rule of thumb:
+The report includes a two-sided binomial sign test (p=0.5, ties and unstable verdicts excluded), computed per split. Rule of thumb:
 
 - 12 cases → 10+ wins one way is p<0.05
+- 24 cases → 18+ wins one way is p<0.05
 - 20 cases → 15+ wins one way is p<0.05
 - 50 cases → 31+ wins one way is p<0.05
 

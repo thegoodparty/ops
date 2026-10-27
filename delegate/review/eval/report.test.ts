@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { summarize, renderMarkdown, renderPrComment, qualityVerdict, costVerdict } from "./report";
 import type { PairVerdict } from "./judge";
-import type { Result } from "./replay";
+import type { Result, RunResults } from "./replay";
+import type { Split } from "./report";
 
 const verdict = (
   winner: PairVerdict["winner"],
@@ -118,6 +119,9 @@ const makeResult = (caseId: string, overrides: Partial<Result> = {}): Result => 
   ...overrides,
 });
 
+const runsOf = (results: Result[]): RunResults =>
+  new Map(results.map((r) => [r.caseId, new Map([[1, r]])]));
+
 const prCommentOpts = (overrides: Partial<Parameters<typeof renderPrComment>[2]> = {}) => ({
   labelA: "prod",
   labelB: "pr-abc1234",
@@ -133,7 +137,7 @@ test("renderPrComment leads with the two verdicts a reader acts on", () => {
   const summary = summarize(verdicts);
   const resultsA = verdicts.map((v) => makeResult(v.caseId, { costUsd: 2 }));
   const resultsB = verdicts.map((v) => makeResult(v.caseId, { costUsd: 1 }));
-  const md = renderPrComment(summary, verdicts, prCommentOpts({ casesCount: 8, resultsA, resultsB }));
+  const md = renderPrComment(summary, verdicts, prCommentOpts({ casesCount: 8, resultsA: runsOf(resultsA), resultsB: runsOf(resultsB) }));
   const visible = md.split("<details>")[0];
   assert.ok(md.startsWith("<!-- delegate-eval -->"));
   assert.ok(visible.includes("**Quality: Better**"));
@@ -158,7 +162,7 @@ test("costVerdict calls under 10% a wash", () => {
 
 test("renderPrComment names failures and unjudged cases", () => {
   const verdicts = [verdict("a")];
-  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, unjudgedCount: 2, replayFailures: 2 }));
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, replayFailures: 2 }));
   assert.ok(md.includes("over 1 of 3 cases"));
   assert.ok(md.includes("2 not judged"));
   assert.ok(md.includes("2 replay failure(s)"));
@@ -173,6 +177,45 @@ test("cost is averaged over cases priced on both sides only", () => {
     makeResult(verdicts[1].caseId, { costUsd: 1 }),
     makeResult(verdicts[2].caseId, { costUsd: null, error: "checkout failed", output: null }),
   ];
-  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, resultsA, resultsB }));
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ casesCount: 3, resultsA: runsOf(resultsA), resultsB: runsOf(resultsB) }));
   assert.ok(md.includes("**Cost: Same** — $1.00 → $1.00 per review"));
+});
+
+test("qualityVerdict reads Better at 18 of 24 wins and Can't tell at 17 of 24", () => {
+  const wins = (b: number, a: number) =>
+    summarize([...Array.from({ length: b }, () => verdict("b")), ...Array.from({ length: a }, () => verdict("a"))]);
+  assert.equal(qualityVerdict(wins(18, 6)), "Better");
+  assert.equal(qualityVerdict(wins(17, 7)), "Can't tell");
+});
+
+const splitSetup = () => {
+  const tune = [verdict("b"), verdict("b"), verdict("a")];
+  const holdout = [verdict("a"), verdict("tie")];
+  const splits = new Map<string, Split>([
+    ...tune.map((v) => [v.caseId, "tune"] as [string, Split]),
+    ...holdout.map((v) => [v.caseId, "holdout"] as [string, Split]),
+  ]);
+  const verdicts = [...tune, ...holdout];
+  return { tune, holdout, splits, verdicts };
+};
+
+test("renderPrComment reports tune and holdout verdicts on separate lines", () => {
+  const { splits, verdicts } = splitSetup();
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ splits }));
+  assert.ok(md.includes("**Quality (tune): Can't tell** — pr-abc1234 won 2, prod won 1, 0 tied or unstable, over 3 of 3 cases"));
+  assert.ok(md.includes("**Quality (holdout): Can't tell** — pr-abc1234 won 0, prod won 1, 1 tied or unstable, over 2 of 2 cases"));
+});
+
+test("renderPrComment lists no holdout case anywhere in the comment", () => {
+  const { tune, holdout, splits, verdicts } = splitSetup();
+  const md = renderPrComment(summarize(verdicts), verdicts, prCommentOpts({ splits }));
+  for (const v of holdout) assert.ok(!md.includes(v.caseId), "holdout case id leaked");
+  for (const v of tune) assert.ok(md.includes(v.caseId), "tune case missing");
+});
+
+test("renderMarkdown keeps holdout cases for the human approver, labelled by split", () => {
+  const { holdout, splits, verdicts } = splitSetup();
+  const md = renderMarkdown(summarize(verdicts), verdicts, { labelA: "main", labelB: "pr", splits });
+  for (const v of holdout) assert.ok(md.includes(`| ${v.caseId} | holdout |`));
+  assert.ok(md.includes("holdout: main 1, pr 0, 1 tied or unstable"));
 });

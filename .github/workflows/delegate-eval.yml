@@ -162,7 +162,7 @@ jobs:
       # Main's results are cached in S3 by a replay key (a hash of main's
       # agents, framework, review code and lockfile), so they are replayed only
       # when those changed or a scenario is new. Pulled results land in
-      # results-main, and replay skips any case that already has a result file.
+      # results-main, and replay skips any run that already has a result file.
       - name: Pull main's eval cache
         id: cache
         env:
@@ -174,6 +174,7 @@ jobs:
           npm run -s review:eval -- cache pull \
             --suite "$SUITE" \
             --key "$replay_key" \
+            --layout runs \
             --out ./eval/results-main
 
       - name: Replay main
@@ -191,6 +192,7 @@ jobs:
             --cases ./eval/cases \
             --out ./eval/results-main \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
+            --replays 2 \
             --concurrency 4 \
             --work-dir ${{ runner.temp }}/work-main
 
@@ -284,6 +286,7 @@ jobs:
             --cases ../eval/cases \
             --out ../eval/results-pr \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
+            --replays 2 \
             --concurrency 4 \
             --work-dir ${{ runner.temp }}/work-pr
 
@@ -402,7 +405,7 @@ jobs:
       artifact-id: ${{ needs.pairwise-main.outputs.results_artifact_id }}
       replay-key: ${{ needs.pairwise-main.outputs.replay_key }}
       suite: ${{ needs.prepare.outputs.suite }}
-      layout: flat
+      layout: runs
       main-sha: ${{ needs.prepare.outputs.main_sha }}
 
   # The known-answer cases in expected/manifest.json. Main's answers to them

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
-import { ScenarioSchema, loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
+import { ScenarioSchema, loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
 import type { Scenario } from "./cases";
 import type { ReviewRecord } from "../schema";
 
@@ -256,6 +256,13 @@ test("loadScenarios refuses an empty suite and an invalid record", async () => {
 test("scenarioNames maps a run id to its scenario id", () => {
   const names = scenarioNames([scenario("omni-1-x", "core", "run-123")]);
   assert.equal(names.get("run-123"), "omni-1-x");
+});
+
+test("scenarioSplits maps a run id to its split", () => {
+  const holdout = { ...scenario("b", "core", "run-2"), split: "holdout" as const };
+  const splits = scenarioSplits([scenario("a", "core", "run-1"), holdout]);
+  assert.equal(splits.get("run-1"), "tune");
+  assert.equal(splits.get("run-2"), "holdout");
 });
 
 test("ScenarioSchema rejects a bad kind and a missing split", () => {
