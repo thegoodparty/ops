@@ -24,6 +24,7 @@ import {
   BIFROST_LOG_RETENTION_DAYS,
   BIFROST_LOG_STREAM_PREFIX,
   BIFROST_HEALTH_CHECK,
+  BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
   BIFROST_SERVICE_NAME,
   BIFROST_TASK_FAMILY,
   DEPLOYMENT_MAXIMUM_PERCENT,
@@ -62,7 +63,13 @@ import { BIFROST_PORT, OAUTH2_PROXY_PORT, REGION } from "./network";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
-import { BIFROST_HOSTNAME } from "./ingress";
+import {
+  BIFROST_HOSTNAME,
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
+  TARGET_GROUP_HEALTHY_THRESHOLD,
+  TARGET_GROUP_UNHEALTHY_THRESHOLD,
+} from "./ingress";
 import {
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_TAG,
@@ -924,6 +931,53 @@ describe("bifrost ecs", () => {
     );
     // The cap is what makes stop-before-start: never above desiredCount.
     assert.ok(DEPLOYMENT_MAXIMUM_PERCENT <= 100);
+  });
+
+  it("does not replace a task whose ALB checks have not passed yet", () => {
+    // The ALB starts failing its target-group check on a replacement task
+    // before the process answers, because `/health` is served by the process and
+    // the process is in its store migrations. Three failures at a 10s interval
+    // is roughly 30 seconds in, well inside the boot the container's start
+    // period covers, and the container check cannot stop ECS acting on it. With
+    // the ECS default grace period of 0 the service stops the task there, and
+    // being stop-before-start it then runs the same migrations again from the
+    // beginning. So the grace period is set, and the resource must carry it.
+    const service = resourceBlock("bifrostService");
+    assert.ok(
+      service.includes(
+        "healthCheckGracePeriodSeconds: BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS",
+      ),
+      service,
+    );
+
+    // Derived from the two windows it has to clear, not a number of its own:
+    // the container's start period, one ALB check already in flight when the
+    // process starts answering, and two full interval ticks for the two
+    // successes that promote the target.
+    assert.equal(BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS, 115);
+    assert.equal(
+      BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
+      BIFROST_HEALTH_CHECK.startPeriod +
+        TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS +
+        TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS *
+          TARGET_GROUP_HEALTHY_THRESHOLD,
+    );
+    assert.ok(
+      BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS >=
+        BIFROST_HEALTH_CHECK.startPeriod,
+      "the grace period must cover the container's own start period",
+    );
+    assert.ok(
+      BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS >
+        TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS *
+          TARGET_GROUP_UNHEALTHY_THRESHOLD,
+      "the grace period must outlast the ALB declaring the booting target unhealthy",
+    );
+    // Still one task and still stop-before-start: the grace period delays ECS's
+    // reaction to a failing check, it is not a second task to replace it with.
+    assert.equal(DEPLOYMENT_MINIMUM_HEALTHY_PERCENT, 0);
+    assert.equal(DEPLOYMENT_MAXIMUM_PERCENT, 100);
+    assert.ok(service.includes("desiredCount: 1"), service);
   });
 
   it("is one task, in a cluster with container insights", () => {

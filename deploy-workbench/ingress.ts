@@ -252,6 +252,17 @@ export const TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS = 30;
  * declare a booting task healthy in about 20 seconds while still requiring
  * three consecutive failures to pull a serving one out of rotation.
  *
+ * Those three failures also declare a *booting* target unhealthy about thirty
+ * seconds in, which is inside the start period the gateway container is allowed
+ * (`BIFROST_HEALTH_CHECK.startPeriod` in `ecs.ts`). For a serving target that
+ * is the intent; for a replacement task it would be a task stopped in the
+ * middle of its store migrations, and because the service is stop-before-start
+ * the replacement would run them again. The second half of that decision is the
+ * service's `healthCheckGracePeriodSeconds`
+ * (`BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS` in `ecs.ts`), which is derived
+ * from these three values: changing them invalidates that derivation and the
+ * test that pins it, on purpose.
+ *
  * Both health check paths are local and cheap (`/health` on the gateway,
  * `/ping` on the sidecar), so the shorter interval costs nothing worth counting.
  */
