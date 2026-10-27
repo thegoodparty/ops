@@ -94,7 +94,8 @@ export const selectCases = (
   filter: { case?: string; split?: string },
 ): ExpectedCase[] => {
   const split = filter.split === undefined ? undefined : SplitSchema.parse(filter.split);
-  return all.filter((c) => (!filter.case || c.id === filter.case) && (!split || c.split === split));
+  const ids = filter.case?.split(",");
+  return all.filter((c) => (!ids || ids.includes(c.id)) && (!split || c.split === split));
 };
 
 export const readBundleFile = (manifestPath: string, file: string): Bundle =>
@@ -290,6 +291,97 @@ const describeBaseline = (b: Baseline, r: CaseReport | undefined): string => {
   return c.unfinished === 0 ? rate : `${rate} (${c.unfinished} of ${c.runs} runs unfinished)`;
 };
 
+export const COST_LIMIT = 1.1;
+
+export type Split = z.infer<typeof SplitSchema>;
+
+export interface GateCase {
+  id: string;
+  split: Split;
+  mainPassed: number;
+  mainCompleted: number;
+  // Passed on some main runs and failed on others: main's own flake.
+  flaky: boolean;
+  candPassed: number;
+  candRuns: number;
+  // `not-held` is a case main did not pass 3/3, so there is nothing to regress.
+  outcome: "pass" | "rerun" | "regression" | "not-held";
+}
+
+export interface Gate {
+  regressions: string[];
+  // Ids to replay `runs` more times and gate again. Empty once `final`.
+  rerun: string[];
+  targetsMissed: string[];
+  // Candidate average cost per run over main's; null when either is unknown.
+  costRatio: number | null;
+  costOver: boolean;
+  pass: boolean;
+  cases: GateCase[];
+}
+
+const avgCost = (reports: CaseReport[]): number | null => {
+  const known = reports.flatMap((r) => r.costs).filter((c): c is number => c !== null);
+  return known.length === 0 ? null : known.reduce((a, b) => a + b, 0) / known.length;
+};
+
+// A case main passes on every run must not regress. One that drops below
+// 3/3 gets `runs` more runs and has to reach 2*runs-1 of 2*runs, so a single
+// unlucky run is not a regression. A run that errored is a failed run, and
+// with `final` a rerun that never happened is a failed rerun, so infra noise
+// cannot pass as an improvement. Each target must pass every run.
+export const computeGate = (
+  reports: CaseReport[],
+  baseline: Baseline,
+  targets: string[],
+  final: boolean,
+): Gate => {
+  const runs = baseline.runs;
+  const counts = reports.map((r) => baselineCounts(baseline, baseline.reports.find((b) => b.c.id === r.c.id)));
+  if (counts.every((c) => c.completed === 0)) {
+    throw new Error("main's baseline has no completed runs, so there is nothing to gate against");
+  }
+  const cases = reports.map((r, i): GateCase => {
+    const main = counts[i];
+    const candPassed = r.scores.filter((s) => s.pass).length;
+    const candRuns = r.scores.length;
+    let outcome: GateCase["outcome"];
+    if (main.runsPassed !== runs || main.completed !== runs) outcome = "not-held";
+    else if (candRuns > runs) outcome = candPassed >= 2 * runs - 1 ? "pass" : "regression";
+    else if (candPassed >= runs) outcome = "pass";
+    else outcome = final ? "regression" : "rerun";
+    return {
+      id: r.c.id,
+      split: r.c.split,
+      mainPassed: main.runsPassed,
+      mainCompleted: main.completed,
+      flaky: main.runsPassed > 0 && main.runsPassed < main.completed,
+      candPassed,
+      candRuns,
+      outcome,
+    };
+  });
+  const idsWith = (o: GateCase["outcome"]) => cases.filter((c) => c.outcome === o).map((c) => c.id);
+  const regressions = idsWith("regression");
+  const rerun = idsWith("rerun");
+  const targetsMissed = targets.filter((id) => {
+    const c = cases.find((x) => x.id === id);
+    return !c || c.candRuns < runs || c.candPassed !== c.candRuns;
+  });
+  const cand = avgCost(reports);
+  const main = avgCost(baseline.reports);
+  const costRatio = cand === null || main === null || main === 0 ? null : cand / main;
+  return {
+    regressions,
+    rerun,
+    targetsMissed,
+    costRatio,
+    costOver: costRatio !== null && costRatio > COST_LIMIT,
+    pass: regressions.length === 0 && rerun.length === 0 && targetsMissed.length === 0,
+    cases,
+  };
+};
+
 // The per-case baseline as data, for the merge gate to read without parsing
 // the markdown. `main` is null only when no baseline was given; a case whose
 // main runs errored or never ran has runs unfinished, not a pass or a fail.
@@ -312,26 +404,71 @@ export const renderExpectJson = (reports: CaseReport[], variant: string, baselin
     2,
   );
 
-export const renderExpectReport = (reports: CaseReport[], variant: string, baseline?: Baseline): string => {
+const OUTCOME_TEXT: Record<GateCase["outcome"], string> = {
+  pass: "pass",
+  rerun: "needs 3 more runs",
+  regression: "regression",
+  "not-held": "main does not pass this 3/3",
+};
+
+// With a gate, holdout cases appear only as an aggregate: no ids, expectations
+// or outputs, so whoever tunes against this comment cannot overfit to them.
+export const renderExpectReport = (
+  allReports: CaseReport[],
+  variant: string,
+  baseline?: Baseline,
+  gate?: Gate,
+): string => {
+  const reports = gate ? allReports.filter((r) => r.c.split === "tune") : allReports;
   const casePasses = reports.filter((r) => r.scores.length > 0 && r.scores.every((s) => s.pass)).length;
   const money = (costs: (number | null)[]) => {
     const known = costs.filter((c): c is number => c !== null);
     return known.length === 0 ? "n/a" : `$${(known.reduce((a, b) => a + b, 0) / known.length).toFixed(2)}`;
   };
+  const holdout = gate?.cases.filter((c) => c.split === "holdout") ?? [];
+  const gateLines = gate
+    ? [
+        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes 3/3 may regress; one that drops gets 3 more runs and needs 5 of 6.`,
+        "",
+        `Holdout: passed ${holdout.filter((c) => c.candRuns > 0 && c.candPassed === c.candRuns).length} of ${holdout.length}, regressions: ${holdout.filter((c) => c.outcome === "regression").length}.`,
+        "",
+        ...(gate.targetsMissed.length > 0
+          ? [`Targets below 3/3: ${gate.targetsMissed.map((id) => `\`${id}\``).join(", ")}.`, ""]
+          : []),
+        gate.costRatio === null
+          ? "Cost vs main: n/a."
+          : `Cost vs main: ${(gate.costRatio * 100).toFixed(0)}%${gate.costOver ? ", needs justification in the PR body." : "."}`,
+        "",
+      ]
+    : [];
+  const table = gate && baseline
+    ? [
+        "| Case | Expected | Runs passed | Main runs passed | Outcome | Avg cost |",
+        "| --- | --- | --- | --- | --- | --- |",
+        ...reports.map((r) => {
+          const g = gate.cases.find((c) => c.id === r.c.id)!;
+          const main = describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id));
+          return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${g.candPassed}/${g.candRuns} | ${main}${g.flaky ? " (flaky)" : ""} | ${OUTCOME_TEXT[g.outcome]} | ${money(r.costs)} |`;
+        }),
+      ]
+    : [
+        baseline
+          ? `| Case | Expected | Runs passed | Main runs passed (\`${baseline.variant}\`) | Avg cost |`
+          : "| Case | Expected | Runs passed | Avg cost |",
+        baseline ? "| --- | --- | --- | --- | --- |" : "| --- | --- | --- | --- |",
+        ...reports.map((r) => {
+          const passed = `${r.scores.filter((s) => s.pass).length}/${r.scores.length}`;
+          const main = baseline ? ` ${describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id))} |` : "";
+          return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${passed} |${main} ${money(r.costs)} |`;
+        }),
+      ];
   const lines = [
-    "### Expected-result eval",
+    gate ? "### Expected-result gate" : "### Expected-result eval",
     "",
-    `**${casePasses}/${reports.length} cases passed** on \`${variant}\`. A case passes only when every run gets the expected result.`,
+    ...gateLines,
+    `**${casePasses}/${reports.length} ${gate ? "tune " : ""}cases passed** on \`${variant}\`. A case passes only when every run gets the expected result.`,
     "",
-    baseline
-      ? `| Case | Expected | Runs passed | Main runs passed (\`${baseline.variant}\`) | Avg cost |`
-      : "| Case | Expected | Runs passed | Avg cost |",
-    baseline ? "| --- | --- | --- | --- | --- |" : "| --- | --- | --- | --- |",
-    ...reports.map((r) => {
-      const passed = `${r.scores.filter((s) => s.pass).length}/${r.scores.length}`;
-      const main = baseline ? ` ${describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id))} |` : "";
-      return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${passed} |${main} ${money(r.costs)} |`;
-    }),
+    ...table,
     "",
     "<details><summary>Every run</summary>",
     "",
@@ -376,6 +513,9 @@ const main = async () => {
   const mode = flags.mode ?? "all";
   const manifestPath = resolve(flags.manifest ?? DEFAULT_MANIFEST);
   const runs = Number(flags.runs ?? 3);
+  // A rerun numbers its runs after the first pass's, so it adds runs instead
+  // of retrying the ones already scored.
+  const fromRun = Number(flags["from-run"] ?? 1);
   const concurrency = Number(flags.concurrency ?? 5);
   const out = resolve(flags.out ?? "./eval-expected");
   const workDir = resolve(flags["work-dir"] ?? "/tmp/review-expect");
@@ -387,6 +527,22 @@ const main = async () => {
     throw new Error(`no case matches${flags.case ? ` --case ${flags.case}` : ""}${flags.split ? ` --split ${flags.split}` : ""}`);
   }
 
+  if (mode === "gate") {
+    if (!flags.base) throw new Error("--mode gate needs --base, main's baseline results");
+    const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
+    const reports = scoreDir(cases, out);
+    const final = flags.final === "true";
+    const targets = flags.targets ? flags.targets.split(",") : [];
+    const gate = computeGate(reports, baseline, targets, final);
+    writeFileSync(join(out, "gate.json"), JSON.stringify(gate, null, 2));
+    const report = renderExpectReport(reports, variant ?? "unknown", baseline, gate);
+    writeFileSync(join(out, "report.md"), report);
+    console.log(report);
+    // Only the final pass decides: the first may still be waiting on reruns.
+    if (final && !gate.pass) process.exitCode = 1;
+    return;
+  }
+
   if (mode === "replay" || mode === "all") {
     const client = new S3Client({});
     const records = new Map<string, ReviewRecord>();
@@ -396,7 +552,7 @@ const main = async () => {
     );
     const checkout = checkoutFor(synthetic);
 
-    const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: i + 1 })));
+    const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: fromRun + i })));
     let next = 0;
     const worker = async () => {
       while (next < tasks.length) {

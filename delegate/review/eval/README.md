@@ -129,6 +129,19 @@ npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tun
 
 Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
 
+### Gate
+
+`--mode gate --base <main-results-dir> [--targets id,id] [--final true] [--runs 3]` turns the baseline into a verdict and writes `<out>/gate.json` and the gate report to `<out>/report.md`. It refuses to run without `--base`, or when main has no completed runs at all.
+
+- A case main passed on every run (`runsPassed == completed == runs`) must not regress. If the candidate passes fewer than `runs`, the case is returned in `rerun`; after `runs` more runs (`--mode replay --case a,b --from-run 4`) it needs `2*runs-1` of `2*runs` (5 of 6), or it is a `regression`. With `--final true` a case still short of `runs` passes counts as a regression, so a rerun that never happened cannot pass.
+- A case main did not pass 3/3 (including one with unfinished main runs) cannot regress.
+- Every id in `--targets` must pass all its runs, or it is in `targetsMissed`. An unknown id is a miss.
+- `costRatio` is the candidate's average cost per run over main's (null when either is unknown). Above `1.10` sets `costOver`, which is reported but never fails the gate.
+- `pass` is true only with no `regressions`, `rerun` or `targetsMissed`. The exit code is non-zero only with `--final true` and `pass` false.
+- `gate.json`: `{ regressions, rerun, targetsMissed, costRatio, costOver, pass, cases: [{ id, split, mainPassed, mainCompleted, flaky, candPassed, candRuns, outcome }] }`. Main's flake rate for a case is `mainPassed/mainCompleted`; `flaky` is true when that is strictly between 0 and 1.
+
+The report lists tune cases with the candidate's and main's pass counts and shows holdout only as `passed X of Y, regressions: N`. `gate.json` and `report.json` still name holdout ids, so they stay in the workflow artifact and are not posted. `delegate eval` on a PR passes no `--targets`; the hill-climb dispatch (ticket 07) supplies them, from main's side, never from PR files. In the workflow, `expected-gate` runs the first pass, `expected-rerun` (PR code, read-only eval role) replays only the flagged cases, and `expected-score` merges only `run-4` to `run-6` from the rerun, gates with `--final true`, posts the gate report (never the score report, which names holdout cases) and goes red on failure.
+
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 
 A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
