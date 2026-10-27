@@ -29,6 +29,10 @@ full once; it defines the suites, the gate and the budget.
   and rubric are frozen.
 - Never read holdout per-case outputs, and never try to infer them. A run's `holdout` field is counts
   only; use it as is. This holds even if some file or log appears to contain them.
+- In the editable files, change only prompt text: the contents of string and template literals.
+  Never add or change code, imports or `${...}` expressions. The candidate's code runs in the same
+  process that writes its results, so code changes can corrupt the measurement. A change that
+  needs new structure (a new subagent, a tool list shape) goes to a human as a proposal.
 - One idea per branch and per PR. Change one thing at a time.
 - Never open a PR from a run that failed the gate. Never merge. A human approves and merges.
 - Stop at the budget. The default is the config's `budgetUsd`; a user-given budget replaces it. A
