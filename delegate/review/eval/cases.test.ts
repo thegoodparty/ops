@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
-import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
+import { ScenarioSchema, loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
 import type { Scenario } from "./cases";
 import type { ReviewRecord } from "../schema";
 
@@ -205,11 +205,24 @@ test("the checked-in scenario manifest parses and core has 12 cases", () => {
   assert.equal(scenarios.filter((s) => s.suite === "core").length, 12);
 });
 
+test("the checked-in scenarios hold out about a third of each suite", () => {
+  const scenarios = readManifest(join(__dirname, "scenarios.json"));
+  assert.equal(scenarios.length, 22);
+  for (const suite of ["core", "re-review"]) {
+    const inSuite = scenarios.filter((s) => s.suite === suite);
+    const holdout = inSuite.filter((s) => s.split === "holdout").length;
+    assert.ok(holdout >= inSuite.length / 4 && holdout <= inSuite.length / 2, `${suite}: ${holdout} holdout`);
+  }
+});
+
 const scenario = (id: string, suite: string, runId: string): Scenario => ({
   id,
   suite,
   key: `reviews/thegoodparty/ops/42/bbbbbb/${runId}.json`,
   tests: "t",
+  split: "tune",
+  source: "simulated",
+  kind: "bug",
 });
 
 const clientFor = (records: Map<string, unknown>) =>
@@ -243,4 +256,29 @@ test("loadScenarios refuses an empty suite and an invalid record", async () => {
 test("scenarioNames maps a run id to its scenario id", () => {
   const names = scenarioNames([scenario("omni-1-x", "core", "run-123")]);
   assert.equal(names.get("run-123"), "omni-1-x");
+});
+
+test("ScenarioSchema rejects a bad kind and a missing split", () => {
+  const ok = scenario("a", "core", "r");
+  assert.equal(ScenarioSchema.safeParse(ok).success, true);
+  assert.equal(ScenarioSchema.safeParse({ ...ok, kind: "typo" }).success, false);
+  const { split: _split, ...noSplit } = ok;
+  assert.equal(ScenarioSchema.safeParse(noSplit).success, false);
+});
+
+test("loadScenarios filters by split and refuses an empty or unknown split", async () => {
+  const a = makeRecord();
+  const b = makeRecord();
+  const scenarios = [
+    scenario("a", "core", a.runId),
+    { ...scenario("b", "core", b.runId), split: "holdout" as const },
+  ];
+  const client = clientFor(new Map([[scenarios[0].key, a], [scenarios[1].key, b]]));
+
+  const holdout = await loadScenarios(scenarios, { split: "holdout" }, client);
+  assert.deepEqual(holdout.map((l) => l.scenario.id), ["b"]);
+  const all = await loadScenarios(scenarios, {}, client);
+  assert.deepEqual(all.map((l) => l.scenario.id), ["a", "b"]);
+  await assert.rejects(loadScenarios([scenarios[0]], { split: "holdout" }, client), /no scenarios in split "holdout"/);
+  await assert.rejects(loadScenarios(scenarios, { split: "dev" }, client));
 });
