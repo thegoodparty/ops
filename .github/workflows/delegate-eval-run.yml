@@ -258,6 +258,33 @@ jobs:
           path: ./baseline/
           include-hidden-files: true
 
+      # A replay that errors still exits 0, and the gate treats a case main did
+      # not finish as not gated, so a regression on it would pass. Fail the job
+      # instead; the good runs are cached, so a re-dispatch replays only the
+      # gaps. Prints a count, never case ids, since gate mode includes holdout.
+      - name: Require a complete baseline
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const cases = require("./delegate/review/eval/expected/manifest.json")
+              .filter((c) => process.env.MODE !== "tune" || c.split === "tune");
+            let missing = 0;
+            for (const c of cases) for (let r = 1; r <= 3; r++) {
+              let ok = false;
+              try {
+                const x = JSON.parse(fs.readFileSync(`./baseline/${c.id}/run-${r}.json`, "utf-8"));
+                ok = !x.error && x.output?.status === "complete";
+              } catch {}
+              if (!ok) missing++;
+            }
+            if (missing) {
+              console.log(`::error::${missing} of ${cases.length * 3} main baseline runs are missing or errored. Re-dispatch to replay only those.`);
+              process.exit(1);
+            }
+          '
+
   # The only writer of the cache.
   main-cache-push:
     needs: main-baseline

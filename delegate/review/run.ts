@@ -10,6 +10,13 @@ import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
 import { buildBundle, priorFindingsFrom } from "./bundle";
 import { decide } from "./gates";
+import {
+  evaluateGating,
+  isGatedRepo,
+  parseGatingMode,
+  type GatingMode,
+  type GatingResult,
+} from "./gating";
 import { createGitTool } from "./git-tool";
 import { createGitHub } from "./github";
 import {
@@ -105,12 +112,54 @@ export const pathGuardHook = (reviewDir: string): HookCallback => {
 // Longer than the worker's wall-clock deadline (45 min) plus teardown.
 const STALE_LOCK_MS = 60 * 60 * 1000;
 
-const statusForRecord = (
+// Whether the gate runs at all, decided by two things and neither of them the
+// model's: the mode, read from `DELEGATE_GATING_MODE` with `off` as the default
+// in code (decision 13 of `docs/plan-gated-merges.md`), and whether the repo
+// has adopted gating (decision 12). `active: false` is the no-op guarantee:
+// every gated code path below is behind this flag, so with the mode off there
+// is no plan fetch, no `CODEOWNERS` read, no prompt change, no body change and
+// no verdict change. A repo that has not adopted the gate behaves the same way
+// even under `enforce` (see `GATED_REPOS`).
+export type GatingRuntime =
+  | { active: false; mode: GatingMode }
+  | { active: true; mode: Exclude<GatingMode, "off"> };
+
+export const gatingFor = (
+  repo: string,
+  env: NodeJS.ProcessEnv = process.env,
+): GatingRuntime => {
+  const mode = parseGatingMode(env.DELEGATE_GATING_MODE);
+  if (mode === "off" || !isGatedRepo(repo)) return { active: false, mode };
+  return { active: true, mode };
+};
+
+export const statusForRecord = (
   record: ReviewRecord,
   targetUrl?: string,
 ): { state: "success" | "error"; description: string; targetUrl?: string } => {
   if (record.action === "approved") return { state: "success", description: "Approved", targetUrl };
   if (record.action === "commented") {
+    // A gated comment can carry no finding at all: the flag is the comment. In
+    // shadow nothing is ever approved, so the status says what the gate would
+    // have done. The reasons come from `record.gates`, not `gating.flags`:
+    // `unparseable_findings` and `unplaceable_findings` are blockers that are
+    // not gating flags, and an empty `gating.flags` beside one of them does not
+    // mean the gate would have approved. For a gated record `wouldApprove` is
+    // false exactly when `gates` is non-empty. Ungated records take the
+    // unchanged branch below.
+    const g = record.gating;
+    if (g !== undefined && record.findings.length === 0) {
+      const reason = record.gates[0];
+      const description =
+        g.mode === "shadow"
+          ? reason
+            ? `Shadow: would comment (${reason})`
+            : "Shadow: would approve"
+          : reason
+            ? `Commented: ${reason}`
+            : "Commented: no findings";
+      return { state: "success", description, targetUrl };
+    }
     return { state: "success", description: `Commented: ${record.findings.length} finding(s)`, targetUrl };
   }
   if (record.action === "skipped") {
@@ -442,6 +491,8 @@ export const runReview = async (args: {
 
   let bundle: Bundle;
   let prior: ReviewRecord | undefined;
+  const gatingRuntime = gatingFor(repo);
+  let gating: GatingResult | undefined;
   try {
     if (trigger !== "re-review") {
       await github
@@ -460,10 +511,37 @@ export const runReview = async (args: {
       reviewDir,
       github,
       priorFindings: priorFindingsFrom(prior),
+      resolvePlan: gatingRuntime.active,
     });
+    if (gatingRuntime.active) {
+      // The same ref as the plan, and only `main` grants anything. A base ref
+      // that is not `main` reads nothing here: `evaluateGating` flags it and
+      // there is no point spending an API call on a file that cannot help.
+      const codeowners =
+        bundle.baseRef === "main"
+          ? (await github.getFileAtRef(repo, ".github/CODEOWNERS", bundle.baseRef))?.text
+          : undefined;
+      gating = evaluateGating({
+        mode: gatingRuntime.mode,
+        body: bundle.body,
+        baseRef: bundle.baseRef,
+        changedFiles: bundle.changedFiles,
+        codeowners,
+        plan:
+          bundle.plan !== undefined
+            ? { path: bundle.plan.path, blobSha: bundle.plan.blobSha }
+            : undefined,
+      });
+    }
   } catch (err) {
     return abort(`could not build review input: ${err instanceof Error ? err.message : String(err)}`);
   }
+
+  // The recorded form of the decision, built once the verdict is known: it has
+  // to carry case 5 too, which is the model's answer and so is folded in by
+  // `decide`. Absent when the gate did not run, which is how a reader tells a
+  // gated record from an ungated one.
+  let gatingRecord: ReviewRecord["gating"];
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
@@ -488,6 +566,7 @@ export const runReview = async (args: {
       verdict: partial.verdict,
       action: partial.action,
       gates: partial.gates,
+      ...(gatingRecord !== undefined ? { gating: gatingRecord } : {}),
       findings: partial.findings,
       droppedFindings: partial.droppedFindings ?? [],
       reviewId: partial.reviewId,
@@ -617,12 +696,31 @@ export const runReview = async (args: {
     return fail(output.reason, { output, costUsd });
   }
 
-  const decision = decide(output, { unparseableCount: parsed.droppedFindingCount });
+  // Placement comes before the decision so a gated run can record the findings
+  // that cannot be posted. They block approval -- `decide` reads the model's
+  // findings -- but they never reach `record.findings`, and a status rendered
+  // from the record has to still say why the verdict was a comment.
   const placed = placeFindings(output.findings, parseDiffAnchors(bundle.diff));
 
   const dropped = placed.filter((p) => "unplaceable" in p).map((p) => p.finding);
   for (const f of dropped) {
     console.warn(`finding dropped, path not in diff: ${f.path}:${f.line}`);
+  }
+
+  const decision = decide(output, {
+    unparseableCount: parsed.droppedFindingCount,
+    unplaceableCount: dropped.length,
+    ...(gating !== undefined ? { gating } : {}),
+  });
+  if (gating !== undefined && decision.gating !== undefined) {
+    gatingRecord = {
+      mode: decision.gating.mode,
+      binding: decision.gating.binding,
+      baseRef: decision.gating.baseRef,
+      ...(decision.gating.plan !== undefined ? { plan: decision.gating.plan } : {}),
+      authority: gating.authority,
+      flags: decision.gating.flags,
+    };
   }
 
   // Identity is the harness's job. Reconcile each placeable finding to the
@@ -839,20 +937,14 @@ export const runReview = async (args: {
     }
   }
 
-  const findingCount = fresh.length + allCarried.length;
-  await github
-    .postStatus(repo, headSha, {
-      state: "success",
-      description:
-        decision.action === "approve"
-          ? tipMovedTo
-            ? "Approved, then dismissed: tip moved"
-            : "Approved"
-          : `Commented: ${findingCount} finding(s)`,
-      targetUrl: args.logsUrl,
-    })
-    .catch((err: unknown) => console.error("terminal status failed:", err));
-
+  // The record is built before the terminal status so the status can be
+  // rendered from it: `statusForRecord` already knows what a gated comment was
+  // gated on and what a shadow run would have done, and the terminal status is
+  // the description a reader actually sees on the check. Deriving it here
+  // instead is how a gated comment with no findings used to post
+  // "Commented: 0 finding(s)". A dismissed approval is the one case the helper
+  // cannot derive -- the dismissal is not part of the verdict -- so it is
+  // spelled out, exactly as before.
   const record = finish({
     output,
     verdict: decision.verdict,
@@ -864,6 +956,16 @@ export const runReview = async (args: {
     tipMovedTo,
     costUsd,
   });
+
+  await github
+    .postStatus(repo, headSha, {
+      ...statusForRecord(record, args.logsUrl),
+      ...(tipMovedTo !== undefined
+        ? { description: "Approved, then dismissed: tip moved" }
+        : {}),
+    })
+    .catch((err: unknown) => console.error("terminal status failed:", err));
+
   await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
 
   emit("review_posted", {
@@ -882,6 +984,14 @@ export const runReview = async (args: {
     tip_moved: Boolean(tipMovedTo),
     cost_usd: costUsd ?? null,
     wall_time_ms: record.wallTimeMs,
+    ...(decision.gating !== undefined
+      ? {
+          gating_mode: decision.gating.mode,
+          gating_flags: decision.gating.flags,
+          gating_would_approve: decision.gating.wouldApprove,
+          gating_plan: decision.gating.plan?.path ?? null,
+        }
+      : {}),
   });
   for (const finding of fresh) {
     emit("finding_emitted", {

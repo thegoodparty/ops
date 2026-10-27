@@ -59,13 +59,20 @@ test("the manifest parses and every simulated bundle matches its diff", () => {
 
 // The two plan cases are simulated PRs in the same corpus, and each carries the
 // plan the model is judged against inside its bundle: nothing fetches it, so a
-// case replays with no GitHub access.
-test("the corpus has one consistent and one inconsistent plan case, both with a plan", () => {
-  const cases = readManifest(MANIFEST).filter((c) => c.expect.verdict === "consistency");
-  const wanted = cases.map((c) =>
-    c.expect.verdict === "consistency" ? c.expect.consistency : null,
-  );
-  assert.deepEqual([...wanted].sort(), ["consistent", "inconsistent"]);
+// case replays with no GitHub access. Step 5 scores their outcomes and keeps
+// the consistency answer as a diagnostic.
+test("the two plan cases assert an outcome and keep consistency as a diagnostic", () => {
+  const cases = readManifest(MANIFEST).filter((c) => c.id.startsWith("ops-plan-"));
+  const byId = new Map(cases.map((c) => [c.id, c]));
+  assert.deepEqual(byId.get("ops-plan-consistent-change")?.expect, {
+    verdict: "approve",
+    consistency: "consistent",
+  });
+  assert.deepEqual(byId.get("ops-plan-inconsistent-change")?.expect, {
+    verdict: "flag",
+    reason: "inconsistent",
+    consistency: "inconsistent",
+  });
   for (const c of cases) {
     assert.ok(c.bundle, `${c.id} must be a simulated bundle`);
     const bundle = readBundleFile(MANIFEST, c.bundle!);
@@ -79,14 +86,14 @@ test("the corpus has one consistent and one inconsistent plan case, both with a 
   }
 });
 
-test("the manifest rejects an unknown answer or verdict, and a consistency case without one", () => {
+test("the manifest rejects an unknown answer, verdict or gate name, and an incomplete expectation", () => {
   const dir = mkdtempSync(join(tmpdir(), "expect-manifest-"));
   const write = (name: string, body: unknown) => {
     const path = join(dir, name);
     writeFileSync(path, JSON.stringify(body));
     return path;
   };
-  const c = readManifest(MANIFEST).find((x) => x.expect.verdict === "consistency")!;
+  const c = readManifest(MANIFEST).find((x) => x.id === "ops-plan-inconsistent-change")!;
   assert.throws(
     () =>
       readManifest(
@@ -99,9 +106,20 @@ test("the manifest rejects an unknown answer or verdict, and a consistency case 
     "a consistency expectation needs the answer it asserts",
   );
   assert.throws(
-    () => readManifest(write("unknown.json", [{ ...c, expect: { verdict: "flag" } }])),
-    "flag is not an expectation type until step 5",
+    () => readManifest(write("noreason.json", [{ ...c, expect: { verdict: "flag" } }])),
+    "a flag expectation needs the gate it names",
   );
+  assert.throws(
+    () =>
+      readManifest(
+        write("unknown.json", [{ ...c, expect: { verdict: "flag", reason: "looks_bad" } }]),
+      ),
+    "a flag must name a gate that exists",
+  );
+  const ok = readManifest(
+    write("ok.json", [{ ...c, expect: { verdict: "flag", reason: "inconsistent" } }]),
+  );
+  assert.equal(ok[0].expect.verdict, "flag");
 });
 
 test("a manifest entry missing split, source or kind, or with a bad value, is rejected", () => {
@@ -129,6 +147,7 @@ test("the checked-in manifest holds out a third, with block and approve on both 
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
     assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
   }
+  assert.ok(selectCases(cases, { split: "holdout" }).some((c) => c.expect.verdict === "flag"));
 });
 
 test("selectCases filters by split and case, and returns everything with no filter", () => {
@@ -161,6 +180,29 @@ const withConsistency = (
       findings,
       summary: "s",
       ...(verdict ? { planConsistency: { verdict, reasoning: "r" } } : {}),
+    },
+  });
+
+// A replayed gated case: the gate's event and the reason it commented. `repo`
+// defaults to a gated one, because that is where a verdict exists at all.
+const withGating = (
+  answer: "consistent" | "inconsistent" | "unclear",
+  gating: { verdict: "approve" | "comment"; gates?: string[] },
+  repo = "thegoodparty/ops",
+) =>
+  result({
+    repo,
+    output: {
+      status: "complete",
+      findings: [],
+      summary: "s",
+      planConsistency: { verdict: answer, reasoning: "r" },
+    },
+    gating: {
+      mode: "enforce",
+      verdict: gating.verdict,
+      gates: gating.gates ?? [],
+      wouldApprove: gating.verdict === "approve",
     },
   });
 
@@ -217,21 +259,80 @@ test("a diagnostic on an outcome case has to be right as well", () => {
   assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("c.ts")])).pass, false);
 });
 
-test("the report names a consistency expectation and an outcome diagnostic", () => {
+test("the report names a consistency expectation, a flag and an outcome diagnostic", () => {
   const cases = readManifest(MANIFEST);
-  const planCases = cases.filter((c) => c.expect.verdict === "consistency");
-  const diagnosed: ExpectedCase = {
-    ...cases[0],
-    id: "diagnosed",
-    expect: { verdict: "approve", consistency: "consistent" },
-  };
+  const base = cases[0];
   const report = renderExpectReport(
-    [...planCases, diagnosed].map((c) => ({ c, scores: [], costs: [] })),
+    [
+      {
+        c: { ...base, id: "consistency", expect: { verdict: "consistency", consistency: "inconsistent" } },
+        scores: [],
+        costs: [],
+      },
+      {
+        c: { ...base, id: "flagged", expect: { verdict: "flag", reason: "no_binding" } },
+        scores: [],
+        costs: [],
+      },
+      {
+        c: { ...base, id: "diagnosed", expect: { verdict: "approve", consistency: "consistent" } },
+        scores: [],
+        costs: [],
+      },
+    ],
     "v",
   );
-  assert.match(report, /planConsistency: consistent/);
   assert.match(report, /planConsistency: inconsistent/);
+  assert.match(report, /flag `no_binding`/);
   assert.match(report, /approve \(diagnostic: planConsistency: consistent\)/);
+});
+
+test("a flag passes only when the review commented and that named gate fired", () => {
+  const flag: Expect = { verdict: "flag", reason: "inconsistent" };
+  const passed = scoreRun(flag, withGating("inconsistent", { verdict: "comment", gates: ["inconsistent"] }));
+  assert.equal(passed.pass, true);
+  assert.match(passed.outcome, /flagged: inconsistent/);
+
+  // A comment is not enough: the named gate has to be the one that fired.
+  const other = scoreRun(flag, withGating("unclear", { verdict: "comment", gates: ["unclear_consistency"] }));
+  assert.equal(other.pass, false);
+  assert.match(other.outcome, /commented: unclear_consistency \(expected inconsistent\)/);
+
+  // Nor is an approval, which is the other thing the agent's output alone
+  // cannot distinguish from a clean comment.
+  assert.equal(scoreRun(flag, withGating("consistent", { verdict: "approve" })).pass, false);
+  assert.equal(scoreRun(flag, result()).pass, false);
+  assert.match(scoreRun(flag, result()).outcome, /no gating verdict/);
+});
+
+test("approve reads the gating verdict, not just the absence of findings", () => {
+  const approve: Expect = { verdict: "approve" };
+  assert.equal(scoreRun(approve, withGating("consistent", { verdict: "approve" })).pass, true);
+
+  const commented = withGating("inconsistent", { verdict: "comment", gates: ["inconsistent"] });
+  assert.equal(scoreRun(approve, commented).pass, false);
+  assert.match(scoreRun(approve, commented).outcome, /commented: inconsistent/);
+
+  // A gated repo's case with no recorded gate verdict fails closed rather
+  // than assuming a clean review.
+  assert.equal(scoreRun(approve, result({ repo: "thegoodparty/ops" })).pass, false);
+  // A repo that has not adopted gating keeps the findings-only outcome.
+  assert.equal(scoreRun(approve, result()).pass, true);
+});
+
+test("a flag's diagnostic must be right too", () => {
+  const flag: Expect = { verdict: "flag", reason: "inconsistent", consistency: "inconsistent" };
+  assert.equal(
+    scoreRun(flag, withGating("inconsistent", { verdict: "comment", gates: ["inconsistent"] })).pass,
+    true,
+  );
+
+  // The gate fired on the right reason but the model's answer says otherwise:
+  // the diagnostic attributes that to the model rather than to the gate.
+  const wrongModel = withGating("consistent", { verdict: "comment", gates: ["inconsistent"] });
+  const resultWrong = scoreRun(flag, wrongModel);
+  assert.equal(resultWrong.pass, false);
+  assert.match(resultWrong.outcome, /planConsistency: consistent \(expected inconsistent\)/);
 });
 
 test("approve passes only with zero findings", () => {
