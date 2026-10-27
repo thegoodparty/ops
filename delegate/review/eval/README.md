@@ -29,7 +29,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
-**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes.
+**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs, gating? }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes. `gating` is the gate's outcome (`{ mode, verdict, gates, wouldApprove }`) and is present only for a repo that has adopted gating: the agent's `output` cannot tell a flag from an ordinary comment, because both are a complete review with no findings.
 
 ## Commands
 
@@ -113,7 +113,11 @@ cat report.md
 
 ## Expected-result suite
 
-Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes with zero findings. The two plan cases use the third expectation type, `{ "verdict": "consistency", "consistency": "consistent" | "inconsistent" | "unclear" }`, which scores the model's own `planConsistency` answer: step 1 of `docs/plan-gated-merges.md` ships no gate to turn that answer into an approval or a comment, so the answer is the whole case. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR. Every case runs several times, and a case passes only when every run does.
+Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+
+The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
+
+Replay runs the gate in `enforce` for a repo on `gating.ts`'s adoption list, which is what makes an approval reachable, and treats the bundle's changed paths as de-owned: a bundle carries no `CODEOWNERS`, so the deterministic authority cases are asserted in `delegate/review/gating.test.ts` rather than replayed. A repo that has not adopted gating records no verdict and keeps the findings-only outcome. The standalone `{ "verdict": "consistency", "consistency": ... }` expectation remains for cases that must be scored on the model's answer alone. Every case runs several times, and a case passes only when every run does.
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
@@ -128,6 +132,19 @@ Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has 
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 
 A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
+
+## Mining candidate cases
+
+```sh
+npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 --out candidates.jsonl
+```
+
+Read-only. Walks every page of `REVIEW_BUCKET`, keeps the latest non-`eval` record per head sha, and proposes cases for a human to confirm. Needs S3 read access and `gh` auth. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--out` (stdout if omitted).
+
+- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, key, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
+- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, key, repo, pr, findings, replies, mergedSha }`.
+
+Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and many real misses need a running system to see, so a person labels each one.
 
 ## Cost expectations
 

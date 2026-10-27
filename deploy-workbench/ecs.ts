@@ -12,9 +12,15 @@ import {
   OAUTH2_PROXY_PORT,
   REGION,
 } from "./network";
-import { BIFROST_HOSTNAME } from "./ingress";
+import {
+  BIFROST_HOSTNAME,
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
+  TARGET_GROUP_HEALTHY_THRESHOLD,
+} from "./ingress";
 import type { BifrostIngress } from "./ingress";
 import {
+  OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH,
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_TAG,
 } from "./oauth2-proxy-image";
@@ -36,9 +42,11 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   task-execution policy plus read on the task's secrets) and the separate
  *   task role (the Bedrock model list and nothing else).
  * - Owns since item 9: the oauth2-proxy sidecar, its three `OAUTH2_PROXY_*`
- *   secret references, and the service's two `loadBalancers` entries. The
- *   rules that make those target groups attachable are `ingress.ts`'s; this
- *   file takes the ingress object and depends on its listener rules, because
+ *   secret references plus the two `bifrost/gateway` keys the header injection
+ *   is computed from, the `--alpha-config` flag that turns that injection on,
+ *   and the service's two `loadBalancers` entries. The rules that make those
+ *   target groups attachable are `ingress.ts`'s; this file takes the ingress
+ *   object and depends on its listener rules, because
  *   ECS's `CreateService` rejects a target group that no listener or listener
  *   rule references (`InvalidParameterException: The target group with
  *   targetGroupArn ... does not have an associated load balancer`). That was
@@ -48,10 +56,11 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   groups or the database. Those are items 5, 6 and 7, and this file consumes
  *   their exports rather than declaring a second copy of any of them. In
  *   particular there is no target group, listener or security group here.
- * - Does not own: the derived oauth2-proxy image or the allowlist baked into
- *   it. `oauth2-proxy-image.ts` pins the image and
- *   `bifrost/allowed-emails.txt` is the list; this file only names the tag and
- *   the container path the image writes the list to.
+ * - Does not own: the derived oauth2-proxy image, the allowlist baked into it
+ *   or the alpha configuration that injects Bifrost's admin credential.
+ *   `oauth2-proxy-image.ts` pins the image, `bifrost/allowed-emails.txt` is the
+ *   list and `bifrost/alpha-config.yaml` is the injection; this file only names
+ *   the tag, the container paths and the `--alpha-config` flag that loads it.
  * - Does not own: `config.json` itself. That file is item 10's, in
  *   `bifrost/config.json`, and is the deployment's declarative configuration;
  *   this module only stores it and gets it into the container.
@@ -129,6 +138,13 @@ export const OAUTH2_PROXY_CONTAINER_NAME = "oauth2-proxy";
  * already makes everywhere else — a task replacement is a short outage — and
  * it is the only shape that keeps the single-node invariant true during a
  * deploy.
+ *
+ * That "short" gap is set by two things outside this module, and on 2026-10-26
+ * it was seven and a half minutes: the target groups' deregistration delay
+ * (300s by default) and their health check timing, both pinned in
+ * `ingress.ts`. Reducing them is the fix for the outage shape; it does not
+ * make the gap zero. Removing it entirely means the rolling update above, and
+ * that needs an answer for two instances racing the store migrations first.
  */
 export const DEPLOYMENT_MINIMUM_HEALTHY_PERCENT = 0;
 export const DEPLOYMENT_MAXIMUM_PERCENT = 100;
@@ -253,6 +269,44 @@ export const OAUTH2_PROXY_SECRET_KEYS = [
 ] as const;
 
 /**
+ * The two `bifrost/gateway` keys the sidecar reads, and the reason it reads
+ * them: the entrypoint wrapper in the derived image turns them into the
+ * `Authorization` header the baked alpha configuration injects upstream
+ * (`deploy-workbench/bifrost/entrypoint.go`), so a human who passed the Google
+ * gate does not meet Bifrost's own login as a second prompt.
+ *
+ * They are the same two keys the gateway container and the claim container
+ * already get, read from the same secret, so this adds a consumer and no new
+ * secret. The values are not copied: the header is computed at container start
+ * from whatever the secret holds at that moment, which is what keeps it from
+ * drifting from the password Bifrost was provisioned with.
+ *
+ * DIFFERS from the previous shape, which deliberately gave the sidecar nothing
+ * from `bifrost/gateway`. That separation is gone by construction: the sidecar
+ * is the component that now holds the admin Basic credential. It still gets no
+ * provider key, no encryption key, no setup token and nothing from the database.
+ */
+export const OAUTH2_PROXY_INJECTED_SECRET_KEYS = [
+  "BIFROST_ADMIN_USERNAME",
+  "BIFROST_ADMIN_PASSWORD",
+] as const;
+
+/**
+ * The sidecar's command: the one flag that makes its baked alpha configuration
+ * load.
+ *
+ * It is here rather than in the image's `CMD` so the flag is part of the task
+ * definition, where `ecs.test.ts` can pin it against the path the Dockerfile
+ * writes. The alpha configuration is not optional: without it oauth2-proxy
+ * ignores `injectRequestHeaders`, and the admin surface quietly reverts to the
+ * shared password prompt. The image's entrypoint wrapper refuses to start the
+ * proxy when this flag is absent, which is the fail-closed half of it.
+ */
+export const OAUTH2_PROXY_COMMAND = [
+  `--alpha-config=${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
+] as const;
+
+/**
  * The one-shot container that claims a fresh deployment (phase 2 item 11), and
  * the three keys it reads from `bifrost/gateway`.
  *
@@ -301,7 +355,19 @@ export const BIFROST_API_BASE_URL = `http://127.0.0.1:${BIFROST_PORT}`;
  * The values are generous on purpose: this is a Go process that loads its
  * config store on start, and a start period that is too short would restart a
  * healthy task mid-boot. Three failures at 15s intervals is the same
- * order of magnitude the upstream Dockerfile uses.
+ * order of magnitude the upstream Dockerfile uses, and the start period is 90
+ * seconds because the first boot after a config change runs the store's
+ * migrations: the 2026-10-26 apply measured 23.1s ("Time spent in Bifrost
+ * server bootstrap") against an empty RDS, and the 30 seconds this used to be
+ * left about seven seconds of margin before a slow boot was reported
+ * unhealthy. A task that is slow because it is migrating is not a task to
+ * restart.
+ *
+ * This is only half of that guarantee. It governs the container-level check,
+ * which ECS acts on, and says nothing about the ALB's target-group check, which
+ * ECS also acts on and which starts failing well before this start period has
+ * run out; see `BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS` below, which is the
+ * other half.
  */
 export const BIFROST_HEALTH_CHECK: {
   command: string[];
@@ -317,8 +383,72 @@ export const BIFROST_HEALTH_CHECK: {
   interval: 15,
   timeout: 5,
   retries: 3,
-  startPeriod: 30,
+  startPeriod: 90,
 };
+
+/**
+ * How long ECS ignores a new task whose ALB health checks have not passed yet:
+ * the service's `healthCheckGracePeriodSeconds`, and the reason `ingress.ts`
+ * can keep the target-group timing short without turning a slow boot into a
+ * replacement loop.
+ *
+ * The two checks measure the same boot from opposite sides, and ECS starts the
+ * clock at `RUNNING` rather than when the process answers. So the ALB check on
+ * a replacement task fails for the whole of the boot: Bifrost's `/health` is
+ * served by the process, which is inside the store migrations for the first
+ * ~23 seconds and longer on a slow one. With the pinned `unhealthyThreshold: 3`
+ * at a 10-second interval the target group declares the target unhealthy about
+ * twenty to thirty seconds in, and with ECS's default grace period of 0 the
+ * service acts on that immediately: it stops the task and starts another. The
+ * container's `startPeriod: 90` cannot prevent that, because it governs only
+ * the container-level check. Since the service is stop-before-start with
+ * `desiredCount: 1`, the replacement starts the same migrations again from the
+ * beginning — a replacement loop with an empty gateway, which is worse than
+ * the gap this deployment is accepted to have.
+ *
+ * The value is derived, not guessed, from the longest boot the deployment
+ * already says it will tolerate. That is the container check's whole tolerance,
+ * not just its start period: failures are ignored for `startPeriod`, and after
+ * it the check still allows `retries` consecutive failures `interval` apart
+ * before it calls the task unhealthy, so a boot that ends at 90 + 3 * 15 = 135
+ * seconds is one the container check would still have called healthy. A grace
+ * period that expired at the start period alone would let the ALB replace that
+ * task anyway, which is the loop again, one boot length further out. So:
+ *
+ *   startPeriod               90
+ *   retries * interval        + 3 * 15 = 45  (the failures after it)
+ *   one ALB check in flight   + 5            (its timeout)
+ *   two ALB interval ticks    + 2 * 10 = 20  (the two successes)
+ *   = 160 seconds
+ *
+ * The ALB terms are there because ECS starts the grace clock at `RUNNING`,
+ * before the process answers, while the two successes that promote the target
+ * only begin once it does: the container check can call a task healthy at 135
+ * seconds while the ALB still needs its two checks after that. The tests hold
+ * the value to this sum and above the target group's own unhealthy window.
+ *
+ * 160 seconds is also the point of diminishing returns: lengthening it further
+ * would tolerate a boot the container check has already given up on, and the
+ * grace period is what bounds how long a genuinely broken task is left in place
+ * before ECS replaces it.
+ *
+ * The cost is one-sided. The grace period suppresses ECS's reaction to failing
+ * load balancer health checks; it does not change the health checks, the
+ * target's state or the traffic, so a task that recovers inside it is promoted
+ * by the ALB after the usual two successes and nothing waits 160 seconds. A
+ * task that is genuinely broken is left in place for up to 160 seconds per
+ * attempt instead of ~30 before ECS replaces it. The gateway answers 503 in both
+ * cases, so that is slower failure detection with the same outage shape, and it
+ * is the trade for never restarting a task that is merely migrating.
+ * `deploy-workbench/scripts/verify-service.ts` is what turns a service that
+ * never converges into a red deploy run (600s default), so the slower detection
+ * is bounded and visible.
+ */
+export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
+  BIFROST_HEALTH_CHECK.startPeriod +
+  BIFROST_HEALTH_CHECK.interval * BIFROST_HEALTH_CHECK.retries +
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS +
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS * TARGET_GROUP_HEALTHY_THRESHOLD;
 
 /**
  * The RDS-managed master password, injected as the task's `PG_PASSWORD`.
@@ -472,23 +602,34 @@ export const BIFROST_CONTAINER_COMMAND = [
 ] as const;
 
 /**
- * The sidecar's non-secret configuration, as a table rather than a list of
- * literals in the container definition so the test can pin every value.
+ * The sidecar's non-secret configuration that is *not* in the alpha
+ * configuration file, as a table rather than a list of literals in the
+ * container definition so the test can pin every value.
  *
  * The settings follow `agent-swarm/host/docker-compose.yml`'s `oauth2-proxy`
- * service, which is the working precedent in this repo, with the two
- * differences the plan names:
+ * service, which is the working precedent in this repo, with these differences:
  *
- * - `OAUTH2_PROXY_UPSTREAMS` is Bifrost in the same task, not `static://202`:
- *   the swarm's Caddy forwards and oauth2-proxy only gates, while here the
- *   proxy is the reverse proxy for the admin surface. The two containers share
- *   the task network namespace, so `127.0.0.1` is Bifrost with no hop back
- *   through the ALB. The port comes from `network.ts`, the same constant the
- *   Bifrost container publishes and the security group admits.
+ * - The sidecar runs with `--alpha-config` (`OAUTH2_PROXY_COMMAND`), because
+ *   injecting Bifrost's admin credential is only expressible there. That moves
+ *   three settings out of this table and into
+ *   `bifrost/alpha-config.yaml`: the provider (`OAUTH2_PROXY_PROVIDER`), the
+ *   upstream (`OAUTH2_PROXY_UPSTREAMS`, Bifrost in the same task rather than
+ *   the swarm's `static://202`, since here the proxy is the reverse proxy) and
+ *   the listen address (`OAUTH2_PROXY_HTTP_ADDRESS`). At v7.15.5 those flags
+ *   are *removed* when alpha configuration is used — an edit that leaves them
+ *   here would be silently ignored, not rejected — so they are gone from this
+ *   table on purpose rather than by omission.
+ * - `OAUTH2_PROXY_SET_XAUTHREQUEST` and `OAUTH2_PROXY_PASS_USER_HEADERS` are
+ *   gone for the same reason: both are removed options under alpha
+ *   configuration, and their replacements are `injectResponseHeaders` and
+ *   `injectRequestHeaders` entries, which this deployment does not need. Bifrost
+ *   does not read `X-Forwarded-User` or `X-Auth-Request-User`; the only header
+ *   it needs is the `Authorization` one the alpha configuration injects.
  * - `OAUTH2_PROXY_REDIRECT_URL` and `OAUTH2_PROXY_WHITELIST_DOMAINS` are this
  *   gateway's hostname, derived from `ingress.ts` rather than spelled again,
  *   so a hostname change cannot leave the Google callback pointing at the old
- *   name.
+ *   name. They stay here: both survived into the core option set and still
+ *   load from `OAUTH2_PROXY_*` with alpha configuration.
  *
  * The allowlist path is the constant the derived image's `Dockerfile` writes
  * to (`oauth2-proxy-image.ts`), not a literal here: a mismatch is a proxy that
@@ -499,19 +640,14 @@ export const BIFROST_CONTAINER_COMMAND = [
  * swarm's compose file uses, not a boolean ECS would reject.
  */
 export const OAUTH2_PROXY_ENVIRONMENT: Readonly<Record<string, string>> = {
-  OAUTH2_PROXY_PROVIDER: "google",
   OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE:
     OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
   OAUTH2_PROXY_REDIRECT_URL: `https://${BIFROST_HOSTNAME}/oauth2/callback`,
-  OAUTH2_PROXY_HTTP_ADDRESS: `0.0.0.0:${OAUTH2_PROXY_PORT}`,
   OAUTH2_PROXY_REVERSE_PROXY: "true",
-  OAUTH2_PROXY_UPSTREAMS: `http://127.0.0.1:${BIFROST_PORT}`,
   OAUTH2_PROXY_COOKIE_SECURE: "true",
   OAUTH2_PROXY_COOKIE_SAMESITE: "lax",
   OAUTH2_PROXY_COOKIE_EXPIRE: "168h",
   OAUTH2_PROXY_COOKIE_REFRESH: "1h",
-  OAUTH2_PROXY_SET_XAUTHREQUEST: "true",
-  OAUTH2_PROXY_PASS_USER_HEADERS: "true",
   OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true",
   OAUTH2_PROXY_WHITELIST_DOMAINS: BIFROST_HOSTNAME,
 };
@@ -884,12 +1020,13 @@ export const createBifrostEcs = (args: {
    *   `BIFROST_CONFIG` from the SSM parameter; see the module header for why
    *   nothing here reads Secrets Manager. Bifrost gets `bifrost/gateway`'s five,
    *   `PG_PASSWORD` and `BIFROST_CONFIG`; the sidecar gets
-   *   `bifrost/oauth2-proxy`'s three and nothing else, so neither container
-   *   sees the other's credentials. The ECS agent resolves every entry before
-   *   the container starts, so a key listed here and absent from the secret is
-   *   a task that never starts: `fill-secrets.sh` has to write
-   *   `BIFROST_SETUP_TOKEN` before a task definition naming it deploys, exactly
-   *   as it already has to write the sidecar's three.
+   *   `bifrost/oauth2-proxy`'s three plus `bifrost/gateway`'s admin username and
+   *   password, which its entrypoint turns into the injected Basic header. It
+   *   gets no provider key, no encryption key and no setup token. The ECS agent
+   *   resolves every entry before the container starts, so a key listed here and
+   *   absent from the secret is a task that never starts: `fill-secrets.sh` has
+   *   to write `BIFROST_SETUP_TOKEN` before a task definition naming it deploys,
+   *   exactly as it already has to write the sidecar's three and the admin pair.
    * - The environment carries `AWS_REGION`, because the Bedrock provider needs
    *   a region (the delegate sets `AWS_DEFAULT_REGION` for the same reason),
    *   and the four non-secret Postgres values `config.json` resolves by name.
@@ -1013,6 +1150,12 @@ export const createBifrostEcs = (args: {
           // not depend on this flag: the ALB has no rule that sends an admin
           // path to Bifrost at all.
           essential: true,
+          // The image's entrypoint is the wrapper (`bifrost/entrypoint.go`),
+          // which is why there is no `entryPoint` override here: the wrapper
+          // computes the Basic credential from the two secrets below and then
+          // execs oauth2-proxy. This argument is the alpha configuration that
+          // carries the header injection.
+          command: [...OAUTH2_PROXY_COMMAND],
           portMappings: [
             {
               containerPort: OAUTH2_PROXY_PORT,
@@ -1023,10 +1166,20 @@ export const createBifrostEcs = (args: {
           environment: Object.entries(OAUTH2_PROXY_ENVIRONMENT).map(
             ([name, value]) => ({ name, value }),
           ),
-          secrets: OAUTH2_PROXY_SECRET_KEYS.map((key) => ({
-            name: key,
-            valueFrom: secretReference(OAUTH2_PROXY_SECRET_NAME, key),
-          })),
+          secrets: [
+            ...OAUTH2_PROXY_SECRET_KEYS.map((key) => ({
+              name: key,
+              valueFrom: secretReference(OAUTH2_PROXY_SECRET_NAME, key),
+            })),
+            // The admin pair the entrypoint wrapper encodes into the header
+            // oauth2-proxy injects upstream. Read from `bifrost/gateway`, the
+            // same keys the gateway container gets, so what the sidecar
+            // forwards cannot drift from what Bifrost was provisioned with.
+            ...OAUTH2_PROXY_INJECTED_SECRET_KEYS.map((key) => ({
+              name: key,
+              valueFrom: secretReference(GATEWAY_SECRET_NAME, key),
+            })),
+          ],
           logConfiguration: {
             logDriver: "awslogs",
             options: {
@@ -1135,6 +1288,10 @@ export const createBifrostEcs = (args: {
    * ECS's defaults would run two tasks at once during an update; see the
    * constants above. This is not autoscaling and not a second task: it caps a
    * deployment at the one instance OSS Bifrost supports.
+   *
+   * `healthCheckGracePeriodSeconds` is set for the same reason: the provider
+   * default is 0, which lets the ALB's target-group check replace a task while
+   * it is still running its store migrations. See the constant.
    */
   const service = new aws.ecs.Service(
     "bifrostService",
@@ -1163,6 +1320,7 @@ export const createBifrostEcs = (args: {
       // constants above for why they are not the defaults.
       deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
       deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT,
+      healthCheckGracePeriodSeconds: BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
       networkConfiguration: {
         subnets: network.privateSubnetIds,
         securityGroups: [network.taskSecurityGroup.id],

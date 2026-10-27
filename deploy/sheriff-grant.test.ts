@@ -21,6 +21,12 @@ const ADMINS_GROUP_ARN =
 const ENGINEERS_GROUP_ARN =
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
 
+// The Approvers group the decision-time gate checks, live on every click.
+// Mirrored from `deploy-infrastructure/sheriff/config.ts`, which mirrors it
+// from the `approvers-google` pair in `deploy-infrastructure/group-sync`.
+const APPROVERS_GROUP_ARN =
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e";
+
 const IDENTITY_STORE_ARN =
   "arn:aws:identitystore::333022194791:identitystore/d-9267e5cf96";
 
@@ -107,9 +113,10 @@ describe("sheriffGrantPolicy", () => {
     }
   });
 
-  it("names the Admins and Engineers groups, the one identity store and the two unavoidable wildcards", () => {
+  it("names the Admins, Engineers and Approvers groups, the one identity store and the two unavoidable wildcards", () => {
     assert.ok(allResources.includes(ADMINS_GROUP_ARN));
     assert.ok(allResources.includes(ENGINEERS_GROUP_ARN));
+    assert.ok(allResources.includes(APPROVERS_GROUP_ARN));
     assert.ok(allResources.includes(IDENTITY_STORE_ARN));
     assert.ok(allResources.includes(USER_ARN));
     assert.ok(allResources.includes(MEMBERSHIP_ARN));
@@ -131,8 +138,9 @@ describe("sheriffGrantPolicy", () => {
       IDENTITY_STORE_ARN,
       USER_ARN,
     ].sort());
-    assert.deepEqual(bySid.RequesterIsEngineer, [
+    assert.deepEqual(bySid.MembershipGates, [
       ENGINEERS_GROUP_ARN,
+      APPROVERS_GROUP_ARN,
       IDENTITY_STORE_ARN,
       USER_ARN,
       MEMBERSHIP_ARN,
@@ -191,6 +199,54 @@ describe("sheriffGrantPolicy", () => {
     );
     assert.match(source, /Admins: "88c1b330-a001-707a-06ca-94e289013bf5"/);
     assert.ok(allResources.includes(ADMINS_GROUP_ARN));
+  });
+
+  // The Approvers group is consulted at decision time, live on every click, so
+  // `IsMemberInGroups` must be authorized for it. It is named in the same
+  // statement as Engineers and nothing about the statement widens: still one
+  // action, still only the two gate groups, still the identity store and the
+  // two unavoidable wildcards, and no new action or resource type appears.
+  it("authorizes the Approvers group for IsMemberInGroups and nothing broader", () => {
+    const gates = statements.filter(
+      (s) => s.Sid === "MembershipGates",
+    );
+    assert.equal(gates.length, 1);
+    assert.deepEqual(asList(gates[0].Action), [
+      "identitystore:IsMemberInGroups",
+    ]);
+    const resources = asList(gates[0].Resource);
+    assert.ok(resources.includes(APPROVERS_GROUP_ARN));
+    assert.deepEqual([...resources].sort(), [
+      ENGINEERS_GROUP_ARN,
+      APPROVERS_GROUP_ARN,
+      IDENTITY_STORE_ARN,
+      USER_ARN,
+      MEMBERSHIP_ARN,
+    ].sort());
+    // The Approvers group is only ever a membership check, never a grant or
+    // revoke target: it must not appear on the write actions' statements.
+    for (const statement of statements) {
+      if (statement.Sid === "MembershipGates") continue;
+      assert.ok(
+        !asList(statement.Resource).includes(APPROVERS_GROUP_ARN),
+        `${statement.Sid} must not name the Approvers group`,
+      );
+    }
+  });
+
+  // The group id is a literal duplicated from the runtime config, which mirrors
+  // it from the group-sync config. Read the source so the policy and the
+  // decision-time gate cannot drift.
+  it("mirrors the Approvers group id in the sheriff config", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../deploy-infrastructure/sheriff/config.ts"),
+      "utf8",
+    );
+    assert.match(
+      source,
+      /APPROVERS_GROUP_ID = "e841e310-0051-7062-2ea4-9905d12f345e"/,
+    );
+    assert.ok(allResources.includes(APPROVERS_GROUP_ARN));
   });
 
   // The Engineers gate reads its group id from the runtime config. Read the
