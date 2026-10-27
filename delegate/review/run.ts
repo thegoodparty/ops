@@ -147,7 +147,7 @@ const balancedObjectEnd = (text: string, start: number): number => {
   return -1;
 };
 
-const extractJsonObjects = (text: string): unknown[] => {
+export const extractJsonObjects = (text: string): unknown[] => {
   const found: unknown[] = [];
   let i = text.indexOf("{");
   while (i !== -1) {

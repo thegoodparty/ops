@@ -29,7 +29,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
-**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes.
+**Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs }`. Replays of the pr-reviewer also carry `leads`: the scout's leads, each with an `outcome` (`not-investigated`, `dropped`, `raised`, `reported`, `unknown`) telling what the deep-reviewer did with it, so a miss can be told apart as "scout never raised it" or "deep-reviewer dropped it". Absent on production-record results and on files written before it existed. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes.
 
 ## Commands
 

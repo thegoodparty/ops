@@ -42,6 +42,13 @@ export type AgentJob = {
   metadata?: Record<string, string>;
 };
 
+export type SubagentCall = {
+  subagent: string;
+  prompt: string;
+  // Final text the subagent returned to the parent; undefined if the run ended first.
+  result?: string;
+};
+
 export type AgentResult = {
   agent: string;
   output: string;
@@ -51,4 +58,5 @@ export type AgentResult = {
   turns?: number;
   structuredOutput?: unknown;
   errorSubtype?: string;
+  subagentCalls?: SubagentCall[];
 };

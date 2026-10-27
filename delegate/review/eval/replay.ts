@@ -5,11 +5,28 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
+import type { SubagentCall } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
-import { agentEnv, parseReviewOutput, pathGuardHook } from "../run";
-import type { Bundle, ReviewOutput, ReviewRecord } from "../schema";
+import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
+import { FindingSchema } from "../schema";
+import type { Bundle, Finding, ReviewOutput, ReviewRecord } from "../schema";
+
+// not-investigated: no deep-reviewer was given the lead. dropped: it returned
+// no findings. raised: it returned findings, none of which reached the final
+// output. reported: one did. unknown: its answer could not be parsed.
+export type LeadOutcome = "not-investigated" | "dropped" | "raised" | "reported" | "unknown";
+
+export interface LeadTrace {
+  area: string;
+  paths: string[];
+  category: string;
+  hypothesis: string;
+  lineRange?: string;
+  outcome: LeadOutcome;
+  findings: number;
+}
 
 export interface Result {
   caseId: string;
@@ -21,6 +38,10 @@ export interface Result {
   error?: string;
   costUsd: number | null;
   wallTimeMs: number;
+  // Absent on results written before this existed and on production records,
+  // which do not keep the scout's output. An empty array is a real answer: the
+  // scout raised no leads. Absent means the scout's answer could not be read.
+  leads?: LeadTrace[];
 }
 
 // caseId -> replay number -> result.
@@ -45,6 +66,75 @@ export const loadRunResults = (dir: string): RunResults => {
     }
   }
   return runs;
+};
+
+const lastObjectWith = (text: string, key: string): Record<string, unknown> | undefined => {
+  const hits = extractJsonObjects(text).filter(
+    (o): o is Record<string, unknown> => typeof o === "object" && o !== null && key in o,
+  );
+  return hits[hits.length - 1];
+};
+
+const asStrings = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+
+const sameSpot = (a: Finding, b: Finding) => a.path === b.path && a.line === b.line;
+
+export const traceLeads = (
+  calls: SubagentCall[] | undefined,
+  output: ReviewOutput | null,
+): LeadTrace[] | undefined => {
+  const scout = calls?.find((c) => c.subagent === "scout");
+  const scoutObj = scout?.result ? lastObjectWith(scout.result, "leads") : undefined;
+  if (!scoutObj || !Array.isArray(scoutObj.leads)) return undefined;
+
+  const reported = output?.status === "complete" ? output.findings : [];
+  const deep = (calls ?? []).filter((c) => c.subagent === "deep-reviewer");
+  const claimed = new Set<SubagentCall>();
+
+  const traces: LeadTrace[] = [];
+  for (const raw of scoutObj.leads) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const lead = raw as Record<string, unknown>;
+    const area = typeof lead.area === "string" ? lead.area : "";
+    const hypothesis = typeof lead.hypothesis === "string" ? lead.hypothesis : "";
+    const base = {
+      area,
+      paths: asStrings(lead.paths),
+      category: typeof lead.category === "string" ? lead.category : "",
+      hypothesis,
+      ...(typeof lead.lineRange === "string" ? { lineRange: lead.lineRange } : {}),
+    };
+
+    // The orchestrator pastes each lead's fields into the deep-reviewer's
+    // prompt, so the hypothesis text finds the call that handled it.
+    const call = deep.find(
+      (c) => !claimed.has(c) && hypothesis !== "" && c.prompt.includes(hypothesis),
+    );
+    if (!call) {
+      traces.push({ ...base, outcome: "not-investigated", findings: 0 });
+      continue;
+    }
+    claimed.add(call);
+
+    const answer = call.result ? lastObjectWith(call.result, "findings") : undefined;
+    if (!answer || !Array.isArray(answer.findings)) {
+      traces.push({ ...base, outcome: "unknown", findings: 0 });
+      continue;
+    }
+    const found = answer.findings.flatMap((f) => {
+      const parsed = FindingSchema.safeParse(f);
+      return parsed.success ? [parsed.data] : [];
+    });
+    const outcome: LeadOutcome =
+      found.length === 0
+        ? "dropped"
+        : found.some((f) => reported.some((r) => sameSpot(f, r)))
+          ? "reported"
+          : "raised";
+    traces.push({ ...base, outcome, findings: found.length });
+  }
+  return traces;
 };
 
 export const resultFromRecord = (record: ReviewRecord): Result => ({
@@ -132,6 +222,7 @@ export const replayCase = async (
     output: ReviewOutput | null,
     costUsd: number | null,
     error?: string,
+    leads?: LeadTrace[],
   ): Result => ({
     caseId,
     repo: bundle.repo,
@@ -142,6 +233,7 @@ export const replayCase = async (
     ...(error !== undefined ? { error } : {}),
     costUsd,
     wallTimeMs: Date.now() - startMs,
+    ...(leads ? { leads } : {}),
   });
 
   try {
@@ -180,15 +272,26 @@ export const replayCase = async (
       null,
       agentResult.costUsd ?? null,
       `agent error (${agentResult.errorSubtype}): ${agentResult.output.slice(0, 300)}`,
+      traceLeads(agentResult.subagentCalls, null),
     );
   }
 
   const parsed = parseReviewOutput(agentResult);
   if ("error" in parsed) {
-    return makeResult(null, agentResult.costUsd ?? null, parsed.error);
+    return makeResult(
+      null,
+      agentResult.costUsd ?? null,
+      parsed.error,
+      traceLeads(agentResult.subagentCalls, null),
+    );
   }
 
-  return makeResult(parsed.output, agentResult.costUsd ?? null);
+  return makeResult(
+    parsed.output,
+    agentResult.costUsd ?? null,
+    undefined,
+    traceLeads(agentResult.subagentCalls, parsed.output),
+  );
 };
 
 export interface ReplayAllOptions {

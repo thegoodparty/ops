@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { replayCase, replayAll, resultFromRecord, loadRunResults } from "./replay";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { ReviewRecord } from "../schema";
+import type { SubagentCall } from "../../framework/types";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
   runId: randomUUID(),
@@ -344,4 +345,144 @@ test("resultFromRecord turns what production posted into a judgeable side", () =
   assert.equal(result.variant, "prod-abcdef1");
   assert.deepEqual(result.output, record.output);
   assert.equal(result.costUsd, record.costUsd);
+});
+
+const finding = (path: string, line: number) => ({
+  path,
+  line,
+  body: "b",
+  category: "bugs" as const,
+  confidence: "high" as const,
+});
+
+const leadOf = (area: string, hypothesis: string) => ({
+  area,
+  paths: ["src/a.ts"],
+  category: "correctness",
+  hypothesis,
+});
+
+const withSubagents = (subagentCalls: SubagentCall[], findings = [finding("src/a.ts", 5)]): RunAgentImpl =>
+  async () => {
+    const output = { status: "complete", findings, summary: "s" };
+    return {
+      agent: "pr-reviewer",
+      output: JSON.stringify(output),
+      durationMs: 1,
+      costUsd: 0.01,
+      structuredOutput: output,
+      subagentCalls,
+    };
+  };
+
+test("replayCase records each lead and what the deep-reviewer did with it", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "diff",
+      result: `thinking\n${JSON.stringify({
+        leads: [
+          leadOf("Timezone", "formatInTimeZone ignores the schedule"),
+          leadOf("Retry", "the retry swallows errors"),
+          leadOf("Cache", "the cache never expires"),
+          leadOf("Docs", "the docs lie"),
+        ],
+        summary: "4 leads",
+      })}`,
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt: "<lead>area: Timezone hypothesis: formatInTimeZone ignores the schedule</lead>",
+      result: JSON.stringify({ findings: [finding("src/a.ts", 5)] }),
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt: "<lead>hypothesis: the retry swallows errors</lead>",
+      result: JSON.stringify({ findings: [] }),
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt: "<lead>hypothesis: the cache never expires</lead>",
+      result: JSON.stringify({ findings: [finding("src/c.ts", 9)] }),
+    },
+  ];
+
+  const result = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents(calls),
+    fakeCheckout,
+  );
+
+  assert.deepEqual(
+    result.leads?.map((l) => [l.area, l.outcome, l.findings]),
+    [
+      ["Timezone", "reported", 1],
+      ["Retry", "dropped", 0],
+      ["Cache", "raised", 1],
+      ["Docs", "not-investigated", 0],
+    ],
+  );
+  assert.equal(result.leads?.[0].hypothesis, "formatInTimeZone ignores the schedule");
+});
+
+test("replayCase records an empty lead list when the scout raised none", async () => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "diff", result: '{"leads":[],"summary":"low risk"}' },
+  ];
+  const result = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents(calls, []),
+    fakeCheckout,
+  );
+  assert.deepEqual(result.leads, []);
+});
+
+test("replayCase leaves leads off when the scout's answer is unreadable or absent", async () => {
+  const garbled = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents([{ subagent: "scout", prompt: "d", result: "no json here" }]),
+    fakeCheckout,
+  );
+  assert.equal("leads" in garbled, false);
+  const none = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    fakeRunAgent,
+    fakeCheckout,
+  );
+  assert.equal("leads" in none, false);
+});
+
+test("a deep-reviewer answer that is not findings JSON is unknown, not dropped", async () => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "d", result: JSON.stringify({ leads: [leadOf("A", "hyp a")], summary: "s" }) },
+    { subagent: "deep-reviewer", prompt: "hyp a", result: "ran out of turns" },
+  ];
+  const result = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents(calls),
+    fakeCheckout,
+  );
+  assert.equal(result.leads?.[0].outcome, "unknown");
+});
+
+test("loadRunResults still parses a result file written without leads", () => {
+  const dir = tmpDir();
+  mkdirSync(join(dir, "c1"), { recursive: true });
+  const old: Result = {
+    caseId: "c1",
+    repo: "r",
+    prNumber: 1,
+    headSha: "s",
+    variant: "v",
+    output: null,
+    costUsd: null,
+    wallTimeMs: 1,
+  };
+  writeFileSync(join(dir, "c1", "run-1.json"), JSON.stringify(old));
+  assert.equal(loadRunResults(dir).get("c1")?.get(1)?.leads, undefined);
 });
