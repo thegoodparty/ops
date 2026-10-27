@@ -19,6 +19,11 @@ import {
   OAUTH2_PROXY_HEALTH_CHECK_PATH,
   OAUTH2_PROXY_TARGET_GROUP_NAME,
   TARGET_GROUPS,
+  TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS,
+  TARGET_GROUP_HEALTHY_THRESHOLD,
+  TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
+  TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
+  TARGET_GROUP_UNHEALTHY_THRESHOLD,
   TELEMETRY_PATH_PATTERNS,
   TELEMETRY_RULE_PRIORITY,
   TLS_POLICY,
@@ -136,6 +141,40 @@ describe("bifrost ingress", () => {
       INGRESS_SOURCE.includes("idleTimeout: ALB_IDLE_TIMEOUT_SECONDS"),
       "the ALB must set idleTimeout from ALB_IDLE_TIMEOUT_SECONDS",
     );
+  });
+
+  it("keeps the replacement gap short: the target group timing is pinned", () => {
+    // The provider defaults are 300s of deregistration and 30s-interval checks
+    // with three successes. The service is stop-before-start, so the first is
+    // most of a seven-and-a-half-minute 503 on every apply and the second adds
+    // another 60 to 90 seconds. Both are pinned so a change to the outage shape
+    // is a visible diff.
+    assert.equal(TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS, 30);
+    assert.ok(
+      TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS < 300,
+      "the deregistration delay must be well below the 300s default",
+    );
+    assert.equal(TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS, 10);
+    assert.equal(TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS, 5);
+    assert.equal(TARGET_GROUP_HEALTHY_THRESHOLD, 2);
+    assert.equal(TARGET_GROUP_UNHEALTHY_THRESHOLD, 3);
+
+    for (const setting of [
+      "deregistrationDelay: TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS",
+      "interval: TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS",
+      "timeout: TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS",
+      "healthyThreshold: TARGET_GROUP_HEALTHY_THRESHOLD",
+      "unhealthyThreshold: TARGET_GROUP_UNHEALTHY_THRESHOLD",
+    ]) {
+      assert.ok(
+        INGRESS_SOURCE.includes(setting),
+        `ingress.ts does not set ${setting}`,
+      );
+    }
+
+    // Every group gets the same timing: the sidecar sits in front of the admin
+    // surface, so a slow group there is the same outage by another name.
+    assert.equal(TARGET_GROUPS.length, 2);
   });
 
   it("raises the listener TLS floor above the provider default", () => {

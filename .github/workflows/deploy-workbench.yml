@@ -66,10 +66,11 @@ env:
   # upstream tag are duplicated from `deploy-workbench/oauth2-proxy-image.ts`
   # because Actions cannot import a TypeScript module, and
   # `oauth2-proxy-image.test.ts` fails if they drift. The tag itself is not a
-  # literal: the build step derives it from the committed allowlist's sha256,
-  # the same input the module hashes, so a changed list is a new tag and a new
-  # digest. The Dockerfile carries the upstream digest, guarded against the
-  # module by the same test.
+  # literal: the build step derives it from the sha256 over the committed build
+  # inputs (the allowlist, the Dockerfile, the alpha configuration and the
+  # entrypoint wrapper), the same files the module hashes in the same order, so
+  # a changed image is a new tag and a new digest. The Dockerfile carries the
+  # upstream digest, guarded against the module by the same test.
   OAUTH2_PROXY_REPOSITORY: bifrost-oauth2-proxy
   OAUTH2_PROXY_UPSTREAM_TAG: v7.15.5
   # The derived one-shot image that claims a fresh deployment (phase 2 item 11).
@@ -243,16 +244,22 @@ jobs:
           docker push "$image_uri"
 
       # Build and push the derived oauth2-proxy image that bakes in the admin
-      # allowlist. Bifrost OSS has no OIDC, and the stock oauth2-proxy image
-      # has no inline email-list flag, so the list reaches the sidecar as a
-      # file in a one-line derivative (`deploy-workbench/bifrost/Dockerfile`).
-      # The Dockerfile carries the pinned upstream digest; this step only
-      # builds the context and pushes it.
+      # allowlist, the alpha configuration that injects Bifrost's admin
+      # credential upstream, and the entrypoint wrapper that computes that
+      # credential from the secrets the task already injects. Bifrost OSS has
+      # no OIDC and the stock oauth2-proxy image has no inline email-list flag,
+      # so both reach the sidecar as files in a derivative
+      # (`deploy-workbench/bifrost/Dockerfile`). The Dockerfile carries the
+      # pinned upstream digest; this step only builds the context and pushes
+      # it.
       #
-      # The tag is content-addressed on the allowlist, so the immutable
-      # repository accepts a push when the list changes and this step skips
-      # when the same list is already built. A fixed tag would make the second
-      # allowlist edit unpushable.
+      # The tag is content-addressed over every committed build input, in the
+      # order `OAUTH2_PROXY_CONTENT_INPUTS` in `oauth2-proxy-image.ts` lists
+      # them, so the immutable repository accepts a push whenever the image's
+      # content changes and this step skips when the same content is already
+      # built. A fixed tag would make the second edit unpushable; a digest over
+      # the allowlist alone would have kept naming an image without the alpha
+      # configuration after this change.
       #
       # Same second-hop credentials as the mirror step above: the ECR login
       # authenticated against this account, so ECR_REGISTRY is its registry.
@@ -261,8 +268,8 @@ jobs:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
           set -euo pipefail
-          allowlist_digest="$(sha256sum deploy-workbench/bifrost/allowed-emails.txt | cut -c1-12)"
-          image_tag="${OAUTH2_PROXY_UPSTREAM_TAG}-${allowlist_digest}"
+          content_digest="$(cat deploy-workbench/bifrost/allowed-emails.txt deploy-workbench/bifrost/Dockerfile deploy-workbench/bifrost/alpha-config.yaml deploy-workbench/bifrost/entrypoint.go deploy-workbench/bifrost/entrypoint_test.go deploy-workbench/bifrost/go.mod | sha256sum | cut -c1-12)"
+          image_tag="${OAUTH2_PROXY_UPSTREAM_TAG}-${content_digest}"
           image_uri="${ECR_REGISTRY}/${OAUTH2_PROXY_REPOSITORY}:${image_tag}"
           if aws ecr describe-images \
               --repository-name "$OAUTH2_PROXY_REPOSITORY" \

@@ -1,0 +1,81 @@
+# oauth2-proxy alpha configuration for the Bifrost admin-surface sidecar
+# (phase 1 item 9 of docs/bifrost-gateway.md).
+#
+# Baked into the derived image at /etc/oauth2-proxy/alpha-config.yaml, and the
+# path the sidecar's `--alpha-config` flag names (deploy-workbench/ecs.ts,
+# `OAUTH2_PROXY_COMMAND`). The entrypoint wrapper
+# (`entrypoint.go`, baked as `/bin/bifrost-oauth2-entrypoint`) refuses to start
+# oauth2-proxy without that flag, so this file is not optional at runtime.
+#
+# Why alpha configuration at all: at v7.15.5 the only way to make oauth2-proxy
+# add a header with a static value is `injectRequestHeaders` in this file
+# (pkg/apis/options/alpha_options.go:17-21 at the pinned image's tag). The
+# flags that would otherwise configure the provider, the upstream and the
+# listen address are *removed* when --alpha-config is given
+# (docs/docs/configuration/alpha_config.md, "Removed options"), so they move
+# here. Everything this file does not carry stays an environment variable in
+# `OAUTH2_PROXY_ENVIRONMENT` (ecs.ts): the allowlist file, the redirect URL,
+# the whitelist domain, the cookie settings and `reverse-proxy` all survived
+# into the core option set and still load from `OAUTH2_PROXY_*`.
+#
+# Two values are deliberately literal rather than templated: the listen
+# address and the upstream URI. `oauth2-proxy-image.test.ts` pins them to
+# `OAUTH2_PROXY_PORT` and `BIFROST_PORT` in `deploy-workbench/network.ts`, so a
+# port change fails a test instead of leaving the proxy on a port nothing
+# routes to. The file is what runs, so it says what it does.
+
+providers:
+  # One provider, which is all this tag supports: "Multiple-providers is not
+  # yet working" (pkg/apis/options/alpha_options.go:44-47).
+  - id: google
+    provider: google
+    # The Google client pair still comes from Secrets Manager as environment
+    # variables. Alpha config substitutes `${...}` at load time (upstream uses
+    # github.com/a8m/envsubst for exactly this: pkg/apis/options/load.go:131),
+    # which is the documented way to keep a secret out of this file. Google
+    # issues these as base64url tokens with no `$` in them, so the substitution
+    # is literal; a provider that shipped a `$`-bearing secret would need the
+    # `clientSecretFile` form instead.
+    clientID: ${OAUTH2_PROXY_CLIENT_ID}
+    clientSecret: ${OAUTH2_PROXY_CLIENT_SECRET}
+
+upstreamConfig:
+  upstreams:
+    # Bifrost in the same task: the two containers share the network
+    # namespace, so this is a loopback hop with no round trip through the ALB.
+    # `id` is a name rather than the legacy conversion's path, because it is
+    # what appears in the proxy's logs and metrics.
+    - id: bifrost
+      path: "/"
+      uri: http://127.0.0.1:8080
+
+server:
+  # 0.0.0.0, not the 127.0.0.1 default: the ALB reaches this container through
+  # the task's elastic network interface, not through loopback.
+  bindAddress: 0.0.0.0:4180
+
+# The reason this file exists. Bifrost OSS has no SSO, so its dashboard and
+# management API keep their own single admin login; a human who has passed the
+# Google gate would otherwise meet that login as a second prompt. Instead
+# oauth2-proxy adds the admin credential to every request it proxies
+# upstream, so the only prompt anyone meets is Google SSO plus the allowlist.
+#
+# `fromEnv`, not `value`: the value is a secret, and `value` would put it in
+# this file. `BIFROST_ADMIN_AUTHORIZATION` is computed at container start by
+# `entrypoint.go` from `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`
+# (both injected from `bifrost/gateway`), so it cannot drift from the password
+# Bifrost itself was provisioned with. oauth2-proxy validates a `fromEnv`
+# source at startup and refuses to run when the variable is empty
+# (pkg/validation/common.go:25-30), which is the second half of fail-closed.
+#
+# `preserveRequestValue` is deliberately absent. It defaults to false
+# (pkg/apis/options/header.go:6-7, 69), which makes the injector strip any
+# client-supplied `Authorization` header before setting this one
+# (pkg/middleware/headers.go:21-43, 54-66). A caller cannot smuggle its own
+# credential upstream, and a caller cannot reach Bifrost's login form with a
+# header of its own either.
+injectRequestHeaders:
+  - name: Authorization
+    values:
+      - secretSource:
+          fromEnv: BIFROST_ADMIN_AUTHORIZATION

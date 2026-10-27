@@ -105,10 +105,10 @@
     "id": "ops-plan-consistent-change",
     "bundle": "ops-plan-consistent-change.bundle.json",
     "expect": {
-      "verdict": "consistency",
+      "verdict": "approve",
       "consistency": "consistent"
     },
-    "tests": "Simulated. The approved plan's step raises the `delegate-webhook` Lambda timeout from 30 to 60 seconds in `deploy/components/webhooks.ts`; the diff changes exactly that field and nothing else. The model must answer `consistent`. Step 1 scores that answer alone, because there is no gate yet to turn it into an approval; from step 5 the case asserts the approval and keeps the answer as a diagnostic.",
+    "tests": "Simulated. The approved plan's step raises the `delegate-webhook` Lambda timeout from 30 to 60 seconds in `deploy/components/webhooks.ts`; the diff changes exactly that field and nothing else. The review must approve, and the model's `consistent` answer stays as a diagnostic so a wrong outcome can be attributed to the gate rather than to the model.",
     "split": "tune",
     "source": "simulated",
     "kind": "bug"
@@ -117,10 +117,11 @@
     "id": "ops-plan-inconsistent-change",
     "bundle": "ops-plan-inconsistent-change.bundle.json",
     "expect": {
-      "verdict": "consistency",
+      "verdict": "flag",
+      "reason": "inconsistent",
       "consistency": "inconsistent"
     },
-    "tests": "Simulated. The approved plan's only step raises the `/aws/ecs/delegate` log group retention in `deploy/components/worker.ts`; the diff instead rewrites the Playwright reports bucket in `deploy/components/playwright-reports.ts` and touches nothing the plan names. The model must answer `inconsistent`. Step 1 scores that answer alone; from step 5 the case asserts the flag and keeps the answer as a diagnostic.",
+    "tests": "Simulated. The approved plan's only step raises the `/aws/ecs/delegate` log group retention in `deploy/components/worker.ts`; the diff instead rewrites the Playwright reports bucket in `deploy/components/playwright-reports.ts` and touches nothing the plan names. The review must comment with the `inconsistent` gate fired, and the model's `inconsistent` answer stays as a diagnostic.",
     "split": "holdout",
     "source": "simulated",
     "kind": "bug"

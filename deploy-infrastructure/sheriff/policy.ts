@@ -10,8 +10,8 @@
  */
 import { randomUUID } from "node:crypto";
 
+import type { ApproverLookup } from "./identity";
 import {
-  APPROVER_SLACK_USER_IDS,
   DURATION_OPTIONS,
   MAX_DURATION_SECONDS,
   MAX_REQUESTS_PER_DAY,
@@ -134,8 +134,93 @@ export const durationSecondsFor = (value: string | undefined): number | null => 
 export const withinDurationCap = (seconds: number): boolean =>
   seconds > 0 && seconds <= MAX_DURATION_SECONDS;
 
-export const isApprover = (slackUserId: string): boolean =>
-  APPROVER_SLACK_USER_IDS.includes(slackUserId);
+/**
+ * The decision-time approver gate, resolved live from the `Approvers` Identity
+ * Center group exactly as the requester is resolved from `Engineers`.
+ *
+ * Every deny path keeps its own message so the clicker knows what to fix, and
+ * `identity-store-error` is explicit rather than silent: if Identity Store
+ * cannot answer, the approval is refused, never allowed. The handler resolves
+ * the Slack email, the Identity Store user and the group membership and passes
+ * the results here, so all four outcomes are testable without AWS or Slack.
+ */
+export type ApproverFailure =
+  | "no-slack-email"
+  | "no-identity-user"
+  | "not-approver"
+  | "identity-store-error";
+
+export const approverErrorMessage = (
+  failure: ApproverFailure,
+  email?: string,
+): string => {
+  switch (failure) {
+    case "identity-store-error":
+      return "AWS Identity Center could not confirm your Approvers group membership, so this decision was refused and no access was granted. Try again once Identity Store is reachable.";
+    case "no-slack-email":
+      return "Slack did not return an email address for your account, so your Approvers group membership could not be checked. This decision was refused and no access was granted.";
+    case "no-identity-user":
+      return `No AWS Identity Center user matches ${email ?? "your Slack email"}. Your Approvers group membership could not be checked, so this decision was refused and no access was granted.`;
+    case "not-approver":
+      return `Your Identity Center account (${email ?? "your email"}) is not a member of the Approvers group, which is required to approve break-glass requests. Ask an engineer to add you to eng-admin@goodparty.org.`;
+  }
+};
+
+export type ApproverResult =
+  | { ok: true; email: string; identityStoreUserId: string }
+  | { ok: false; failure: ApproverFailure; email?: string };
+
+/**
+ * Pure form of the live approver check. Evaluation order is fail-closed first:
+ * an Identity Store error wins over every other answer, so an outage can never
+ * read as "not a member" that someone might be tempted to special-case, and
+ * neither can a missing email or user fall through to an allow.
+ */
+export const evaluateApprover = (args: {
+  slackEmail: string | null | undefined;
+  identityStoreUserId: string | null | undefined;
+  isApproversMember: boolean | null | undefined;
+  identityStoreError?: boolean;
+}): ApproverResult => {
+  const email = args.slackEmail?.trim();
+  if (args.identityStoreError) {
+    return { ok: false, failure: "identity-store-error", email };
+  }
+  if (!email) return { ok: false, failure: "no-slack-email" };
+  if (!args.identityStoreUserId) {
+    return { ok: false, failure: "no-identity-user", email };
+  }
+  if (args.isApproversMember !== true) {
+    return { ok: false, failure: "not-approver", email };
+  }
+  return { ok: true, email, identityStoreUserId: args.identityStoreUserId };
+};
+
+/**
+ * Maps the live lookup result onto the pure gate above.
+ *
+ * The mapping is separate from the handler so the one case that is easy to get
+ * wrong is tested: an Identity Store `error`, and a failed AssumeRole (a
+ * `null` lookup, before Identity Store is reached), must both surface as
+ * `identity-store-error`, which tells a real approver to retry. Folding either
+ * into `no-identity-user` would still refuse the decision, but would tell them
+ * their account is missing when the directory was simply unreachable.
+ */
+export const evaluateApproverLookup = (args: {
+  slackEmail: string | null | undefined;
+  lookup: ApproverLookup | null;
+}): ApproverResult =>
+  evaluateApprover({
+    slackEmail: args.slackEmail,
+    identityStoreUserId:
+      args.lookup && "identityStoreUserId" in args.lookup
+        ? args.lookup.identityStoreUserId
+        : undefined,
+    isApproversMember: args.lookup?.status === "member",
+    identityStoreError:
+      Boolean(args.slackEmail?.trim()) &&
+      (args.lookup === null || args.lookup.status === "error"),
+  });
 
 export const rateLimitExceeded = (count: number): boolean =>
   count > MAX_REQUESTS_PER_DAY;
@@ -199,12 +284,14 @@ export const decodeSlackPayload = (
 export type DecisionCheck = { ok: true } | { ok: false; reason: string };
 
 /**
- * The approval checks that make sense without a grant: the clicker is on the
- * hardcoded approver list, the clicker is not the requester, the request has
- * not already been decided, and the requested duration is within the cap.
+ * The approval checks that make sense without a grant: the clicker is not the
+ * requester, the request has not already been decided, and the requested
+ * duration is within the cap.
  *
- * The at-most-one-active-grant guard and the `CreateGroupMembership` path are
- * in the handler; there is no grant here to guard.
+ * The clicker's approver membership is not checked here because it needs AWS:
+ * `evaluateApprover` is the pure half of that gate and the handler resolves it
+ * live before this runs. The at-most-one-active-grant guard and the
+ * `CreateGroupMembership` path are in the handler too.
  */
 export const evaluateDecision = (args: {
   request: Pick<
@@ -213,9 +300,6 @@ export const evaluateDecision = (args: {
   >;
   clickerSlackId: string;
 }): DecisionCheck => {
-  if (!isApprover(args.clickerSlackId)) {
-    return { ok: false, reason: "You are not an approver for break-glass requests." };
-  }
   if (args.clickerSlackId === args.request.requesterSlackId) {
     return {
       ok: false,

@@ -305,35 +305,43 @@ together either way.
   browser redirect. `/metrics` stays on Bifrost's own basic auth.
 - Everything else — the UI and `/api/*` — falls through to oauth2-proxy.
 
-**Configuration**, following `agent-swarm/host/docker-compose.yml`:
+**Configuration**, following `agent-swarm/host/docker-compose.yml` where the
+options survive:
 
-- `OAUTH2_PROXY_PROVIDER: google`, with the Google Cloud OAuth consent screen
-  set **Internal**, so only `goodparty.org` accounts can sign in at all.
+- Google as the provider, with the Google Cloud OAuth consent screen set
+  **Internal**, so only `goodparty.org` accounts can sign in at all. The
+  provider block lives in the sidecar's alpha configuration (see below), not in
+  an environment variable: `provider` is one of the options alpha format
+  removes.
 - `OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: /etc/oauth2-proxy/allowed-emails.txt`,
   backed by a file committed under `deploy-workbench/` (for example
   `deploy-workbench/bifrost/allowed-emails.txt`), one address per line, the
   same shape as `agent-swarm/host/allowed-emails.txt`. Granting and revoking
   access is a PR to that file. The stock oauth2-proxy image has no inline
   email-list flag — `--authenticated-emails-file` is the only form (upstream
-  issues #968 and #3391) — so the file reaches the container in a one-line
-  derived image: a Dockerfile under `deploy-workbench/bifrost/` whose `FROM`
-  is the same pinned digest `agent-swarm` uses
+  issues #968 and #3391) — so the file reaches the container in a derived
+  image: a Dockerfile under `deploy-workbench/bifrost/` whose `FROM` is the same
+  pinned digest `agent-swarm` uses
   (`quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916`)
   and whose `COPY` puts the allowlist at that path. CI builds and pushes it
-  beside the Bifrost mirror, and Pulumi references it by digest, so a change
-  to the list is a reviewed PR and a new digest.
-- `OAUTH2_PROXY_UPSTREAMS: http://127.0.0.1:8080` — the one setting that
-  differs from the swarm, which uses `static://202` because Caddy does the
-  forwarding. Here oauth2-proxy is the reverse proxy, so it points at Bifrost
-  in the same task.
+  beside the Bifrost mirror, and Pulumi references it by digest, so a change to
+  the list is a reviewed PR and a new digest.
+- The upstream is Bifrost in the same task (`http://127.0.0.1:8080`), not the
+  swarm's `static://202`: the swarm's Caddy forwards and oauth2-proxy only
+  gates, while here the proxy is the reverse proxy for the admin surface. The
+  two containers share the task network namespace, so this is a loopback hop
+  with no round trip through the ALB.
 - The three secrets — `OAUTH2_PROXY_CLIENT_ID`,
   `OAUTH2_PROXY_CLIENT_SECRET`, `OAUTH2_PROXY_COOKIE_SECRET` — go in Secrets
   Manager and reach the sidecar as `secrets`, written out of band the way
   `agent-swarm/host/fill-secrets.sh` writes the swarm's `DELEGATE_SWARM`
   secret. The swarm's `render-env.sh` refuses a partial set; the task
-  definition should carry all three or none, and the deploy should fail
-  closed if the admin surface is enabled without them.
-- The rest of the swarm's settings carry over: `OAUTH2_PROXY_REVERSE_PROXY:
+  definition carries all three or none, and the deploy fails closed if the
+  admin surface is enabled without them. The client pair is still a secret
+  even though the provider moved into the alpha file: alpha config substitutes
+  `${OAUTH2_PROXY_CLIENT_ID}` and `${OAUTH2_PROXY_CLIENT_SECRET}` at load time.
+- The rest of the swarm's settings carry over as environment variables, since
+  all of them survived into the core option set: `OAUTH2_PROXY_REVERSE_PROXY:
   "true"`, `OAUTH2_PROXY_COOKIE_SECURE: "true"`,
   `OAUTH2_PROXY_COOKIE_SAMESITE: lax`, `OAUTH2_PROXY_COOKIE_EXPIRE: 168h`,
   `OAUTH2_PROXY_COOKIE_REFRESH: 1h`,
@@ -341,8 +349,100 @@ together either way.
   `OAUTH2_PROXY_WHITELIST_DOMAINS: bifrost.workbench.goodparty.org`, and
   `OAUTH2_PROXY_REDIRECT_URL:
   https://bifrost.workbench.goodparty.org/oauth2/callback`.
-- The OSS admin username/password stays as the second layer inside
-  oauth2-proxy.
+
+**Bifrost's own login is injected, not typed.** Bifrost OSS keeps its single
+admin username and password: `auth_config` stays enabled in `config.json` and
+`/metrics` stays on Bifrost's own basic auth, exactly as before. What changed
+is who answers that login. The sidecar runs with `--alpha-config`, and
+oauth2-proxy's alpha configuration injects the admin credential into every
+request it proxies upstream (`injectRequestHeaders`), so the only prompt a
+human meets is Google SSO plus the committed allowlist. Nobody types the
+shared OSS credential, and it is not in a file: an entrypoint wrapper in the
+derived image computes `base64(admin_username:admin_password)` at container
+start from the two keys the task already injects from `bifrost/gateway`, so it
+cannot drift from the password Bifrost was provisioned with. This works
+because the gateway's own `AuthMiddleware` accepts an HTTP Basic credential on
+every protected route, not only on the login call: it splits the scheme and
+token, compares the username with `auth_config`'s and the password against the
+stored hash (`transports/bifrost-http/handlers/middlewares.go` at `v2.3.0`).
+`/metrics` is unaffected either way — it is routed straight to Bifrost and
+never through the sidecar.
+
+Three details of that, all of them properties of oauth2-proxy v7.15.5 rather
+than choices of ours, checked against the pinned image's source:
+
+- The header is **stripped then set**. `PreserveRequestValue` defaults to
+  false (`pkg/apis/options/header.go`), so the injector removes any
+  client-supplied `Authorization` header before adding its own
+  (`pkg/middleware/headers.go`, `newStripHeaders`/`injectRequestHeaders`). A
+  caller cannot smuggle a credential upstream or reach Bifrost's login form
+  with a header of its own.
+- The value comes from the environment, not the file:
+  `secretSource.fromEnv`. The configuration reference for `SecretSource` lists
+  `value` (base64), `fromEnv` and `fromFile`, and oauth2-proxy validates the
+  `fromEnv` source against a non-empty variable before it will start
+  (`pkg/validation/common.go`, `validateSecretSourceEnv`).
+- `--alpha-config` is not additive-only. Options the alpha format absorbed are
+  *removed* when it is used (`docs/docs/configuration/alpha_config.md`,
+  "Removed options"): `provider`, `client-id`, `client-secret`, `upstream`,
+  `http-address`, `set-xauthrequest` and `pass-user-headers` among them. So
+  the provider, the upstream and the listen address live in
+  `deploy-workbench/bifrost/alpha-config.yaml`, and those environment
+  variables are gone from the task definition rather than left in place — a
+  removed option is silently ignored, which is the kind of failure that looks
+  like it deployed. Everything not in that list (the allowlist path, the
+  redirect URL, the whitelist domain, the cookie settings, `reverse-proxy`)
+  survived into the core option set and still loads from `OAUTH2_PROXY_*`.
+  `pass-user-headers` and `set-xauthrequest` are dropped instead of ported:
+  Bifrost reads none of the `X-Forwarded-*` or `X-Auth-Request-*` headers, and
+  the only header this deployment needs is the `Authorization` one.
+
+**Fail-closed.** A task that cannot inject the credential must not run. Three
+layers, in order:
+
+1. The ECS agent resolves both `bifrost/gateway` keys before the container
+   starts, so a missing key is a task that never starts.
+2. The entrypoint wrapper exits non-zero when either value is missing or
+   empty, and refuses to start oauth2-proxy without `--alpha-config` — an
+   unconfigured proxy would otherwise serve the admin paths and silently put
+   the shared password prompt back.
+3. oauth2-proxy itself refuses to start when the `fromEnv` variable is empty.
+
+The sidecar is `essential: true`, so any of the three takes the task with it.
+That is the intended failure: a gateway whose admin surface has no door is
+worse than a task that visibly will not stabilize.
+
+**Risk, and the rollback.** `injectRequestHeaders` is alpha configuration: its
+structure may change between minor releases (upstream's own warning, and the
+flag's help text). The pin is what contains that — the digest in
+`deploy-workbench/bifrost/Dockerfile` and `oauth2-proxy-image.ts` — and the
+image tag is content-addressed over the allowlist, the Dockerfile, the alpha
+file and the wrapper, so no input can change under a fixed tag. The image build
+also runs `oauth2-proxy --config-test` over the baked alpha file in a stage of
+its own, with dummy values, so a bump that renames or removes a key fails the
+build rather than the deploy: at this tag an unknown alpha key is an error at
+container start (`ErrorUnused` in `pkg/apis/options/load.go`), which would
+drain the running task and then refuse to start the new one. If something does
+get through, the rollback is to drop `OAUTH2_PROXY_COMMAND` (the
+`--alpha-config` flag) and revert the image pin to the previous content tag:
+the sidecar comes back up on its environment-variable configuration with no
+injection, and the shared admin password prompt returns. That is a working
+state, not an outage — the allowlist and Google SSO still gate the surface —
+which is why this is a rollback rather than a redesign.
+
+**What SSO here is not.** Every allowlisted address signs in and then acts as
+the one shared Bifrost admin. There is no per-person attribution in Bifrost's
+audit records, no per-person role, and no way to revoke one person without
+editing the allowlist. That needs Enterprise. A plugin cannot supply it at
+this tag either, which the earlier version of this section got wrong: the
+plugin interfaces at `v2.3.0` are LLM, MCP, A2A, HTTP-transport and
+observability (`core/schemas/plugin.go`), with no hook on the dashboard or
+management auth path; and the shared-object loader goes through Go's
+`plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
+pinned image's `/app/main` — a statically linked executable with no
+dynamically linked Go runtime to share. So the injected credential is the
+whole of what this design gets, and per-person attribution stays an
+Enterprise question.
 
 **Prerequisite, manual.** A Google Cloud OAuth client of type Web
 application, consent screen Internal, redirect URI
@@ -397,10 +497,21 @@ third holds secret values:
    `deploy-workbench/bifrost/config.json`) and holds the providers, the
    client settings, and the `governance` block — teams, budgets and virtual
    keys — with an `env.` reference everywhere a secret would otherwise be.
-   Pulumi stores it as an SSM SecureString (or Secrets Manager entry) and
+   Pulumi stores it as a plain SSM `String` parameter (`/bifrost/config`) and
    injects it as `BIFROST_CONFIG`; the container entrypoint writes it to
    `/app/data/config.json`, which is the shape the upstream ECS guide
    documents. A change to it is a reviewed PR, not a console edit.
+   `String`, not `SecureString`: the file is committed here, so encrypting the
+   deployed copy protects nothing, while it would hide the configuration
+   production is running from the reviewers who would diff it, and it would
+   put `kms:Decrypt` on the account's `aws/ssm` key in the ECS agent's policy.
+   No secret lives in the file — every credential in it is an `env.` name
+   resolved from Secrets Manager, and the database password reaches the task
+   through `secrets` — which `deploy-workbench/bifrost/config.test.ts`
+   checks: no credential-shaped literal, and every `env.` name is one the
+   deployment actually provides. The mechanism, including the parameter's
+   version in the task definition so an edit rolls the task, is documented in
+   `deploy-workbench/bifrost/README.md`.
    `source_of_truth: "config.json"` makes the file authoritative for the
    sections it declares, so a redeploy converges to the repo instead of
    preserving UI drift; the upstream "missing vs empty" caveat in
@@ -517,8 +628,16 @@ Virtual keys are Bifrost's primary governance entity
   on for one request. Upstream is explicit that the layers compose and that a
   key with `false` overrides the global setting
   (`docs/features/observability/content-logging.mdx`).
-- **Retention.** Set `logs_store.retention_days` explicitly (90 days is a
-  reasonable first value) rather than accepting the default. The account's
+- **Retention.** There are two settings at the pinned tag and they are not
+  interchangeable. `client.log_retention_days` is the cleanup job's window and
+  the one `PUT /api/config` validates — it rejects anything below `1`
+  (`handlers/config.go`, "log_retention_days must be at least 1") — while
+  `logs_store.retention_days` is the store's own purge window, whose valid
+  range starts at `0`. A store that has never saved the first one reports `0`
+  on `GET /api/config`, so anything that round-trips the server's own config
+  back (the first-admin claim does) gets a `400` until it raises the value.
+  `deploy-workbench/bifrost/config.json` sets both to 90 days, so there is one
+  retention story rather than two. The account's
   Bedrock invocation log uses 365 days because it is the durable
   cost-attribution record; the gateway log is an operational and budget
   record, and 90 days covers a budget cycle. Raise it, or offload to object
@@ -853,9 +972,9 @@ network or a permission can land before the item that creates it.
 
 10. Commit the non-secret `config.json` under `deploy-workbench/` with
     providers, client settings and the `governance` block, using `env.`
-    references; have Pulumi store it as an SSM SecureString and inject it as
-    `BIFROST_CONFIG`. Set `source_of_truth: "config.json"` for the sections
-    the repo owns.
+    references; have Pulumi store it as a plain SSM `String` parameter and
+    inject it as `BIFROST_CONFIG`. Set `source_of_truth: "config.json"` for
+    the sections the repo owns.
 11. Add the secret containers and the read grants, and write the secret
     values out of band (provider keys, `BIFROST_ENCRYPTION_KEY`, admin
     credential, `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,

@@ -31,6 +31,17 @@ import { assumeRoleEnvironment, runAws } from "./aws-role";
  * put in an error message. Anything that prevents the comparison (a missing
  * permission, a secret that is not JSON, a preview with no task definition)
  * fails the run rather than being treated as a pass.
+ *
+ * Only Secrets Manager references are compared. `container.secrets` is also
+ * where ECS accepts an SSM parameter ARN, and the gateway's configuration is
+ * injected that way (`BIFROST_CONFIG`, from `/bifrost/config`), so a task
+ * definition can carry both kinds. An SSM parameter is not a secret and is not
+ * read through `secretsmanager:GetSecretValue`; it is a Pulumi resource in the
+ * same stack, so there is no out-of-band write that could be missing. Passing
+ * its ARN to `parseSecretReference` used to be a silent misparse - the ARN has
+ * no `:secret:` marker, so the fields shifted and the "secret" became `arn` -
+ * and the next deploy failed on `ResourceNotFoundException` from a
+ * `get-secret-value` for a secret named `arn`. Both halves are pinned by tests.
  */
 
 export type SecretReference = {
@@ -54,7 +65,22 @@ const isRecord = (value: unknown): value is JsonRecord =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
+ * Whether a `secrets[].valueFrom` names an SSM parameter rather than a
+ * Secrets Manager secret. The two ARNs differ in the service segment:
+ * `arn:aws:ssm:<region>:<account>:parameter/<name>` against
+ * `arn:aws:secretsmanager:<region>:<account>:secret:<name>:<key>::`. ECS also
+ * allows a bare secret name, which is always a Secrets Manager name.
+ */
+export const isSsmParameterReference = (valueFrom: string): boolean =>
+  /^arn:[^:]+:ssm:[^:]*:[^:]*:parameter\//.test(valueFrom);
+
+/**
  * Read `{ secretId, key }` from an ECS `secrets[].valueFrom` reference.
+ *
+ * A `valueFrom` that is an ARN for some other service is rejected rather than
+ * parsed: there is no unambiguous reading of it as `<secret>:<key>::`, and the
+ * silent alternative is the wrong-field interpretation described at the top of
+ * this file.
  *
  * The stack builds these as
  * `arn:aws:secretsmanager:<region>:<account>:secret:<name>:<key>::`, and the
@@ -66,6 +92,13 @@ const isRecord = (value: unknown): value is JsonRecord =>
 export const parseSecretReference = (valueFrom: string): SecretReference => {
   const marker = ":secret:";
   const markerAt = valueFrom.indexOf(marker);
+
+  if (markerAt === -1 && valueFrom.startsWith("arn:")) {
+    throw new Error(
+      `not a Secrets Manager key reference (no ":secret:" in the ARN): ${valueFrom}`,
+    );
+  }
+
   const nameAndKey =
     markerAt === -1 ? valueFrom : valueFrom.slice(markerAt + marker.length);
   const parts = nameAndKey.split(":");
@@ -190,6 +223,11 @@ export const extractRequiredSecretReferences = (
               "the synthesized task definition has a secret entry without a valueFrom",
             );
           }
+
+          // An SSM parameter in `secrets` is how ECS injects the gateway's
+          // config; it is not a secret and there is nothing out of band that
+          // could be missing. See the header.
+          if (isSsmParameterReference(secret.valueFrom)) continue;
 
           const reference = parseSecretReference(secret.valueFrom);
           const identity = `${reference.secretId}\u0000${reference.key}`;

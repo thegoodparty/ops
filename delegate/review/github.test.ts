@@ -417,3 +417,68 @@ describe("createGitHub", () => {
     );
   });
 });
+
+describe("getFileAtRef", () => {
+  const text = "# Plan\n\nDo the thing.\n";
+  const sha = "1c7ac96f062c9263697f7208056f9941e4dc499a";
+
+  it("reads a file at a ref through the contents API", async () => {
+    const { mockFetch, calls } = createMockFetch([
+      {
+        status: 200,
+        body: { sha, content: Buffer.from(text).toString("base64"), encoding: "base64" },
+      },
+    ]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    const file = await gh.getFileAtRef(REPO, "docs/plan.md", "main");
+
+    assert.deepEqual(file, { blobSha: sha, text });
+    assert.equal(calls[0].method, "GET");
+    assert.equal(calls[0].url, "https://api.github.com/repos/acme/my-repo/contents/docs/plan.md?ref=main");
+    assert.equal(calls[0].headers["Authorization"], "Bearer test-token");
+  });
+
+  it("encodes a ref that is not a plain branch name", async () => {
+    const { mockFetch, calls } = createMockFetch([
+      { status: 200, body: { sha, content: "", encoding: "base64" } },
+    ]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    assert.deepEqual(await gh.getFileAtRef(REPO, "docs/plan.md", "release/2026"), {
+      blobSha: sha,
+      text: "",
+    });
+    assert.ok(calls[0].url.endsWith("?ref=release%2F2026"));
+  });
+
+  it("returns undefined when the file does not exist at that ref", async () => {
+    const { mockFetch } = createMockFetch([{ status: 404, body: { message: "Not Found" } }]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    assert.equal(await gh.getFileAtRef(REPO, "docs/missing.md", "main"), undefined);
+  });
+
+  it("throws on anything that is not a 404", async () => {
+    const { mockFetch } = createMockFetch([{ status: 403, body: { message: "Forbidden" } }]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    await assert.rejects(
+      () => gh.getFileAtRef(REPO, "docs/plan.md", "main"),
+      (err: Error) => {
+        assert.ok(err.message.includes("403"));
+        return true;
+      },
+    );
+  });
+
+  it("refuses a response it cannot decode rather than returning an empty plan", async () => {
+    const { mockFetch } = createMockFetch([
+      { status: 200, body: { sha, content: "", encoding: "none" } },
+    ]);
+    const gh = createGitHub(TOKEN, mockFetch);
+    await assert.rejects(
+      () => gh.getFileAtRef(REPO, "docs/plan.md", "main"),
+      (err: Error) => {
+        assert.ok(err.message.includes("unsupported contents encoding"));
+        return true;
+      },
+    );
+  });
+});

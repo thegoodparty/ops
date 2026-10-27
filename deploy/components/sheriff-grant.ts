@@ -6,7 +6,8 @@ import {
 import type { PolicyDocument } from "./identity-center/policies";
 
 // The management-account role the break-glass Lambda (infrastructure account,
-// step 4 of `docs/sheriff.md`) assumes to resolve a requester and toggle
+// step 4 of `docs/sheriff.md`) assumes to resolve the requester's `Engineers`
+// membership, resolve the clicker's `Approvers` membership, and toggle
 // membership in the one `Admins` Identity Store group. It is the crown jewels
 // of the plan: the Lambda's own role gets `sts:AssumeRole` on this ARN and
 // nothing else in the management account, and this role's inline policy is what
@@ -38,6 +39,14 @@ const GROUP_ARN =
 // there is no Pulumi resource to reference.
 const ENGINEERS_GROUP_ARN =
   "arn:aws:identitystore:::group/383193a0-7001-70d9-a321-ffe6d8af7378";
+
+// The `Approvers` group id, mirrored from
+// `deploy-infrastructure/sheriff/config.ts`, which itself mirrors it from the
+// `approvers-google` pair in `deploy-infrastructure/group-sync/config.ts`.
+// The decision-time gate checks membership in this group, live on every click,
+// so `IsMemberInGroups` names it. Same literal reason as above.
+const APPROVERS_GROUP_ARN =
+  "arn:aws:identitystore:::group/e841e310-0051-7062-2ea4-9905d12f345e";
 
 // `DeleteGroupMembership` takes a `MembershipId` that does not exist when the
 // policy is written, so the membership resource has to be a wildcard. It is
@@ -78,9 +87,11 @@ export const sheriffGrantTrust = {
 //
 // `identitystore:GetUserId` resolves the requester from their Slack email
 // (open question 3, settled by the engineer in favour of email mapping), and
-// `identitystore:IsMemberInGroups` is the `Engineers` gate. Both were absent in
-// step 3, when the requester mapping was a maintained table and the tool did no
-// directory read at all; the policy is no longer "unchanged from step 2".
+// `identitystore:IsMemberInGroups` is the two membership gates: `Engineers` at
+// request time and `Approvers` at decision time. Both were absent in step 3,
+// when the requester mapping was a maintained table, the approver set was a
+// hard-coded Slack id list and the tool did no directory read at all; the
+// policy is no longer "unchanged from step 2".
 //
 // Deliberately absent, per "The tool's own privilege" in `docs/sheriff.md`:
 // every `sso:*`, `sso-directory:*` and `sso-oauth:*` action (the
@@ -119,14 +130,16 @@ export const sheriffGrantPolicy: PolicyDocument = {
       Resource: [IDENTITY_STORE_ARN, USER_ARN],
     },
     {
-      Sid: "RequesterIsEngineer",
+      Sid: "MembershipGates",
       Effect: "Allow",
       // IsMemberInGroups supports Group, GroupMembership, Identitystore and
-      // User. Only the `Engineers` group is ever queried, so the group ARN is
-      // that one, not `Admins`.
+      // User. The two group ARNs are the only groups ever queried: `Engineers`
+      // for the requester gate and `Approvers` for the decision-time gate.
+      // Nothing wider is added: no other group, no `*`.
       Action: ["identitystore:IsMemberInGroups"],
       Resource: [
         ENGINEERS_GROUP_ARN,
+        APPROVERS_GROUP_ARN,
         IDENTITY_STORE_ARN,
         USER_ARN,
         MEMBERSHIP_ARN,

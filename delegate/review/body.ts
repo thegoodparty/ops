@@ -1,4 +1,44 @@
-import type { Decision } from "./gates";
+import { GATING_FLAG_REASON, type GatingFlag } from "./gating";
+import type { Decision, DecisionGating } from "./gates";
+
+const flagText = (flag: GatingFlag, g: DecisionGating): string => {
+  const reason = GATING_FLAG_REASON[flag];
+  if (flag === "owned_paths" && g.ownedPaths.length > 0) {
+    const shown = g.ownedPaths.slice(0, 5).join(", ");
+    const more = g.ownedPaths.length > 5 ? `, and ${g.ownedPaths.length - 5} more` : "";
+    return `\`${flag}\`: ${reason} (${shown}${more})`;
+  }
+  return `\`${flag}\`: ${reason}`;
+};
+
+// One line, in the same body a reviewer already reads for findings, carrying
+// the verdict, what it was checked against and why it is not an approval. A
+// reader should not have to open the run record to learn why the bot declined,
+// and a shadow run says so out loud rather than looking like a real comment.
+const renderGating = (g: DecisionGating): string => {
+  const target = g.plan
+    ? `against \`${g.plan.path}\` at \`${g.plan.blobSha.slice(0, 7)}\``
+    : "with no plan read";
+  const why =
+    g.flags.length > 0
+      ? ` Flags: ${g.flags.map((f) => flagText(f, g)).join("; ")}.`
+      : "";
+
+  if (g.mode === "shadow") {
+    const head = g.wouldApprove
+      ? `**Gate: shadow, would have approved** ${target}.`
+      : `**Gate: shadow, would have commented** ${target}.`;
+    return `${head}${why} Shadow mode records the decision and posts a comment, never an approval.`;
+  }
+
+  const head = g.wouldApprove
+    ? `**Gate: approve** ${target}.`
+    : `**Gate: comment** ${target}.`;
+  const tail = g.wouldApprove
+    ? " Every changed path is unowned in `CODEOWNERS` on `main`, and the change is consistent with the plan."
+    : "";
+  return `${head}${why}${tail}`;
+};
 
 // Findings are inline comments, never body text. The body carries the verdict,
 // the agent's reasoning for it (so a human can check that the PR description,
@@ -17,6 +57,9 @@ export const renderBody = (args: {
   const sha7 = args.headSha.slice(0, 7);
 
   parts.push(`**Recommendation: ${args.decision.verdict}**`);
+  // Absent when the gate did not run, which is what keeps an ungated body
+  // identical to the one it rendered before this existed.
+  if (args.decision.gating) parts.push(renderGating(args.decision.gating));
   parts.push(args.summary.trim());
 
   if (args.inlineCount > 0) {
