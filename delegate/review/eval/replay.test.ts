@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { replayCase, replayAll, resultFromRecord } from "./replay";
+import { replayCase, replayAll, resultFromRecord, loadRunResults } from "./replay";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
 
@@ -303,7 +303,8 @@ test("replayAll skips cases that already have a result file", async () => {
     costUsd: 0.01,
     wallTimeMs: 100,
   };
-  writeFileSync(join(out, `${record.runId}.json`), JSON.stringify(preExisting));
+  mkdirSync(join(out, record.runId));
+  writeFileSync(join(out, record.runId, "run-1.json"), JSON.stringify(preExisting));
 
   let agentCalled = false;
   const guardAgent: RunAgentImpl = async () => {
@@ -339,7 +340,8 @@ test("replayAll replays cases when force is true even if result exists", async (
     costUsd: null,
     wallTimeMs: 0,
   };
-  writeFileSync(join(out, `${record.runId}.json`), JSON.stringify(preExisting));
+  mkdirSync(join(out, record.runId));
+  writeFileSync(join(out, record.runId, "run-1.json"), JSON.stringify(preExisting));
 
   const results = await replayAll(
     [record],
@@ -366,10 +368,74 @@ test("replayAll writes result JSON files for each replayed case", async () => {
     fakeCheckout,
   );
 
-  const resultPath = join(out, `${record.runId}.json`);
+  const resultPath = join(out, record.runId, "run-1.json");
   assert.ok(existsSync(resultPath), "result file should be written");
   const written = JSON.parse(readFileSync(resultPath, "utf-8")) as Result;
   assert.equal(written.caseId, record.runId);
+});
+
+test("replayAll writes one result file per replay and skips the ones that exist", async () => {
+  const out = tmpDir();
+  const workDir = tmpDir();
+  const record = makeRecord();
+  const calls: string[] = [];
+  const agent: RunAgentImpl = async (_config, _prompt, overrides) => {
+    calls.push(overrides.cwd);
+    return fakeRunAgent(_config, _prompt, overrides);
+  };
+
+  await replayAll([record], { out, workDir, variant: "v1", replays: 2 }, { concurrency: 2 }, agent, fakeCheckout);
+  assert.ok(existsSync(join(out, record.runId, "run-1.json")));
+  assert.ok(existsSync(join(out, record.runId, "run-2.json")));
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0], calls[1], "side-by-side replays of one case need separate checkouts");
+
+  await replayAll([record], { out, workDir, variant: "v1", replays: 2 }, { concurrency: 2 }, agent, fakeCheckout);
+  assert.equal(calls.length, 2, "both replays already had results");
+});
+
+test("replayAll replays only the missing run of a partly cached case", async () => {
+  const out = tmpDir();
+  const record = makeRecord();
+  const cached: Result = {
+    caseId: record.runId,
+    repo: record.repo,
+    prNumber: record.prNumber,
+    headSha: record.headSha,
+    variant: "cached",
+    output: { status: "complete", findings: [], summary: "cached" },
+    costUsd: 0.01,
+    wallTimeMs: 1,
+  };
+  mkdirSync(join(out, record.runId));
+  writeFileSync(join(out, record.runId, "run-1.json"), JSON.stringify(cached));
+
+  let calls = 0;
+  const agent: RunAgentImpl = async (c, p, o) => {
+    calls++;
+    return fakeRunAgent(c, p, o);
+  };
+  const results = await replayAll([record], { out, workDir: tmpDir(), variant: "new", replays: 2 }, { concurrency: 1 }, agent, fakeCheckout);
+
+  assert.equal(calls, 1);
+  assert.deepEqual(results.map((r) => r.variant).sort(), ["cached", "new"]);
+  const runs = loadRunResults(out).get(record.runId)!;
+  assert.equal(runs.get(1)?.variant, "cached");
+  assert.equal(runs.get(2)?.variant, "new");
+});
+
+test("loadRunResults reads run dirs and treats a loose result file as run 1", () => {
+  const dir = tmpDir();
+  const record = makeRecord();
+  const loose = makeRecord();
+  mkdirSync(join(dir, record.runId));
+  writeFileSync(join(dir, record.runId, "run-2.json"), JSON.stringify(resultFromRecord(record)));
+  writeFileSync(join(dir, loose.runId + ".json"), JSON.stringify(resultFromRecord(loose)));
+  writeFileSync(join(dir, ".cache-pulled"), "x\n");
+
+  const runs = loadRunResults(dir);
+  assert.deepEqual([...runs.get(record.runId)!.keys()], [2]);
+  assert.deepEqual([...runs.get(loose.runId)!.keys()], [1]);
 });
 
 test("replayAll runs multiple cases with the worker pool", async () => {

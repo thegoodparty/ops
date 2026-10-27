@@ -1,11 +1,10 @@
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames } from "./cases";
+import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
 import { pullCache, pushCache, replayKey } from "./cache";
 import type { CacheLayout } from "./cache";
 import { SplitSchema } from "./expect";
-import { replayAll, resultFromRecord } from "./replay";
-import type { Result } from "./replay";
+import { loadRunResults, replayAll, resultFromRecord } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
 import { summarize, renderMarkdown, renderPrComment } from "./report";
 
@@ -35,11 +34,6 @@ const flag = (flags: Record<string, string | boolean>, key: string): string | un
 const boolFlag = (flags: Record<string, string | boolean>, key: string): boolean =>
   flags[key] === true;
 
-const loadResultsFromDir = (dir: string): Result[] => {
-  const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
-  return files.map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result);
-};
-
 const usage = () => {
   console.error(
     [
@@ -47,7 +41,7 @@ const usage = () => {
       "  review:eval cases scenarios --manifest <scenarios.json> --out <dir> [--suite <name>] [--split tune|holdout]",
       "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>] [--only-complete]",
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
-      "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--force] [--split tune|holdout --manifest <scenarios.json>]",
+      "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--replays 1] [--force] [--split tune|holdout --manifest <scenarios.json>]",
       "  review:eval cache key | cache pull|push --suite <name> --key <replay-key> --out <dir> [--layout flat|runs]",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
@@ -154,6 +148,8 @@ const main = async () => {
     const concurrency = flag(flags, "concurrency") ? parseInt(flag(flags, "concurrency")!, 10) : 4;
     const workDir = flag(flags, "work-dir") ?? "/tmp/review-eval";
     const force = boolFlag(flags, "force");
+    const replays = flag(flags, "replays") ? parseInt(flag(flags, "replays")!, 10) : 1;
+    if (!(replays >= 1)) { console.error("--replays must be a positive integer"); process.exit(1); }
 
     let records = await loadCases({ from: casesFrom });
     const splitFlag = flag(flags, "split");
@@ -164,8 +160,8 @@ const main = async () => {
       const inSplit = scenarioNames(readManifest(manifest).filter((s) => s.split === split));
       records = records.filter((r) => inSplit.has(r.runId));
     }
-    console.error(`Loaded ${records.length} case(s), concurrency ${concurrency}`);
-    const results = await replayAll(records, { out, variant, workDir, force }, { concurrency });
+    console.error(`Loaded ${records.length} case(s), ${replays} replay(s) each, concurrency ${concurrency}`);
+    const results = await replayAll(records, { out, variant, workDir, force, replays }, { concurrency });
     const errors = results.filter((r) => r.error);
     console.error(
       `Done. ${results.length - errors.length} succeeded, ${errors.length} failed.`,
@@ -191,41 +187,43 @@ const main = async () => {
     const prCommentFile = flag(flags, "pr-comment");
     const runUrl = flag(flags, "run-url") ?? "";
     const manifest = flag(flags, "manifest");
-    const names = manifest ? scenarioNames(readManifest(manifest)) : undefined;
+    const scenarios = manifest ? readManifest(manifest) : undefined;
+    const names = scenarios && scenarioNames(scenarios);
 
     const records = await loadCases({ from: casesFrom });
-    const resultsA = loadResultsFromDir(aDirArg);
-    const resultsB = loadResultsFromDir(bDirArg);
+    const runsA = loadRunResults(aDirArg);
+    const runsB = loadRunResults(bDirArg);
+    const splits = scenarios && new Map([...scenarioSplits(scenarios)].filter(([id]) => records.some((r) => r.runId === id)));
 
     console.error(`Judging ${records.length} case(s) with model ${modelId}, ${passes} passes each, concurrency ${concurrency}...`);
 
     const model = createAnthropicJudgeModel({ model: modelId });
-    const verdicts = await judgeAll(records, resultsA, resultsB, model, passes, concurrency);
+    const verdicts = await judgeAll(records, runsA, runsB, model, passes, concurrency);
 
     const summary = summarize(verdicts);
-    const report = renderMarkdown(summary, verdicts, { labelA, labelB, names });
+    const report = renderMarkdown(summary, verdicts, { labelA, labelB, names, splits });
 
-    console.log(report);
+    // Not printed: the report lists holdout cases, and CI job logs are readable by whoever tunes.
     if (outFile) {
       writeFileSync(outFile, report);
       console.error(`Report written to ${outFile}`);
     }
 
     if (prCommentFile) {
-      const both = [...resultsA, ...resultsB];
+      const both = [...runsA.values(), ...runsB.values()].flatMap((runs) => [...runs.values()]);
       const replayCost = both.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
       const replayFailures = both.filter((r) => r.error).length;
       const comment = renderPrComment(summary, verdicts, {
         labelA,
         labelB,
         casesCount: records.length,
-        unjudgedCount: records.length - verdicts.length,
         replayCost,
         replayFailures,
         runUrl,
-        resultsA,
-        resultsB,
+        resultsA: runsA,
+        resultsB: runsB,
         names,
+        splits,
       });
       writeFileSync(prCommentFile, comment);
       console.error(`PR comment written to ${prCommentFile}`);

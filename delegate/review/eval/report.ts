@@ -1,5 +1,8 @@
 import type { PairVerdict } from "./judge";
-import type { Result } from "./replay";
+import type { Result, RunResults } from "./replay";
+import type { Scenario } from "./cases";
+
+export type Split = Scenario["split"];
 
 export interface Summary {
   a: number;
@@ -37,9 +40,9 @@ const caseName = (v: PairVerdict, names?: Map<string, string>): string =>
 export const renderMarkdown = (
   summary: Summary,
   verdicts: PairVerdict[],
-  labels: { labelA: string; labelB: string; names?: Map<string, string> },
+  labels: { labelA: string; labelB: string; names?: Map<string, string>; splits?: Map<string, Split> },
 ): string => {
-  const { labelA, labelB, names } = labels;
+  const { labelA, labelB, names, splits } = labels;
   const lines: string[] = [];
 
   lines.push("# PR-reviewer eval report");
@@ -54,13 +57,22 @@ export const renderMarkdown = (
     `Sign test p-value (${labelA} vs ${labelB}, two-sided): **${summary.signTestP.toFixed(4)}**`,
   );
   lines.push(
-    "> Excludes ties and unstable verdicts. At 12 cases, 10+ wins one way is p<0.05.",
+    "> Excludes ties and unstable verdicts. At 24 cases, 18+ wins one way is p<0.05.",
   );
+  if (splits) {
+    for (const split of ["tune", "holdout"] as const) {
+      const s = summarize(verdicts.filter((v) => splits.get(v.caseId) === split));
+      lines.push("");
+      lines.push(
+        `${split}: ${labelA} ${s.a}, ${labelB} ${s.b}, ${s.ties + s.unstable} tied or unstable, p=${s.signTestP.toFixed(4)} (${qualityVerdict(s)})`,
+      );
+    }
+  }
   lines.push("");
   lines.push("## Per-case results");
   lines.push("");
-  lines.push("| Case | Repo#PR | Winner | Deciding criterion |");
-  lines.push("| --- | --- | --- | --- |");
+  lines.push(splits ? "| Case | Split | Repo#PR | Winner | Deciding criterion |" : "| Case | Repo#PR | Winner | Deciding criterion |");
+  lines.push(splits ? "| --- | --- | --- | --- | --- |" : "| --- | --- | --- | --- |");
 
   for (const v of verdicts) {
     const winnerLabel =
@@ -70,8 +82,9 @@ export const renderMarkdown = (
           ? labelB
           : v.winner;
     const criterion = v.passes.find((p) => p.deciding_criterion)?.deciding_criterion ?? "";
+    const split = splits ? ` ${splits.get(v.caseId) ?? ""} |` : "";
     lines.push(
-      `| ${caseName(v, names)} | ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`,
+      `| ${caseName(v, names)} |${split} ${v.repo}#${v.prNumber} | ${winnerLabel} | ${criterion} |`,
     );
   }
 
@@ -83,12 +96,14 @@ export interface PrCommentOptions {
   labelA: string;
   labelB: string;
   casesCount: number;
-  unjudgedCount?: number;
   replayCost: number;
   replayFailures: number;
   runUrl: string;
-  resultsA?: Result[];
-  resultsB?: Result[];
+  resultsA?: RunResults;
+  resultsB?: RunResults;
+  // When present, the comment reports tune and holdout separately and lists
+  // only tune cases.
+  splits?: Map<string, Split>;
 }
 
 const renderPerCaseTable = (
@@ -159,19 +174,21 @@ export const qualityVerdict = (summary: Summary): "Better" | "Worse" | "Can't te
   return summary.b > summary.a ? "Better" : "Worse";
 };
 
-// Same cases on both sides, or a replay that failed on one side moves the
+// Same replays on both sides, or a replay that failed on one side moves the
 // headline without any review having changed price.
-const pairedAvgCost = (a: Result[], b: Result[]): [number | null, number | null] => {
-  const bById = new Map(b.map((r) => [r.caseId, r]));
-  const pairs = a
-    .map((ra) => [ra, bById.get(ra.caseId)] as const)
-    .filter((p): p is readonly [Result, Result] =>
-      p[1] !== undefined && typeof p[0].costUsd === "number" && typeof p[1].costUsd === "number",
-    );
+const pairedAvgCost = (a: RunResults, b: RunResults): [number | null, number | null] => {
+  const pairs: [number, number][] = [];
+  for (const [caseId, aRuns] of a) {
+    for (const [run, ra] of aRuns) {
+      const rb = b.get(caseId)?.get(run);
+      if (rb && typeof ra.costUsd === "number" && typeof rb.costUsd === "number") {
+        pairs.push([ra.costUsd, rb.costUsd]);
+      }
+    }
+  }
   if (pairs.length === 0) return [null, null];
-  const avg = (pick: (p: readonly [Result, Result]) => number) =>
-    pairs.reduce((sum, p) => sum + pick(p), 0) / pairs.length;
-  return [avg((p) => p[0].costUsd ?? 0), avg((p) => p[1].costUsd ?? 0)];
+  const avg = (i: 0 | 1) => pairs.reduce((sum, p) => sum + p[i], 0) / pairs.length;
+  return [avg(0), avg(1)];
 };
 
 export const costVerdict = (
@@ -189,24 +206,41 @@ export const renderPrComment = (
   verdicts: PairVerdict[],
   opts: PrCommentOptions,
 ): string => {
-  const { labelA, labelB, casesCount, unjudgedCount = 0, replayFailures, runUrl, resultsA = [], resultsB = [], names } = opts;
-  const [before, after] = pairedAvgCost(resultsA, resultsB);
+  const { labelA, labelB, casesCount, replayFailures, runUrl, names, splits } = opts;
+  const [before, after] = pairedAvgCost(opts.resultsA ?? new Map(), opts.resultsB ?? new Map());
   const money = (n: number | null) => (n === null ? "n/a" : `$${n.toFixed(2)}`);
-  const judged = casesCount - unjudgedCount;
-  const unjudgedNote = unjudgedCount ? `, ${unjudgedCount} not judged` : "";
-  const failureNote = replayFailures ? `, ${replayFailures} replay failure(s) across both sides` : "";
+  const failures = `${replayFailures} replay failure(s) across both sides`;
+
+  const qualityLine = (title: string, s: Summary, total: number) => {
+    const unjudged = total - s.n;
+    const unjudgedNote = unjudged ? `, ${unjudged} not judged` : "";
+    return `**${title}: ${qualityVerdict(s)}** — ${labelB} won ${s.b}, ${labelA} won ${s.a}, ${s.ties + s.unstable} tied or unstable, over ${s.n} of ${total} cases (p=${s.signTestP.toFixed(2)})${unjudgedNote}`;
+  };
+
+  // Holdout cases stay out of the comment (counts only); the artifact keeps them.
+  const inSplit = (split: Split) => verdicts.filter((v) => splits?.get(v.caseId) === split);
+  const splitTotal = (split: Split) => [...(splits?.values() ?? [])].filter((s) => s === split).length;
+  const quality = splits
+    ? [
+        `${qualityLine("Quality (tune)", summarize(inSplit("tune")), splitTotal("tune"))}.`,
+        "",
+        `${qualityLine("Quality (holdout)", summarize(inSplit("holdout")), splitTotal("holdout"))}.`,
+        ...(replayFailures ? ["", `${failures}.`] : []),
+      ]
+    : [`${qualityLine("Quality", summary, casesCount)}${replayFailures ? `, ${failures}` : ""}.`];
+  const listed = splits ? inSplit("tune") : verdicts;
 
   return [
     "<!-- delegate-eval -->",
     `### Delegate eval: ${labelB} vs ${labelA}`,
     "",
-    `**Quality: ${qualityVerdict(summary)}** — ${labelB} won ${summary.b}, ${labelA} won ${summary.a}, ${summary.ties + summary.unstable} tied or unstable, over ${judged} of ${casesCount} cases (p=${summary.signTestP.toFixed(2)})${unjudgedNote}${failureNote}.`,
+    ...quality,
     "",
     `**Cost: ${costVerdict(before, after)}** — ${money(before)} → ${money(after)} per review (${labelA} → ${labelB}).`,
     "",
-    "<details><summary>Per-case results</summary>",
+    `<details><summary>Per-case results${splits ? " (tune)" : ""}</summary>`,
     "",
-    renderPerCaseTable(verdicts, labelA, labelB, names),
+    renderPerCaseTable(listed, labelA, labelB, names),
     "",
     "</details>",
     "",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { judgePair, judgeAll } from "./judge";
 import type { JudgeModel, PairVerdict } from "./judge";
-import type { Result } from "./replay";
+import type { Result, RunResults } from "./replay";
 import type { ReviewRecord } from "../schema";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
@@ -52,6 +52,12 @@ const makeResult = (overrides: Partial<Result> = {}): Result => ({
   wallTimeMs: 100,
   ...overrides,
 });
+
+const runsOf = (...results: Result[]): RunResults => {
+  const runs: RunResults = new Map();
+  for (const r of results) runs.set(r.caseId, (runs.get(r.caseId) ?? new Map()).set((runs.get(r.caseId)?.size ?? 0) + 1, r));
+  return runs;
+};
 
 const fakeModel = (
   verdicts: { winner: string; margin: string }[],
@@ -206,7 +212,7 @@ test("judgeAll skips records missing from either side", async () => {
   const bResults = [makeResult({ caseId: record1.runId }), makeResult({ caseId: record2.runId })];
 
   const model = fakeModel([{ winner: "tie", margin: "tie" }]);
-  const verdicts = await judgeAll([record1, record2], aResults, bResults, model);
+  const verdicts = await judgeAll([record1, record2], runsOf(...aResults), runsOf(...bResults), model);
 
   assert.equal(verdicts.length, 1);
   assert.equal(verdicts[0].caseId, record1.runId);
@@ -218,7 +224,7 @@ test("judgeAll includes repo and prNumber in each verdict", async () => {
   const b = makeResult({ caseId: record.runId });
 
   const model = fakeModel([{ winner: "tie", margin: "tie" }]);
-  const verdicts = await judgeAll([record], [a], [b], model);
+  const verdicts = await judgeAll([record], runsOf(a), runsOf(b), model);
 
   assert.equal(verdicts[0].repo, "thegoodparty/gp-webapp");
   assert.equal(verdicts[0].prNumber, 99);
@@ -251,7 +257,7 @@ test("judgeAll with concurrency > 1 returns results in record order", async () =
     };
   };
 
-  const verdicts = await judgeAll(records, aResults, bResults, model, 1, 6);
+  const verdicts = await judgeAll(records, runsOf(...aResults), runsOf(...bResults), model, 1, 6);
 
   assert.equal(verdicts.length, 3);
   assert.deepEqual(
@@ -267,7 +273,75 @@ test("judgeAll with concurrency 1 behaves identically to serial", async () => {
   const bResults = records.map((r) => makeResult({ caseId: r.runId }));
 
   const model = fakeModel([{ winner: "tie", margin: "tie" }]);
-  const verdicts = await judgeAll(records, aResults, bResults, model, 1, 1);
+  const verdicts = await judgeAll(records, runsOf(...aResults), runsOf(...bResults), model, 1, 1);
 
   assert.equal(verdicts.length, 2);
+});
+
+const summaryResult = (caseId: string, summary: string): Result =>
+  makeResult({ caseId, output: { status: "complete", findings: [], summary } });
+
+// Reads which outputs a judge prompt shows, whichever order they are in.
+const shown = (prompt: string): string[] => [...prompt.matchAll(/summary-([ab]\d)/g)].map((m) => m[1]);
+
+test("judgeAll pairs replay k of a only with replay k of b", async () => {
+  const record = makeRecord();
+  const a1 = summaryResult(record.runId, "summary-a1");
+  const a2 = summaryResult(record.runId, "summary-a2");
+  const b1 = summaryResult(record.runId, "summary-b1");
+  const b2 = summaryResult(record.runId, "summary-b2");
+  const seen = new Set<string>();
+  const model: JudgeModel = async (request) => {
+    seen.add(shown(request.prompt).sort().join("+"));
+    return { toolInput: { winner: "tie", margin: "tie", deciding_criterion: "none", rationale: "r" }, stopReason: "tool_use" };
+  };
+
+  const verdicts = await judgeAll(
+    [record],
+    runsOf(a1, a2),
+    runsOf(b1, b2),
+    model,
+    4,
+    1,
+  );
+
+  assert.deepEqual([...seen].sort(), ["a1+b1", "a2+b2"]);
+  assert.equal(verdicts.length, 1);
+  assert.equal(verdicts[0].passes.length, 8);
+  assert.deepEqual(verdicts[0].passes.map((p) => p.replay), [1, 1, 1, 1, 2, 2, 2, 2]);
+});
+
+test("judgeAll sums both pairs: agreement decides the case, a split is no decision", async () => {
+  const record = makeRecord();
+  const a = [summaryResult(record.runId, "summary-a1"), summaryResult(record.runId, "summary-a2")];
+  const b = [summaryResult(record.runId, "summary-b1"), summaryResult(record.runId, "summary-b2")];
+  // Whichever order, the judge prefers the output of the named side.
+  const preferring = (side: (replay: string) => "a" | "b" | "tie"): JudgeModel => async (request) => {
+    const [first] = shown(request.prompt);
+    const wanted = side(first.slice(1));
+    const winner = wanted === "tie" ? "tie" : first.startsWith(wanted) ? "output_1" : "output_2";
+    return { toolInput: { winner, margin: wanted === "tie" ? "tie" : "better", deciding_criterion: "c", rationale: "r" }, stopReason: "tool_use" };
+  };
+  const first = (m: JudgeModel) => judgeAll([record], runsOf(...a), runsOf(...b), m, 4, 1).then((v) => v[0]);
+
+  assert.equal((await first(preferring(() => "b"))).winner, "b");
+  assert.equal((await first(preferring((replay) => (replay === "1" ? "a" : "b")))).winner, "unstable");
+});
+
+test("judgeAll judges the replays both sides have and skips a case with none in common", async () => {
+  const record = makeRecord();
+  const lone = makeRecord();
+  const runsA: RunResults = new Map([
+    [record.runId, new Map([[1, makeResult({ caseId: record.runId })], [2, makeResult({ caseId: record.runId })]])],
+    [lone.runId, new Map([[2, makeResult({ caseId: lone.runId })]])],
+  ]);
+  const runsB: RunResults = new Map([
+    [record.runId, new Map([[1, makeResult({ caseId: record.runId })]])],
+    [lone.runId, new Map([[1, makeResult({ caseId: lone.runId })]])],
+  ]);
+
+  const verdicts = await judgeAll([record, lone], runsA, runsB, fakeModel([{ winner: "tie", margin: "tie" }]));
+
+  assert.deepEqual(verdicts.map((v) => v.caseId), [record.runId]);
+  assert.equal(verdicts[0].passes.length, 4);
 });
