@@ -468,6 +468,32 @@ export const githubActionsInfrastructureDeployTrust = opsWorkflowTrust(
 
 export const githubActionsDelegateEvalTrust = opsWorkflowTrust("delegate-eval.yml");
 
+// The one credential that can write the eval cache, kept off the role above
+// because every job in delegate-eval.yml can assume that one, including the
+// jobs that execute the PR head's code. A job in a called reusable workflow
+// presents the called file as its `job_workflow_ref`, so pinning this trust to
+// delegate-eval-cache-push.yml means no job in delegate-eval.yml can assume it.
+export const githubActionsDelegateEvalCachePushTrust = opsWorkflowTrust(
+  "delegate-eval-cache-push.yml",
+);
+
+// Main's replay results, cached per replay key. Production review records
+// under reviews/ are not writable. The condition requires If-None-Match, so S3
+// itself refuses to overwrite an entry. (Multipart uploads carry no such
+// header and are refused too.) Nothing here reads: the push only puts.
+export const githubActionsDelegateEvalCachePush: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "DelegateEvalCacheWrite",
+      Effect: "Allow",
+      Action: "s3:PutObject",
+      Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
+      Condition: { Null: { "s3:if-none-match": "false" } },
+    },
+  ],
+};
+
 export const githubActionsDelegateEval: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -482,17 +508,6 @@ export const githubActionsDelegateEval: PolicyDocument = {
       Effect: "Allow",
       Action: "s3:ListBucket",
       Resource: "arn:aws:s3:::delegate-reviews",
-    },
-    // Main's replay results, cached per agent version. Production review
-    // records under reviews/ stay read-only to this role. The condition
-    // requires If-None-Match, so S3 itself refuses to overwrite an entry.
-    // (Multipart uploads carry no such header and are refused too.)
-    {
-      Sid: "DelegateEvalCacheWrite",
-      Effect: "Allow",
-      Action: "s3:PutObject",
-      Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
-      Condition: { Null: { "s3:if-none-match": "false" } },
     },
   ],
 };

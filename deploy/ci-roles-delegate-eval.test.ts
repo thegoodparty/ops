@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   githubActionsDelegateEvalTrust,
   githubActionsDelegateEval,
+  githubActionsDelegateEvalCachePushTrust,
+  githubActionsDelegateEvalCachePush,
 } from "./components/ci-roles/policies";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
@@ -55,8 +57,8 @@ describe("githubActionsDelegateEval", () => {
       Array.isArray(s.Resource) ? s.Resource : [s.Resource as string],
     ).filter((r): r is string => typeof r === "string");
 
-  it("allows only S3 read, list and cache-write actions", () => {
-    const allowed = new Set(["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket", "s3:PutObject"]);
+  it("allows only S3 read and list actions", () => {
+    const allowed = new Set(["s3:GetObject", "s3:GetObjectVersion", "s3:ListBucket"]);
     for (const action of actions()) {
       assert.ok(allowed.has(action), `unexpected action: ${action}`);
     }
@@ -73,25 +75,11 @@ describe("githubActionsDelegateEval", () => {
     assert.equal(resource, "arn:aws:s3:::delegate-reviews/*");
   });
 
-  it("grants PutObject only under eval-cache/, never reviews/", () => {
-    const writers = githubActionsDelegateEval.Statement.filter((s) =>
-      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes("s3:PutObject"),
+  it("grants no write action, so every job that can assume it is read-only", () => {
+    assert.deepEqual(
+      actions().filter((a) => /Put|Delete|Replicate|Restore|Abort/.test(a)),
+      [],
     );
-    assert.equal(writers.length, 1);
-    assert.equal(writers[0].Effect, "Allow");
-    assert.equal(writers[0].Resource, "arn:aws:s3:::delegate-reviews/eval-cache/*");
-  });
-
-  it("requires If-None-Match on every cache write, so S3 refuses an overwrite", () => {
-    const writer = githubActionsDelegateEval.Statement.find((s) =>
-      (Array.isArray(s.Action) ? s.Action : [s.Action]).includes("s3:PutObject"),
-    );
-    assert.deepEqual(writer?.Condition, { Null: { "s3:if-none-match": "false" } });
-  });
-
-  it("grants no write or delete action beyond PutObject", () => {
-    const writes = actions().filter((a) => /Put|Delete|Replicate|Restore|Abort/.test(a));
-    assert.deepEqual(writes, ["s3:PutObject"]);
   });
 
   it("scopes list to the delegate-reviews bucket itself", () => {
@@ -118,5 +106,42 @@ describe("githubActionsDelegateEval", () => {
         `resource outside delegate-reviews: ${resource}`,
       );
     }
+  });
+});
+
+describe("githubActionsDelegateEvalCachePushTrust", () => {
+  const [statement] = githubActionsDelegateEvalCachePushTrust.Statement;
+
+  it("has exactly one statement", () => {
+    assert.equal(githubActionsDelegateEvalCachePushTrust.Statement.length, 1);
+  });
+
+  it("is pinned to the push workflow on ops main, not to delegate-eval.yml", () => {
+    assert.equal(
+      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+      "thegoodparty/ops/.github/workflows/delegate-eval-cache-push.yml@refs/heads/main",
+    );
+    assert.equal(
+      statement.Condition.StringEquals?.[SUBJECT_KEY],
+      "repo:thegoodparty/ops:ref:refs/heads/main",
+    );
+    assert.notEqual(
+      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+      githubActionsDelegateEvalTrust.Statement[0].Condition.StringEquals?.[WORKFLOW_KEY],
+    );
+  });
+});
+
+describe("githubActionsDelegateEvalCachePush", () => {
+  it("is exactly a conditional PutObject on eval-cache/*", () => {
+    assert.deepEqual(githubActionsDelegateEvalCachePush.Statement, [
+      {
+        Sid: "DelegateEvalCacheWrite",
+        Effect: "Allow",
+        Action: "s3:PutObject",
+        Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
+        Condition: { Null: { "s3:if-none-match": "false" } },
+      },
+    ]);
   });
 });

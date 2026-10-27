@@ -10,19 +10,22 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
-  pull-requests: write
-  issues: write
 
-# Credentials and PR code never share a job with write access. Any job that
-# executes the PR head's code assumes the eval role through a session policy
-# that can only read, so PR code cannot write the eval cache. Main's replay
-# results are produced, and pushed to the cache, in jobs that run only main's
-# code; the PR code never runs on those runners, so it cannot touch what they
-# upload. Results cross between jobs as artifacts, which main's code reads as
-# data.
+# The eval role every job here can assume is read-only. The only credential
+# that can write the eval cache belongs to a second role whose trust accepts
+# only delegate-eval-cache-push.yml, and a job in this file presents this file
+# as its job_workflow_ref, so no job here can assume it, PR code included.
+# Main's replay results are produced in jobs that run only main's code, and
+# the reusable push workflow uploads them from an artifact whose id the
+# producing job reports; if PR code got to that artifact name first, the
+# producing job's own upload fails, no id is reported and nothing is pushed.
+# Each job asks for `id-token: write` only if it assumes a role.
 jobs:
   prepare:
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
     if: |
       github.event.issue.pull_request != null &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
@@ -91,12 +94,17 @@ jobs:
           echo "main_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "main_sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
 
-  # Main's side of the pairwise eval. Runs only main's code, with the
-  # unrestricted eval role, so it is the only place the cache is written. The
-  # PR is checked out for its scenario manifest alone (sparse, no install),
-  # which main's code reads as data.
+  # Main's side of the pairwise eval. Runs only main's code. The PR is checked
+  # out for its scenario manifest alone (sparse, no install), which main's code
+  # reads as data. The cache is written by the pairwise-cache-push job below.
   pairwise-main:
+    permissions:
+      contents: read
+      id-token: write
     needs: prepare
+    outputs:
+      replay_key: ${{ steps.cache.outputs.replay_key }}
+      results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -168,47 +176,47 @@ jobs:
             --key "$replay_key" \
             --out ./eval/results-main
 
-      - name: Replay main and cache the results
+      - name: Replay main
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SUITE: ${{ needs.prepare.outputs.suite }}
-          REPLAY_KEY: ${{ steps.cache.outputs.replay_key }}
         run: |
           # gh clones with the app token, but the follow-up git fetch of the
           # recorded sha needs it too, or private repos fail to check out.
           gh auth setup-git
-          replay_status=0
           npm run -s review:eval -- replay \
             --cases ./eval/cases \
             --out ./eval/results-main \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work-main || replay_status=$?
-          # Pushed even when the replay failed: errored results are skipped,
-          # the rest are good and the failed cases are retried next eval.
-          npm run -s review:eval -- cache push \
-            --suite "$SUITE" \
-            --key "$REPLAY_KEY" \
-            --out ./eval/results-main
-          exit $replay_status
+            --work-dir ${{ runner.temp }}/work-main
 
+      # Uploaded even when the replay failed, so the good results still reach
+      # the cache. Hidden files are included for the pulled-results marker.
       - name: Upload main's results
+        id: upload-results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
-          path: |
-            ./eval/cases
-            ./eval/results-main
+          path: ./eval/results-main
+          include-hidden-files: true
 
-  # The PR head's side. Executes the PR's code, so its credentials are the eval
-  # role narrowed by a session policy to read and list: the PR's code can read
-  # what main's job reads but cannot write the cache or anything else.
+      - name: Upload cases
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/cases
+
+  # The PR head's side. Executes the PR's code, with the read-only eval role.
   pairwise-pr:
+    permissions:
+      contents: read
+      id-token: write
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -237,15 +245,11 @@ jobs:
         run: npm ci
         working-directory: pr/
 
-      - name: Configure AWS credentials (read-only)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
-          inline-session-policy: >-
-            {"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::delegate-reviews/*"},
-            {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::delegate-reviews"}]}
 
       - name: Create GitHub App token for repo cloning
         id: app-token
@@ -293,6 +297,10 @@ jobs:
   # Judges the two result sets. Main's code only, and no AWS credentials: it
   # reads the cases and results from artifacts.
   pairwise-judge:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     needs: [prepare, pairwise-main, pairwise-pr]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -323,7 +331,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
-          path: ./eval
+          path: ./eval/results-main
+
+      - name: Download cases
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/cases
 
       - name: Download PR results
         uses: actions/download-artifact@v4
@@ -375,11 +389,34 @@ jobs:
           name: delegate-eval-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/
 
+  # The only writer of the cache. The reusable workflow's own job_workflow_ref
+  # is what the push role trusts.
+  pairwise-cache-push:
+    needs: [prepare, pairwise-main]
+    if: always() && needs.pairwise-main.outputs.results_artifact_id != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-cache-push.yml
+    with:
+      artifact-id: ${{ needs.pairwise-main.outputs.results_artifact_id }}
+      replay-key: ${{ needs.pairwise-main.outputs.replay_key }}
+      suite: ${{ needs.prepare.outputs.suite }}
+      layout: flat
+      main-sha: ${{ needs.prepare.outputs.main_sha }}
+
   # The known-answer cases in expected/manifest.json. Main's answers to them
   # are the baseline each case is read against: replayed (or pulled from the
   # cache) in a main-only job, alongside the PR head's own replay.
   expected-main:
+    permissions:
+      contents: read
+      id-token: write
     needs: prepare
+    outputs:
+      replay_key: ${{ steps.cache.outputs.replay_key }}
+      suite: ${{ steps.cache.outputs.suite }}
+      results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -428,44 +465,53 @@ jobs:
             --layout runs \
             --out ./eval-expected-main
 
-      - name: Replay main and cache the results
+      - name: Replay main
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          SUITE: ${{ steps.cache.outputs.suite }}
-          REPLAY_KEY: ${{ steps.cache.outputs.replay_key }}
         run: |
           gh auth setup-git
-          replay_status=0
           npm run -s review:expect -- \
             --mode replay \
             --runs 3 \
             --concurrency 5 \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --out ./eval-expected-main \
-            --work-dir ${{ runner.temp }}/work-expected-main || replay_status=$?
-          # Pushed even when the replay failed: errored runs are skipped, the
-          # rest are good and the failed runs are retried next eval.
-          npm run -s review:eval -- cache push \
-            --suite "$SUITE" \
-            --key "$REPLAY_KEY" \
-            --layout runs \
-            --out ./eval-expected-main
-          exit $replay_status
+            --work-dir ${{ runner.temp }}/work-expected-main
 
+      # Uploaded even when the replay failed, so the good runs still reach the
+      # cache. Hidden files are included for the pulled-results marker.
       - name: Upload main's results
+        id: upload-results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-main/
+          include-hidden-files: true
 
-  # Executes the PR's code, so it gets the same read-only session as
-  # pairwise-pr and cannot write the cache.
+  expected-cache-push:
+    needs: [prepare, expected-main]
+    if: always() && needs.expected-main.outputs.results_artifact_id != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-cache-push.yml
+    with:
+      artifact-id: ${{ needs.expected-main.outputs.results_artifact_id }}
+      replay-key: ${{ needs.expected-main.outputs.replay_key }}
+      suite: ${{ needs.expected-main.outputs.suite }}
+      layout: runs
+      main-sha: ${{ needs.prepare.outputs.main_sha }}
+
+  # Executes the PR's code, with the read-only eval role.
   expected-pr:
+    permissions:
+      contents: read
+      id-token: write
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -491,15 +537,11 @@ jobs:
         run: npm ci
         working-directory: pr/
 
-      - name: Configure AWS credentials (read-only)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
-          inline-session-policy: >-
-            {"Version":"2012-10-17","Statement":[
-            {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:aws:s3:::delegate-reviews/*"},
-            {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::delegate-reviews"}]}
 
       - name: Create GitHub App token for repo cloning
         id: app-token
@@ -537,6 +579,10 @@ jobs:
   # Scores with main's code, so a PR cannot change the cases or the scoring it
   # is graded on. No AWS credentials.
   expected-score:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     needs: [prepare, expected-main, expected-pr]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -602,6 +648,8 @@ jobs:
             ./eval-expected-main/
 
   finish:
+    permissions:
+      issues: write
     needs: [prepare, pairwise-judge, expected-score]
     if: always() && needs.prepare.result != 'skipped'
     runs-on: ubuntu-latest
