@@ -14,6 +14,8 @@ import {
   githubActionsInfrastructureDeployTrust,
   githubActionsDelegateEval,
   githubActionsDelegateEvalTrust,
+  githubActionsDelegateEvalCachePush,
+  githubActionsDelegateEvalCachePushTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -236,6 +238,20 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsDelegateEval),
   });
 
+  const delegateEvalCachePushRole = new aws.iam.Role("githubActionsDelegateEvalCachePush", {
+    name: "github-actions-delegate-eval-cache-push",
+    description:
+      "Writes main's delegate eval results to eval-cache/. Assumed only by delegate-eval-cache-push.yml on thegoodparty/ops main; no job in delegate-eval.yml can assume it.",
+    assumeRolePolicy: JSON.stringify(githubActionsDelegateEvalCachePushTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsDelegateEvalCachePushPolicy", {
+    name: "DelegateEvalCachePush",
+    role: delegateEvalCachePushRole.id,
+    policy: JSON.stringify(githubActionsDelegateEvalCachePush),
+  });
+
   return {
     deployRole,
     deployPolicy,
@@ -245,5 +261,6 @@ export const createCiRoles = () => {
     previewRole,
     planRole,
     delegateEvalRole,
+    delegateEvalCachePushRole,
   };
 };

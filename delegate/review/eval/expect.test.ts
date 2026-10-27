@@ -9,6 +9,7 @@ import {
   scoreDir,
   readBundleFile,
   readManifest,
+  renderExpectJson,
   renderExpectReport,
   scoreRun,
   selectCases,
@@ -323,4 +324,74 @@ test("scoreDir fails a case the replay left no results for", () => {
   mkdirSync(join(out, approveCase.id));
   writeFileSync(join(out, approveCase.id, "run-1.json"), JSON.stringify(result()));
   assert.match(renderExpectReport(scoreDir([approveCase], out), "v"), /\*\*1\/1 cases passed\*\*/);
+});
+
+test("the report carries main's pass count per case, and the json does too", () => {
+  const cases = readManifest(MANIFEST).slice(0, 2);
+  const pass = { pass: true, outcome: "x" };
+  const fail = { pass: false, outcome: "approved" };
+  const pr = [
+    { c: cases[0], scores: [pass, pass, pass], costs: [1, 1, 1] },
+    { c: cases[1], scores: [pass, pass, pass], costs: [1, 1, 1] },
+  ];
+  const main = {
+    variant: "main-def5678",
+    runs: 3,
+    reports: [
+      { c: cases[0], scores: [pass, fail, pass], costs: [1, 1, 1] },
+      { c: cases[1], scores: [], costs: [] },
+    ],
+  };
+
+  const md = renderExpectReport(pr, "pr-abc1234", main);
+  assert.match(md, /Main runs passed \(`main-def5678`\)/);
+  assert.match(md, new RegExp(`${cases[0].id} \\|[^\\n]*\\| 3/3 \\| 2/3 \\|`));
+
+  const json = JSON.parse(renderExpectJson(pr, "pr-abc1234", main));
+  assert.equal(json.baselineVariant, "main-def5678");
+  assert.deepEqual(json.cases[0], {
+    id: cases[0].id,
+    runs: 3,
+    runsPassed: 3,
+    main: { runs: 3, completed: 3, runsPassed: 2, unfinished: 0 },
+  });
+});
+
+test("errored and missing main runs are unfinished, never a pass or a fail", () => {
+  const cases = readManifest(MANIFEST).slice(0, 3);
+  const pass = { pass: true, outcome: "x" };
+  const fail = { pass: false, outcome: "approved" };
+  const noReview = { pass: false, outcome: "no review: boom", errored: true };
+  const pr = cases.map((c) => ({ c, scores: [pass, pass, pass], costs: [1, 1, 1] }));
+  const main = {
+    variant: "main-def5678",
+    runs: 3,
+    reports: [
+      { c: cases[0], scores: [pass, noReview, fail], costs: [1, null, 1] },
+      { c: cases[1], scores: [pass, pass], costs: [1, 1] },
+      { c: cases[2], scores: [noReview, noReview, noReview], costs: [null, null, null] },
+    ],
+  };
+
+  const json = JSON.parse(renderExpectJson(pr, "v", main));
+  assert.deepEqual(json.cases[0].main, { runs: 3, completed: 2, runsPassed: 1, unfinished: 1 });
+  assert.deepEqual(json.cases[1].main, { runs: 3, completed: 2, runsPassed: 2, unfinished: 1 });
+  assert.deepEqual(json.cases[2].main, { runs: 3, completed: 0, runsPassed: 0, unfinished: 3 });
+
+  const md = renderExpectReport(pr, "v", main);
+  assert.match(md, /\| 1\/2 \(1 of 3 runs unfinished\) \|/);
+  assert.match(md, /\| 2\/2 \(1 of 3 runs unfinished\) \|/);
+  assert.match(md, /\| n\/a \(3 of 3 runs unfinished\) \|/);
+});
+
+test("a result with no review scores as errored", () => {
+  assert.equal(scoreRun({ verdict: "approve" }, result({ output: null, error: "boom" })).errored, true);
+  assert.equal(scoreRun({ verdict: "approve" }, result()).errored, undefined);
+});
+
+test("without a baseline the report keeps its original columns", () => {
+  const cases = readManifest(MANIFEST).slice(0, 1);
+  const pr = [{ c: cases[0], scores: [{ pass: true, outcome: "x" }], costs: [1] }];
+  assert.doesNotMatch(renderExpectReport(pr, "v"), /Main runs passed/);
+  assert.equal(JSON.parse(renderExpectJson(pr, "v")).cases[0].main, null);
 });

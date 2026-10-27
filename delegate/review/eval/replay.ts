@@ -204,6 +204,7 @@ export const replayAll = async (
     toRun.push(record);
   }
 
+  console.error(`Replaying ${toRun.length} case(s); ${results.length} already had results`);
   if (toRun.length === 0) return results;
 
   let index = 0;

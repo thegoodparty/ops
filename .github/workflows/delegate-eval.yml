@@ -10,19 +10,34 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
-  pull-requests: write
-  issues: write
 
+# The eval role every job here can assume is read-only. The only credential
+# that can write the eval cache belongs to a second role whose trust accepts
+# only delegate-eval-cache-push.yml, and a job in this file presents this file
+# as its job_workflow_ref, so no job here can assume it, PR code included.
+# Main's replay results are produced in jobs that run only main's code, and
+# the reusable push workflow uploads them from an artifact whose id the
+# producing job reports; if PR code got to that artifact name first, the
+# producing job's own upload fails, no id is reported and nothing is pushed.
+# Each job asks for `id-token: write` only if it assumes a role.
 jobs:
-  eval:
+  prepare:
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
     if: |
       github.event.issue.pull_request != null &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       startsWith(github.event.comment.body, 'delegate eval')
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    outputs:
+      suite: ${{ steps.parse.outputs.suite }}
+      pr_number: ${{ steps.parse.outputs.pr_number }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      sha7: ${{ steps.pr.outputs.sha7 }}
+      main_sha: ${{ steps.main.outputs.main_sha }}
+      main_sha7: ${{ steps.main.outputs.main_sha7 }}
     steps:
       # The comment body is attacker-controlled text. It reaches the shell as
       # an environment variable, never as template substitution into the
@@ -68,16 +83,154 @@ jobs:
           echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
 
+      # Every job checks out this sha, so a merge to main while the eval runs
+      # cannot split the jobs across two versions of main.
+      - name: Resolve main sha
+        id: main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api repos/${{ github.repository }}/commits/main --jq '.sha')
+          echo "main_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "main_sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+  # Main's side of the pairwise eval. Runs only main's code. The PR is checked
+  # out for its scenario manifest alone (sparse, no install), which main's code
+  # reads as data. The cache is written by the pairwise-cache-push job below.
+  pairwise-main:
+    permissions:
+      contents: read
+      id-token: write
+    needs: prepare
+    outputs:
+      replay_key: ${{ steps.cache.outputs.replay_key }}
+      results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - name: Checkout PR scenario manifest (data only)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: pr/
+          sparse-checkout: delegate/review/eval/scenarios.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      # The scenario list is fixed, so every eval replays the same cases. The
+      # PR's own manifest wins when it has one, so a PR that adds a scenario
+      # is evaluated on it.
+      - name: Load scenarios
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          SUITE: ${{ needs.prepare.outputs.suite }}
+        run: |
+          manifest=delegate/review/eval/scenarios.json
+          if [ -f "pr/$manifest" ]; then manifest="pr/$manifest"; fi
+          npm run -s review:eval -- cases scenarios \
+            --manifest "$manifest" \
+            --out ./eval/cases \
+            --suite "$SUITE"
+
+      # Main's results are cached in S3 by a replay key (a hash of main's
+      # agents, framework, review code and lockfile), so they are replayed only
+      # when those changed or a scenario is new. Pulled results land in
+      # results-main, and replay skips any case that already has a result file.
+      - name: Pull main's eval cache
+        id: cache
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          SUITE: ${{ needs.prepare.outputs.suite }}
+        run: |
+          replay_key=$(npm run -s review:eval -- cache key)
+          echo "replay_key=${replay_key}" >> "$GITHUB_OUTPUT"
+          npm run -s review:eval -- cache pull \
+            --suite "$SUITE" \
+            --key "$replay_key" \
+            --out ./eval/results-main
+
+      - name: Replay main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # gh clones with the app token, but the follow-up git fetch of the
+          # recorded sha needs it too, or private repos fail to check out.
+          gh auth setup-git
+          npm run -s review:eval -- replay \
+            --cases ./eval/cases \
+            --out ./eval/results-main \
+            --variant main-${{ needs.prepare.outputs.main_sha7 }} \
+            --concurrency 4 \
+            --work-dir ${{ runner.temp }}/work-main
+
+      # Uploaded even when the replay failed, so the good results still reach
+      # the cache. Hidden files are included for the pulled-results marker.
+      - name: Upload main's results
+        id: upload-results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/results-main
+          include-hidden-files: true
+
+      - name: Upload cases
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/cases
+
+  # The PR head's side. Executes the PR's code, with the read-only eval role.
+  pairwise-pr:
+    permissions:
+      contents: read
+      id-token: write
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
       - name: Checkout main (tooling)
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR head (agent under test)
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.pr.outputs.head_sha }}
+          ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
 
       - uses: actions/setup-node@v6
@@ -106,27 +259,19 @@ jobs:
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
           owner: thegoodparty
 
-      # The scenario list is fixed, so every eval replays the same cases. The
-      # PR's own manifest wins when it has one, so a PR that adds a scenario
-      # is evaluated on it.
       - name: Load scenarios
-        id: scenarios
         env:
           REVIEW_BUCKET: delegate-reviews
-          SUITE: ${{ steps.parse.outputs.suite }}
+          SUITE: ${{ needs.prepare.outputs.suite }}
         run: |
           manifest=delegate/review/eval/scenarios.json
           if [ -f "pr/$manifest" ]; then manifest="pr/$manifest"; fi
-          echo "manifest=${manifest}" >> "$GITHUB_OUTPUT"
           npm run -s review:eval -- cases scenarios \
             --manifest "$manifest" \
             --out ./eval/cases \
             --suite "$SUITE"
 
-      # Both sides are replayed on the same scenarios: what production posted
-      # at the time came from whatever agent version was live, and a failed
-      # run posted nothing to compare against.
-      - name: Replay main and PR head
+      - name: Replay PR head
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
@@ -134,46 +279,89 @@ jobs:
           REVIEW_BUCKET: delegate-reviews
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # gh clones with the app token, but the follow-up git fetch of the
-          # recorded sha needs it too, or private repos fail to check out.
           gh auth setup-git
-          main_sha7=$(git rev-parse --short=7 HEAD)
-          echo "main_sha7=${main_sha7}" >> "$GITHUB_ENV"
-          npm run -s review:eval -- replay \
-            --cases ./eval/cases \
-            --out ./eval/results-main \
-            --variant main-${main_sha7} \
-            --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work-main &
-          main_pid=$!
-          (cd pr && npm run -s review:eval -- replay \
+          cd pr && npm run -s review:eval -- replay \
             --cases ../eval/cases \
             --out ../eval/results-pr \
-            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work-pr) &
-          pr_pid=$!
-          main_status=0; pr_status=0
-          wait $main_pid || main_status=$?
-          wait $pr_pid || pr_status=$?
-          if [ $main_status -ne 0 ] || [ $pr_status -ne 0 ]; then exit 1; fi
+            --work-dir ${{ runner.temp }}/work-pr
+
+      - name: Upload PR results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-pr-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/results-pr
+
+  # Judges the two result sets. Main's code only, and no AWS credentials: it
+  # reads the cases and results from artifacts.
+  pairwise-judge:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    needs: [prepare, pairwise-main, pairwise-pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - name: Checkout PR scenario manifest (data only)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: pr/
+          sparse-checkout: delegate/review/eval/scenarios.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download main's results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/results-main
+
+      - name: Download cases
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/cases
+
+      - name: Download PR results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-pr-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval/results-pr
 
       - name: Judge
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-          REVIEW_BUCKET: delegate-reviews
         run: |
+          manifest=delegate/review/eval/scenarios.json
+          if [ -f "pr/$manifest" ]; then manifest="pr/$manifest"; fi
           npm run -s review:eval -- judge \
             --cases ./eval/cases \
             --a ./eval/results-main \
             --b ./eval/results-pr \
-            --label-a main-${main_sha7} \
-            --label-b pr-${{ steps.pr.outputs.sha7 }} \
+            --label-a main-${{ needs.prepare.outputs.main_sha7 }} \
+            --label-b pr-${{ needs.prepare.outputs.sha7 }} \
             --passes 4 \
             --concurrency 6 \
-            --manifest ${{ steps.scenarios.outputs.manifest }} \
+            --manifest "$manifest" \
             --out ./eval/report.md \
             --pr-comment ./eval/comment.md \
             --run-url https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -183,7 +371,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           body=$(cat ./eval/comment.md)
-          pr=${{ steps.parse.outputs.pr_number }}
+          pr=${{ needs.prepare.outputs.pr_number }}
           existing_id=$(gh api --paginate repos/${{ github.repository }}/issues/${pr}/comments \
             --jq '.[] | select(.body | startswith("<!-- delegate-eval -->")) | .id' | sed -n 1p)
           if [ -n "$existing_id" ]; then
@@ -198,68 +386,152 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: delegate-eval-${{ steps.pr.outputs.sha7 }}
+          name: delegate-eval-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/
 
-      - name: Remove eyes reaction
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          reaction_id=$(gh api \
-            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
-            --jq '[.[] | select(.content == "eyes")] | first | .id // empty')
-          if [ -n "$reaction_id" ]; then
-            gh api --method DELETE \
-              repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
-          fi
+  # The only writer of the cache. The reusable workflow's own job_workflow_ref
+  # is what the push role trusts.
+  pairwise-cache-push:
+    needs: [prepare, pairwise-main]
+    if: always() && needs.pairwise-main.outputs.results_artifact_id != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-cache-push.yml
+    with:
+      artifact-id: ${{ needs.pairwise-main.outputs.results_artifact_id }}
+      replay-key: ${{ needs.pairwise-main.outputs.replay_key }}
+      suite: ${{ needs.prepare.outputs.suite }}
+      layout: flat
+      main-sha: ${{ needs.prepare.outputs.main_sha }}
 
-  # The known-answer cases in expected/manifest.json, run against the PR head
-  # on their own runner so they add no wall time. Scored on outcome alone and
-  # posted as a separate comment.
-  expected:
-    if: |
-      github.event.issue.pull_request != null &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-      startsWith(github.event.comment.body, 'delegate eval')
+  # The known-answer cases in expected/manifest.json. Main's answers to them
+  # are the baseline each case is read against: replayed (or pulled from the
+  # cache) in a main-only job, alongside the PR head's own replay.
+  expected-main:
+    permissions:
+      contents: read
+      id-token: write
+    needs: prepare
+    outputs:
+      replay_key: ${{ steps.cache.outputs.replay_key }}
+      suite: ${{ steps.cache.outputs.suite }}
+      results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     steps:
-      - name: Resolve PR head sha
-        id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          head_repo=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.repo.full_name')
-          if [ "$head_repo" != "${{ github.repository }}" ]; then
-            echo "::error::delegate eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
-            exit 1
-          fi
-          sha=$(gh api repos/${{ github.repository }}/pulls/${PR_NUMBER} --jq '.head.sha')
-          echo "head_sha=${sha}" >> "$GITHUB_OUTPUT"
-          echo "sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout main (cases and scoring)
+      - name: Checkout main
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
-
-      - name: Checkout PR head (agent under test)
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ steps.pr.outputs.head_sha }}
-          path: pr/
 
       - uses: actions/setup-node@v6
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - name: Install deps (main)
+      - name: Install deps
         run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
+          aws-region: us-west-2
+
+      - name: Create GitHub App token for repo cloning
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          owner: thegoodparty
+
+      # The cache suite is also keyed on the tree of expected/, so an edited
+      # case definition never reuses an answer to the old one.
+      - name: Pull main's expected-result cache
+        id: cache
+        env:
+          REVIEW_BUCKET: delegate-reviews
+        run: |
+          replay_key=$(npm run -s review:eval -- cache key)
+          cases_tree=$(git rev-parse HEAD:delegate/review/eval/expected)
+          echo "replay_key=${replay_key}" >> "$GITHUB_OUTPUT"
+          echo "suite=expected-${cases_tree:0:12}" >> "$GITHUB_OUTPUT"
+          npm run -s review:eval -- cache pull \
+            --suite "expected-${cases_tree:0:12}" \
+            --key "$replay_key" \
+            --layout runs \
+            --out ./eval-expected-main
+
+      - name: Replay main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh auth setup-git
+          npm run -s review:expect -- \
+            --mode replay \
+            --runs 3 \
+            --concurrency 5 \
+            --variant main-${{ needs.prepare.outputs.main_sha7 }} \
+            --out ./eval-expected-main \
+            --work-dir ${{ runner.temp }}/work-expected-main
+
+      # Uploaded even when the replay failed, so the good runs still reach the
+      # cache. Hidden files are included for the pulled-results marker.
+      - name: Upload main's results
+        id: upload-results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected-main/
+          include-hidden-files: true
+
+  expected-cache-push:
+    needs: [prepare, expected-main]
+    if: always() && needs.expected-main.outputs.results_artifact_id != ''
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/delegate-eval-cache-push.yml
+    with:
+      artifact-id: ${{ needs.expected-main.outputs.results_artifact_id }}
+      replay-key: ${{ needs.expected-main.outputs.replay_key }}
+      suite: ${{ needs.expected-main.outputs.suite }}
+      layout: runs
+      main-sha: ${{ needs.prepare.outputs.main_sha }}
+
+  # Executes the PR's code, with the read-only eval role.
+  expected-pr:
+    permissions:
+      contents: read
+      id-token: write
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout main (cases and scoring)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - name: Checkout PR head (agent under test)
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+          path: pr/
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
 
       - name: Install deps (pr)
         run: npm ci
@@ -293,21 +565,68 @@ jobs:
             --manifest ../delegate/review/eval/expected/manifest.json \
             --runs 3 \
             --concurrency 5 \
-            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --out ../eval-expected \
             --work-dir ${{ runner.temp }}/work-expected
+
+      - name: Upload PR results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected/
+
+  # Scores with main's code, so a PR cannot change the cases or the scoring it
+  # is graded on. No AWS credentials.
+  expected-score:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    needs: [prepare, expected-main, expected-pr]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.main_sha }}
+          path: .
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download main's results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected-main
+
+      - name: Download PR results
+        uses: actions/download-artifact@v4
+        with:
+          name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
+          path: ./eval-expected
 
       - name: Score against main's expectations
         run: |
           npm run -s review:expect -- \
             --mode score \
-            --variant pr-${{ steps.pr.outputs.sha7 }} \
+            --runs 3 \
+            --variant pr-${{ needs.prepare.outputs.sha7 }} \
+            --baseline ./eval-expected-main \
+            --baseline-variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --out ./eval-expected
 
       - name: Post or update PR comment
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
         run: |
           body=$(printf '<!-- delegate-eval-expected -->\n%s\n\n[Workflow run](https://github.com/%s/actions/runs/%s) has every result as an artifact.' \
             "$(cat ./eval-expected/report.md)" "${{ github.repository }}" "${{ github.run_id }}")
@@ -323,5 +642,26 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: delegate-eval-expected-${{ steps.pr.outputs.sha7 }}
-          path: ./eval-expected/
+          name: delegate-eval-expected-${{ needs.prepare.outputs.sha7 }}
+          path: |
+            ./eval-expected/
+            ./eval-expected-main/
+
+  finish:
+    permissions:
+      issues: write
+    needs: [prepare, pairwise-judge, expected-score]
+    if: always() && needs.prepare.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove eyes reaction
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reaction_id=$(gh api \
+            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            --jq '[.[] | select(.content == "eyes")] | first | .id // empty')
+          if [ -n "$reaction_id" ]; then
+            gh api --method DELETE \
+              repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
+          fi

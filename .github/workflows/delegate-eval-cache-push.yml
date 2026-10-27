@@ -1,0 +1,78 @@
+name: Delegate eval cache push
+
+# Called by delegate-eval.yml. A job in a called workflow presents this file as
+# its job_workflow_ref, which is what the cache-push role's trust accepts, so
+# no job in delegate-eval.yml can assume that role. This is the only workflow
+# that can write the eval cache, and it runs only main's code.
+on:
+  workflow_call:
+    inputs:
+      artifact-id:
+        description: Id of the artifact main's replay job uploaded
+        type: string
+        required: true
+      replay-key:
+        type: string
+        required: true
+      suite:
+        type: string
+        required: true
+      layout:
+        description: flat or runs
+        type: string
+        required: true
+      main-sha:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.main-sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download main's results
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.artifact-id }}
+          path: ./results
+          merge-multiple: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval-cache-push
+          aws-region: us-west-2
+
+      # Errored and failed results are skipped by the command itself, and a key
+      # that already exists is left alone.
+      - name: Push to the eval cache
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          SUITE: ${{ inputs.suite }}
+          REPLAY_KEY: ${{ inputs.replay-key }}
+          LAYOUT: ${{ inputs.layout }}
+        run: |
+          npm run -s review:eval -- cache push \
+            --suite "$SUITE" \
+            --key "$REPLAY_KEY" \
+            --layout "$LAYOUT" \
+            --out ./results

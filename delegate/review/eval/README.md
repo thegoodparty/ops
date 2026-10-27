@@ -56,6 +56,18 @@ For each case, clones the target repo at `bundle.headSha`, runs the agent exactl
 
 Each replay is a full agent run — budget roughly $1–5 per case depending on diff size.
 
+### Cache main's results
+
+`delegate eval` replays main on every run, which is half its cost. Main's results are cached in `s3://delegate-reviews/eval-cache/main/<replayKey>/<suite>/<caseId>/run-<n>.json`, where `<replayKey>` is `cache key`: a hash of the git tree ids of `delegate/agents`, `delegate/framework`, `delegate/review` and `package-lock.json` on main, which is everything main's replay executes. Unrelated merges keep the cache warm; a change to any of those starts a fresh full replay (an eval-code edit under `delegate/review` costs a replay, never a stale baseline). A pairwise result is stored as `run-1`.
+
+```sh
+npm run review:eval -- cache pull --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
+# replay as usual into the same directory: cases with a result file are skipped
+npm run review:eval -- cache push --suite core --key "$(npm run -s review:eval -- cache key)" --out ./results-main
+```
+
+Use `--layout runs` for the expected suite's `<case>/run-<n>.json` directories. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, and a record under `reviews/` is written once, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 case(s); N already had results`.
+
 ### Judge two sets of results
 
 ```sh
@@ -104,13 +116,13 @@ Nine cases with a known right answer, listed in `expected/manifest.json`. Each i
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` as `cases[].main = { runs, completed, runsPassed, unfinished }` for the merge gate to read. `runs` is how many runs each case should have; a run that errored or never happened counts toward `unfinished`, not toward `runsPassed` or a failure, and the markdown reads `2/2 (1 of 3 runs unfinished)`. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
 
 ```sh
-npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect]
+npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` and the report to `<out>/report.md`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
 
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   githubActionsDelegateEvalTrust,
   githubActionsDelegateEval,
+  githubActionsDelegateEvalCachePushTrust,
+  githubActionsDelegateEvalCachePush,
 } from "./components/ci-roles/policies";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
@@ -73,6 +75,13 @@ describe("githubActionsDelegateEval", () => {
     assert.equal(resource, "arn:aws:s3:::delegate-reviews/*");
   });
 
+  it("grants no write action, so every job that can assume it is read-only", () => {
+    assert.deepEqual(
+      actions().filter((a) => /Put|Delete|Replicate|Restore|Abort/.test(a)),
+      [],
+    );
+  });
+
   it("scopes list to the delegate-reviews bucket itself", () => {
     const listStatement = githubActionsDelegateEval.Statement.find(
       (s) =>
@@ -97,5 +106,42 @@ describe("githubActionsDelegateEval", () => {
         `resource outside delegate-reviews: ${resource}`,
       );
     }
+  });
+});
+
+describe("githubActionsDelegateEvalCachePushTrust", () => {
+  const [statement] = githubActionsDelegateEvalCachePushTrust.Statement;
+
+  it("has exactly one statement", () => {
+    assert.equal(githubActionsDelegateEvalCachePushTrust.Statement.length, 1);
+  });
+
+  it("is pinned to the push workflow on ops main, not to delegate-eval.yml", () => {
+    assert.equal(
+      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+      "thegoodparty/ops/.github/workflows/delegate-eval-cache-push.yml@refs/heads/main",
+    );
+    assert.equal(
+      statement.Condition.StringEquals?.[SUBJECT_KEY],
+      "repo:thegoodparty/ops:ref:refs/heads/main",
+    );
+    assert.notEqual(
+      statement.Condition.StringEquals?.[WORKFLOW_KEY],
+      githubActionsDelegateEvalTrust.Statement[0].Condition.StringEquals?.[WORKFLOW_KEY],
+    );
+  });
+});
+
+describe("githubActionsDelegateEvalCachePush", () => {
+  it("is exactly a conditional PutObject on eval-cache/*", () => {
+    assert.deepEqual(githubActionsDelegateEvalCachePush.Statement, [
+      {
+        Sid: "DelegateEvalCacheWrite",
+        Effect: "Allow",
+        Action: "s3:PutObject",
+        Resource: "arn:aws:s3:::delegate-reviews/eval-cache/*",
+        Condition: { Null: { "s3:if-none-match": "false" } },
+      },
+    ]);
   });
 });
