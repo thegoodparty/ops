@@ -1,5 +1,6 @@
 import { execFileSync } from "child_process";
-import type { Bundle, PriorFinding, ReviewRecord } from "./schema";
+import { isPlanPath, parsePlanBinding } from "./gating";
+import type { Bundle, Plan, PriorFinding, ReviewRecord } from "./schema";
 import type { createGitHub } from "./github";
 
 const EXEC_OPTS = { timeout: 60_000, maxBuffer: 50 * 1024 * 1024 } as const;
@@ -21,6 +22,14 @@ export const buildBundle = async (args: {
   reviewDir: string;
   github: ReturnType<typeof createGitHub>;
   priorFindings: PriorFinding[];
+  /**
+   * Resolve the PR's `Plan:` binding and read the plan at the base ref. False
+   * by default, and false is the whole no-op guarantee: with the gate off this
+   * function makes exactly the GitHub calls and builds exactly the bundle it
+   * built before the gate existed, so the prompt, the verdict and the body are
+   * unchanged.
+   */
+  resolvePlan?: boolean;
 }): Promise<Bundle> => {
   const pull = await args.github.getPull(args.repo, args.prNumber);
 
@@ -83,6 +92,22 @@ export const buildBundle = async (args: {
     .split("\n")
     .filter(Boolean);
 
+  // The plan is read once, here, and only when the gate asked for it. The
+  // binding is parsed here to decide what to fetch; the gate itself re-derives
+  // it from the bundle in `gating.ts`, so the two cannot disagree about what
+  // the PR named. Two things it deliberately does not do: read the plan out of
+  // the PR (the author would be supplying the spec) and read it off any base
+  // ref but `main` (an unmerged plan is a proposal, not a spec).
+  let plan: Plan | undefined;
+  if (args.resolvePlan) {
+    const binding = parsePlanBinding(pull.body);
+    const path = binding.paths.length === 1 ? binding.paths[0] : undefined;
+    if (path !== undefined && isPlanPath(path) && pull.baseRef === "main") {
+      const file = await args.github.getFileAtRef(args.repo, path, pull.baseRef);
+      if (file !== undefined) plan = { path, blobSha: file.blobSha, text: file.text };
+    }
+  }
+
   return {
     repo: args.repo,
     prNumber: args.prNumber,
@@ -95,5 +120,6 @@ export const buildBundle = async (args: {
     diff,
     changedFiles,
     priorFindings: args.priorFindings,
+    ...(plan !== undefined ? { plan } : {}),
   };
 };

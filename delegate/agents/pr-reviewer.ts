@@ -69,11 +69,13 @@ ${pd.inline}
     )
     .join("\n");
 
-  // Dormant in production: nothing populates bundle.plan until step 4 of
-  // `docs/plan-gated-merges.md`, so a production prompt is byte-for-byte what
-  // it was before this element existed. The eval corpus in
-  // delegate/review/eval/expected/ is the only caller that sets a plan today,
-  // and it scores the answer this section asks for.
+  // Present when the gate is on: `bundle.ts` reads the PR's `Plan:` binding at
+  // `main` and puts the text here, so the same prompt asks the consistency
+  // question that `gates.ts` treats as case 5 of
+  // `docs/plan-gated-merges.md`. Absent whenever gating did not run
+  // (`DELEGATE_GATING_MODE=off`, the default, or a repo that has not adopted
+  // it), and then this prompt is byte-for-byte what it was before the element
+  // existed.
   //
   // The plan text is escaped rather than boundary-tokened like the diff: it is
   // prose read from `main`, not code, so XML-escaping cannot change what the

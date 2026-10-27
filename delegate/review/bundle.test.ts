@@ -189,3 +189,126 @@ describe("buildBundle", () => {
     assert.deepEqual(bundle.priorFindings, priorFindings);
   });
 });
+
+// The plan is read only when the gate asked for it, and only from `main`.
+// Every other path is the no-op guarantee: `DELEGATE_GATING_MODE=off` passes
+// `resolvePlan: false`, and then this function makes exactly the GitHub calls
+// it made before the gate existed.
+describe("buildBundle plan resolution", () => {
+  let tempDir: string;
+  let baseSha: string;
+
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: tempDir, encoding: "utf8" }).trim();
+
+  before(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "bundle-plan-test-"));
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test User");
+    writeFileSync(join(tempDir, "foo.ts"), "const x = 1;\n");
+    git("add", ".");
+    git("commit", "-m", "base commit");
+    baseSha = git("rev-parse", "HEAD");
+    writeFileSync(join(tempDir, "foo.ts"), "const x = 2;\n");
+    git("add", ".");
+    git("commit", "-m", "pr change");
+  });
+
+  after(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const PLAN_SHA = "1c7ac96f062c9263697f7208056f9941e4dc499a";
+
+  const stub = (body: string, baseRef = "main") => {
+    const calls: Array<{ path: string; ref: string }> = [];
+    const github = {
+      getPull: async () => ({
+        headSha: "unused",
+        baseSha,
+        baseRef,
+        title: "T",
+        body,
+        author: "u",
+        isDraft: false,
+        changedFiles: [],
+      }),
+      getFileAtRef: async (_repo: string, path: string, ref: string) => {
+        calls.push({ path, ref });
+        return path.endsWith(".md") ? { blobSha: PLAN_SHA, text: "# the plan\n" } : undefined;
+      },
+    } as unknown as ReturnType<typeof createGitHub>;
+    return { github, calls };
+  };
+
+  const build = (github: ReturnType<typeof createGitHub>, resolvePlan?: boolean) =>
+    buildBundle({
+      repo: "thegoodparty/ops",
+      prNumber: 4,
+      reviewDir: tempDir,
+      github,
+      priorFindings: [],
+      ...(resolvePlan !== undefined ? { resolvePlan } : {}),
+    });
+
+  it("makes no extra call and adds no plan when the gate is off", async () => {
+    const { github, calls } = stub("Plan: docs/plan.md");
+    for (const resolvePlan of [undefined, false]) {
+      const bundle = await build(github, resolvePlan);
+      assert.equal(bundle.plan, undefined);
+    }
+    assert.deepEqual(calls, []);
+  });
+
+  it("reads the bound plan at the base ref and puts it on the bundle", async () => {
+    const { github, calls } = stub("Plan: docs/plan-gated-merges.md\nStep: 4");
+    const bundle = await build(github, true);
+    assert.deepEqual(calls, [{ path: "docs/plan-gated-merges.md", ref: "main" }]);
+    assert.deepEqual(bundle.plan, {
+      path: "docs/plan-gated-merges.md",
+      blobSha: PLAN_SHA,
+      text: "# the plan\n",
+    });
+  });
+
+  it("does not read a plan off a base ref that is not main", async () => {
+    const { github, calls } = stub("Plan: docs/plan.md", "release/2026");
+    const bundle = await build(github, true);
+    assert.deepEqual(calls, []);
+    assert.equal(bundle.plan, undefined);
+    assert.equal(bundle.baseRef, "release/2026");
+  });
+
+  it("does not read anything when the binding is absent, ambiguous or invalid", async () => {
+    for (const body of [
+      "no plan here",
+      "Plan: docs/a.md\nPlan: docs/b.md",
+      "Plan: README.md",
+      "Plan: docs/a.txt",
+    ]) {
+      const { github, calls } = stub(body);
+      const bundle = await build(github, true);
+      assert.deepEqual(calls, [], body);
+      assert.equal(bundle.plan, undefined, body);
+    }
+  });
+
+  it("leaves the plan off the bundle when it does not exist at the base ref", async () => {
+    const github = {
+      getPull: async () => ({
+        headSha: "unused",
+        baseSha,
+        baseRef: "main",
+        title: "T",
+        body: "Plan: docs/not-yet.md",
+        author: "u",
+        isDraft: false,
+        changedFiles: [],
+      }),
+      getFileAtRef: async () => undefined,
+    } as unknown as ReturnType<typeof createGitHub>;
+    const bundle = await build(github, true);
+    assert.equal(bundle.plan, undefined);
+  });
+});
