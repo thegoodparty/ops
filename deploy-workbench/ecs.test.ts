@@ -951,21 +951,28 @@ describe("bifrost ecs", () => {
     );
 
     // Derived from the two windows it has to clear, not a number of its own:
-    // the container's start period, one ALB check already in flight when the
-    // process starts answering, and two full interval ticks for the two
-    // successes that promote the target.
-    assert.equal(BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS, 115);
+    // the container check's whole tolerance — its start period plus the retries
+    // it still allows afterwards — and then the ALB's promotion window, because
+    // the grace clock starts at RUNNING while the two successes that promote
+    // the target only begin once the process answers.
+    assert.equal(BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS, 160);
     assert.equal(
       BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
       BIFROST_HEALTH_CHECK.startPeriod +
+        BIFROST_HEALTH_CHECK.interval * BIFROST_HEALTH_CHECK.retries +
         TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS +
         TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS *
           TARGET_GROUP_HEALTHY_THRESHOLD,
     );
+    // Not just the start period: the container check ignores failures for that
+    // long and then allows its retries, so a boot ending inside that window is
+    // one the deployment means to keep. A grace period that expired earlier
+    // would let the ALB replace exactly that task.
     assert.ok(
-      BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS >=
-        BIFROST_HEALTH_CHECK.startPeriod,
-      "the grace period must cover the container's own start period",
+      BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS >
+        BIFROST_HEALTH_CHECK.startPeriod +
+          BIFROST_HEALTH_CHECK.interval * BIFROST_HEALTH_CHECK.retries,
+      "the grace period must cover the container check's whole tolerance, not only its start period",
     );
     assert.ok(
       BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS >

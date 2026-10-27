@@ -364,18 +364,37 @@ export const BIFROST_HEALTH_CHECK: {
  * beginning — a replacement loop with an empty gateway, which is worse than
  * the gap this deployment is accepted to have.
  *
- * The value is derived, not guessed: the container's start period, plus the one
- * ALB check that can already be in flight when the process starts answering,
- * plus two full interval ticks for the two successes that promote the target.
- * 90 + 5 + 2 * 10 = 115 seconds. The tests hold it above both windows it has to
- * cover: the container start period, and the target group's own unhealthy
- * declaration.
+ * The value is derived, not guessed, from the longest boot the deployment
+ * already says it will tolerate. That is the container check's whole tolerance,
+ * not just its start period: failures are ignored for `startPeriod`, and after
+ * it the check still allows `retries` consecutive failures `interval` apart
+ * before it calls the task unhealthy, so a boot that ends at 90 + 3 * 15 = 135
+ * seconds is one the container check would still have called healthy. A grace
+ * period that expired at the start period alone would let the ALB replace that
+ * task anyway, which is the loop again, one boot length further out. So:
+ *
+ *   startPeriod               90
+ *   retries * interval        + 3 * 15 = 45  (the failures after it)
+ *   one ALB check in flight   + 5            (its timeout)
+ *   two ALB interval ticks    + 2 * 10 = 20  (the two successes)
+ *   = 160 seconds
+ *
+ * The ALB terms are there because ECS starts the grace clock at `RUNNING`,
+ * before the process answers, while the two successes that promote the target
+ * only begin once it does: the container check can call a task healthy at 135
+ * seconds while the ALB still needs its two checks after that. The tests hold
+ * the value to this sum and above the target group's own unhealthy window.
+ *
+ * 160 seconds is also the point of diminishing returns: lengthening it further
+ * would tolerate a boot the container check has already given up on, and the
+ * grace period is what bounds how long a genuinely broken task is left in place
+ * before ECS replaces it.
  *
  * The cost is one-sided. The grace period suppresses ECS's reaction to failing
  * load balancer health checks; it does not change the health checks, the
  * target's state or the traffic, so a task that recovers inside it is promoted
- * by the ALB after the usual two successes and nothing waits 115 seconds. A
- * task that is genuinely broken is left in place for up to 115 seconds per
+ * by the ALB after the usual two successes and nothing waits 160 seconds. A
+ * task that is genuinely broken is left in place for up to 160 seconds per
  * attempt instead of ~30 before ECS replaces it. The gateway answers 503 in both
  * cases, so that is slower failure detection with the same outage shape, and it
  * is the trade for never restarting a task that is merely migrating.
@@ -385,6 +404,7 @@ export const BIFROST_HEALTH_CHECK: {
  */
 export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
   BIFROST_HEALTH_CHECK.startPeriod +
+  BIFROST_HEALTH_CHECK.interval * BIFROST_HEALTH_CHECK.retries +
   TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS +
   TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS * TARGET_GROUP_HEALTHY_THRESHOLD;
 

@@ -260,8 +260,9 @@ export const TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS = 30;
  * the replacement would run them again. The second half of that decision is the
  * service's `healthCheckGracePeriodSeconds`
  * (`BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS` in `ecs.ts`), which is derived
- * from these three values: changing them invalidates that derivation and the
- * test that pins it, on purpose.
+ * from these three values and the gateway container check's own tolerance:
+ * changing them invalidates that derivation and the test that pins it, on
+ * purpose.
  *
  * Both health check paths are local and cheap (`/health` on the gateway,
  * `/ping` on the sidecar), so the shorter interval costs nothing worth counting.
