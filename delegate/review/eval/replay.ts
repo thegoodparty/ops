@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { rmSync } from "node:fs";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
@@ -23,6 +22,30 @@ export interface Result {
   costUsd: number | null;
   wallTimeMs: number;
 }
+
+// caseId -> replay number -> result.
+export type RunResults = Map<string, Map<number, Result>>;
+
+// A replay dir holds <caseId>/run-<n>.json. A loose <caseId>.json (what
+// `results from-cases` writes) counts as run 1.
+export const loadRunResults = (dir: string): RunResults => {
+  const runs: RunResults = new Map();
+  const add = (path: string, run: number) => {
+    const result = JSON.parse(readFileSync(path, "utf-8")) as Result;
+    runs.set(result.caseId, (runs.get(result.caseId) ?? new Map()).set(run, result));
+  };
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      for (const f of readdirSync(join(dir, entry.name))) {
+        const m = /^run-(\d+)\.json$/.exec(f);
+        if (m) add(join(dir, entry.name, f), Number(m[1]));
+      }
+    } else if (entry.name.endsWith(".json")) {
+      add(join(dir, entry.name), 1);
+    }
+  }
+  return runs;
+};
 
 export const resultFromRecord = (record: ReviewRecord): Result => ({
   caseId: record.runId,
@@ -173,6 +196,8 @@ export interface ReplayAllOptions {
   variant?: string;
   workDir?: string;
   force?: boolean;
+  // Replays per case, each written to <out>/<caseId>/run-<n>.json.
+  replays?: number;
 }
 
 export const replayAll = async (
@@ -182,44 +207,48 @@ export const replayAll = async (
   runAgentImpl?: RunAgentImpl,
   checkoutFn?: CheckoutFn,
 ): Promise<Result[]> => {
-  const { out, variant, workDir = "/tmp/review-eval", force = false } = opts;
+  const { out, variant, workDir = "/tmp/review-eval", force = false, replays = 1 } = opts;
   const { concurrency = 4 } = poolOpts;
 
   mkdirSync(out, { recursive: true });
   mkdirSync(workDir, { recursive: true });
 
   const results: Result[] = [];
-  const toRun: ReviewRecord[] = [];
+  const toRun: { record: ReviewRecord; run: number }[] = [];
 
   for (const record of records) {
-    const resultPath = join(out, `${record.runId}.json`);
-    if (!force && existsSync(resultPath)) {
-      try {
-        results.push(JSON.parse(readFileSync(resultPath, "utf-8")) as Result);
-        continue;
-      } catch {
-        // file unreadable — fall through to replay
+    for (let run = 1; run <= replays; run++) {
+      const resultPath = join(out, record.runId, `run-${run}.json`);
+      if (!force && existsSync(resultPath)) {
+        try {
+          results.push(JSON.parse(readFileSync(resultPath, "utf-8")) as Result);
+          continue;
+        } catch {
+          // file unreadable — fall through to replay
+        }
       }
+      toRun.push({ record, run });
     }
-    toRun.push(record);
   }
 
-  console.error(`Replaying ${toRun.length} case(s); ${results.length} already had results`);
+  console.error(`Replaying ${toRun.length} run(s); ${results.length} already had results`);
   if (toRun.length === 0) return results;
 
   let index = 0;
   const worker = async () => {
     while (index < toRun.length) {
-      const record = toRun[index++];
+      const { record, run } = toRun[index++];
+      // A case's replays run side by side, so each needs its own checkout dir.
       const result = await replayCase(
         record,
-        { workDir, variant },
+        { workDir: join(workDir, `run-${run}`), variant },
         runAgentImpl,
         checkoutFn,
       );
       results.push(result);
+      mkdirSync(join(out, result.caseId), { recursive: true });
       writeFileSync(
-        join(out, `${result.caseId}.json`),
+        join(out, result.caseId, `run-${run}.json`),
         JSON.stringify(result, null, 2),
       );
     }

@@ -141,6 +141,10 @@ export const readManifest = (path: string): Scenario[] =>
 export const scenarioNames = (scenarios: Scenario[]): Map<string, string> =>
   new Map(scenarios.map((s) => [s.key.split("/").pop()!.replace(/\.json$/, ""), s.id]));
 
+// Keyed like scenarioNames, so the report can split cases without a lookup.
+export const scenarioSplits = (scenarios: Scenario[]): Map<string, Scenario["split"]> =>
+  new Map(scenarios.map((s) => [s.key.split("/").pop()!.replace(/\.json$/, ""), s.split]));
+
 // Fails loudly on a missing or invalid scenario: a suite that silently
 // shrinks is the moving-corpus problem this replaces.
 export const loadScenarios = async (
