@@ -353,8 +353,10 @@ deactivated key and an active one held by someone who left.
 ### 7. Distribution: `gp-pi bifrost-key`
 
 The interface is one command in the **`thegoodparty/gp-pi`** repository, in a
-later PR; this document only specifies it. The gateway's provider entry in Pi's
-`models.json` is:
+later PR; this document only specifies it. **The name is the interface, not yet
+a command that exists in the image** — checked against the `gp-pi` code and
+recorded at the end of this decision, because `gp-pi` is a host-side launcher
+there. The gateway's provider entry in Pi's `models.json` is:
 
 ```json
 "bifrost": {
