@@ -365,6 +365,25 @@ settings the store holds. A store that already has an admin account with
 dashboard auth disabled is left alone; re-enabling it needs proof of control,
 and that is a human decision.
 
+That early exit is what makes the claim safe with auth disabled, and it is
+worth naming the two upstream facts it rests on, because neither is obvious
+from this repo:
+
+- `loadAuthConfig` (`transports/bifrost-http/lib/config.go` at `v2.3.0`)
+  persists the admin account from a file's `auth_config` even with
+  `is_enabled: false`, so the row exists on the first boot after
+  `BIFROST_CONFIG` is injected.
+- `GET /api/config` includes `auth_config` whenever that row exists
+  (`handlers/config.go`, `getConfig`, "When authConfig is nil, no admin
+  account has been created yet" is the only case where it is omitted). So the
+  script's `has("auth_config")` test is true, not false, on a store whose
+  account was provisioned with auth disabled.
+
+Without those two the script would fall through to the claim branch and write
+`is_enabled: true`, silently undoing the decision this change makes. The
+order is load-bearing, and the claim is idempotent in the direction that
+matters: it only ever acts when no account exists.
+
 **One field it has to correct, and why that mattered.** The write path is
 stricter than the read path: a store that has never saved a retention returns
 `client_config.log_retention_days: 0`, and `PUT /api/config` refuses anything
@@ -402,9 +421,12 @@ to oauth2-proxy (`ingress.ts`, `ADMIN_PATH_PATTERNS`), so from a laptop the
 request is a 302 to Google sign-in, and the useful output never arrives. The
 state is therefore read from inside the task (or from the claim container's
 log line). Through the proxy the dashboard goes straight in: its loader calls
-`GET /api/config`, which succeeds because the sidecar presents the setup token,
-so `setup_required: true` never turns into a visible setup page for an
-allowlisted human.
+`GET /api/config` and, if that returns 200, redirects into the workspace
+instead of rendering the setup view (`ui/app/login/layout.tsx`,
+`setupSessionActive`). It returns 200 because the sidecar presents the setup
+token, so `setup_required: true` never turns into a visible setup page for an
+allowlisted human. That is also the one thing this file cannot prove: it is a
+property of the deployed task, and phase 2 item 12 confirms it end to end.
 
 **Doing it by hand**, for a break-glass claim or when the container's log says
 it exited non-zero. Read the token and the admin password from
