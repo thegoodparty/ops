@@ -204,7 +204,7 @@ from nothing else (`deploy-workbench/network.ts`). That rule is the first
 exception to that invariant and it belongs in the PR that adds the function,
 documented where the rule is written.
 
-**Not verified, and the whole of step 2 depends on it:** that a Lambda attached
+**Not verified, and the whole of step 3 depends on it:** that a Lambda attached
 to those subnets can reach the task on 8080 at all, and that the gateway
 answers a setup-token request on that path. See "Open items".
 
@@ -714,7 +714,7 @@ Everything else:
 
 ## Open items, and what is not yet verified
 
-1. **The Lambda-to-Bifrost network path.** Not verified, and step 2 cannot land
+1. **The Lambda-to-Bifrost network path.** Not verified, and step 3 cannot land
    without it. To check: that a Lambda attached to the gateway's private
    subnets can open 8080 on the task (a new ingress rule on
    `bifrostTaskSecurityGroup`, and the task's own egress already allows what it
