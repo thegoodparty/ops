@@ -41,7 +41,7 @@ import {
   OAUTH2_PROXY_CONTAINER_NAME,
   OAUTH2_PROXY_COMMAND,
   OAUTH2_PROXY_ENVIRONMENT,
-  OAUTH2_PROXY_INJECTED_SECRET_KEYS,
+  OAUTH2_PROXY_GATEWAY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_NAME,
   PG_DATABASE_ENV_NAME,
@@ -424,9 +424,9 @@ describe("bifrost ecs", () => {
 
     // The gateway container gets exactly its own five, by name, from its own
     // container; the sidecar gets its own three from its own container, plus
-    // the admin pair from the gateway's — the two values its entrypoint encodes
-    // into the header oauth2-proxy injects. It never gets the gateway's provider
-    // key, encryption key or setup token.
+    // the setup token from the gateway's — the value the alpha configuration
+    // injects as Bifrost's setup-lock header. It never gets the gateway's
+    // provider key, encryption key or admin username/password.
     const gateway = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(gateway.includes("GATEWAY_SECRET_KEYS.map"), gateway);
     assert.ok(
@@ -443,13 +443,12 @@ describe("bifrost ecs", () => {
       sidecar.includes("secretReference(OAUTH2_PROXY_SECRET_NAME, key)"),
       sidecar,
     );
-    assert.deepEqual([...OAUTH2_PROXY_INJECTED_SECRET_KEYS], [
-      "BIFROST_ADMIN_USERNAME",
-      "BIFROST_ADMIN_PASSWORD",
+    assert.deepEqual([...OAUTH2_PROXY_GATEWAY_SECRET_KEYS], [
+      "BIFROST_SETUP_TOKEN",
     ]);
     assert.ok(
       sidecar.includes("secretReference(GATEWAY_SECRET_NAME, key)"),
-      "the sidecar's admin pair must come from the gateway's own secret",
+      "the sidecar's setup token must come from the gateway's own secret",
     );
   });
 
@@ -720,23 +719,22 @@ describe("bifrost ecs", () => {
       sidecar.includes("secretReference(OAUTH2_PROXY_SECRET_NAME, key)"),
       sidecar,
     );
-    // The admin pair from `bifrost/gateway`, and nothing else from it: the
-    // entrypoint wrapper encodes exactly these two into the header the alpha
-    // configuration injects. The provider key, the encryption key and the
-    // setup token stay with the gateway and the claim container.
+    // The setup token from `bifrost/gateway`, and nothing else from it: the
+    // baked alpha configuration injects exactly that as the header Bifrost's
+    // setup lock reads. The provider key, the encryption key and the admin
+    // username/password stay with the gateway and the claim container.
     assert.ok(
-      sidecar.includes("OAUTH2_PROXY_INJECTED_SECRET_KEYS.map"),
+      sidecar.includes("OAUTH2_PROXY_GATEWAY_SECRET_KEYS.map"),
       sidecar,
     );
     assert.ok(
       sidecar.includes("secretReference(GATEWAY_SECRET_NAME, key)"),
       sidecar,
     );
-    assert.deepEqual([...OAUTH2_PROXY_INJECTED_SECRET_KEYS], [
-      "BIFROST_ADMIN_USERNAME",
-      "BIFROST_ADMIN_PASSWORD",
+    assert.deepEqual([...OAUTH2_PROXY_GATEWAY_SECRET_KEYS], [
+      "BIFROST_SETUP_TOKEN",
     ]);
-    for (const key of OAUTH2_PROXY_INJECTED_SECRET_KEYS) {
+    for (const key of OAUTH2_PROXY_GATEWAY_SECRET_KEYS) {
       assert.ok(
         (GATEWAY_SECRET_KEYS as readonly string[]).includes(key),
         `${key} is not one of the gateway container's injected secrets`,
@@ -745,10 +743,11 @@ describe("bifrost ecs", () => {
     for (const key of [
       "FIREWORKS_API_KEY",
       "BIFROST_ENCRYPTION_KEY",
-      "BIFROST_SETUP_TOKEN",
+      "BIFROST_ADMIN_USERNAME",
+      "BIFROST_ADMIN_PASSWORD",
     ]) {
       assert.ok(
-        !(OAUTH2_PROXY_INJECTED_SECRET_KEYS as readonly string[]).includes(key),
+        !(OAUTH2_PROXY_GATEWAY_SECRET_KEYS as readonly string[]).includes(key),
         `the sidecar must not receive ${key}`,
       );
     }
@@ -761,25 +760,26 @@ describe("bifrost ecs", () => {
     assert.ok(sidecar.includes("essential: true"), sidecar);
   });
 
-  it("loads the baked alpha configuration so the admin credential is injected", () => {
-    // The flag is the only thing that turns `injectRequestHeaders` on. Without
-    // it the admin surface quietly reverts to Bifrost's shared password prompt,
-    // which is the state this change exists to remove.
+  it("loads the baked alpha configuration so the setup token is injected", () => {
+    // The flag is what loads the provider, the upstreams, the listen address
+    // and `injectRequestHeaders`. Without it oauth2-proxy has none of them at
+    // this tag and refuses to start, which is the state this change relies on
+    // rather than a silently unconfigured door.
     assert.deepEqual([...OAUTH2_PROXY_COMMAND], [
       `--alpha-config=${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
     ]);
 
     const sidecar = containerDefinitionBlock("OAUTH2_PROXY_CONTAINER_NAME");
     assert.ok(sidecar.includes("command: [...OAUTH2_PROXY_COMMAND]"), sidecar);
-    // The image's entrypoint is the wrapper that computes the credential. An
-    // entryPoint override here would start oauth2-proxy without it, and the
-    // header would never be set.
+    // The image's entrypoint is upstream's own; an entryPoint override here
+    // would be a second thing to maintain for no behavior.
     assert.ok(!sidecar.includes("entryPoint:"), sidecar);
 
-    // The value itself is never configuration: the wrapper derives it at start
-    // from the two secrets above. A static value in the environment would be a
-    // second copy that can drift from the password Bifrost holds.
-    assert.ok(!("BIFROST_ADMIN_AUTHORIZATION" in OAUTH2_PROXY_ENVIRONMENT));
+    // The value itself is never configuration: it arrives as a secret from
+    // `bifrost/gateway`, so the alpha file's `fromEnv` reads the same value
+    // the gateway and the claim container get. A static value in the
+    // environment would be a second copy that can drift.
+    assert.ok(!("BIFROST_SETUP_TOKEN" in OAUTH2_PROXY_ENVIRONMENT));
 
     // The alpha configuration is baked by the image, so the port it listens on
     // and the upstream it proxies to have to be the ports `network.ts` gives

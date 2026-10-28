@@ -270,9 +270,28 @@ including the cloud container, without depending on private-network
 reachability. The threat model to weigh is not "can someone reach port 443";
 it is "can someone get a virtual key", and the key is the control.
 
-Inference paths (`/v1/*`, `/anthropic/*`, `/openai/*`, `/genai/*`, `/health`,
-and `/metrics` if scraped) are open at the network layer and gated by virtual
-keys. The admin surface is not: it sits behind `oauth2-proxy`.
+Inference paths (`/v1/*`, `/anthropic/*`, `/openai/*`, `/genai/*`) are open
+at the network layer and gated by virtual keys, and `/health` is open and
+unauthenticated because the ALB's health check cannot present a credential.
+Everything else — the dashboard, `/api/*`, `/metrics` and every other route the
+gateway registers — is behind `oauth2-proxy`. The rule table in "Protecting the
+admin surface" is the authoritative list, and the commentary there records the
+route enumeration it was checked against at the pinned tag.
+
+**Revised decision: Bifrost's own dashboard auth is off.** The earlier version
+of this plan kept `governance.auth_config` enabled and had the sidecar inject
+the shared admin Basic credential, on the claim that a human would then meet
+only Google SSO. That claim was wrong in an important way: the dashboard's
+gate is a **session cookie**, not a per-request credential, so the injected
+Basic header authenticated the proxy's requests rather than a person, and
+every allowlisted address still acted as the same admin. The decision now is
+`is_enabled: false`: oauth2-proxy plus the committed email allowlist is the
+only gate on the admin surface, and the edge invariant — no route reaches
+Bifrost directly except the enumerated inference prefixes and `/health` — is
+what keeps that true. The admin username and password references stay in
+`config.json` and the setup token stays, because a store with auth disabled
+needs proof of operator control before auth can be turned back on; the section
+below is the detail.
 
 ### Protecting the admin surface
 
@@ -297,13 +316,47 @@ with no hop back through the ALB. A separate small ECS service buys nothing
 here, because the gateway is single-node OSS and the two containers restart
 together either way.
 
-**Routing.** The listener rules are:
+**Routing, and the edge invariant.** The listener rules are:
 
 - `/oauth2/*` → oauth2-proxy (login start, Google callback, sign-out).
-- The inference prefixes (`/v1/*`, `/anthropic/*`, `/openai/*`, `/genai/*`),
-  `/health` and `/metrics` → Bifrost directly, so a harness never meets a
-  browser redirect. `/metrics` stays on Bifrost's own basic auth.
-- Everything else — the UI and `/api/*` — falls through to oauth2-proxy.
+- `/` and `/api/*` → oauth2-proxy, so a browser or a script is authenticated
+  before Bifrost sees the request.
+- The four inference prefixes (`/v1/*`, `/anthropic/*`, `/openai/*`,
+  `/genai/*`) → Bifrost directly, so a harness never meets a browser redirect.
+  Every route under them is gated by a virtual key: the governance plugin's
+  `Evaluate` is the funnel every request pipeline passes through, and
+  `client.enforce_auth_on_inference: true` makes a missing or unknown key a
+  `401` before any provider call (`plugins/governance/main.go`,
+  `"virtual key is required"`).
+- `/health` → Bifrost directly, unauthenticated. **This is the one allowed
+  exception**, and it is allowed because the ALB target group's health check
+  is a machine that cannot authenticate; Bifrost whitelists the path itself, in
+  both its auth middleware and the OSS setup lock.
+- Everything else falls through to oauth2-proxy, which is the HTTPS listener's
+  **default action**. That is the half that keeps the failure direction closed:
+  a route added at the next Bifrost bump is behind the proxy unless someone
+  adds a rule for it.
+
+`/metrics` is deliberately not a direct rule. It used to be, on the strength of
+Bifrost's own basic auth; with that auth off the endpoint would have no
+credential at all, so the rule was removed rather than left for a future
+scraper to inherit as public. Nothing scrapes it yet (metrics wiring is phase 3
+item 15), so the cost today is zero. A machine scraper **cannot** authenticate
+through Google SSO, so the future scraper has to read `/metrics` over loopback
+from a sidecar in the task — not over the ALB, where the default action sends
+it to the proxy's sign-in flow.
+
+At the pinned tag the routes Bifrost registers are `/api/*`, `/v1/*`,
+`/anthropic/*`, `/openai/*`, `/genai/*`, `/cohere/*`, `/litellm/*`,
+`/langchain/*`, `/pydanticai/*`, `/bedrock/*`, `/typesafe/*`, `/cursor/*`,
+the seven `*_passthrough/*` prefixes, `/mcp` and `/mcp/{slug}`, `/agents/a2a/*`,
+`/ws`, `/realtime`, `/.well-known/*`, `/oauth2/{authorize,register,token}`,
+`/robots.txt`, `/` and `/{filepath:*}`, `/metrics` and `/health`
+(`transports/bifrost-http` route registrations at `transports/v2.3.0`). The
+per-route table, and which credential each route carries, is in the pull
+request that made this change; the only ones any rule sends to Bifrost are the
+inference prefixes and `/health`, and `deploy-workbench/ingress.test.ts` fails
+if a rule adds another.
 
 **Configuration**, following `agent-swarm/host/docker-compose.yml` where the
 options survive:
@@ -350,33 +403,57 @@ options survive:
   `OAUTH2_PROXY_REDIRECT_URL:
   https://bifrost.workbench.goodparty.org/oauth2/callback`.
 
-**Bifrost's own login is injected, not typed.** Bifrost OSS keeps its single
-admin username and password: `auth_config` stays enabled in `config.json` and
-`/metrics` stays on Bifrost's own basic auth, exactly as before. What changed
-is who answers that login. The sidecar runs with `--alpha-config`, and
-oauth2-proxy's alpha configuration injects the admin credential into every
-request it proxies upstream (`injectRequestHeaders`), so the only prompt a
-human meets is Google SSO plus the committed allowlist. Nobody types the
-shared OSS credential, and it is not in a file: an entrypoint wrapper in the
-derived image computes `base64(admin_username:admin_password)` at container
-start from the two keys the task already injects from `bifrost/gateway`, so it
-cannot drift from the password Bifrost was provisioned with. This works
-because the gateway's own `AuthMiddleware` accepts an HTTP Basic credential on
-every protected route, not only on the login call: it splits the scheme and
-token, compares the username with `auth_config`'s and the password against the
-stored hash (`transports/bifrost-http/handlers/middlewares.go` at `v2.3.0`).
-`/metrics` is unaffected either way — it is routed straight to Bifrost and
-never through the sidecar.
+**Bifrost's own login is off, and the OSS setup lock is satisfied by the
+sidecar.** `governance.auth_config.is_enabled` is false in `config.json`, so
+there is no shared admin login to answer and no password on the human path.
+That is not the same as "the API is open" at `v2.3.0`, and this is the detail
+a future session will otherwise get wrong:
 
-Three details of that, all of them properties of oauth2-proxy v7.15.5 rather
-than choices of ours, checked against the pinned image's source:
+- The OSS server installs `SetupLockMiddleware` whenever dashboard auth is not
+  active — no admin account, *or* an admin account with auth disabled — and it
+  refuses every non-public `/api` call that does not carry the operator's setup
+  token in `X-Bifrost-Setup-Token` (or the HttpOnly setup-session cookie minted
+  from it) (`transports/bifrost-http/handlers/middlewares.go`,
+  `SetupLockMiddleware` and `isAPIRouteWhitelisted`). The dashboard's loader
+  asks `GET /api/session/is-auth-enabled`, sees `setup_required: true`, and
+  renders the setup page — a *second prompt* — unless an API call with the
+  cookie or header succeeds.
+- So the sidecar still injects one header, and it is the setup token rather
+  than a Basic credential: `injectRequestHeaders` sets
+  `X-Bifrost-Setup-Token` from `BIFROST_SETUP_TOKEN`, which the task definition
+  already injects into the sidecar from `bifrost/gateway`. A human who passes
+  Google SSO lands on the dashboard; nothing is typed a second time.
+- The token is what proves operator control for re-enabling auth (`PUT
+  /api/config` with an `auth_config` block). It is held by the deployment, not
+  by a person: it never reaches a browser, and a client-supplied header of that
+  name is stripped before the injected one is set. `bootstrap.sh` already sends
+  the same header for the first-admin claim and is a no-op once an account
+  exists with auth disabled, so the two paths agree.
+- The entrypoint wrapper that used to compute `base64(admin_username:
+  admin_password)` was removed with the credential it encoded. It was genuinely
+  dead weight: with auth off nothing consumes a Basic header, the value the
+  setup lock needs is already an environment variable, and the wrapper's Go
+  stage, tests and `go.mod` were maintained only for that. Two things break if
+  it were left in place — the header it computes would authenticate nothing,
+  and the setup lock would still 401 every `/api` call behind the proxy, so
+  every allowlisted human would meet the setup page. The alpha configuration
+  stays: with `--alpha-config` in use, `provider`, the upstreams and the listen
+  address are removed core options and are defined nowhere else.
+- The admin username and password `env.` references stay in `config.json`.
+  `loadAuthConfig` still hashes the password and writes the admin account at
+  boot, which is the account re-enabling auth acts on; removing the references
+  would make re-enabling auth a config-shape change with no credential to
+  re-enable. Nothing authenticates with them while auth is off.
+
+Three details of the injection, all of them properties of oauth2-proxy v7.15.5
+and its alpha format rather than choices of ours, checked against the pinned
+image's source:
 
 - The header is **stripped then set**. `PreserveRequestValue` defaults to
   false (`pkg/apis/options/header.go`), so the injector removes any
-  client-supplied `Authorization` header before adding its own
+  client-supplied header of that name before adding its own
   (`pkg/middleware/headers.go`, `newStripHeaders`/`injectRequestHeaders`). A
-  caller cannot smuggle a credential upstream or reach Bifrost's login form
-  with a header of its own.
+  caller cannot smuggle a token upstream.
 - The value comes from the environment, not the file:
   `secretSource.fromEnv`. The configuration reference for `SecretSource` lists
   `value` (base64), `fromEnv` and `fromFile`, and oauth2-proxy validates the
@@ -395,52 +472,58 @@ than choices of ours, checked against the pinned image's source:
   survived into the core option set and still loads from `OAUTH2_PROXY_*`.
   `pass-user-headers` and `set-xauthrequest` are dropped instead of ported:
   Bifrost reads none of the `X-Forwarded-*` or `X-Auth-Request-*` headers, and
-  the only header this deployment needs is the `Authorization` one.
+  the only header this deployment needs is the setup token.
 
-**Fail-closed.** A task that cannot inject the credential must not run. Three
-layers, in order:
+**Fail-closed.** A task that cannot present the setup token must not run, and
+the layers are now:
 
-1. The ECS agent resolves both `bifrost/gateway` keys before the container
-   starts, so a missing key is a task that never starts.
-2. The entrypoint wrapper exits non-zero when either value is missing or
-   empty, and refuses to start oauth2-proxy without `--alpha-config` — an
-   unconfigured proxy would otherwise serve the admin paths and silently put
-   the shared password prompt back.
-3. oauth2-proxy itself refuses to start when the `fromEnv` variable is empty.
+1. The ECS agent resolves `BIFROST_SETUP_TOKEN` from `bifrost/gateway` before
+   the container starts, so a missing key is a task that never starts.
+2. oauth2-proxy itself refuses to start when the `fromEnv` variable is empty
+   (`pkg/validation/common.go`, `validateSecretSourceEnv`).
+3. `--alpha-config` is what supplies the provider, the upstreams and the listen
+   address at this tag, so a task definition that dropped the flag gets a proxy
+   that refuses to start rather than one that serves the admin paths
+   unconfigured.
+4. If all of that were bypassed, the direction is still closed: Bifrost's setup
+   lock answers `401` or `403` rather than opening `/api`, which is the failure
+   the previous design could not fall back on.
 
-The sidecar is `essential: true`, so any of the three takes the task with it.
-That is the intended failure: a gateway whose admin surface has no door is
+The sidecar is `essential: true`, so any of the first three takes the task with
+it. That is the intended failure: a gateway whose admin surface has no door is
 worse than a task that visibly will not stabilize.
 
 **Risk, and the rollback.** `injectRequestHeaders` is alpha configuration: its
 structure may change between minor releases (upstream's own warning, and the
-flag's help text). The pin is what contains that — the digest in
+flag's help text), and the wrapper is gone so the injected value is now a
+single `fromEnv` reference. The pin is what contains that — the digest in
 `deploy-workbench/bifrost/Dockerfile` and `oauth2-proxy-image.ts` — and the
-image tag is content-addressed over the allowlist, the Dockerfile, the alpha
-file and the wrapper, so no input can change under a fixed tag. The image build
-also runs `oauth2-proxy --config-test` over the baked alpha file in a stage of
-its own, with dummy values, so a bump that renames or removes a key fails the
-build rather than the deploy: at this tag an unknown alpha key is an error at
-container start (`ErrorUnused` in `pkg/apis/options/load.go`), which would
-drain the running task and then refuse to start the new one. If something does
-get through, the rollback is to drop `OAUTH2_PROXY_COMMAND` (the
-`--alpha-config` flag) and revert the image pin to the previous content tag:
-the sidecar comes back up on its environment-variable configuration with no
-injection, and the shared admin password prompt returns. That is a working
-state, not an outage — the allowlist and Google SSO still gate the surface —
-which is why this is a rollback rather than a redesign.
+image tag is content-addressed over the allowlist, the Dockerfile and the alpha
+file, so no input can change under a fixed tag. The image build also runs
+`oauth2-proxy --config-test` over the baked alpha file in a stage of its own,
+with dummy values including a dummy `BIFROST_SETUP_TOKEN`, so a bump that
+renames or removes a key fails the build rather than the deploy: at this tag an
+unknown alpha key is an error at container start (`ErrorUnused` in
+`pkg/apis/options/load.go`), which would drain the running task and then refuse
+to start the new one. The rollback is a `config.json` change, not an image
+rollback: set `governance.auth_config.is_enabled: true` and the shared admin
+login is back, with the injected setup-token header ignored by
+`APIMiddleware` because auth is active. That is a working state rather than an
+outage — Google SSO and the allowlist still gate the surface — which is why
+this is a rollback rather than a redesign.
 
 **What SSO here is not.** Every allowlisted address signs in and then acts as
 the one shared Bifrost admin. There is no per-person attribution in Bifrost's
 audit records, no per-person role, and no way to revoke one person without
-editing the allowlist. That needs Enterprise. A plugin cannot supply it at
+editing the allowlist — turning the shared password off does not create a user.
+That needs Enterprise. A plugin cannot supply it at
 this tag either, which the earlier version of this section got wrong: the
 plugin interfaces at `v2.3.0` are LLM, MCP, A2A, HTTP-transport and
 observability (`core/schemas/plugin.go`), with no hook on the dashboard or
 management auth path; and the shared-object loader goes through Go's
 `plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
 pinned image's `/app/main` — a statically linked executable with no
-dynamically linked Go runtime to share. So the injected credential is the
+dynamically linked Go runtime to share. So the allowlist plus the proxy is the
 whole of what this design gets, and per-person attribution stays an
 Enterprise question.
 
@@ -592,10 +675,12 @@ Virtual keys are Bifrost's primary governance entity
 - **Expiry and offboarding.** Keys carry an `expires_at` where a contractor or
   temporary key is involved, and offboarding is "deactivate the virtual key",
   which is one action and does not touch a provider.
-- **Admin auth.** Enable `governance.auth_config` (admin username/password) so
-  the UI and governance API are not open, with oauth2-proxy in front of it as
-  described above. The admin credential is a gateway secret and belongs in
-  Secrets Manager, not in the repo.
+- **Admin auth is off; the proxy is the gate.** `governance.auth_config` is
+  present with `is_enabled: false`. Turning the shared OSS login off is what
+  makes oauth2-proxy plus the allowlist the only gate a human passes (see
+  "Protecting the admin surface"); the credential references and the setup
+  token stay so operator control to re-enable it is provable. Both are gateway
+  secrets and belong in Secrets Manager, not in the repo.
 - **The encryption key is load-bearing.** Provider keys stored in the config
   store are encrypted with `encryption_key`
   (`env.BIFROST_ENCRYPTION_KEY`). Losing it means re-entering every provider
@@ -669,9 +754,12 @@ Virtual keys are Bifrost's primary governance entity
   workbench account today, so the low-friction path is the CloudWatch agent
   scraping `/metrics` on the task and publishing selected series, plus
   container logs in a CloudWatch log group. A real Prometheus/Grafana stack is
-  a larger decision and is not required for phase one. Note that when admin
-  auth is enabled, `/metrics` requires credentials; the scraper must be
-  configured accordingly, and over TLS if it crosses a network.
+  a larger decision and is not required for phase one. `/metrics` has no
+  direct ALB rule (see "Routing, and the edge invariant"), and a machine
+  scraper cannot pass Google SSO, so the scraper must run **inside the task or
+  a sidecar and read it over loopback**, with the setup token the OSS setup
+  lock requires. Any credential a scraper needs is not a human's SSO session,
+  so it cannot be scraped through the proxy.
 - **Cost tracking.** Bifrost computes cost from its model catalog. Fireworks
   pricing should be checked against the catalog and overridden with
   `custom_pricing`/pricing overrides if it is wrong or missing — a gateway
@@ -746,7 +834,9 @@ OSS over Enterprise clustering.
   database, not the app. Mitigated by break-glass, not eliminated.
 - **A public endpoint and an admin UI.** Inference is protected by virtual
   keys; the admin surface is protected by oauth2-proxy with a static email
-  allowlist plus the OSS admin password. The allowlist is separate from the
+  allowlist and Bifrost's OSS setup lock (the shared admin password no longer
+  gates a request; it is only the credential a re-enabled auth would use). The
+  allowlist is separate from the
   Identity Center `Admins` group that `sheriff` mutates, so the two drift; the
   most likely incident is an admin who was removed from `Admins` but not from
   the Bifrost list, or a new admin who cannot get in. The list is the control,
@@ -954,6 +1044,12 @@ network or a permission can land before the item that creates it.
    separate rule because an ALB `path-pattern` condition accepts at most five
    values.
 
+   **Superseded by the proxy-only auth change.** Dashboard auth is now off, and
+   the direct rules are the inference prefixes plus `/health`; `/metrics` is no
+   longer routed directly. See "Routing, and the edge invariant" and "Bifrost's
+   own login is off" above. The rest of this entry is the state item 9 landed
+   in.
+
    The service now registers the task as a target in both groups, with the
    listener rules as an explicit `dependsOn` so the groups are associated
    before `CreateService` runs. That is the registration item 8 could not make,
@@ -993,8 +1089,10 @@ network or a permission can land before the item that creates it.
 
 **Phase 3 — observability and cost**
 
-15. Wire `/metrics` into CloudWatch (agent scrape) or the chosen metrics path,
-    with the credentials the enabled admin auth requires.
+15. Wire `/metrics` into CloudWatch (agent scrape) or the chosen metrics path.
+    It is no longer reachable over the ALB and cannot be scraped through Google
+    SSO, so the scraper reads it over loopback from the task or a sidecar, with
+    the setup token the OSS setup lock requires.
 16. Reconcile gateway cost numbers against a week of provider billing for the
     pilot, and add pricing overrides if they disagree.
 17. Confirm the account budget and the Bifrost budgets are both wired, and

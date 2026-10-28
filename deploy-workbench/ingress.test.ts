@@ -24,8 +24,8 @@ import {
   TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
   TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
   TARGET_GROUP_UNHEALTHY_THRESHOLD,
-  TELEMETRY_PATH_PATTERNS,
-  TELEMETRY_RULE_PRIORITY,
+  HEALTH_PATH_PATTERNS,
+  HEALTH_RULE_PRIORITY,
   TLS_POLICY,
 } from "./ingress";
 import {
@@ -219,8 +219,10 @@ describe("bifrost ingress", () => {
   it("splits the admin surface from inference by path, as the plan specifies", () => {
     // The routing table in "Protecting the admin surface": `/oauth2/*` and the
     // admin paths to the proxy on 4180, the inference prefixes to Bifrost on
-    // 8080, and `/health` and `/metrics` to Bifrost so a harness never meets a
-    // browser redirect and the scraper never needs a Google session.
+    // 8080, and `/health` to Bifrost so a harness and the ALB health check
+    // never meet a browser redirect. `/metrics` is not routed directly: with
+    // Bifrost's dashboard auth off it has no credential of its own, so it falls
+    // to the proxy default instead.
     assert.deepEqual(
       HTTPS_LISTENER_RULES.map((rule) => ({
         key: rule.key,
@@ -248,9 +250,9 @@ describe("bifrost ingress", () => {
           target: "bifrost",
         },
         {
-          key: "telemetry",
-          priority: TELEMETRY_RULE_PRIORITY,
-          paths: ["/health", "/metrics"],
+          key: "health",
+          priority: HEALTH_RULE_PRIORITY,
+          paths: ["/health"],
           target: "bifrost",
         },
       ],
@@ -264,9 +266,10 @@ describe("bifrost ingress", () => {
 
   it("leaves no admin or login path that reaches Bifrost without oauth2-proxy", () => {
     // The property the fail-closed default buys: the only paths that reach
-    // Bifrost directly are the enumerated inference and telemetry ones, and
-    // none of them is the admin surface or a login endpoint. `/health` and
-    // `/metrics` are the deliberate exceptions the plan names, not a bypass.
+    // Bifrost directly are the enumerated inference ones plus `/health`, and
+    // none of them is the admin surface, a login endpoint or `/metrics`.
+    // `/health` is the one deliberate exception (the ALB's own health check
+    // needs it unauthenticated), not a bypass.
     const bifrostPaths = HTTPS_LISTENER_RULES.filter(
       (rule) => rule.target === "bifrost",
     ).flatMap((rule) => [...rule.pathPatterns]);
@@ -275,7 +278,6 @@ describe("bifrost ingress", () => {
       [
         "/genai/*",
         "/health",
-        "/metrics",
         "/openai/*",
         "/v1/*",
         "/anthropic/*",
@@ -307,7 +309,7 @@ describe("bifrost ingress", () => {
       "/openai/*",
       "/genai/*",
     ]);
-    assert.deepEqual([...TELEMETRY_PATH_PATTERNS], ["/health", "/metrics"]);
+    assert.deepEqual([...HEALTH_PATH_PATTERNS], ["/health"]);
 
     // An ALB path-pattern condition accepts at most five values; more is an
     // apply-time error rather than a routing surprise.
@@ -317,6 +319,106 @@ describe("bifrost ingress", () => {
         `${rule.key} has ${rule.pathPatterns.length} path values; ALB allows at most 5`,
       );
     }
+  });
+
+  it("fails if any listener rule sends a non-inference path directly to Bifrost", () => {
+    // The edge invariant this change rests on. With `governance.auth_config`
+    // disabled, Bifrost's own dashboard auth no longer gates anything, so a
+    // path that reaches 8080 directly is a path whose only credential is a
+    // virtual key — or nothing at all. The allowed direct paths are therefore
+    // enumerated here by hand, in the plan's terms, and never computed by
+    // subtracting the admin paths from the rule table: a route added at a
+    // Bifrost bump has to be argued for in this list, which is the review the
+    // test exists to force.
+    const ALLOWED_DIRECT_TO_BIFROST = [
+      // Inference: the four provider-shaped prefixes the harness table names,
+      // each gated by `client.enforce_auth_on_inference: true`.
+      "/v1/*",
+      "/anthropic/*",
+      "/openai/*",
+      "/genai/*",
+      // The one allowed exception: the ALB's target-group health check cannot
+      // authenticate, and Bifrost whitelists `/health` itself.
+      "/health",
+    ] as const;
+
+    const directPaths = HTTPS_LISTENER_RULES.filter(
+      (rule) => rule.target === "bifrost",
+    ).flatMap((rule) => [...rule.pathPatterns]);
+    assert.deepEqual(
+      [...directPaths].sort(),
+      [...ALLOWED_DIRECT_TO_BIFROST].sort(),
+      "a listener rule sends a path to Bifrost that is not one of the enumerated direct paths",
+    );
+
+    // The other direction, enumerated too: every prefix Bifrost registers that
+    // is not inference, and therefore must never be direct. `/metrics` is the
+    // one this change removed; the rest are Bifrost's own admin and transport
+    // surfaces, which the HTTPS listener's default action sends to the proxy.
+    // The list is read from the pinned tag's route registrations
+    // (`transports/bifrost-http` at `v2.3.0`, recorded in the PR body).
+    for (const forbidden of [
+      "/metrics",
+      "/api/*",
+      "/",
+      "/oauth2/*",
+      "/ws",
+      "/mcp",
+      "/mcp/*",
+      "/realtime",
+      "/agents/a2a/*",
+      "/.well-known/*",
+      "/cursor/*",
+      "/litellm/*",
+      "/cohere/*",
+      "/langchain/*",
+      "/pydanticai/*",
+      "/bedrock/*",
+      "/typesafe/*",
+      "/openai_passthrough/*",
+      "/anthropic_passthrough/*",
+      "/genai_passthrough/*",
+      "/chatgpt_passthrough/*",
+      "/azure_passthrough/*",
+      "/runware_passthrough/*",
+    ]) {
+      assert.ok(
+        !directPaths.includes(forbidden),
+        `${forbidden} must go through oauth2-proxy, not straight to Bifrost`,
+      );
+    }
+
+    // The failure direction stays closed: a path no rule matches is the
+    // listener's default action, and that action is the proxy. Without this
+    // half, removing a direct rule would not make a path safe — it would only
+    // make the next rule the one that leaks.
+    const httpsBlock = resourceBlock("bifrostHttpsListener");
+    const defaultActions = httpsBlock.match(
+      /defaultActions:\s*\[([\s\S]*?)\n\s*\],/,
+    );
+    assert.ok(defaultActions, "the HTTPS listener must declare defaultActions");
+    assert.ok(
+      defaultActions[1].includes("targetGroupArn: oauth2ProxyTargetGroup.arn"),
+      "the default action must forward to oauth2-proxy",
+    );
+    assert.ok(
+      !defaultActions[1].includes("bifrostTargetGroup"),
+      "the default action must never forward to Bifrost",
+    );
+
+    // And the rules themselves come only from the table above: a rule created
+    // with a literal path in the resource call would bypass this whole test.
+    assert.ok(
+      INGRESS_SOURCE.includes(
+        "conditions: [{ pathPattern: { values: [...spec.pathPatterns] } }]",
+      ),
+      "listener rules must take their paths from HTTPS_LISTENER_RULES, not from a literal that this test cannot see",
+    );
+    assert.equal(
+      INGRESS_SOURCE.match(/new aws\.lb\.ListenerRule\(/g)?.length,
+      1,
+      "there must be exactly one ListenerRule construction, mapped over HTTPS_LISTENER_RULES",
+    );
   });
 
   it("creates the rules against the listener and both target groups", () => {

@@ -418,17 +418,23 @@ describe("bifrost config.json", () => {
     );
   });
 
-  it("enables admin auth and leaves item 14's governance entities absent", () => {
-    // The admin account is config-store state, not a config.json field: at the
-    // pinned tag `loadAuthConfig` hashes this password and writes the account
-    // at boot, so the block provisions the login once the file is injected.
-    // It is not the bootstrap path — before an account exists, `/api` is gated
-    // by the setup lock and the setup token above is the only way in.
+  it("turns Bifrost's own dashboard auth off and leaves item 14's governance entities absent", () => {
+    // The decided shape: oauth2-proxy plus the email allowlist is the only gate
+    // a human meets, so the shared OSS admin login is off. The admin account
+    // is still provisioned from this block at boot (`loadAuthConfig` hashes the
+    // password and writes the account), which is the state a store with auth
+    // disabled is in: it needs proof of operator control before anyone turns
+    // auth back on, and the setup token above is that proof.
+    //
+    // The references stay even though nothing authenticates with them today:
+    // dropping them would make re-enabling auth a config-shape change as well
+    // as a decision, and the account would have no credential to be re-enabled
+    // with.
     const governance = loadConfig().governance;
     assert.ok(governance, "config.json has no governance block");
     const auth = governance.auth_config;
     assert.ok(auth, "governance has no auth_config");
-    assert.equal(auth.is_enabled, true);
+    assert.equal(auth.is_enabled, false);
     assert.equal(auth.admin_username, "env.BIFROST_ADMIN_USERNAME");
     assert.equal(auth.admin_password, "env.BIFROST_ADMIN_PASSWORD");
     // The v2.3.0 schema marks this deprecated and ignored; the client flag is

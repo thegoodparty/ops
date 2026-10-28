@@ -9,7 +9,8 @@ import {
   OAUTH2_PROXY_ALLOWLIST_PATH,
   OAUTH2_PROXY_CONTENT_DIGEST,
   OAUTH2_PROXY_CONTENT_INPUTS,
-  OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV,
+  OAUTH2_PROXY_INJECTED_HEADER_NAME,
+  OAUTH2_PROXY_SETUP_TOKEN_ENV,
   OAUTH2_PROXY_REPOSITORY_NAME,
   OAUTH2_PROXY_REPOSITORY_ROOT,
   OAUTH2_PROXY_TAG,
@@ -27,8 +28,6 @@ const WORKFLOW = path.resolve(
 const DOCKERFILE = path.resolve(__dirname, "bifrost/Dockerfile");
 const ALLOWLIST = path.resolve(__dirname, "bifrost/allowed-emails.txt");
 const ALPHA_CONFIG = path.resolve(__dirname, "bifrost/alpha-config.yaml");
-const ENTRYPOINT = path.resolve(__dirname, "bifrost/entrypoint.go");
-const ENTRYPOINT_TEST = path.resolve(__dirname, "bifrost/entrypoint_test.go");
 
 /**
  * Reads a value from the workflow's top-level `env:` block.
@@ -129,9 +128,9 @@ describe("derived oauth2-proxy image pin", () => {
   // The tag is content-addressed over every committed build input, so a change
   // to any of them is a new tag and a push. Hashing the allowlist alone was
   // right while the image was a one-line derivative; it stopped being right
-  // when the Dockerfile grew an alpha configuration and an entrypoint wrapper,
-  // because a deploy would then name an image without them and the injection
-  // would never happen.
+  // when the Dockerfile grew an alpha configuration, because a deploy would
+  // then name an image without it and the setup-token header would never be
+  // injected.
   it("derives the content tag from every build input the module hashes", () => {
     const expectedDigest = OAUTH2_PROXY_CONTENT_INPUTS.reduce(
       (hash, relativePath) =>
@@ -171,9 +170,6 @@ describe("derived oauth2-proxy image pin", () => {
     for (const required of [
       "deploy-workbench/bifrost/Dockerfile",
       "deploy-workbench/bifrost/alpha-config.yaml",
-      "deploy-workbench/bifrost/entrypoint.go",
-      "deploy-workbench/bifrost/entrypoint_test.go",
-      "deploy-workbench/bifrost/go.mod",
     ]) {
       assert.ok(
         (OAUTH2_PROXY_CONTENT_INPUTS as readonly string[]).includes(required),
@@ -276,7 +272,7 @@ describe("derived oauth2-proxy image pin", () => {
       "OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE",
       "OAUTH2_PROXY_REDIRECT_URL",
       "OAUTH2_PROXY_WHITELIST_DOMAINS",
-      "BIFROST_ADMIN_AUTHORIZATION",
+      "BIFROST_SETUP_TOKEN",
     ]) {
       assert.ok(stage.includes(name), `the check stage does not set ${name}`);
     }
@@ -286,34 +282,43 @@ describe("derived oauth2-proxy image pin", () => {
     );
   });
 
-  // This is the mechanism behind "no human meets a second login": the header
-  // oauth2-proxy adds to the upstream request, sourced from an environment
+  // This is the mechanism behind "no human meets a second gate": the header
+  // oauth2-proxy adds to the upstream request, sourced from the environment
   // variable rather than from the file, and stripped from the client's request
   // first. Each of those is a property of the YAML, so each is asserted here.
-  it("injects the admin credential as a request header from the environment", () => {
+  //
+  // The header is Bifrost's setup token, not a Basic admin credential: with
+  // `governance.auth_config.is_enabled` false there is no login to answer, but
+  // the OSS setup lock still gates `/api` and this is what satisfies it.
+  it("injects the setup token as a request header from the environment", () => {
     const alpha = fs.readFileSync(ALPHA_CONFIG, "utf8");
 
     assert.match(alpha, /^injectRequestHeaders:$/m);
-    assert.match(alpha, /^ {2}- name: Authorization$/m);
     assert.match(
       alpha,
-      new RegExp(
-        `^ {10}fromEnv: ${OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV}$`,
-        "m",
-      ),
-      `the injected header must read ${OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV}`,
+      new RegExp(`^ {2}- name: ${OAUTH2_PROXY_INJECTED_HEADER_NAME}$`, "m"),
+      `the injected header must be ${OAUTH2_PROXY_INJECTED_HEADER_NAME}`,
     );
+    assert.match(
+      alpha,
+      new RegExp(`^ {10}fromEnv: ${OAUTH2_PROXY_SETUP_TOKEN_ENV}$`, "m"),
+      `the injected header must read ${OAUTH2_PROXY_SETUP_TOKEN_ENV}`,
+    );
+    // The name has to be the one Bifrost's own middleware reads, and the one
+    // the claim container sends; a rename here is a 401 on every /api call.
+    assert.equal(OAUTH2_PROXY_INJECTED_HEADER_NAME, "X-Bifrost-Setup-Token");
+    assert.equal(OAUTH2_PROXY_SETUP_TOKEN_ENV, "BIFROST_SETUP_TOKEN");
 
     // `value:` would put the credential in a committed file. The source has to
-    // be the environment, which the container derives at start.
+    // be the environment the task definition injects.
     assert.ok(
       !/secretSource:\s*\n\s*value:/.test(alpha),
       "the injected credential must not be a literal in the alpha config",
     );
 
     // Stripped-then-set: `preserveRequestValue` defaults to false upstream, so
-    // a client's own Authorization header is removed before this one is added.
-    // Setting it true here would let a caller smuggle a credential upstream.
+    // a client's own header of this name is removed before this one is added.
+    // Setting it true here would let a caller smuggle the setup token.
     assert.ok(
       !/^\s*preserveRequestValue:/m.test(alpha),
       "preserveRequestValue must stay at its default (false): the injected header replaces the client's",
@@ -332,67 +337,37 @@ describe("derived oauth2-proxy image pin", () => {
     );
   });
 
-  // The wrapper is the half that makes the injection fail closed, and it is
-  // built from committed Go rather than from anything pinned upstream, so the
-  // YAML, the Go source and the task definition have to name the same three
-  // variables.
-  it("names the same credential variables in the wrapper as the alpha config", () => {
-    const entrypoint = fs.readFileSync(ENTRYPOINT, "utf8");
-    assert.ok(
-      entrypoint.includes(
-        `AuthorizationEnv = "${OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV}"`,
-      ),
-      `entrypoint.go must export ${OAUTH2_PROXY_INJECTED_AUTHORIZATION_ENV}, the variable the alpha config reads`,
-    );
-    assert.ok(
-      entrypoint.includes('UsernameEnv = "BIFROST_ADMIN_USERNAME"'),
-      "entrypoint.go must read BIFROST_ADMIN_USERNAME",
-    );
-    assert.ok(
-      entrypoint.includes('PasswordEnv = "BIFROST_ADMIN_PASSWORD"'),
-      "entrypoint.go must read BIFROST_ADMIN_PASSWORD",
-    );
-    // The same two names are the keys the task definition injects; that side is
-    // pinned in `ecs.test.ts`, against the same literals.
-    assert.ok(
-      entrypoint.includes("alphaConfigFlag = \"--alpha-config\""),
-      "entrypoint.go must refuse to start the proxy without --alpha-config",
-    );
-  });
-
-  // The runtime image is `gcr.io/distroless/static:nonroot`: no shell, no
-  // coreutils. The wrapper gets there as a static binary built in a stage of
-  // its own, and its own tests run during the build -- which is what stops a
-  // wrapper that does not fail closed from ever reaching ECR.
-  it("builds the entrypoint wrapper statically and tests it during the build", () => {
+  // The wrapper used to compute `base64(admin_username:admin_password)` for
+  // Bifrost's Basic login. With dashboard auth off there is no password to
+  // encode and the token the header needs is already an environment variable,
+  // so the wrapper, its Go stage and its tests were removed rather than left
+  // as a second thing to maintain. This is the assertion that they stay gone:
+  // a re-added ENTRYPOINT override would silently bypass upstream's own and
+  // the image would start nothing.
+  it("has no entrypoint wrapper, and starts the upstream binary directly", () => {
     const dockerfile = fs.readFileSync(DOCKERFILE, "utf8");
     assert.ok(
-      dockerfile.includes("AS entrypoint"),
-      "the wrapper must be built in its own stage",
+      !dockerfile.includes("AS entrypoint"),
+      "the base64 wrapper stage was removed with the Basic credential; it must not come back",
     );
     assert.ok(
-      dockerfile.includes("CGO_ENABLED=0"),
-      "the wrapper must be static: the runtime image has no dynamic loader",
+      !dockerfile.includes("bifrost-oauth2-entrypoint"),
+      "the wrapper binary was removed with the Basic credential; it must not come back",
     );
     assert.ok(
-      dockerfile.includes("go test ./..."),
-      "the wrapper's fail-closed tests must run during the image build",
+      !/^ENTRYPOINT /m.test(dockerfile),
+      "the image must keep upstream's own ENTRYPOINT so `--alpha-config` reaches oauth2-proxy",
     );
-    assert.ok(
-      dockerfile.includes(
-        "COPY --from=entrypoint /out/bifrost-oauth2-entrypoint /bin/bifrost-oauth2-entrypoint",
-      ),
-      dockerfile,
-    );
-    assert.ok(
-      dockerfile.includes(
-        'ENTRYPOINT ["/bin/bifrost-oauth2-entrypoint"]',
-      ),
-      "the wrapper must replace the image's own entrypoint",
-    );
-    // The Dockerfile says why the wrapper exists in Go; the tests themselves
-    // live beside it and are hashed into the tag above.
-    assert.ok(fs.existsSync(ENTRYPOINT_TEST));
+    for (const removed of [
+      path.resolve(__dirname, "bifrost/entrypoint.go"),
+      path.resolve(__dirname, "bifrost/entrypoint_test.go"),
+      path.resolve(__dirname, "bifrost/go.mod"),
+    ]) {
+      assert.ok(
+        !fs.existsSync(removed),
+        `${removed} is dead weight with dashboard auth off and must stay deleted`,
+      );
+    }
   });
 
   it("keeps the allowlist one goodparty.org address per line", () => {

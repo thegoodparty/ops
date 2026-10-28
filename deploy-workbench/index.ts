@@ -453,10 +453,11 @@ const network = createWorkbenchNetwork({ provider });
 //
 // The path rules that split inference from the admin surface are item 9's and
 // live in `ingress.ts`: `/oauth2/*` and the admin paths to oauth2-proxy, the
-// inference prefixes and health/metrics to Bifrost. The HTTPS listener's
-// default action still points at oauth2-proxy, the plan's catch-all, and the
-// rules do not re-point it: an unmatched path is authenticated by the proxy,
-// never sent straight to Bifrost. See the design record in `ingress.ts`.
+// inference prefixes and `/health` to Bifrost. The HTTPS listener's default
+// action still points at oauth2-proxy, the plan's catch-all, and the rules do
+// not re-point it: an unmatched path is authenticated by the proxy, never sent
+// straight to Bifrost. `/metrics` is deliberately not a direct rule, so it
+// falls to that default too. See the design record in `ingress.ts`.
 const ingress = createBifrostIngress({
   provider,
   zone: workbenchZone,
