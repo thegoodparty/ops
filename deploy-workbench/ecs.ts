@@ -1142,12 +1142,12 @@ export const createBifrostEcs = (args: {
           // rather than leaving a gateway whose admin surface has no door.
           // The alternative — non-essential, so Bifrost keeps serving
           // inference while a crash-looping proxy 503s the admin paths — was
-          // considered and rejected: the sidecar is given all three
-          // credentials unconditionally, so a proxy that will not start is a
-          // missing or wrong value in Secrets Manager, and a task that never
-          // stabilizes is the visible failure. The fail-closed property does
-          // not depend on this flag: the ALB has no rule that sends an admin
-          // path to Bifrost at all.
+          // considered and rejected: the sidecar is given its Google pair, its
+          // cookie secret and the setup token unconditionally, so a proxy that
+          // will not start is a missing or wrong value in Secrets Manager, and
+          // a task that never stabilizes is the visible failure. The
+          // fail-closed property does not depend on this flag: the ALB has no
+          // rule that sends an admin path to Bifrost at all.
           essential: true,
           // The image's entrypoint is upstream's own: with dashboard auth off
           // there is no Basic credential to compute, and the header value the
