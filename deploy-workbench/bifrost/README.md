@@ -195,10 +195,10 @@ upstream pin and the ECR repository, and
 workflow and the module drift. CI builds and pushes the image to the
 `bifrost-oauth2-proxy` repository in the workbench account on every workbench
 change, tagged `v7.15.5-<first 12 hex of the sha256 over the image's committed
-inputs>` — the allowlist, the Dockerfile, `alpha-config.yaml`, the wrapper and
-its test, and its `go.mod` — so the tag changes when and only when the image's
-content does. Pulumi will reference it by digest (phase 1). The repository is
-immutable, so a re-push of an existing tag is skipped rather than rejected.
+inputs>` — the allowlist, the Dockerfile and `alpha-config.yaml` — so the tag
+changes when and only when the image's content does. Pulumi will reference it
+by digest (phase 1). The repository is immutable, so a re-push of an existing
+tag is skipped rather than rejected.
 
 Build it locally (no push, no ECR credentials needed):
 
