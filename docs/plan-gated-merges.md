@@ -253,9 +253,14 @@ the obstacle rather than calling the changes correct. When the findings line is
 `none` the body says in plain words that this review flagged nothing, that the
 gate alone is why the review is a comment, and that a human approval is still
 required: the required status check and `CODEOWNERS` are unchanged, and the
-bot's review is not a required check. The record keeps the two apart as well,
-as `findingsVerdict` (`none` | `findings`) beside `gating`, so the pair can be
-joined without reading prose. None of this is a new decision: the event is
+bot's review is not a required check. The line at the top, `Recommendation:`,
+reports the same judgement of the code: it says `approve` when this pass
+flagged nothing and `comment` when it did, so a human gets the signal that the
+code is good but the approval unsanctioned, while the gate line directly below
+states the action actually taken (`COMMENT`, never an `APPROVE`). The record
+keeps the two apart as well, as `findingsVerdict` (`none` | `findings`) beside
+`gating`, so the pair can be joined without reading prose. None of this is a
+new decision: the event is
 still `COMMENT` and the bot still approves nothing it did not approve before.
 
 | # | Case | Decided by | Why it is not the bot's call |
@@ -579,10 +584,12 @@ to `CODEOWNERS`.
     summary) and the gate verdict (which case fired and its detail). A clean PR
     the gate blocked says in plain words that this review flagged nothing, that
     the gate alone is why it is a comment, and that a human approval is still
-    required. That is a statement about the bot's own judgement, of this pass
-    and no more — never a recorded approval and never a claim that the code is
-    correct (ops#392). The record carries `findingsVerdict` beside `gating` so
-    the two can be counted apart.
+    required. The `Recommendation:` line carries the same signal: `approve`
+    when this pass flagged nothing, `comment` when it did, while the review
+    event stays `COMMENT` and the gate line states that. That is a statement
+    about the bot's own judgement, of this pass and no more — never a recorded
+    approval and never a claim that the code is correct (ops#392). The record
+    carries `findingsVerdict` beside `gating` so the two can be counted apart.
 11. **Progress status is derived from git/PR history; ClickUp is optional.**
     **Decided here**, from the review question. `docs/` is human-owned from
     step 2, so a checklist update in an implementation PR would put a human

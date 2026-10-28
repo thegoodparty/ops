@@ -153,7 +153,9 @@ describe("renderBody with the gate on", () => {
       body.includes("**Gate: shadow, would have approved** against `docs/plan-gated-merges.md` at `1c7ac96`."),
     );
     assert.ok(body.includes("Shadow mode records the decision and posts a comment, never an approval."));
-    assert.ok(body.startsWith("**Recommendation: comment**"));
+    // The recommendation is the bot's judgement of the code; the event is still
+    // a comment, and the gate line right below says so.
+    assert.ok(body.startsWith("**Recommendation: approve**"));
   });
 
   it("a shadow run that would have flagged carries the reason too", () => {
@@ -186,7 +188,9 @@ describe("renderBody with the gate on", () => {
 
     it(`${flag} with no findings says the gate alone blocked it`, () => {
       const body = renderBody({ ...baseArgs, decision: gated(gate()) });
-      assert.ok(body.includes("**Recommendation: comment**"));
+      // The signal a human needs: the code is good, the gate is the obstacle.
+      assert.ok(body.startsWith("**Recommendation: approve**"));
+      assert.ok(body.includes("**Gate: comment**"));
       assert.ok(body.includes("**Findings: none in this pass.**"));
       assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
       assert.ok(body.includes(detail));
@@ -201,7 +205,7 @@ describe("renderBody with the gate on", () => {
 
     it(`${flag} with findings says the findings came too`, () => {
       const body = renderBody({ ...baseArgs, decision: gated(gate(), withFindings) });
-      assert.ok(body.includes("**Recommendation: comment**"));
+      assert.ok(body.startsWith("**Recommendation: comment**"));
       assert.ok(body.includes("**Findings: 2 finding(s) in this pass.**"));
       assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
       assert.ok(body.includes(detail));
@@ -246,6 +250,9 @@ describe("renderBody with the gate on", () => {
       ),
     });
     assert.ok(body.includes("**Findings: none in this pass.**"));
+    // No findings, so the recommendation says the code looks good; the gate
+    // line says the comment is what it would have posted.
+    assert.ok(body.startsWith("**Recommendation: approve**"));
     assert.ok(body.includes("**Gate: shadow, would have commented**"));
     assert.ok(
       body.includes(

@@ -75,6 +75,18 @@ const renderGating = (g: DecisionGating): string => {
   return `${head}${why}${tail}`;
 };
 
+// The top line is the bot's judgement of the code, not the review event. When
+// the gate withholds an approval the event is a `COMMENT` (the bot approves
+// nothing the gate does not sanction), but a pass that flagged nothing still
+// says so: a human reading the PR needs to know the gate is the only obstacle,
+// and the gate line below states the action. Ungated, the two are one thing.
+const recommendation = (d: Decision): "approve" | "comment" =>
+  d.gating !== undefined && d.findingsVerdict !== undefined
+    ? d.findingsVerdict.verdict === "none"
+      ? "approve"
+      : "comment"
+    : d.verdict;
+
 // Findings are inline comments, never body text. The body carries the verdict,
 // the agent's reasoning for it (so a human can check that the PR description,
 // the review and the code agree), and the bookkeeping a reader needs to trust it.
@@ -91,7 +103,7 @@ export const renderBody = (args: {
   const parts: string[] = [];
   const sha7 = args.headSha.slice(0, 7);
 
-  parts.push(`**Recommendation: ${args.decision.verdict}**`);
+  parts.push(`**Recommendation: ${recommendation(args.decision)}**`);
   // Absent when the gate did not run, which is what keeps an ungated body
   // identical to the one it rendered before this existed. The findings verdict
   // and the gate verdict are separate paragraphs on purpose; an approval is
