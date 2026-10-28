@@ -1908,8 +1908,9 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       Resource: "*",
     },
     {
-      // `pr-<n>-Queue.fifo` and `pr-<n>-DLQ.fifo`. Lifecycle only: the app
-      // sends and receives through its task role, not through this one.
+      // `pr-<n>-Queue.fifo` and `pr-<n>-DLQ.fifo`, the same shapes the
+      // boundary names. Lifecycle only: the app sends and receives through its
+      // task role, not through this one.
       Sid: "PreviewQueues",
       Effect: "Allow",
       Action: [
@@ -1922,7 +1923,7 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
         "sqs:UntagQueue",
         "sqs:ListQueueTags",
       ],
-      Resource: "arn:aws:sqs:us-west-2:333022194791:pr-*",
+      Resource: PREVIEW_QUEUES,
     },
     {
       // The two buckets each preview owns. The reads are what the provider
