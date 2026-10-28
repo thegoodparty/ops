@@ -187,12 +187,12 @@ describe("renderBody with the gate on", () => {
     it(`${flag} with no findings says the gate alone blocked it`, () => {
       const body = renderBody({ ...baseArgs, decision: gated(gate()) });
       assert.ok(body.includes("**Recommendation: comment**"));
-      assert.ok(body.includes("**Findings: none.**"));
+      assert.ok(body.includes("**Findings: none in this pass.**"));
       assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
       assert.ok(body.includes(detail));
       assert.ok(
         body.includes(
-          "No findings: the changes look approvable, and the gate alone is why this is a comment rather than an approval.",
+          "This review flagged nothing; the gate alone is why this is a comment rather than an approval.",
         ),
       );
       assert.ok(body.includes("A human still has to approve this PR"));
@@ -202,7 +202,7 @@ describe("renderBody with the gate on", () => {
     it(`${flag} with findings says the findings came too`, () => {
       const body = renderBody({ ...baseArgs, decision: gated(gate(), withFindings) });
       assert.ok(body.includes("**Recommendation: comment**"));
-      assert.ok(body.includes("**Findings: 2 finding(s).**"));
+      assert.ok(body.includes("**Findings: 2 finding(s) in this pass.**"));
       assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
       assert.ok(body.includes(detail));
       assert.ok(
@@ -210,13 +210,13 @@ describe("renderBody with the gate on", () => {
           "The findings are why this is not an approval, and the gate flagged the PR independently.",
         ),
       );
-      assert.equal(body.includes("No findings:"), false);
+      assert.equal(body.includes("This review flagged nothing"), false);
     });
   }
 
   it("a findings-only comment says the findings are the whole reason", () => {
     const body = renderBody({ ...baseArgs, decision: gated(gating({}), withFindings) });
-    assert.ok(body.includes("**Findings: 2 finding(s).**"));
+    assert.ok(body.includes("**Findings: 2 finding(s) in this pass.**"));
     assert.ok(body.includes("The findings are why this is not an approval."));
     assert.equal(body.includes("flagged the PR independently"), false);
   });
@@ -226,10 +226,10 @@ describe("renderBody with the gate on", () => {
       ...baseArgs,
       decision: gated(gating({ mode: "shadow", wouldApprove: true })),
     });
-    assert.ok(body.includes("**Findings: none.**"));
+    assert.ok(body.includes("**Findings: none in this pass.**"));
     assert.ok(
       body.includes(
-        "No findings: the changes look approvable, and shadow mode alone is why this is a comment rather than an approval.",
+        "This review flagged nothing, and shadow mode alone is why this is a comment rather than an approval.",
       ),
     );
     assert.ok(body.includes("A human still has to approve this PR"));
@@ -245,11 +245,11 @@ describe("renderBody with the gate on", () => {
         gating({ mode: "shadow", flags: ["owned_paths"], ownedPaths: ["deploy/index.ts"] }),
       ),
     });
-    assert.ok(body.includes("**Findings: none.**"));
+    assert.ok(body.includes("**Findings: none in this pass.**"));
     assert.ok(body.includes("**Gate: shadow, would have commented**"));
     assert.ok(
       body.includes(
-        "No findings: the changes look approvable, but the gate flagged the PR as well, and shadow mode posts a comment either way.",
+        "This review flagged nothing, but the gate flagged the PR as well, and shadow mode posts a comment either way.",
       ),
     );
     assert.equal(body.includes("shadow mode alone"), false);

@@ -12,16 +12,23 @@ const flagText = (flag: GatingFlag, g: DecisionGating): string => {
 };
 
 // The two halves of the verdict, stated as two facts. The gate line says why
-// the bot may not approve; this one says whether it found anything wrong with
-// the code. Without it a comment gated for a missing `Plan:` line and a comment
-// carrying a finding read the same to a human, and they need opposite replies.
+// the bot may not approve; this one says what this pass flagged. Without it a
+// comment gated for a missing `Plan:` line and a comment carrying a finding
+// read the same to a human, and they need opposite replies. The `in this pass`
+// is load-bearing: a clean pass is not a claim that the code is sound. In
+// ops#392 the reviewer reported no findings and a human reviewer then raised
+// three, one of them a blocker (the schema-failure fallback in `replay.ts`).
 const renderFindings = (f: FindingsVerdict): string =>
-  f.verdict === "none" ? "**Findings: none.**" : `**Findings: ${f.count} finding(s).**`;
+  f.verdict === "none"
+    ? "**Findings: none in this pass.**"
+    : `**Findings: ${f.count} finding(s) in this pass.**`;
 
-// The plain-language half of the same fact, short enough to scan. A clean PR
-// blocked by the gate says so out loud and says that a human still has to
-// approve it: the required check and `CODEOWNERS` do not change because the
-// bot had nothing to flag.
+// The plain-language half of the same fact, short enough to scan. It says what
+// this pass found, never that the code is correct: the obstacle it names is the
+// gate, not the diff. That distinction is the whole point of ops#392, and it is
+// why the sentence does not read "the changes look approvable". A human still
+// has to approve the PR: the required check and `CODEOWNERS` do not change
+// because the bot had nothing to flag.
 const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
   if (f.verdict === "none") {
     if (g.mode === "shadow") {
@@ -29,10 +36,10 @@ const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
       // gate is what would have blocked an approval too, and saying shadow
       // alone did it would contradict the gate line in the same body.
       return g.flags.length === 0
-        ? "No findings: the changes look approvable, and shadow mode alone is why this is a comment rather than an approval. A human still has to approve this PR."
-        : "No findings: the changes look approvable, but the gate flagged the PR as well, and shadow mode posts a comment either way. A human still has to approve this PR.";
+        ? "This review flagged nothing, and shadow mode alone is why this is a comment rather than an approval. A human still has to approve this PR."
+        : "This review flagged nothing, but the gate flagged the PR as well, and shadow mode posts a comment either way. A human still has to approve this PR.";
     }
-    return "No findings: the changes look approvable, and the gate alone is why this is a comment rather than an approval. A human still has to approve this PR — the bot's review is not a required check and `CODEOWNERS` is unchanged.";
+    return "This review flagged nothing; the gate alone is why this is a comment rather than an approval. A human still has to approve this PR — the bot's review is not a required check and `CODEOWNERS` is unchanged.";
   }
   return g.flags.length > 0
     ? "The findings are why this is not an approval, and the gate flagged the PR independently."

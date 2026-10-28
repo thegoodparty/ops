@@ -32,16 +32,17 @@ export type Decision = {
    */
   gating?: DecisionGating;
   /**
-   * The finding gate's own answer, deliberately outside `gating`: "did the
-   * reviewer find anything wrong with the code" and "may the bot approve this
-   * PR at all" are different questions, and a reader (or a script) that
-   * conflates them cannot tell a clean PR the gate blocked from a PR with
-   * problems. Present exactly when `gating` is, for the same reason.
+   * The finding gate's own answer, deliberately outside `gating`: what this
+   * review flagged and "may the bot approve this PR at all" are different
+   * questions, and a reader (or a script) that conflates them cannot tell a
+   * clean PR the gate blocked from a PR with problems. Present exactly when
+   * `gating` is, for the same reason.
    */
   findingsVerdict?: FindingsVerdict;
 };
 
 export type FindingsVerdict = {
+  /** What this pass flagged. `none` is not a claim that the code is sound. */
   verdict: "none" | "findings";
   /** Findings counted against approval, including ones the schema dropped. */
   count: number;
