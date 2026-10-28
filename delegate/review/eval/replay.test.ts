@@ -599,6 +599,24 @@ test("a deep-reviewer answer that is not findings JSON is unknown, not dropped",
   assert.equal(result.leads?.[0].outcome, "unknown");
 });
 
+test("a deep-reviewer whose findings all fail the schema is unknown, not dropped", async () => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "d", result: JSON.stringify({ leads: [leadOf("A", "hyp a")], summary: "s" }) },
+    {
+      subagent: "deep-reviewer",
+      prompt: "hyp a",
+      result: JSON.stringify({ findings: [{ path: "src/a.ts", line: "5", category: "correctness" }] }),
+    },
+  ];
+  const result = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents(calls),
+    fakeCheckout,
+  );
+  assert.equal(result.leads?.[0].outcome, "unknown");
+});
+
 test("loadRunResults still parses a result file written without leads", () => {
   const dir = tmpDir();
   mkdirSync(join(dir, "c1"), { recursive: true });

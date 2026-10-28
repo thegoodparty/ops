@@ -18,7 +18,8 @@ import type { Bundle, Finding, ReviewOutput, ReviewRecord } from "../schema";
 
 // not-investigated: no deep-reviewer was given the lead. dropped: it returned
 // no findings. raised: it returned findings, none of which reached the final
-// output. reported: one did. unknown: its answer could not be parsed.
+// output. reported: one did. unknown: its answer could not be parsed, or
+// none of its findings matched the finding schema.
 export type LeadOutcome = "not-investigated" | "dropped" | "raised" | "reported" | "unknown";
 
 export interface LeadTrace {
@@ -147,6 +148,10 @@ export const traceLeads = (
       const parsed = FindingSchema.safeParse(f);
       return parsed.success ? [parsed.data] : [];
     });
+    if (found.length === 0 && answer.findings.length > 0) {
+      traces.push({ ...base, outcome: "unknown", findings: 0 });
+      continue;
+    }
     const outcome: LeadOutcome =
       found.length === 0
         ? "dropped"
