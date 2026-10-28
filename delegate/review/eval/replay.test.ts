@@ -585,6 +585,41 @@ test("replayCase leaves leads off when the scout's answer is unreadable or absen
   assert.equal("leads" in none, false);
 });
 
+test("a lead restated in the orchestrator's own words still finds its deep-reviewer", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "d",
+      result: JSON.stringify({
+        leads: [
+          leadOf("Alerts", "The `keepFiringFor` hold ends when count_over_time returns no series and noDataState is OK."),
+          leadOf("Docs", "observability.md still describes range queries"),
+        ],
+        summary: "s",
+      }),
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt:
+        "Investigate this lead.\nArea: Alerts\nHypothesis: keepFiringFor hold ends when\n  count_over_time returns no series, and noDataState is OK\nDiff: /tmp/diff.txt",
+      result: JSON.stringify({ findings: [] }),
+    },
+  ];
+  const result = await replayCase(
+    makeRecord(),
+    { workDir: tmpDir(), variant: "v" },
+    withSubagents(calls),
+    fakeCheckout,
+  );
+  assert.deepEqual(
+    result.leads?.map((l) => [l.area, l.outcome]),
+    [
+      ["Alerts", "dropped"],
+      ["Docs", "not-investigated"],
+    ],
+  );
+});
+
 test("a deep-reviewer answer that is not findings JSON is unknown, not dropped", async () => {
   const calls: SubagentCall[] = [
     { subagent: "scout", prompt: "d", result: JSON.stringify({ leads: [leadOf("A", "hyp a")], summary: "s" }) },
