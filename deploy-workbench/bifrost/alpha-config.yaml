@@ -1,22 +1,18 @@
 # oauth2-proxy alpha configuration for the Bifrost admin-surface sidecar
-# (phase 1 item 9 of docs/bifrost-gateway.md).
+# (phase 1 item 9 of docs/bifrost-gateway.md, revised by the change that turned
+# Bifrost's own dashboard auth off).
 #
 # Baked into the derived image at /etc/oauth2-proxy/alpha-config.yaml, and the
 # path the sidecar's `--alpha-config` flag names (deploy-workbench/ecs.ts,
-# `OAUTH2_PROXY_COMMAND`). The entrypoint wrapper
-# (`entrypoint.go`, baked as `/bin/bifrost-oauth2-entrypoint`) refuses to start
-# oauth2-proxy without that flag, so this file is not optional at runtime.
-#
-# Why alpha configuration at all: at v7.15.5 the only way to make oauth2-proxy
-# add a header with a static value is `injectRequestHeaders` in this file
-# (pkg/apis/options/alpha_options.go:17-21 at the pinned image's tag). The
-# flags that would otherwise configure the provider, the upstream and the
-# listen address are *removed* when --alpha-config is given
-# (docs/docs/configuration/alpha_config.md, "Removed options"), so they move
-# here. Everything this file does not carry stays an environment variable in
-# `OAUTH2_PROXY_ENVIRONMENT` (ecs.ts): the allowlist file, the redirect URL,
+# `OAUTH2_PROXY_COMMAND`). At v7.15.5 the flags that configure the provider,
+# the upstreams and the listen address are *removed* when --alpha-config is
+# given (docs/docs/configuration/alpha_config.md, "Removed options"), so they
+# move here and must not also appear as `OAUTH2_PROXY_*` variables — a removed
+# option is silently ignored, which is the failure that looks like it
+# deployed. Everything this file does not carry stays an environment variable
+# in `OAUTH2_PROXY_ENVIRONMENT` (ecs.ts): the allowlist file, the redirect URL,
 # the whitelist domain, the cookie settings and `reverse-proxy` all survived
-# into the core option set and still load from `OAUTH2_PROXY_*`.
+# into the core option set.
 #
 # Two values are deliberately literal rather than templated: the listen
 # address and the upstream URI. `oauth2-proxy-image.test.ts` pins them to
@@ -29,7 +25,7 @@ providers:
   # yet working" (pkg/apis/options/alpha_options.go:44-47).
   - id: google
     provider: google
-    # The Google client pair still comes from Secrets Manager as environment
+    # The Google client pair comes from Secrets Manager as environment
     # variables. Alpha config substitutes `${...}` at load time (upstream uses
     # github.com/a8m/envsubst for exactly this: pkg/apis/options/load.go:131),
     # which is the documented way to keep a secret out of this file. Google
@@ -54,28 +50,41 @@ server:
   # the task's elastic network interface, not through loopback.
   bindAddress: 0.0.0.0:4180
 
-# The reason this file exists. Bifrost OSS has no SSO, so its dashboard and
-# management API keep their own single admin login; a human who has passed the
-# Google gate would otherwise meet that login as a second prompt. Instead
-# oauth2-proxy adds the admin credential to every request it proxies
-# upstream, so the only prompt anyone meets is Google SSO plus the allowlist.
+# Why this file still injects a header after Bifrost's own dashboard auth was
+# turned off.
+#
+# `governance.auth_config.is_enabled` is false, so oauth2-proxy is the only
+# gate a human passes. But at v2.3.0 "auth disabled" is not "API open": the OSS
+# server installs `SetupLockMiddleware` whenever dashboard auth is not active
+# (`transports/bifrost-http/handlers/middlewares.go`), and it refuses every
+# non-public /api call that does not carry the operator's setup token in
+# `X-Bifrost-Setup-Token` (or the HttpOnly setup-session cookie minted from
+# it). Without this header the admin surface would work only after a second
+# prompt for that token — the setup page, not the dashboard — which is exactly
+# the second gate this design exists to remove.
+#
+# So the sidecar presents the token the task already injects from
+# `bifrost/gateway`, and the human path is Google SSO plus the committed
+# allowlist, once. The token is what proves operator control for re-enabling
+# auth (`PUT /api/config` with an `auth_config` block); it is held by the
+# deployment, never typed by a person, and never reaches the browser.
 #
 # `fromEnv`, not `value`: the value is a secret, and `value` would put it in
-# this file. `BIFROST_ADMIN_AUTHORIZATION` is computed at container start by
-# `entrypoint.go` from `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`
-# (both injected from `bifrost/gateway`), so it cannot drift from the password
-# Bifrost itself was provisioned with. oauth2-proxy validates a `fromEnv`
+# this file. `BIFROST_SETUP_TOKEN` is injected into this container by the task
+# definition from `bifrost/gateway`, and oauth2-proxy validates a `fromEnv`
 # source at startup and refuses to run when the variable is empty
-# (pkg/validation/common.go:25-30), which is the second half of fail-closed.
+# (pkg/validation/common.go:25-30), which is the fail-closed half of it. The
+# wrapper that used to compute a Basic credential here is gone: with dashboard
+# auth off there is no password to encode, and the token is already an
+# environment variable.
 #
 # `preserveRequestValue` is deliberately absent. It defaults to false
 # (pkg/apis/options/header.go:6-7, 69), which makes the injector strip any
-# client-supplied `Authorization` header before setting this one
+# client-supplied header of this name before setting it
 # (pkg/middleware/headers.go:21-43, 54-66). A caller cannot smuggle its own
-# credential upstream, and a caller cannot reach Bifrost's login form with a
-# header of its own either.
+# setup token through the proxy.
 injectRequestHeaders:
-  - name: Authorization
+  - name: X-Bifrost-Setup-Token
     values:
       - secretSource:
-          fromEnv: BIFROST_ADMIN_AUTHORIZATION
+          fromEnv: BIFROST_SETUP_TOKEN

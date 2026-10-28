@@ -1,5 +1,6 @@
 # Derived oauth2-proxy image for the Bifrost admin surface (phase 1 item 9 of
-# docs/bifrost-gateway.md).
+# docs/bifrost-gateway.md, revised when Bifrost's own dashboard auth was turned
+# off).
 #
 # It exists for two reasons, both of them things the stock image cannot do:
 #
@@ -9,12 +10,20 @@
 #    path the task definition's `OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE` names.
 #    Granting or revoking access is therefore a PR to `allowed-emails.txt` and
 #    a new image digest, not a runtime setting.
-# 2. Bifrost keeps its own admin login, and no human should have to type it a
-#    second time behind the Google gate. `alpha-config.yaml` injects that
-#    credential upstream (`injectRequestHeaders`); `entrypoint.go` computes the
-#    header value from the two secrets the task already injects, and fails the
-#    container closed when either is missing. See "Protecting the admin
-#    surface" in README.md.
+# 2. `alpha-config.yaml` carries everything the `--alpha-config` flag removes
+#    from the core options -- the Google provider, the upstream and the listen
+#    address -- and one injected header. With Bifrost's dashboard auth off, the
+#    OSS setup lock is what gates `/api`, so the sidecar presents the operator's
+#    setup token from `bifrost/gateway` on every proxied request; a human then
+#    meets Google SSO and nothing else. See "The image" in README.md.
+#
+# There is no entrypoint wrapper any more. The previous one computed
+# `base64(admin_username:admin_password)` for Bifrost's Basic login; with
+# `governance.auth_config.is_enabled` false there is no password to encode and
+# the value the header needs (`BIFROST_SETUP_TOKEN`) is already an environment
+# variable injected by the task definition, so the binary, its Go toolchain
+# stage and its tests were dead weight and were removed with the behavior they
+# implemented.
 #
 # The `FROM` pin is the same digest `agent-swarm/host/docker-compose.yml` uses.
 # It is duplicated from `deploy-workbench/oauth2-proxy-image.ts`, and
@@ -28,35 +37,6 @@
 #
 # See `README.md` in this directory for the manual Google Cloud step and the
 # secrets the task definition injects.
-
-# The entrypoint wrapper is built here, in a stage of its own, because the
-# runtime image is `gcr.io/distroless/static:nonroot` -- no shell, no coreutils
-# -- and a wrapper has to exist as a static binary to have any chance of
-# running there. It has no dependencies beyond the Go standard library, so this
-# stage needs no module downloads, and it runs the wrapper's own tests before
-# building: an entrypoint that does not fail closed (or that mangles the Basic
-# credential) fails the image build, which fails the deploy before the running
-# task is drained.
-#
-# The builder is pinned by digest for the same reason the runtime image is: a
-# floating tag would let a new Go release change the binary that ends up in an
-# ECR tag that is supposed to be immutable. Bump it deliberately.
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308 AS entrypoint
-
-WORKDIR /src
-
-COPY go.mod entrypoint.go entrypoint_test.go ./
-
-# The tests run on the build host's own architecture (no GOOS/GOARCH), so they
-# execute rather than needing emulation; the build below cross-compiles to the
-# target the runtime stage needs.
-RUN go test ./...
-
-ARG TARGETOS=linux
-ARG TARGETARCH
-
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/bifrost-oauth2-entrypoint .
 
 # Build-time assertion that the pinned release still accepts the alpha
 # configuration this image bakes, and still reads the options that survived
@@ -74,7 +54,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # The environment is dummy on purpose and is confined to this stage: the
 # runtime stage starts from the pinned image again, so none of it reaches the
 # image that ships. `${...}` in the alpha file is substituted from it, which is
-# the same mechanism the task definition relies on.
+# the same mechanism the task definition relies on. `BIFROST_SETUP_TOKEN` is
+# set because the injected header reads it with `fromEnv`, and oauth2-proxy
+# refuses to load a config whose `fromEnv` source is empty -- which is also the
+# fail-closed behavior the real task gets from a missing secret key.
 FROM quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916 AS alpha-config-check
 
 COPY allowed-emails.txt /etc/oauth2-proxy/allowed-emails.txt
@@ -88,7 +71,7 @@ ENV OAUTH2_PROXY_CLIENT_ID=build-time-config-check-not-a-real-client-id \
     OAUTH2_PROXY_WHITELIST_DOMAINS=example.invalid \
     OAUTH2_PROXY_REVERSE_PROXY=true \
     OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true \
-    BIFROST_ADMIN_AUTHORIZATION="Basic ZHVtbXk6ZHVtbXk="
+    BIFROST_SETUP_TOKEN=build-time-config-check-not-a-real-setup-token
 
 # Exec form, because the runtime image is distroless and has no shell to run a
 # string-form `RUN` with.
@@ -104,15 +87,12 @@ FROM quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a
 COPY allowed-emails.txt /etc/oauth2-proxy/allowed-emails.txt
 
 # The alpha configuration: the provider, the upstream, the listen address and
-# the request-header injection. It is a file because `--alpha-config` takes a
+# the injected setup-token header. It is a file because `--alpha-config` takes a
 # path, and it is baked rather than mounted so the sidecar's behaviour is a
 # reviewed commit like the allowlist is. Taken from the validated stage above.
 COPY --from=alpha-config-check /etc/oauth2-proxy/alpha-config.yaml /etc/oauth2-proxy/alpha-config.yaml
 
-COPY --from=entrypoint /out/bifrost-oauth2-entrypoint /bin/bifrost-oauth2-entrypoint
-
-# Replaces the image's `ENTRYPOINT ["/bin/oauth2-proxy"]`: the wrapper execs
-# that binary itself, so PID 1 is oauth2-proxy and signals are handled exactly
-# as upstream intends. `CMD` is deliberately left unset -- the task definition
-# passes `--alpha-config=...`, and the wrapper refuses to start without it.
-ENTRYPOINT ["/bin/bifrost-oauth2-entrypoint"]
+# The upstream image's own `ENTRYPOINT ["/rootfs/oauth2-proxy"]` is left in
+# place: there is no wrapper to replace it, and `CMD` is deliberately unset --
+# the task definition passes `--alpha-config=...`, and without that flag the
+# proxy has no provider and no upstream and refuses to start.

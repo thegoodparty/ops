@@ -23,7 +23,7 @@ import {
  *   Route 53 alias for `bifrost.workbench.goodparty.org`.
  * - Owns since item 9: the four HTTPS listener rules that split inference from
  *   the admin surface — `/oauth2/*` and the admin paths to oauth2-proxy, the
- *   inference prefixes and health/metrics to Bifrost — and the rule set that
+ *   inference prefixes and `/health` to Bifrost — and the rule set that
  *   makes both target groups associated with a listener, which is what lets
  *   item 9 register the ECS task against them.
  *
@@ -104,11 +104,26 @@ export type TargetGroupSpec = {
  * - The inference prefixes go straight to Bifrost, so a harness never meets a
  *   browser redirect. These are the four provider-shaped paths in the plan's
  *   harness table.
- * - `/health` and `/metrics` also belong on Bifrost: `/health` is item 12's
- *   end-to-end proof through the ALB, and `/metrics` is scraped without a
- *   Google session and stays on Bifrost's own basic auth (plan,
- *   "Observability"). They are a separate rule from the inference prefixes
- *   because an ALB `path-pattern` condition accepts at most five values.
+ * - `/health` also belongs on Bifrost: it is item 12's end-to-end proof through
+ *   the ALB, and the ALB's own target-group health check needs it
+ *   unauthenticated. It is `docs/bifrost-gateway.md`'s one allowed exception
+ *   to "everything else is behind the proxy". It is a rule of its own rather
+ *   than part of the inference one because an ALB `path-pattern` condition
+ *   accepts at most five values.
+ *
+ * `/metrics` is deliberately **not** here. It used to ride on Bifrost's own
+ * basic auth in the telemetry rule; with `governance.auth_config.is_enabled`
+ * false that credential no longer exists, so leaving the rule in place would
+ * expose the endpoint directly on 8080 to whatever the OSS setup lock does not
+ * cover. Nothing scrapes it yet (metrics wiring is a later task), so it now
+ * falls to the listener's default action, which sends it to oauth2-proxy — and
+ * a machine scraper cannot pass Google SSO, which is why the future scraper has
+ * to read it over loopback from a sidecar instead of over the ALB.
+ *
+ * The invariant the change leaves behind, and which `ingress.test.ts` pins: the
+ * only paths any rule sends straight to Bifrost are the enumerated inference
+ * prefixes plus `/health`, and the default action is oauth2-proxy, so a route
+ * added at the next Bifrost bump cannot become directly reachable by accident.
  *
  * Priorities are explicit and ascending in the order above; the paths are
  * disjoint, so the order is documentation rather than a precedence
@@ -123,12 +138,38 @@ export const INFERENCE_PATH_PATTERNS = [
   "/openai/*",
   "/genai/*",
 ] as const;
-export const TELEMETRY_PATH_PATTERNS = ["/health", "/metrics"] as const;
+
+/**
+ * The one direct route that is not inference: the ALB's health check path.
+ *
+ * Bifrost's auth middleware whitelists `/health`, and so does the OSS setup
+ * lock, so it is unauthenticated by design — which is why it is the only one,
+ * and why it is spelled here rather than computed by excluding everything
+ * else.
+ */
+export const HEALTH_PATH_PATTERNS = ["/health"] as const;
 
 export const OAUTH2_CALLBACK_RULE_PRIORITY = 10;
 export const ADMIN_RULE_PRIORITY = 20;
 export const INFERENCE_RULE_PRIORITY = 30;
-export const TELEMETRY_RULE_PRIORITY = 40;
+
+/**
+ * The health rule's priority, which is deliberately **not** 40.
+ *
+ * 40 was the telemetry rule this one replaces (`/health` and `/metrics`). The
+ * rule's Pulumi logical name comes from its `key`, and the key had to change
+ * with the paths: leaving it `telemetry` for a rule that carries only `/health`
+ * would keep the deploy quiet at the cost of a name that lies. But a renamed
+ * resource is a create and a delete, and Pulumi creates before it deletes — so
+ * a new rule at priority 40 would be rejected by the ALB with
+ * `PriorityInUse` while the old rule still holds 40. Taking the next free
+ * priority makes the create succeed first and the old rule be deleted after,
+ * which the PR's `pulumi preview` shows as `+1 create / -1 delete` rather than
+ * an apply-time failure. The final listener is identical either way; the
+ * absolute number is not load bearing, only its uniqueness and its order above
+ * the inference rule.
+ */
+export const HEALTH_RULE_PRIORITY = 50;
 
 /** Which target group a rule forwards to, by the key `TARGET_GROUPS` uses. */
 export type ListenerRuleTarget = "bifrost" | "oauth2Proxy";
@@ -161,9 +202,9 @@ export const HTTPS_LISTENER_RULES: ListenerRuleSpec[] = [
     target: "bifrost",
   },
   {
-    key: "telemetry",
-    priority: TELEMETRY_RULE_PRIORITY,
-    pathPatterns: TELEMETRY_PATH_PATTERNS,
+    key: "health",
+    priority: HEALTH_RULE_PRIORITY,
+    pathPatterns: HEALTH_PATH_PATTERNS,
     target: "bifrost",
   },
 ];
@@ -391,9 +432,9 @@ export const createBifrostIngress = (args: {
    * adds the path rules below without re-pointing it, which is what keeps the
    * listener fail-closed: an unmatched path is still authenticated by the proxy
    * before it can reach the gateway, and Bifrost is reachable only on the
-   * inference and telemetry paths the rules enumerate. There is deliberately
-   * no rule that sends `/api/*` or the dashboard to Bifrost directly; that is
-   * the bypass this default is here to prevent.
+   * inference prefixes and `/health` the rules enumerate. There is deliberately
+   * no rule that sends `/api/*`, the dashboard or `/metrics` to Bifrost
+   * directly; that is the bypass this default is here to prevent.
    */
   const httpsListener = new aws.lb.Listener(
     "bifrostHttpsListener",

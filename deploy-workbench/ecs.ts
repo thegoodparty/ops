@@ -42,9 +42,9 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   task-execution policy plus read on the task's secrets) and the separate
  *   task role (the Bedrock model list and nothing else).
  * - Owns since item 9: the oauth2-proxy sidecar, its three `OAUTH2_PROXY_*`
- *   secret references plus the two `bifrost/gateway` keys the header injection
- *   is computed from, the `--alpha-config` flag that turns that injection on,
- *   and the service's two `loadBalancers` entries. The rules that make those
+ *   secret references plus the one `bifrost/gateway` key the injected header is
+ *   read from, the `--alpha-config` flag that loads the alpha file, and the
+ *   service's two `loadBalancers` entries. The rules that make those
  *   target groups attachable are `ingress.ts`'s; this file takes the ingress
  *   object and depends on its listener rules, because
  *   ECS's `CreateService` rejects a target group that no listener or listener
@@ -57,10 +57,11 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   their exports rather than declaring a second copy of any of them. In
  *   particular there is no target group, listener or security group here.
  * - Does not own: the derived oauth2-proxy image, the allowlist baked into it
- *   or the alpha configuration that injects Bifrost's admin credential.
- *   `oauth2-proxy-image.ts` pins the image, `bifrost/allowed-emails.txt` is the
- *   list and `bifrost/alpha-config.yaml` is the injection; this file only names
- *   the tag, the container paths and the `--alpha-config` flag that loads it.
+ *   or the alpha configuration that carries the provider, the upstream and the
+ *   injected setup-token header. `oauth2-proxy-image.ts` pins the image,
+ *   `bifrost/allowed-emails.txt` is the list and `bifrost/alpha-config.yaml` is
+ *   the rest; this file only names the tag, the container paths and the
+ *   `--alpha-config` flag that loads it.
  * - Does not own: `config.json` itself. That file is item 10's, in
  *   `bifrost/config.json`, and is the deployment's declarative configuration;
  *   this module only stores it and gets it into the container.
@@ -237,17 +238,16 @@ export const OAUTH2_PROXY_SECRET_NAME = "bifrost/oauth2-proxy";
  * `DELEGATES` secret.
  *
  * `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD` are the OSS admin
- * credential for the dashboard and governance API; they arrive here now
- * because they belong to this container, and they are inert until the admin
- * surface is reachable (item 9 puts oauth2-proxy in front of it).
- *
- * `BIFROST_SETUP_TOKEN` is the bootstrap secret from phase 2 item 11 that a
- * fresh deployment is claimed with. At the pinned tag Bifrost reads it from
- * this environment variable as well as from `config.json`'s top-level
- * `setup_token` (`resolveSetupToken` in `transports/bifrost-http/lib/config.go`
- * at `v2.3.0`), so injecting it here is what makes the claim path work before
- * item 10's `BIFROST_CONFIG` injection lands, and it stays the value the
- * file's `env.BIFROST_SETUP_TOKEN` reference resolves to afterwards.
+ * credential. With dashboard auth turned off in `config.json` they no longer
+ * authenticate a request; they stay injected because the file still references
+ * them and because an admin account with auth disabled needs proof of operator
+ * control before someone re-enables it. `BIFROST_SETUP_TOKEN` is that proof at
+ * the pinned tag: while dashboard auth is not active the OSS setup lock
+ * requires it on every non-public `/api` call, and it is also the first-admin
+ * claim secret (phase 2 item 11). At the pinned tag Bifrost reads it from this
+ * environment variable as well as from `config.json`'s top-level `setup_token`
+ * (`resolveSetupToken` in `transports/bifrost-http/lib/config.go` at
+ * `v2.3.0`).
  */
 export const GATEWAY_SECRET_KEYS = [
   "BIFROST_ENCRYPTION_KEY",
@@ -269,27 +269,24 @@ export const OAUTH2_PROXY_SECRET_KEYS = [
 ] as const;
 
 /**
- * The two `bifrost/gateway` keys the sidecar reads, and the reason it reads
- * them: the entrypoint wrapper in the derived image turns them into the
- * `Authorization` header the baked alpha configuration injects upstream
- * (`deploy-workbench/bifrost/entrypoint.go`), so a human who passed the Google
- * gate does not meet Bifrost's own login as a second prompt.
+ * The one `bifrost/gateway` key the sidecar reads, and the reason it reads it:
+ * the baked alpha configuration injects `X-Bifrost-Setup-Token` on every
+ * request it proxies upstream (`deploy-workbench/bifrost/alpha-config.yaml`),
+ * so the OSS setup lock is satisfied by the deployment rather than by a human
+ * typing a second credential.
  *
- * They are the same two keys the gateway container and the claim container
- * already get, read from the same secret, so this adds a consumer and no new
- * secret. The values are not copied: the header is computed at container start
- * from whatever the secret holds at that moment, which is what keeps it from
- * drifting from the password Bifrost was provisioned with.
+ * This replaced the admin username/password pair the sidecar used to receive.
+ * Those two existed so a wrapper could compute Bifrost's Basic credential into
+ * an `Authorization` header; with `governance.auth_config.is_enabled` false
+ * there is no login to answer, and an injected Basic header is not the setup
+ * token, so the wrapper and the pair are gone. The token is read from the same
+ * `bifrost/gateway` container the gateway container and the claim container
+ * use, so there is no second secret and no copy that can drift.
  *
- * DIFFERS from the previous shape, which deliberately gave the sidecar nothing
- * from `bifrost/gateway`. That separation is gone by construction: the sidecar
- * is the component that now holds the admin Basic credential. It still gets no
- * provider key, no encryption key, no setup token and nothing from the database.
+ * The sidecar still gets no provider key, no encryption key and nothing from
+ * the database.
  */
-export const OAUTH2_PROXY_INJECTED_SECRET_KEYS = [
-  "BIFROST_ADMIN_USERNAME",
-  "BIFROST_ADMIN_PASSWORD",
-] as const;
+export const OAUTH2_PROXY_GATEWAY_SECRET_KEYS = ["BIFROST_SETUP_TOKEN"] as const;
 
 /**
  * The sidecar's command: the one flag that makes its baked alpha configuration
@@ -297,10 +294,10 @@ export const OAUTH2_PROXY_INJECTED_SECRET_KEYS = [
  *
  * It is here rather than in the image's `CMD` so the flag is part of the task
  * definition, where `ecs.test.ts` can pin it against the path the Dockerfile
- * writes. The alpha configuration is not optional: without it oauth2-proxy
- * ignores `injectRequestHeaders`, and the admin surface quietly reverts to the
- * shared password prompt. The image's entrypoint wrapper refuses to start the
- * proxy when this flag is absent, which is the fail-closed half of it.
+ * writes. Without it, the provider, the upstreams, the listen address and the
+ * setup-token header are all absent at v7.15.5 -- alpha configuration absorbs
+ * those options and oauth2-proxy has no other source for them -- so the proxy
+ * refuses to start rather than serving an unconfigured door.
  */
 export const OAUTH2_PROXY_COMMAND = [
   `--alpha-config=${OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH}`,
@@ -610,21 +607,22 @@ export const BIFROST_CONTAINER_COMMAND = [
  * service, which is the working precedent in this repo, with these differences:
  *
  * - The sidecar runs with `--alpha-config` (`OAUTH2_PROXY_COMMAND`), because
- *   injecting Bifrost's admin credential is only expressible there. That moves
- *   three settings out of this table and into
- *   `bifrost/alpha-config.yaml`: the provider (`OAUTH2_PROXY_PROVIDER`), the
- *   upstream (`OAUTH2_PROXY_UPSTREAMS`, Bifrost in the same task rather than
- *   the swarm's `static://202`, since here the proxy is the reverse proxy) and
- *   the listen address (`OAUTH2_PROXY_HTTP_ADDRESS`). At v7.15.5 those flags
- *   are *removed* when alpha configuration is used — an edit that leaves them
- *   here would be silently ignored, not rejected — so they are gone from this
- *   table on purpose rather than by omission.
+ *   the provider, the upstreams, the listen address and the injected
+ *   setup-token header are only expressible there. That moves three settings
+ *   out of this table and into `bifrost/alpha-config.yaml`: the provider
+ *   (`OAUTH2_PROXY_PROVIDER`), the upstream (`OAUTH2_PROXY_UPSTREAMS`, Bifrost
+ *   in the same task rather than the swarm's `static://202`, since here the
+ *   proxy is the reverse proxy) and the listen address
+ *   (`OAUTH2_PROXY_HTTP_ADDRESS`). At v7.15.5 those flags are *removed* when
+ *   alpha configuration is used — an edit that leaves them here would be
+ *   silently ignored, not rejected — so they are gone from this table on
+ *   purpose rather than by omission.
  * - `OAUTH2_PROXY_SET_XAUTHREQUEST` and `OAUTH2_PROXY_PASS_USER_HEADERS` are
  *   gone for the same reason: both are removed options under alpha
  *   configuration, and their replacements are `injectResponseHeaders` and
- *   `injectRequestHeaders` entries, which this deployment does not need. Bifrost
- *   does not read `X-Forwarded-User` or `X-Auth-Request-User`; the only header
- *   it needs is the `Authorization` one the alpha configuration injects.
+ *   `injectRequestHeaders` entries. Bifrost does not read `X-Forwarded-User` or
+ *   `X-Auth-Request-User`; the only header it needs is the setup token the
+ *   alpha configuration injects.
  * - `OAUTH2_PROXY_REDIRECT_URL` and `OAUTH2_PROXY_WHITELIST_DOMAINS` are this
  *   gateway's hostname, derived from `ingress.ts` rather than spelled again,
  *   so a hostname change cannot leave the Google callback pointing at the old
@@ -1020,13 +1018,14 @@ export const createBifrostEcs = (args: {
    *   `BIFROST_CONFIG` from the SSM parameter; see the module header for why
    *   nothing here reads Secrets Manager. Bifrost gets `bifrost/gateway`'s five,
    *   `PG_PASSWORD` and `BIFROST_CONFIG`; the sidecar gets
-   *   `bifrost/oauth2-proxy`'s three plus `bifrost/gateway`'s admin username and
-   *   password, which its entrypoint turns into the injected Basic header. It
-   *   gets no provider key, no encryption key and no setup token. The ECS agent
+   *   `bifrost/oauth2-proxy`'s three plus `bifrost/gateway`'s setup token,
+   *   which the alpha configuration injects upstream. It gets no provider key,
+   *   no encryption key and no admin username or password. The ECS agent
    *   resolves every entry before the container starts, so a key listed here and
    *   absent from the secret is a task that never starts: `fill-secrets.sh` has
    *   to write `BIFROST_SETUP_TOKEN` before a task definition naming it deploys,
-   *   exactly as it already has to write the sidecar's three and the admin pair.
+   *   exactly as it already has to write the sidecar's three and the gateway's
+   *   five.
    * - The environment carries `AWS_REGION`, because the Bedrock provider needs
    *   a region (the delegate sets `AWS_DEFAULT_REGION` for the same reason),
    *   and the four non-secret Postgres values `config.json` resolves by name.
@@ -1143,18 +1142,18 @@ export const createBifrostEcs = (args: {
           // rather than leaving a gateway whose admin surface has no door.
           // The alternative — non-essential, so Bifrost keeps serving
           // inference while a crash-looping proxy 503s the admin paths — was
-          // considered and rejected: the sidecar is given all three
-          // credentials unconditionally, so a proxy that will not start is a
-          // missing or wrong value in Secrets Manager, and a task that never
-          // stabilizes is the visible failure. The fail-closed property does
-          // not depend on this flag: the ALB has no rule that sends an admin
-          // path to Bifrost at all.
+          // considered and rejected: the sidecar is given its Google pair, its
+          // cookie secret and the setup token unconditionally, so a proxy that
+          // will not start is a missing or wrong value in Secrets Manager, and
+          // a task that never stabilizes is the visible failure. The
+          // fail-closed property does not depend on this flag: the ALB has no
+          // rule that sends an admin path to Bifrost at all.
           essential: true,
-          // The image's entrypoint is the wrapper (`bifrost/entrypoint.go`),
-          // which is why there is no `entryPoint` override here: the wrapper
-          // computes the Basic credential from the two secrets below and then
-          // execs oauth2-proxy. This argument is the alpha configuration that
-          // carries the header injection.
+          // The image's entrypoint is upstream's own: with dashboard auth off
+          // there is no Basic credential to compute, and the header value the
+          // alpha file injects is the setup token the secret below already
+          // provides. This argument is the alpha configuration that carries
+          // the provider, the upstream, the listen address and the header.
           command: [...OAUTH2_PROXY_COMMAND],
           portMappings: [
             {
@@ -1171,11 +1170,12 @@ export const createBifrostEcs = (args: {
               name: key,
               valueFrom: secretReference(OAUTH2_PROXY_SECRET_NAME, key),
             })),
-            // The admin pair the entrypoint wrapper encodes into the header
-            // oauth2-proxy injects upstream. Read from `bifrost/gateway`, the
-            // same keys the gateway container gets, so what the sidecar
-            // forwards cannot drift from what Bifrost was provisioned with.
-            ...OAUTH2_PROXY_INJECTED_SECRET_KEYS.map((key) => ({
+            // The setup token the baked alpha configuration injects as
+            // `X-Bifrost-Setup-Token`, read from `bifrost/gateway`. That is
+            // what satisfies Bifrost's OSS setup lock while dashboard auth is
+            // off, so a human who passed the Google gate lands on the
+            // dashboard rather than on the setup page.
+            ...OAUTH2_PROXY_GATEWAY_SECRET_KEYS.map((key) => ({
               name: key,
               valueFrom: secretReference(GATEWAY_SECRET_NAME, key),
             })),

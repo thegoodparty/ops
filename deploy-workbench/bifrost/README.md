@@ -21,17 +21,14 @@ files that belong in review:
   from the Identity Center `Admins` group, which `sheriff` mutates at runtime,
   so the two are expected to drift. The owner is **jagoda for now**.
 - `Dockerfile` — the derivative of the stock oauth2-proxy image: it bakes the
-  allowlist in, bakes the alpha configuration in, and builds the static
-  entrypoint wrapper in a stage of its own.
+  allowlist and the alpha configuration in, and keeps upstream's own
+  `ENTRYPOINT`. The Go entrypoint wrapper it used to build in a stage of its
+  own is gone with Bifrost's Basic login (see "The image").
 - `alpha-config.yaml` — oauth2-proxy's alpha configuration, loaded with
   `--alpha-config`: the Google provider, the upstream, the listen address and
-  the `injectRequestHeaders` entry that adds Bifrost's admin Basic credential
-  to every proxied request. See "The image" below.
-- `entrypoint.go`, `entrypoint_test.go`, `go.mod` — the wrapper that computes
-  that credential at container start from `BIFROST_ADMIN_USERNAME` and
-  `BIFROST_ADMIN_PASSWORD`, and the tests that pin its fail-closed behaviour.
-  Go rather than a shell script because the runtime image has no shell; the
-  tests run during the image build.
+  the `injectRequestHeaders` entry that presents Bifrost's setup token on every
+  proxied request, so the OSS setup lock is satisfied by the deployment rather
+  than by a human. See "The image" below.
 - `bootstrap.sh` and `bootstrap.Dockerfile` — the one-shot claim container
   (phase 2 item 11): the script that creates the first admin account from
   inside the task, and the derivative of the pinned Bifrost image that gives it
@@ -41,13 +38,14 @@ files that belong in review:
 The ECS task definition, the sidecar container and the ALB routing rules are
 the other half of phase 1 item 9 and live in `deploy-workbench/ecs.ts` and
 `deploy-workbench/ingress.ts`: the task runs this image on 4180 with the three
-`OAUTH2_PROXY_*` secrets, the two `bifrost/gateway` keys the injected header is
-computed from, and the `--alpha-config` flag that carries the injection, while
-the settings alpha configuration did not absorb stay as `OAUTH2_PROXY_*`
-environment variables. The HTTPS listener sends `/oauth2/*` and the admin paths
-to the sidecar; inference and `/metrics` still go straight to Bifrost. Those
-secrets are written to Secrets Manager out of band (phase 2 item 11) with
-`fill-secrets.sh`, never committed; see "Secrets" below.
+`OAUTH2_PROXY_*` secrets, the `BIFROST_SETUP_TOKEN` key the injected header is
+read from, and the `--alpha-config` flag that loads the rest, while the settings
+alpha configuration did not absorb stay as `OAUTH2_PROXY_*` environment
+variables. The HTTPS listener sends `/oauth2/*` and the admin paths to the
+sidecar; the inference prefixes and `/health` go straight to Bifrost, and
+`/metrics` falls to the proxy default because it no longer has a credential of
+its own. Those secrets are written to Secrets Manager out of band (phase 2 item
+11) with `fill-secrets.sh`, never committed; see "Secrets" below.
 
 ## `config.json` (phase 2 item 10)
 
@@ -78,17 +76,17 @@ a later tag. It holds:
   (`allow_direct_keys: false`), content logging is off with no per-request
   override, metadata logging is on with an explicit 90-day retention, and the
   gateway's public origin is the only allowed CORS origin.
-- **Governance.** Admin username/password auth is on, with both values
-  referenced as `env.` names. At the pinned tag a file's `auth_config` is
-  *not* write-only the way an API config write is: `loadAuthConfig` in
-  `transports/bifrost-http/lib/config.go` reads it at boot, hashes the
-  password and writes the admin account to the config store, so once this file
-  is injected the account exists and dashboard auth is active from the first
-  start — which is why the claim container is a no-op from the first start of
-  a task with `BIFROST_CONFIG` (see "The first admin account" below). That is
-  why those two keys stay generated: they are the credential the injected file
-  provisions the account with, and the login automation uses for `/api` — the
-  setup token is not a substitute. The `engineering` team, its
+- **Governance.** `auth_config` is present with `is_enabled: false`: Bifrost's
+  own dashboard login is off, and oauth2-proxy plus the allowlist is the only
+  gate a human passes. At the pinned tag a file's `auth_config` is *not*
+  write-only the way an API config write is — `loadAuthConfig` in
+  `transports/bifrost-http/lib/config.go` reads it at boot, hashes the password
+  and writes the admin account to the config store — so the account exists with
+  auth disabled, which is the state re-enabling it acts on. The username and
+  password references stay for that reason: turning auth back on should be one
+  decision, not a config-shape change with no credential. Re-enabling needs
+  proof of operator control, and the setup token is it. The `engineering`
+  team, its
   budget and the first virtual keys are **item 14** and are deliberately
   absent, not empty: under `source_of_truth: "config.json"` a present-but-empty
   section would prune rows created later.
@@ -164,27 +162,26 @@ The stock oauth2-proxy image has no inline email-list flag — the only form is
 allowlist reaches the container as a file in a derived image. The `FROM` pins
 the same digest `agent-swarm/host/docker-compose.yml` uses.
 
-The image does two more things, both of them for the same reason — that a human
-who passed the Google gate should not then meet Bifrost's own login:
+The image also bakes the alpha configuration, for the same reason — that a human
+who passed the Google gate should not then meet Bifrost's own setup page:
 
 - `alpha-config.yaml` is oauth2-proxy's alpha configuration, baked at
   `/etc/oauth2-proxy/alpha-config.yaml` and loaded with `--alpha-config` (the
   flag lives in `deploy-workbench/ecs.ts`, `OAUTH2_PROXY_COMMAND`). It carries
   the Google provider, the upstream and the listen address — all of which are
   *removed* options when alpha configuration is used — and, in
-  `injectRequestHeaders`, the `Authorization` header that satisfies Bifrost's
-  admin login. The value comes from `secretSource.fromEnv:
-  BIFROST_ADMIN_AUTHORIZATION`, and `PreserveRequestValue` stays at its default
-  false, so a client's own `Authorization` header is stripped before ours is
-  set.
-- `entrypoint.go` is the wrapper that computes that value. The runtime image is
-  `gcr.io/distroless/static:nonroot`, which has no shell and no coreutils, so
-  the wrapper is a small static Go binary built in a stage of its own; it
-  encodes `base64(admin_username:admin_password)` from the two keys the task
-  injects from `bifrost/gateway`, exports it, and execs oauth2-proxy. It exits
-  non-zero when either key is missing, and refuses to start the proxy without
-  `--alpha-config`, so a task that cannot inject the credential never serves
-  the admin surface. Its own Go tests run during the image build.
+  `injectRequestHeaders`, the `X-Bifrost-Setup-Token` header that satisfies
+  Bifrost's OSS setup lock. The value comes from `secretSource.fromEnv:
+  BIFROST_SETUP_TOKEN` (injected into this container from `bifrost/gateway`),
+  and `PreserveRequestValue` stays at its default false, so a client's own
+  header of that name is stripped before ours is set.
+- There is no entrypoint wrapper. The previous one computed
+  `base64(admin_username:admin_password)` for Bifrost's Basic login; with
+  dashboard auth off there is no login to answer and the header value is
+  already an environment variable, so the Go wrapper, its stage, its tests and
+  its `go.mod` were removed with the behavior. The image keeps upstream's own
+  `ENTRYPOINT` and the task definition passes `--alpha-config=...`, which is
+  what loads the provider and the upstreams.
 - A second stage runs `oauth2-proxy --config-test` over the baked alpha file
   with dummy values, and the runtime image copies the file from that stage. The
   alpha structure may change between minor releases, and at the pinned tag an
@@ -198,10 +195,10 @@ upstream pin and the ECR repository, and
 workflow and the module drift. CI builds and pushes the image to the
 `bifrost-oauth2-proxy` repository in the workbench account on every workbench
 change, tagged `v7.15.5-<first 12 hex of the sha256 over the image's committed
-inputs>` — the allowlist, the Dockerfile, `alpha-config.yaml`, the wrapper and
-its test, and its `go.mod` — so the tag changes when and only when the image's
-content does. Pulumi will reference it by digest (phase 1). The repository is
-immutable, so a re-push of an existing tag is skipped rather than rejected.
+inputs>` — the allowlist, the Dockerfile and `alpha-config.yaml` — so the tag
+changes when and only when the image's content does. Pulumi will reference it
+by digest (phase 1). The repository is immutable, so a re-push of an existing
+tag is skipped rather than rejected.
 
 Build it locally (no push, no ECR credentials needed):
 
@@ -235,24 +232,24 @@ settings, the whitelist domain, the redirect URL, the allowlist path and
 `reverse-proxy` survive into the core option set and are still environment
 variables in `deploy-workbench/ecs.ts`.
 
-**The OSS admin credential is injected, not typed.** Bifrost's dashboard auth
-stays on and `/metrics` stays on Bifrost's own basic auth; what changed is that
-nobody meets that login. The wrapper described under "The image" computes the
-credential at container start from the same `bifrost/gateway` values the
-gateway itself uses, so there is no second copy to rotate and nothing that can
-drift from the password Bifrost was provisioned with. Two consequences worth
-knowing:
+**Bifrost's login is off; the setup lock is presented by the sidecar.** With
+`governance.auth_config.is_enabled: false` there is no shared admin password on
+the human path. But "auth off" is not "API open" at the pinned tag: the OSS
+server installs `SetupLockMiddleware` whenever dashboard auth is not active, so
+every non-public `/api` call needs the operator's setup token in
+`X-Bifrost-Setup-Token` (or the setup-session cookie). That is why the alpha
+config still injects one header, and why it is the setup token rather than a
+Basic credential. Two consequences worth knowing:
 
-- The sidecar now reads `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`
-  from `bifrost/gateway`, which it deliberately did not before. It still gets
-  no provider key, no encryption key, no setup token and nothing from the
-  database.
-- The injection is alpha configuration, which upstream may reshape between
-  minor releases. The image digest and the content-addressed tag are the
-  containment; the rollback is to drop the `--alpha-config` flag and revert the
-  image pin, which brings the sidecar back with no injection and the shared
-  admin password prompt back with it. That is a working state rather than an
-  outage — Google SSO and the allowlist still gate the surface.
+- The sidecar reads `BIFROST_SETUP_TOKEN` from `bifrost/gateway`. It still gets
+  no provider key, no encryption key and no admin username or password.
+- Leaving the old Basic injection in place would break the surface rather than
+  secure it: nothing consumes a Basic header with auth off, and the setup lock
+  would still `401` every `/api` call, so every allowlisted human would meet
+  the setup page behind the Google gate. The image digest and the
+  content-addressed tag pin the alpha file; the rollback is
+  `is_enabled: true` in `config.json`, which brings the shared-password login
+  back as a working state rather than an outage.
 
 ## Secrets (phase 2 item 11)
 
@@ -266,7 +263,7 @@ the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
 | `bifrost/gateway` | `BIFROST_ENCRYPTION_KEY` | generated, 32 bytes base64url |
 | | `BIFROST_ADMIN_USERNAME` | generated (`bifrost-admin`), safe to print |
 | | `BIFROST_ADMIN_PASSWORD` | generated, never printed |
-| | `BIFROST_SETUP_TOKEN` | generated, never printed; first-run claim, restore and proof of control |
+| | `BIFROST_SETUP_TOKEN` | generated, never printed; the header the sidecar presents, first-run claim, restore and proof of control |
 | | `FIREWORKS_API_KEY` | a human |
 | `bifrost/oauth2-proxy` | `OAUTH2_PROXY_COOKIE_SECRET` | generated, 32 bytes base64url |
 | | `OAUTH2_PROXY_CLIENT_ID` | a human, from the Google client above |
@@ -280,11 +277,13 @@ phase 2 item 14, and their names follow the keys `config.json` declares. The RDS
 master credentials are managed by RDS in its own secret (phase 1 item 7).
 
 Item 8 wires `bifrost/gateway` into the task definition's `secrets` list and
-item 9 wires the three `OAUTH2_PROXY_*` keys. Item 11's claim container reads
-only `BIFROST_SETUP_TOKEN`, `BIFROST_ADMIN_USERNAME` and
-`BIFROST_ADMIN_PASSWORD` from the same container — no new secret, and nothing
-beyond those three. Those names are the seam between this script and the task
-definition, so renaming a container or a key is a change to both.
+item 9 wires the three `OAUTH2_PROXY_*` keys. The sidecar also reads
+`BIFROST_SETUP_TOKEN` from `bifrost/gateway` for the injected header, and
+item 11's claim container reads `BIFROST_SETUP_TOKEN`,
+`BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD` from the same container
+— no new secret, and nothing beyond those three names. Those names are the seam
+between this script and the task definition, so renaming a container or a key
+is a change to both.
 
 The session has to be able to write Secrets Manager in `024901689212`. The
 account's `WorkbenchAccess` set deliberately has no Secrets Manager write (its
@@ -367,6 +366,25 @@ settings the store holds. A store that already has an admin account with
 dashboard auth disabled is left alone; re-enabling it needs proof of control,
 and that is a human decision.
 
+That early exit is what makes the claim safe with auth disabled, and it is
+worth naming the two upstream facts it rests on, because neither is obvious
+from this repo:
+
+- `loadAuthConfig` (`transports/bifrost-http/lib/config.go` at `v2.3.0`)
+  persists the admin account from a file's `auth_config` even with
+  `is_enabled: false`, so the row exists on the first boot after
+  `BIFROST_CONFIG` is injected.
+- `GET /api/config` includes `auth_config` whenever that row exists
+  (`handlers/config.go`, `getConfig`, "When authConfig is nil, no admin
+  account has been created yet" is the only case where it is omitted). So the
+  script's `has("auth_config")` test is true, not false, on a store whose
+  account was provisioned with auth disabled.
+
+Without those two the script would fall through to the claim branch and write
+`is_enabled: true`, silently undoing the decision this change makes. The
+order is load-bearing, and the claim is idempotent in the direction that
+matters: it only ever acts when no account exists.
+
 **One field it has to correct, and why that mattered.** The write path is
 stricter than the read path: a store that has never saved a retention returns
 `client_config.log_retention_days: 0`, and `PUT /api/config` refuses anything
@@ -403,36 +421,44 @@ is whitelisted by Bifrost's middleware, but not by the ALB: `/api/*` is routed
 to oauth2-proxy (`ingress.ts`, `ADMIN_PATH_PATTERNS`), so from a laptop the
 request is a 302 to Google sign-in, and the useful output never arrives. The
 state is therefore read from inside the task (or from the claim container's
-log line), and from the dashboard, which serves the setup page while the lock
-is on and the login form once the account exists.
+log line). Through the proxy the dashboard goes straight in: its loader calls
+`GET /api/config` and, if that returns 200, redirects into the workspace
+instead of rendering the setup view (`ui/app/login/layout.tsx`,
+`setupSessionActive`). It returns 200 because the sidecar presents the setup
+token, so `setup_required: true` never turns into a visible setup page for an
+allowlisted human. That is also the one thing this file cannot prove: it is a
+property of the deployed task, and phase 2 item 12 confirms it end to end.
 
 **Doing it by hand**, for a break-glass claim or when the container's log says
 it exited non-zero. Read the token and the admin password from
-`bifrost/gateway` (the two read-backs above), then either open
-`https://bifrost.workbench.goodparty.org`, enter the token on the setup page and
-create the admin account it hands off to, or send the token in
+`bifrost/gateway` (the two read-backs above), then send the token in
 `X-Bifrost-Setup-Token` on the `PUT /api/config` that creates the account
-(`auth_config.setup_token` in the body is the equivalent). A password the
-policy rejects is fixed with `fill-secrets.sh --force`, which regenerates the
-admin password, the setup token and the cookie secret.
+(`auth_config.setup_token` in the body is the equivalent), or open the setup
+page `https://bifrost.workbench.goodparty.org` in the one case it appears: the
+sidecar is not presenting the token, so the lock answers `401` and the page
+asks for it. A password the policy rejects is fixed with
+`fill-secrets.sh --force`, which regenerates the admin password, the setup
+token and the cookie secret.
 
-**Scope and what the token is not.** The lock covers `/api/*` only: inference
-is not behind it, and `client.enforce_auth_on_inference` remains the only
-inference control. Once dashboard auth is active, `APIMiddleware` never
-consults the token and `ClearBootstrapToken` nils the first-admin half, so it
-is not a login and never becomes a bearer token; its one remaining role is
-`CheckConfiguredSetupToken`, the proof of operator control for `auth_config`
-changes made while dashboard auth is disabled. Keep it in Secrets Manager: a
-rebuilt task whose config store is empty has no admin account, and a token
-nobody retained is a gateway nobody can administer. Anything scripted against
-the management API signs in as the admin account — `BIFROST_ADMIN_USERNAME` /
-`BIFROST_ADMIN_PASSWORD` via `POST /api/session/login` — or uses a scoped key
-for inference; the setup token is not a substitute for those two keys.
+**Scope and what the token is.** The lock covers `/api/*` only: inference is
+not behind it, and `client.enforce_auth_on_inference` remains the only
+inference control. With dashboard auth disabled the token is load-bearing for
+the admin surface: the sidecar presents it on every proxied request (see "The
+image" and "`config.json`") and anything scripted against the management API
+has to send `X-Bifrost-Setup-Token` itself, because `POST /api/session/login`
+answers `403 Authentication is not enabled` and `APIMiddleware` has no session
+to check. It is still not a bearer token for inference. Re-enabling dashboard
+auth (`is_enabled: true`) makes `APIMiddleware` the gate again, retires the
+token from the request path, and leaves `CheckConfiguredSetupToken` as the
+proof of operator control for later `auth_config` changes. Keep it in Secrets
+Manager either way: the sidecar cannot present what the secret does not hold,
+and a token nobody retained is a gateway nobody can administer.
 
-**One login, and it is Google.** The only prompt a human meets is Google SSO
-plus the committed allowlist; oauth2-proxy then injects Bifrost's admin
-credential upstream, so the OSS login is answered by the proxy rather than by a
-person. What that does **not** buy is per-person identity: every allowlisted
+**One login, and it is Google.** The only gate on the admin surface is
+oauth2-proxy plus the committed allowlist: Bifrost's own dashboard auth is off,
+so there is no shared admin password on the human path, and the sidecar
+presents the setup token Bifrost's lock requires rather than a person typing
+it. What that does **not** buy is per-person identity: every allowlisted
 address acts as the same Bifrost admin, and Bifrost's own records cannot tell
 them apart. Enterprise SSO is what separates them. A plugin cannot stand in for
 it at this tag, which an earlier version of this section claimed it could: the
