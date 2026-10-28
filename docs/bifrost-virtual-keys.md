@@ -1,13 +1,14 @@
 # Per-user Bifrost virtual keys
 
-> **Status: proposal, decisions settled in review. Nothing has been built.**
 > This is the design for how a person gets a key to the Bifrost gateway, how it
 > is taken away, and how a coding harness presents it. It is the second half of
 > phase E of [`bifrost-gateway.md`](./bifrost-gateway.md), which is the
 > gateway's plan and the place to start: this document assumes the gateway, its
 > oauth2-proxy admin surface, its RDS config store and the image pinned at
 > `v2.3.0` described there. It changes no code and no infrastructure.
-> Implementation PRs follow, and each names one step of "Implementation plan".
+> Implementation PRs follow, and a PR names this document and the step it
+> implements in its body; progress is derived from those PRs and is not written
+> here (decision 11 of [`plan-gated-merges.md`](./plan-gated-merges.md)).
 
 The gateway's plan settled that the human path is **one virtual key per
 person**, and then deliberately stopped: "how virtual keys are distributed to
