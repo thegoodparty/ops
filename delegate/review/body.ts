@@ -24,9 +24,15 @@ const renderFindings = (f: FindingsVerdict): string =>
 // bot had nothing to flag.
 const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
   if (f.verdict === "none") {
-    return g.mode === "shadow"
-      ? "No findings: the changes look approvable, and shadow mode alone is why this is a comment rather than an approval. A human still has to approve this PR."
-      : "No findings: the changes look approvable, and the gate alone is why this is a comment rather than an approval. A human still has to approve this PR — the bot's review is not a required check and `CODEOWNERS` is unchanged.";
+    if (g.mode === "shadow") {
+      // Shadow withholds on its own only when no flag fired. With a flag, the
+      // gate is what would have blocked an approval too, and saying shadow
+      // alone did it would contradict the gate line in the same body.
+      return g.flags.length === 0
+        ? "No findings: the changes look approvable, and shadow mode alone is why this is a comment rather than an approval. A human still has to approve this PR."
+        : "No findings: the changes look approvable, but the gate flagged the PR as well, and shadow mode posts a comment either way. A human still has to approve this PR.";
+    }
+    return "No findings: the changes look approvable, and the gate alone is why this is a comment rather than an approval. A human still has to approve this PR — the bot's review is not a required check and `CODEOWNERS` is unchanged.";
   }
   return g.flags.length > 0
     ? "The findings are why this is not an approval, and the gate flagged the PR independently."

@@ -235,6 +235,27 @@ describe("renderBody with the gate on", () => {
     assert.ok(body.includes("A human still has to approve this PR"));
   });
 
+  it("a shadow comment with no findings but a flag does not blame shadow alone", () => {
+    // Shadow withholds on its own only when no flag fired. With a flag the
+    // gate would have blocked an approval too, and the gate line in the same
+    // body says "would have commented", so the sentence must not contradict it.
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({ mode: "shadow", flags: ["owned_paths"], ownedPaths: ["deploy/index.ts"] }),
+      ),
+    });
+    assert.ok(body.includes("**Findings: none.**"));
+    assert.ok(body.includes("**Gate: shadow, would have commented**"));
+    assert.ok(
+      body.includes(
+        "No findings: the changes look approvable, but the gate flagged the PR as well, and shadow mode posts a comment either way.",
+      ),
+    );
+    assert.equal(body.includes("shadow mode alone"), false);
+    assert.ok(body.includes("A human still has to approve this PR"));
+  });
+
   it("an approval does not gain a findings line", () => {
     // Approved: there is nothing withheld to explain, and the body is what it
     // was before this existed.
