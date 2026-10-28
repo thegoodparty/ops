@@ -10,7 +10,7 @@ interface ContentBlock {
 }
 
 // The SDK has called its subagent tool both "Task" and "Agent".
-const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
+export const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
 
 export const recordSubagentUses = (calls: Map<string, SubagentCall>, blocks: ContentBlock[]) => {
   for (const b of blocks) {
