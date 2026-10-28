@@ -257,13 +257,14 @@ uniform and a mistake is uniform:
   Each provider entry also carries `key_ids: ["*"]`, because a provider config
   with no keys allows none: empty is deny, `"*"` is "use the provider's keys",
   and the gateway's keys are the deployment's, not the person's.
-- **A conservative per-key budget and a per-key rate limit**, because the
-  mechanism is what this document needs to exist and the numbers are a
-  measurement: `budgets` (`max_limit`, `reset_duration`) and `rate_limit`
-  (`token_max_limit`/`token_reset_duration`, `request_max_limit`/
-  `request_reset_duration`). **The numbers are TODO for the implementer**, to
-  be set from a week of real usage rather than guessed here. The team budget
-  under `engineering` stays the backstop.
+- **No `budgets` and no `rate_limit` on the key.** Decided in review on this
+  PR: per-person budgets and rate limits are skipped for now, because AWS and
+  Fireworks already impose provider-level limits that act as the stopgap, and a
+  number chosen before there is any usage data is as likely to starve a person
+  mid-task as to catch anything. What stays is attribution, which is what the
+  key is for. What this gives up is stated in "Deferred": nothing stops one
+  person's runaway loop except the provider's own limit, and the account
+  budget alerts rather than binds.
 - **A marker in `description`** identifies the key as Lambda-managed. It is the
   janitor's only input, and it is what keeps a hand-made key — a test key, an
   experiment, a key a human created in the dashboard — out of reach of a job
@@ -272,11 +273,12 @@ uniform and a mistake is uniform:
 - **The template is a file, not a code path.** A committed JSON template beside
   the Lambda, stored by Pulumi as an SSM `String` parameter and read at run
   time, the same shape the group-sync job uses for its pair list. Widening a
-  model list or changing a budget is then a reviewed file change and an apply,
-  with no Lambda code change — which is what "the tier is data" has to mean if
-  a non-engineer is later to be a record rather than a branch. A test fails if
-  the template names a model the gateway's `config.json` does not allow, since
-  a model in one and not the other is a `404` or an `AccessDenied` at runtime.
+  model list is then a reviewed file change and an apply, with no Lambda code
+  change — which is what "the tier is data" has to mean if a non-engineer is
+  later to be a record rather than a branch. A test fails if the template names
+  a model the gateway's `config.json` does not allow, since a model in one and
+  not the other is a `404` or an `AccessDenied` at runtime. When budgets come
+  back, they come back through this file.
 
 ### 6. The janitor: a scheduled reconcile loop
 
@@ -524,9 +526,6 @@ not decided here.
 
 ## The key, as the Lambda sends it
 
-Shape only: every number in it is a placeholder, and the budget and
-rate-limit numbers are the implementer's to settle (step 6).
-
 ```json
 {
   "name": "jeff@goodparty.org",
@@ -536,30 +535,38 @@ rate-limit numbers are the implementer's to settle (step 6).
   "provider_configs": [
     { "provider": "bedrock",   "allowed_models": ["…"], "key_ids": ["*"] },
     { "provider": "fireworks", "allowed_models": ["…"], "key_ids": ["*"] }
-  ],
-  "budgets":    [{ "max_limit": 0, "reset_duration": "1M" }],
-  "rate_limit": {
-    "token_max_limit": 0, "token_reset_duration": "1h",
-    "request_max_limit": 0, "request_reset_duration": "1m"
-  }
+  ]
 }
 ```
 
 The model lists are the gateway's own, copied by the template test from
 `deploy-workbench/bifrost/config.json`; the team is the one item 14 creates.
+There is deliberately no `budgets` or `rate_limit` entry (decision 5): adding
+one later is adding a field here.
 
 ## Deferred, recorded and not designed
 
 - **Per-person tier expression.** "Who may use the higher-grade models" is a
   decision the engineer chose to skip for pass one, and it is recorded here as
   an open decision rather than an oversight. The data model already supports
-  it: a tier *is* a key's `provider_configs` and its budget, so a second
-  template plus a mapping from group membership to template is the whole
-  mechanism, and the Lambda would pick the template from the group that
-  admitted the caller. The two candidate shapes are a second Identity Center
-  group (tiers as membership, one more group to maintain, no per-person state)
-  and an edited per-person record (tiers as data, one row per exception, no new
-  group). Both are compatible with everything above; neither is designed here.
+  it: a tier *is* a key's `provider_configs` (and, when budgets come back, its
+  budget), so a second template plus a mapping from group membership to
+  template is the whole mechanism, and the Lambda would pick the template from
+  the group that admitted the caller. The two candidate shapes are a second
+  Identity Center group (tiers as membership, one more group to maintain, no
+  per-person state) and an edited per-person record (tiers as data, one row per
+  exception, no new group). Both are compatible with everything above; neither
+  is designed here.
+- **Per-key budgets and rate limits.** Decided in review on this PR to skip them
+  for pass one: AWS and Fireworks already impose provider-level limits that act
+  as the stopgap, and a per-person number chosen before there is any usage data
+  is a guess that can starve a person mid-task as easily as catch a runaway.
+  **What this costs is real and worth knowing:** the key gives attribution and
+  no cap, so a runaway loop spends the team's provider quota rather than
+  tripping a gateway limit, and the account budget alerts rather than binds.
+  Coming back is cheap — `budgets` and `rate_limit` are fields on the key's
+  template (decision 5) and the key is already attributable, which is what
+  makes a number possible to choose from evidence rather than by guessing.
 - **Scheduled rotation.** The endpoints exist at the pinned tag —
   `POST /api/governance/virtual-keys/{vk_id}/rotate` and the bulk
   `POST /api/governance/virtual-keys/rotate` — and a rotated key keeps its
@@ -596,9 +603,10 @@ Step: 2
 ```
 
 1. **The default template, as data.** A committed JSON template beside the
-   mint Lambda, with the test that pins it to `deploy-workbench/bifrost/config.json`'s
-   model lists and to the TODO budgets. No infrastructure, no code path —
-   reviewable on its own. The numbers stay TODO here and are settled by step 6.
+   mint Lambda, with the test that pins it to
+   `deploy-workbench/bifrost/config.json`'s model lists. No infrastructure, no
+   code path — reviewable on its own. It carries no budget or rate limit
+   (decision 5).
 2. **The mint Lambda.** In `deploy-workbench/`: the function, its execution
    role, the Function URL with `AuthType: AWS_IAM`, its VPC attachment to the
    private subnets, its own security group, the new ingress rule on
@@ -630,10 +638,6 @@ Step: 2
    `--refresh`, and the provider entry. **Depends on steps 2 and 3** — before
    them there is nothing to call. It also settles the command's name in the
    image, per decision 7.
-6. **The numbers.** Set the default budget and rate limit from a week of real
-   usage, and the janitor interval if an hour turns out to be wrong in either
-   direction. **Depends on 2 and 5 being in use**; until then every number in
-   the template is a placeholder and every document that quotes one says so.
 
 ## Cited so the next session can check
 
@@ -688,23 +692,20 @@ Everything else:
    the `409` on a duplicate name, that a created key authenticates against
    `/v1` immediately, and that `key_ids: ["*"]` is what makes a pinned
    `provider_configs` entry usable.
-3. **The default budget and rate-limit numbers.** TODO by design. They are a
-   measurement, not a guess, and a wrong budget either starves a person
-   mid-task or does nothing.
-4. **The janitor interval.** Hourly is this document's choice. It is worth
+3. **The janitor interval.** Hourly is this document's choice. It is worth
    revisiting if the gateway's request logs show a revoked key still being used
    after an hour, or if the janitor's own runs turn out to be the noisiest
    thing in the account.
-5. **Which secret the mint Lambda reads.** `bifrost/gateway` is one read grant
+4. **Which secret the mint Lambda reads.** `bifrost/gateway` is one read grant
    and one copy of the token, but it also makes the encryption key and the
    Fireworks key readable by the function. A dedicated `bifrost/vk-mint`
    container holding only `BIFROST_SETUP_TOKEN` closes that at the cost of a
    second copy. The engineer's call; the design works either way.
-6. **The command's name inside the container.** `gp-pi bifrost-key` is the
+5. **The command's name inside the container.** `gp-pi bifrost-key` is the
    design's name for the interface; the image has no `gp-pi` executable, so
    decision 7's two options are a new dispatcher or the `gp-bifrost-key` idiom.
    Settled in the `gp-pi` PR, not here.
-7. **A user whose `userName` is not their email.** The session name is the
+6. **A user whose `userName` is not their email.** The session name is the
    Identity Center `userName`, and in this identity store that is the email
    (`deploy-infrastructure/group-sync/identity.ts` creates users that way), so
    the key name and the janitor's `GetUserId(emails.value)` lookup agree. If a

@@ -37,8 +37,13 @@ Success, in the order it should be proven:
    person's traffic and nothing else has to be rotated; who gets one, and what
    takes it away, is
    [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md).
-3. **Budgets that bind.** Per-engineer and per-team spend is visible in the
-   gateway and capped by it, independent of the account's billing alert.
+3. **Spend per person, visible.** Per-person spend is visible in the gateway
+   and attributable, because each key belongs to a person. **The cap is the
+   provider's, not the gateway's, for now**: per-key budgets and rate limits
+   were dropped by agreement on #404
+   ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred") in
+   favour of the limits AWS and Fireworks already impose, plus the account's
+   billing alert.
 4. **Metadata only.** Prompt and completion bodies are not persisted by the
    gateway, matching the workbench account's existing Bedrock invocation
    logging posture. See "Observability".
@@ -699,11 +704,15 @@ Virtual keys are Bifrost's primary governance entity
   harness expects — the same key can be used as `x-bf-vk`,
   `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`, which is why one
   key works across Claude Code, Codex and Gemini CLI.
-- **A team per group of humans.** An `engineering` team owns the human keys
-  and a monthly budget; per-key budgets sit under it. Budget enforcement is a
-  rationing tool: it stops one engineer starving the others, and it caps the
-  fleet's spend. It does not raise the provider ceiling, which is the account
-  and quota argument `workbench-account.md` already makes.
+- **A team per group of humans.** An `engineering` team owns the human keys, so
+  the gateway can total them. It was to carry a monthly budget with per-key
+  budgets under it; **per-key budgets and rate limits were dropped by agreement
+  on #404** ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md),
+  "Deferred"), with the providers' own limits as the stopgap. Budget
+  enforcement, when it comes back, is a rationing tool: it stops one engineer
+  starving the others, and it caps the fleet's spend. It does not raise the
+  provider ceiling, which is the account and quota argument
+  `workbench-account.md` already makes.
 - **Expiry and offboarding.** Offboarding is "deactivate the virtual key",
   which is one action and does not touch a provider. Who does it, and when,
   is [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a scheduled
@@ -803,13 +812,15 @@ Virtual keys are Bifrost's primary governance entity
   `custom_pricing`/pricing overrides if it is wrong or missing — a gateway
   whose per-key cost numbers are wrong is worse than one with none, because
   the budgets enforce against them.
-- **Budgets and alerts.** The account already has
-  `workbench-monthly-spend` in `deploy-workbench/index.ts` with actual and
-  forecasted email notifications. The gateway adds per-key and per-team
-  budgets inside Bifrost. The two are complementary: the AWS budget is the
-  account-level backstop and lags hours; the Bifrost budget is the fast,
-  per-person control. RDS adds its own storage and instance cost, which the
-  account budget already covers.
+- **Budgets and alerts.** The account already has `workbench-monthly-spend` in
+  `deploy-workbench/index.ts` with actual and forecasted email notifications,
+  and that is the only cap in place for now: per-key and per-team budgets
+  inside Bifrost were dropped by agreement on #404
+  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred"), leaving
+  the providers' own limits as the stopgap. The AWS budget is an alert rather
+  than a rationer — it lags hours and stops nothing — which is worth saying
+  plainly now that it is the only guardrail on spend. RDS adds its own storage
+  and instance cost, which the account budget already covers.
 - **Audit.** CloudTrail for the account covers infrastructure actions. The
   gateway's own log is the record of model traffic. Neither is a content log,
   by design.
@@ -1161,9 +1172,11 @@ network or a permission can land before the item that creates it.
     the setup token the OSS setup lock requires.
 16. Reconcile gateway cost numbers against a week of provider billing for the
     pilot, and add pricing overrides if they disagree.
-17. Confirm the account budget and the Bifrost budgets are both wired, and
-    that a threshold crossing is actually delivered (the workbench document's
-    warning about alerts that only prove the wire exists).
+17. Confirm the account budget is wired and that a threshold crossing is
+    actually delivered (the workbench document's warning about alerts that only
+    prove the wire exists). The Bifrost-side budgets this item used to name
+    were dropped by agreement on #404, so the account budget is the only one to
+    prove.
 
 **Phase 4 — migration**
 
@@ -1179,7 +1192,7 @@ network or a permission can land before the item that creates it.
 21. Credential distribution and `gp-pi` wiring (phase E above), gated on the
     gateway having proven out. **Designed** in
     [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), whose own numbered
-    steps 1–6 are the implementation plan for it; a PR implementing one of
+    steps 1–5 are the implementation plan for it; a PR implementing one of
     them names that document and its step, not this item.
 22. Tighten `WorkbenchAccess`/`EngineerAccess` Bedrock invoke and remove
     direct provider keys, in a separate PR, after a full cycle on the gateway.
