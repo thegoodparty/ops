@@ -65,9 +65,10 @@ export type TrustPolicyDocument = {
 // `pull_request`: it does not, and has not since that workflow's publish job
 // was gated to push and workflow_dispatch. What does need `pull_request`
 // today is five other omni workflows and one in gp-terraform-dataplatform.
-// gpvpn is push-only and can be pinned independently. See
+// gpvpn is pinned to main in its own statement (step 9): its only workflow
+// runs on push to main, so nothing needed the wildcard. See
 // docs/deploy-role-trust.md for what each one does and the order to narrow
-// them in.
+// the other two in.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -107,9 +108,25 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
         StringLike: {
           "token.actions.githubusercontent.com:sub": [
             "repo:thegoodparty/gp-terraform-dataplatform:*",
-            "repo:thegoodparty/gpvpn:*",
             "repo:thegoodparty/omni:*",
           ],
+        },
+      },
+    },
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // Its own statement, because `sub` under StringEquals and StringLike
+          // in one statement is ANDed, not ORed. gpvpn's one workflow,
+          // `main.yml`, runs only on push to main.
+          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/gpvpn:ref:refs/heads/main",
         },
       },
     },

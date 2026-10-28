@@ -26,7 +26,7 @@ const wildcardSubjects = () =>
 describe("githubActionsPulumiDeployTrust", () => {
   // `sub` under both StringEquals and StringLike in one statement is not "or":
   // IAM ANDs them, so nothing would match. The pin must be its own statement.
-  it("pins the ops subject to main under StringEquals, in its own statement", () => {
+  it("pins the ops and gpvpn subjects to main under StringEquals, each in its own statement", () => {
     const exact = subjectConditions().filter(
       (c) => c.operator === "StringEquals"
     );
@@ -34,6 +34,10 @@ describe("githubActionsPulumiDeployTrust", () => {
       {
         operator: "StringEquals",
         value: "repo:thegoodparty/ops:ref:refs/heads/main",
+      },
+      {
+        operator: "StringEquals",
+        value: "repo:thegoodparty/gpvpn:ref:refs/heads/main",
       },
     ]);
   });
@@ -63,16 +67,23 @@ describe("githubActionsPulumiDeployTrust", () => {
     );
   });
 
-  // Exact equality, not inclusion: these three are the live repositories that
-  // still assume the role, and a fourth added to an administrator role's
-  // trust should fail the test rather than pass silently. The list only ever
-  // shrinks from here; docs/deploy-role-trust.md is the plan for emptying it.
-  it("leaves exactly the three live repositories wildcarded", () => {
+  // Exact equality, not inclusion: these two are the live repositories that
+  // still assume the role on a pull request, and another added to an
+  // administrator role's trust should fail the test rather than pass silently.
+  // The list only ever shrinks from here; docs/deploy-role-trust.md is the
+  // plan for emptying it.
+  it("leaves exactly the two pull request consumers wildcarded", () => {
     assert.deepEqual(wildcardSubjects(), [
       "repo:thegoodparty/gp-terraform-dataplatform:*",
-      "repo:thegoodparty/gpvpn:*",
       "repo:thegoodparty/omni:*",
     ]);
+  });
+
+  it("keeps no wildcard gpvpn subject", () => {
+    assert.equal(
+      wildcardSubjects().some((s) => s.startsWith("repo:thegoodparty/gpvpn:")),
+      false
+    );
   });
 
   // The five removed in step 2 are archived, so they cannot run a workflow at
