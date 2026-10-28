@@ -31,6 +31,20 @@ export type Decision = {
    * an ungated review is byte-for-byte the review it was before this existed.
    */
   gating?: DecisionGating;
+  /**
+   * The finding gate's own answer, deliberately outside `gating`: "did the
+   * reviewer find anything wrong with the code" and "may the bot approve this
+   * PR at all" are different questions, and a reader (or a script) that
+   * conflates them cannot tell a clean PR the gate blocked from a PR with
+   * problems. Present exactly when `gating` is, for the same reason.
+   */
+  findingsVerdict?: FindingsVerdict;
+};
+
+export type FindingsVerdict = {
+  verdict: "none" | "findings";
+  /** Findings counted against approval, including ones the schema dropped. */
+  count: number;
 };
 
 export type DecisionGating = {
@@ -94,6 +108,10 @@ export const decide = (
     verdict,
     action: verdict,
     gates: [...blockers, ...flags],
+    findingsVerdict: {
+      verdict: clean ? "none" : "findings",
+      count: output.findings.length + (opts.unparseableCount ?? 0),
+    },
     gating: {
       mode: gating.mode,
       wouldApprove,

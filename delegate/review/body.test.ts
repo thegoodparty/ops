@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { renderBody, renderFailureBody } from "./body";
-import type { Decision, DecisionGating } from "./gates";
+import type { Decision, DecisionGating, FindingsVerdict } from "./gates";
 
 const approveDecision: Decision = { verdict: "approve", action: "approve", gates: [] };
 const commentDecision: Decision = { verdict: "comment", action: "comment", gates: [] };
@@ -80,12 +80,17 @@ describe("renderBody with the gate on", () => {
     ownedPaths: [],
     ...over,
   });
-  const gated = (g: DecisionGating): Decision => ({
+  const gated = (
+    g: DecisionGating,
+    findings: FindingsVerdict = { verdict: "none", count: 0 },
+  ): Decision => ({
     verdict: g.mode === "enforce" && g.wouldApprove ? "approve" : "comment",
     action: g.mode === "enforce" && g.wouldApprove ? "approve" : "comment",
     gates: g.flags,
+    findingsVerdict: findings,
     gating: g,
   });
+  const withFindings: FindingsVerdict = { verdict: "findings", count: 2 };
 
   it("says nothing when the gate did not run", () => {
     const body = renderBody(baseArgs);
@@ -158,6 +163,87 @@ describe("renderBody with the gate on", () => {
     });
     assert.ok(body.includes("**Gate: shadow, would have commented**"));
     assert.ok(body.includes("Flags: `inconsistent`: the change is not consistent with the plan."));
+  });
+
+  // The reason this exists: a reader could not tell "the reviewer found nothing
+  // wrong, the gate blocked it" from "the reviewer found problems", and those
+  // need opposite human replies. Each of the five gate cases is rendered twice,
+  // once with no findings and once with two.
+  const gateCases: Array<{ flag: DecisionGating["flags"][number]; detail: string }> = [
+    { flag: "no_binding", detail: "the PR body has no `Plan:` line" },
+    { flag: "invalid_binding", detail: "is not a repo-relative `docs/**.md` document" },
+    { flag: "ambiguous_binding", detail: "names more than one plan" },
+    { flag: "unverifiable_authority", detail: "has no `*` default" },
+    { flag: "owned_paths", detail: "deploy/index.ts" },
+  ];
+
+  for (const { flag, detail } of gateCases) {
+    const gate = (): DecisionGating =>
+      gating({
+        flags: [flag],
+        ownedPaths: flag === "owned_paths" ? ["deploy/index.ts"] : [],
+      });
+
+    it(`${flag} with no findings says the gate alone blocked it`, () => {
+      const body = renderBody({ ...baseArgs, decision: gated(gate()) });
+      assert.ok(body.includes("**Recommendation: comment**"));
+      assert.ok(body.includes("**Findings: none.**"));
+      assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
+      assert.ok(body.includes(detail));
+      assert.ok(
+        body.includes(
+          "No findings: the changes look approvable, and the gate alone is why this is a comment rather than an approval.",
+        ),
+      );
+      assert.ok(body.includes("A human still has to approve this PR"));
+      assert.equal(body.includes("The findings are why"), false);
+    });
+
+    it(`${flag} with findings says the findings came too`, () => {
+      const body = renderBody({ ...baseArgs, decision: gated(gate(), withFindings) });
+      assert.ok(body.includes("**Recommendation: comment**"));
+      assert.ok(body.includes("**Findings: 2 finding(s).**"));
+      assert.ok(body.includes(`**Gate: comment** against \`docs/plan-gated-merges.md\``));
+      assert.ok(body.includes(detail));
+      assert.ok(
+        body.includes(
+          "The findings are why this is not an approval, and the gate flagged the PR independently.",
+        ),
+      );
+      assert.equal(body.includes("No findings:"), false);
+    });
+  }
+
+  it("a findings-only comment says the findings are the whole reason", () => {
+    const body = renderBody({ ...baseArgs, decision: gated(gating({}), withFindings) });
+    assert.ok(body.includes("**Findings: 2 finding(s).**"));
+    assert.ok(body.includes("The findings are why this is not an approval."));
+    assert.equal(body.includes("flagged the PR independently"), false);
+  });
+
+  it("a shadow comment keeps the findings verdict separate from the would-have line", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ mode: "shadow", wouldApprove: true })),
+    });
+    assert.ok(body.includes("**Findings: none.**"));
+    assert.ok(
+      body.includes(
+        "No findings: the changes look approvable, and shadow mode alone is why this is a comment rather than an approval.",
+      ),
+    );
+    assert.ok(body.includes("A human still has to approve this PR"));
+  });
+
+  it("an approval does not gain a findings line", () => {
+    // Approved: there is nothing withheld to explain, and the body is what it
+    // was before this existed.
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(gating({ wouldApprove: true }), { verdict: "none", count: 0 }),
+    });
+    assert.ok(body.startsWith("**Recommendation: approve**"));
+    assert.equal(body.includes("**Findings:"), false);
   });
 });
 
