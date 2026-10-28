@@ -9,20 +9,29 @@ const preToolUse = (tool_name: string, tool_input: Record<string, unknown>) => (
 });
 
 describe("forceSynchronousTaskHook", () => {
+  const updatedInput = (out: unknown) =>
+    (out as { hookSpecificOutput?: { updatedInput?: unknown } }).hookSpecificOutput?.updatedInput;
+
   for (const tool of ["Agent", "Task"]) {
-    it(`strips run_in_background from a ${tool} call`, async () => {
+    it(`makes a background ${tool} call synchronous`, async () => {
       const out = await forceSynchronousTaskHook(
         preToolUse(tool, { subagent_type: "scout", prompt: "p", run_in_background: true }),
       );
-      assert.deepEqual(
-        (out as { hookSpecificOutput?: { updatedInput?: unknown } }).hookSpecificOutput?.updatedInput,
-        { subagent_type: "scout", prompt: "p" },
-      );
+      assert.deepEqual(updatedInput(out), { subagent_type: "scout", prompt: "p", run_in_background: false });
     });
   }
 
-  it("leaves a synchronous subagent call alone", async () => {
-    const out = await forceSynchronousTaskHook(preToolUse("Agent", { subagent_type: "scout", prompt: "p" }));
+  // Eval run 40778431408: every deep-reviewer call omitted the flag and came
+  // back "Async agent launched" instead of findings.
+  it("makes a call that omits the flag synchronous", async () => {
+    const out = await forceSynchronousTaskHook(preToolUse("Agent", { subagent_type: "deep-reviewer", prompt: "p" }));
+    assert.deepEqual(updatedInput(out), { subagent_type: "deep-reviewer", prompt: "p", run_in_background: false });
+  });
+
+  it("leaves an explicitly synchronous call alone", async () => {
+    const out = await forceSynchronousTaskHook(
+      preToolUse("Agent", { subagent_type: "scout", prompt: "p", run_in_background: false }),
+    );
     assert.deepEqual(out, { continue: true });
   });
 
