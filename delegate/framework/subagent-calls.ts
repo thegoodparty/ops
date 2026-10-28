@@ -9,9 +9,12 @@ interface ContentBlock {
   content?: unknown;
 }
 
+// The SDK has called its subagent tool both "Task" and "Agent".
+const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
+
 export const recordSubagentUses = (calls: Map<string, SubagentCall>, blocks: ContentBlock[]) => {
   for (const b of blocks) {
-    if (b.type === "tool_use" && b.name === "Task" && b.id && b.input) {
+    if (b.type === "tool_use" && b.name !== undefined && SUBAGENT_TOOLS.has(b.name) && b.id && b.input) {
       calls.set(b.id, {
         subagent: String(b.input.subagent_type ?? ""),
         prompt: String(b.input.prompt ?? ""),

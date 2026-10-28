@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { recordSubagentResults, recordSubagentUses } from "./subagent-calls";
 import type { SubagentCall } from "./types";
 
-const taskUse = (id: string, subagent: string, prompt: string) => ({
+const taskUse = (id: string, subagent: string, prompt: string, name = "Agent") => ({
   type: "tool_use",
   id,
-  name: "Task",
+  name,
   input: { subagent_type: subagent, prompt },
 });
 
@@ -19,6 +19,15 @@ describe("subagent call pairing", () => {
       { type: "text" },
     ]);
     assert.deepEqual([...calls.entries()], [["t1", { subagent: "scout", prompt: "read the diff" }]]);
+  });
+
+  it("records the subagent tool under either SDK name", () => {
+    const calls = new Map<string, SubagentCall>();
+    recordSubagentUses(calls, [taskUse("a1", "scout", "p", "Agent"), taskUse("t1", "deep-reviewer", "q", "Task")]);
+    assert.deepEqual(
+      [...calls.values()].map((c) => c.subagent),
+      ["scout", "deep-reviewer"],
+    );
   });
 
   it("pairs a string tool_result with its tool_use", () => {
