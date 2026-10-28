@@ -41,7 +41,8 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   with `desiredCount: 1` registered as a target in both ingress target
  *   groups, the `/aws/ecs/bifrost` log group, the execution role (managed ECS
  *   task-execution policy plus read on the task's secrets) and the separate
- *   task role (the Bedrock model list and nothing else).
+ *   task role (the Bedrock model list, the catalog listing that renders it, and
+ *   nothing else).
  * - Owns since item 9: the oauth2-proxy sidecar, its three `OAUTH2_PROXY_*`
  *   secret references plus the one `bifrost/gateway` key the injected header is
  *   read from, the `--alpha-config` flag that loads the alpha file, and the
@@ -692,8 +693,11 @@ export const OAUTH2_PROXY_ENVIRONMENT: Readonly<Record<string, string>> = {
  * list to read rather than a policy document to parse.
  *
  * The execution role reads secrets and nothing else beyond its managed policy;
- * the task role invokes the enumerated models and does nothing else. No
- * `secretsmanager:*`, no `bedrock:*`, no wildcard resource on either.
+ * the task role invokes the enumerated models and reads the one account-wide
+ * catalog listing that draws the dashboard's model list, and does nothing
+ * else. No `secretsmanager:*`, no `bedrock:*`, and one wildcard resource in the
+ * whole file: the catalog read, which Bedrock gives no resource type to scope
+ * (see `TASK_BEDROCK_READ_RESOURCES`).
  */
 export const EXECUTION_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
 
@@ -721,8 +725,10 @@ export const EXECUTION_PARAMETER_ACTIONS = ["ssm:GetParameters"] as const;
  *
  * - `bedrock:Get*` / `bedrock:List*`, which `WorkbenchAccess` holds wide so a
  *   person is never blocked mid-task. The gateway is not a person and invokes
- *   a fixed model list; if item 12 shows the provider enumerating the catalog
- *   at boot, this is where that read is added, named rather than wildcarded.
+ *   a fixed model list. The one read it turned out to need is named, not
+ *   wildcarded: `TASK_BEDROCK_READ_ACTIONS` below, added when bringing the
+ *   service up showed the provider enumerating the catalog to render its model
+ *   list.
  * - anything `aws-marketplace`, which is what auto-subscribes a model nobody
  *   chose. Subscriptions are out of band, per the plan and step 11.
  */
@@ -732,6 +738,54 @@ export const TASK_BEDROCK_ACTIONS = [
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
 ] as const;
+
+/**
+ * The one Bedrock read the provider makes to render its model list.
+ *
+ * `ListModels` in Bifrost's Bedrock provider is a signed `GET
+ * /foundation-models` against the Bedrock control plane, which is AWS's
+ * `ListFoundationModels` (`core/providers/bedrock/bedrock.go`, `listModelsByKey`
+ * at upstream tag `v2.3.0`). The dashboard's Model Providers page calls it, and
+ * an identity without this action gets the provider's error instead of a list:
+ *
+ *     User: arn:aws:sts::024901689212:assumed-role/bifrost-task/... is not
+ *     authorized to perform: bedrock:ListFoundationModels because no
+ *     identity-based policy allows the bedrock:ListFoundationModels action
+ *
+ * The invoke set above serves a request; it does not draw the page. The two are
+ * separate statements rather than one wider one because they take opposite
+ * resource shapes: invoke names the models, this names nothing.
+ *
+ * Deliberately not here, each checked against the pinned provider rather than
+ * assumed, because "the model list" suggests reads the provider never makes:
+ *
+ * - `bedrock:ListInferenceProfiles` / `bedrock:GetInferenceProfile`. Nothing at
+ *   `v2.3.0` calls them. The `us.` and `global.` inference profiles
+ *   `bifrost/config.json` allows are listed from the key's own `models`
+ *   allowlist — the list pipeline backfills allowlist entries the
+ *   foundation-model response does not contain (`BackfillModels` in
+ *   `core/providers/utils/models.go`) — and invoked through their profile ARNs,
+ *   which the invoke statement already grants.
+ * - `bedrock:GetFoundationModel`, the singular describe. The list response
+ *   carries the fields Bifrost reads.
+ * - whatever the Mantle `/v1/models` call `listModelsByKey` also makes. That is
+ *   best-effort: a failure is logged and the foundation-model list is returned
+ *   anyway, and no model this deployment allows is Mantle-only, so it is not
+ *   granted.
+ */
+export const TASK_BEDROCK_READ_ACTIONS = ["bedrock:ListFoundationModels"] as const;
+
+/**
+ * `ListFoundationModels` is account-wide, so its resource can only be `*`.
+ *
+ * Bedrock's service authorization reference defines no resource type for it —
+ * not a model ARN, not a profile ARN — so a narrower `Resource` fails rather
+ * than scoping the call. It is therefore the single wildcard in either role,
+ * and it is named here once (rather than inline) so the wildcard checks in
+ * `ecs.test.ts` can tell this deliberate one from an edit that widens
+ * something else.
+ */
+export const TASK_BEDROCK_READ_RESOURCES = ["*"] as const;
 
 /**
  * The IAM resource ARN of a secret this stack does not own.
@@ -820,6 +874,13 @@ export const executionRoleConfigParameterPolicyDocument = (
  * walks and the same one `WorkbenchAccess` composes from. One list, so a model
  * added there is reachable by the gateway without a second edit, and a model
  * removed there is not.
+ *
+ * Plus the catalog read. Without it the gateway can serve inference but cannot
+ * show its models: the dashboard's provider page asks Bifrost to list them and
+ * `ListFoundationModels` is refused, which is the warning this pair of
+ * statements fixes. The read is kept to the one action the provider calls, on
+ * the one resource shape IAM permits for it — see
+ * `TASK_BEDROCK_READ_ACTIONS` and `TASK_BEDROCK_READ_RESOURCES`.
  */
 export const taskRolePolicyDocument = (
   bedrockResources: string[],
@@ -831,6 +892,12 @@ export const taskRolePolicyDocument = (
       Effect: "Allow",
       Action: [...TASK_BEDROCK_ACTIONS],
       Resource: bedrockResources,
+    },
+    {
+      Sid: "ReadBedrockFoundationModelCatalog",
+      Effect: "Allow",
+      Action: [...TASK_BEDROCK_READ_ACTIONS],
+      Resource: [...TASK_BEDROCK_READ_RESOURCES],
     },
   ],
 });
@@ -1012,15 +1079,18 @@ export const createBifrostEcs = (args: {
    * No managed policies at all. DIFFERS from `deploy/components/worker.ts`,
    * whose task role carries five AWS-managed read policies because the
    * delegate is a general-purpose agent that is expected to explore the
-   * account. The gateway is a proxy: it may invoke its models and nothing
-   * else, and the `Resource` list is the model list rather than `*`.
+   * account. The gateway is a proxy: it may invoke its models, read the one
+   * account-wide catalog listing that draws its model list, and nothing else.
+   * The invoke statement's `Resource` list is the model list rather than `*`;
+   * the catalog statement's is `*` because Bedrock offers nothing to scope it
+   * to.
    */
   const taskRole = new aws.iam.Role(
     "bifrostTaskRole",
     {
       name: TASK_ROLE_NAME,
       description:
-        "Bifrost gateway task: invoke the models in utils/bedrock-models.ts and nothing else.",
+        "Bifrost gateway task: invoke the models in utils/bedrock-models.ts, list the Bedrock catalog, and nothing else.",
       assumeRolePolicy: pulumi.jsonStringify({
         Version: "2012-10-17",
         Statement: [

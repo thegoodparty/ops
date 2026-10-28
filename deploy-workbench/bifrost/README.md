@@ -14,7 +14,8 @@ files that belong in review:
   both providers, both stores in Postgres, every `env.` reference a name the
   deployment actually provides, no credential literal, and Bedrock's model
   list matching `utils/bedrock-models.ts` (the list the task role's IAM is
-  built from).
+  built from, alongside the `bedrock:ListFoundationModels` grant that renders
+  it).
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -70,7 +71,16 @@ a later tag. It holds:
   Bedrock model list is the same set `utils/bedrock-models.ts` derives, which
   is what the task role's IAM policy enumerates; the test fails if the two
   drift, because a model in one and not the other is a 404 or an
-  `AccessDenied` at runtime.
+  `AccessDenied` at runtime. Listing that list is a separate permission from
+  invoking it: the provider renders its model list from a signed
+  `GET /foundation-models`, so the task role also holds
+  `bedrock:ListFoundationModels` (on `*`, since Bedrock defines no resource
+  type for it). Without it the provider page shows
+  `not authorized to perform: bedrock:ListFoundationModels` instead of the
+  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The
+  `us.`/`global.` inference profiles in the list need no separate read — they
+  come from the key's own `models` allowlist and are invoked through profile
+  ARNs the invoke statement grants.
 - **Client settings.** Inference auth is enforced
   (`enforce_auth_on_inference: true`), direct provider keys are refused
   (`allow_direct_keys: false`), content logging is off with no per-request

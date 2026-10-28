@@ -507,7 +507,9 @@ export const bifrostDatabaseEndpoint = database.endpoint;
 // definition copies the idiom in `deploy/components/worker.ts` — `secrets` from
 // Secrets Manager, `awslogs`, `linuxParameters.initProcessEnabled` — with a
 // separate task role scoped to the Bedrock model list in
-// `utils/bedrock-models.ts` rather than the delegate's five broad read policies.
+// `utils/bedrock-models.ts` — plus the account-wide `ListFoundationModels` read
+// that renders that list in the dashboard — rather than the delegate's five
+// broad read policies.
 //
 // It consumes item 5's private subnets and task security group, item 7's
 // database secret and item 6's ingress rather than declaring any of them again.
