@@ -106,13 +106,25 @@ leaving the Workspace group, and no second Google integration is needed — whic
 matters, because domain-wide delegation is a credential this organization
 grants sparingly and a second consumer of it would be a new decision.
 
-**Being able to call the mint endpoint is itself the membership check.** An
-engineer's session in the container is
+**Being able to call the mint endpoint is the first half of the membership
+check.** An engineer's session in the container is
 `arn:aws:sts::024901689212:assumed-role/AWSReservedSSO_WorkbenchAccess_<hash>/<email>`
 (verified in this container with `aws sts get-caller-identity`). A person who
 is not in `Engineers` cannot assume `WorkbenchAccess`, so they cannot reach the
-endpoint at all. There is no separate allowlist to drift, and no "is this
-person allowed" branch in the code to get wrong.
+endpoint at all. There is no separate allowlist to drift, and the caller's
+identity is not something they can assert.
+
+**It is only half, because a session outlives a membership.** A
+`WorkbenchAccess` session lasts up to 12 hours (`PT12H` in
+`deploy/components/identity-center.ts`), so somebody removed from `Engineers`
+keeps a working session until it expires — and a session that can reach the
+endpoint can re-mint. Review caught exactly that, and without a second check the
+janitor's deactivation would be undone by one `--refresh` from the old session.
+So the mint **also checks live membership on every call**: resolve the session
+name to a user id with `GetUserId` on `emails.value`, list the group's
+memberships, and refuse with `403` when the caller is not in it — failing
+closed on a read error. The gate is "whose session is this" *and* "is that
+person in the group now", and the second half is what makes revocation stick.
 
 ### 2. Mint on demand, through a Lambda the caller cannot lie to
 
@@ -144,6 +156,11 @@ as a header the caller set.
   gateway's own inference endpoint chose: reachable from anywhere a harness
   runs, and refused without a credential. Nothing about the endpoint is
   reachable anonymously.
+- **It reads the directory through the same small cross-account role the
+  janitor uses** (decision 6): `GetUserId` on `emails.value` and
+  `ListGroupMemberships` on `Engineers`, read-only, no `DescribeUser`. That
+  grant is the second half of the membership check, and the only reason the
+  mint function reaches the management account at all.
 
 ### 3. The Lambda holds the gateway's setup token, and that is a real credential
 
@@ -222,8 +239,9 @@ Every part of that is checked against the pinned source rather than assumed:
   "no expiry") and `delete_after_expire: null` (back to inheriting
   `client.delete_expired_virtual_keys`) — because an expiry that has passed
   rejects the key whatever `is_active` says, and the deletion would take the
-  history the reactivation exists to keep. A reactivation that sets only
-  `is_active` is a key that dies on the old timer.
+  history the reactivation exists to keep. A reactivation only ever happens for
+  a caller the membership check has just admitted (decision 1), so a
+  deactivated key is never a way back in for someone who has left.
 - **A create takes effect immediately**, not at the next restart: the handler
   reloads the key into the running gateway's governance manager before it
   answers.
@@ -319,25 +337,31 @@ Rules, each of which is a decision:
   of a mass removal is to not do it — the same guard, for the same reason, as
   the incomplete-read abort in `google-group-sync.md`.
 - **Revocation takes effect at the next run**, so the interval is a choice and
-  not a detail: hourly means "leaving the group stops traffic within about an
-  hour and a quarter", counting the Workspace→Identity Center sync's fifteen
-  minutes. An hour, and not five minutes, because a person who has left is not
-  a five-minute emergency and a job that runs often enough to page on is a job
-  that pages for a bad reason.
+  not a detail: hourly means traffic stops within about an hour and a quarter of
+  the person leaving the *Workspace* group, counting the fifteen-minute
+  Workspace→Identity Center sync. That bound holds only because the mint also
+  checks membership (decision 1): the janitor deactivates, and a session the
+  person still holds cannot undo it by minting again. Without that check the
+  real bound would be the session's 12 hours, and every revocation would be
+  reversible. An hour, and not five minutes, because a person who has left is
+  not a five-minute emergency and a job that runs often enough to page on is a
+  job that pages for a bad reason.
 - **The janitor is in the workbench account and reads the directory
-  cross-account.** It has to be in the workbench account — it is the second
-  caller of the VPC-internal admin API — and the Identity Store lives in the
-  management account. So it assumes a small role there, in the shape
+  cross-account, through the same role the mint uses.** It has to be in the
+  workbench account — it is the second caller of the VPC-internal admin API —
+  and the Identity Store lives in the management account. Both Lambdas
+  therefore assume one small role there, in the shape
   `deploy/components/identity-group-sync-grant.ts` already establishes: the
-  same account-root-plus-`aws:PrincipalArn` trust, the same fixed session
-  name, and two actions rather than five — `ListGroupMemberships` on the
-  group and `GetUserId` on the store, with nothing that writes to the
-  directory. `ListGroupMemberships` returns user ids and not emails, and the
-  job deliberately does not gain `DescribeUser`: it resolves each managed
-  key's owner with `GetUserId` on `emails.value` (the lookup
-  `deploy-infrastructure/sheriff/identity.ts` already makes) and intersects on
-  user id. A key whose owner resolves to no user is not a member, and is
-  deactivated — the fail-closed direction.
+  same account-root-plus-`aws:PrincipalArn` trust (two trusted roles), the same
+  fixed session name, and two actions rather than five — `ListGroupMemberships`
+  on the group and `GetUserId` on the store, with nothing that writes to the
+  directory. One role rather than two because the read is identical and the
+  audit story is better with a single name in CloudTrail.
+  `ListGroupMemberships` returns user ids and not emails, and neither job gains
+  `DescribeUser`: each resolves the email it already has with `GetUserId` on
+  `emails.value` (the lookup `deploy-infrastructure/sheriff/identity.ts`
+  already makes) and intersects on user id. A key whose owner resolves to no
+  user is not a member, and is deactivated — the fail-closed direction.
 - **The janitor holds the setup token too**, for the same reason the mint
   function does (decision 3): it is the second caller of the admin API, so it
   reads the same secret, is granted the same one container, and is under the
@@ -427,10 +451,11 @@ per container per few minutes and buys a check that cannot be wrong.
 - **The live-SSO gate applies at mint time only.** A lapsed AWS session does
   not cut off the holder of a cached key, because the credential that matters
   is the gateway key. Revocation is Bifrost-side `is_active` plus the janitor,
-  which is the design and not a gap: a `WorkbenchAccess` session lasts up to
-  12 hours (`PT12H` in `deploy/components/identity-center.ts`), far longer than
-  the janitor's hour, so "the session will expire" was never going to be a
-  revocation mechanism.
+  which is the design and not a gap: a `WorkbenchAccess` session lasts up to 12
+  hours (`PT12H` in `deploy/components/identity-center.ts`), far longer than the
+  janitor's hour, so "the session will expire" was never going to be a
+  revocation mechanism — and the mint's live membership check (decision 1) is
+  what closes the re-mint path a live session would otherwise leave open.
 
 **Rejected alternative: export the key into the environment at session start.**
 It never updates mid-session, so a recreated key or a reactivation is invisible
@@ -476,6 +501,7 @@ not decided here.
    workbench account ┌────────────────────────────────────────────────┐
                      │ vk-mint Lambda  (in the gateway's private VPC) │
                      │  X-Bifrost-Setup-Token from bifrost/gateway    │
+                     │  read-only role -> identity store (Engineers)  │
                      └───────────────┬────────────────────────────────┘
                                      │ http://<task>:8080/api/governance/virtual-keys
                                      ▼
@@ -493,13 +519,16 @@ not decided here.
 4. The Lambda verifies the `userArn` is `AWSReservedSSO_WorkbenchAccess_*` in
    the workbench account, takes the session name as the email, and **ignores
    the request body**.
-5. It searches the gateway for that exact name; if a key exists and is
+5. It checks that email against the group: `GetUserId` on `emails.value`, then
+   the group's memberships through the read-only role. Not a member is a `403`;
+   a directory read that fails is a `503`; neither one mints.
+6. It searches the gateway for that exact name; if a key exists and is
    inactive, it reactivates it and returns it; if none exists, it creates one
    from the template and returns the created key. A `409` on create means
    another call won the race, so it re-reads and returns that key.
-6. The Lambda returns `{ "key": "sk-bf-…", "email": "…" }` and logs neither.
-7. The command writes the cache `600`, prints the key, and exits.
-8. Pi sends the request to `/v1` with that key; Bifrost checks `is_active` and
+7. The Lambda returns `{ "key": "sk-bf-…", "email": "…" }` and logs neither.
+8. The command writes the cache `600`, prints the key, and exits.
+9. Pi sends the request to `/v1` with that key; Bifrost checks `is_active` and
    the key's provider allowlist, and invokes Bedrock as the task role.
 
 **Later calls, warm cache.**
@@ -513,7 +542,8 @@ not decided here.
 **The janitor, hourly.**
 
 1. EventBridge invokes the janitor Lambda.
-2. It assumes the read-only role in the management account.
+2. It assumes the read-only role in the management account — the same role the
+   mint uses (decision 2).
 3. `ListGroupMemberships` on `Engineers`, every page; the user ids are the
    member set.
 4. It reads the gateway's keys (`GET /api/governance/virtual-keys`, `export`
@@ -590,9 +620,9 @@ one later is adding a field here.
 - **Not a security boundary against the person it issues to.** See caveat 1.
 - **Not a replacement for `WorkbenchAccess`.** The gateway's Bedrock IAM stays
   the task role's; this only decides which models a person's key may reach.
-- **Not a per-request check of group membership.** Mint is checked live, and
-  steady state is checked hourly. The gateway enforces `is_active`, not the
-  group.
+- **Not a per-request check of group membership.** Membership is checked when a
+  key is minted, `is_active` is checked on every request, and the janitor
+  reconciles the two hourly. The gateway itself knows nothing about the group.
 
 ## Implementation plan
 
@@ -609,37 +639,43 @@ Step: 2
    `deploy-workbench/bifrost/config.json`'s model lists. No infrastructure, no
    code path — reviewable on its own. It carries no budget or rate limit
    (decision 5).
-2. **The mint Lambda.** In `deploy-workbench/`: the function, its execution
-   role, the Function URL with `AuthType: AWS_IAM`, its VPC attachment to the
-   private subnets, its own security group, the new ingress rule on
-   `bifrostTaskSecurityGroup` for 8080, the SSM-backed template, the read grant
-   on `bifrost/gateway` (or a dedicated `bifrost/vk-mint`, per the open item),
-   the log group, and the idempotency logic with its unit tests (exact-match
-   filter, reactivation that also clears `expires_at` and
-   `delete_after_expire`, `409`-then-reread). **Depends on steps 1 and the
-   gateway being deployed**; the network path is the thing to prove first,
-   because everything else is ordinary.
-3. **The invoke grant for people.** In `deploy/`: `WorkbenchAccess` gets
+2. **The read-only membership role.** In `deploy/`: `bifrost-vk-reader`, a
+   management-account role trusting the two workbench Lambdas' roles by
+   account-root-plus-`aws:PrincipalArn`, in the shape of
+   `deploy/components/identity-group-sync-grant.ts`. Two actions and no
+   writing: `GetUserId` on `emails.value` and `ListGroupMemberships` on the
+   `Engineers` group. **Both Lambdas depend on it** (3 and 5): without it they
+   fail closed with `AccessDenied`, which is safe and noisy. It can land
+   before, after or at the same time as either function, because the trust and
+   the ARNs are literals.
+3. **The mint Lambda.** In `deploy-workbench/`: the function, its execution
+   role (`sts:AssumeRole` on step 2's role), the Function URL with
+   `AuthType: AWS_IAM`, its VPC attachment to the private subnets, its own
+   security group, the new ingress rule on `bifrostTaskSecurityGroup` for 8080,
+   the SSM-backed template, the read grant on `bifrost/gateway` (or a dedicated
+   `bifrost/vk-mint`, per the open item), the log group, the membership check,
+   and the idempotency logic with its unit tests (exact-match filter,
+   reactivation that also clears `expires_at` and `delete_after_expire`,
+   `409`-then-reread, a non-member refused, a directory read error refused).
+   **Depends on steps 1 and 2 and the gateway being deployed**; the network
+   path is the thing to prove first, because everything else is ordinary.
+4. **The invoke grant for people.** In `deploy/`: `WorkbenchAccess` gets
    `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` on the function ARN
    with the `FunctionUrlAuthType` and `InvokedViaFunctionUrl` conditions, and
    the test that pins the absence of a bare `InvokeFunction`. **Depends on step
-   2 existing** (the ARN is a literal, so the two applies may land in either
+   3 existing** (the ARN is a literal, so the two applies may land in either
    order; the permission is useless until the function does). This is the step
-   that makes "being able to call is the membership check" true, and the one
-   that needs a human's sign-off, because it is an identity-policy change.
-4. **The janitor.** Two halves in two stacks: the read-only cross-account role
-   in `deploy/` (trusting the janitor Lambda's role in the workbench account,
-   the action set of `identity-group-sync-grant` minus everything that writes)
-   and the Lambda plus its hourly `EventBridge` rule in `deploy-workbench/`.
-   **The grant must finish applying before the janitor's first run**, or the
-   first run is an `AccessDenied` that does nothing (fail closed); it is two
-   PRs or one PR whose two workflows race by an hour, which the schedule
-   absorbs.
-5. **`gp-pi bifrost-key` and the `models.json` entry**, in
+   that lets a person reach the mint at all, and the one that needs a human's
+   sign-off, because it is an identity-policy change.
+5. **The janitor.** The Lambda plus its hourly `EventBridge` rule in
+   `deploy-workbench/`, assuming step 2's read-only role. **Depends on step 2**;
+   before it the first run is an `AccessDenied` that does nothing (fail closed),
+   so the two may land in either order and the schedule absorbs the race.
+6. **`gp-pi bifrost-key` and the `models.json` entry**, in
    `thegoodparty/gp-pi`: the command, the cache, the lock, the identity check,
-   `--refresh`, and the provider entry. **Depends on steps 2 and 3** — before
-   them there is nothing to call. It also settles the command's name in the
-   image, per decision 7.
+   `--refresh`, and the provider entry. **Depends on steps 3 and 4** — before
+   them there is nothing to call or no permission to call it. It also settles
+   the command's name in the image, per decision 7.
 
 ## Cited so the next session can check
 

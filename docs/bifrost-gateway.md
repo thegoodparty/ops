@@ -597,8 +597,9 @@ third holds secret values:
 2. **Bifrost's own configuration is a file in the repo.** A non-secret
    `config.json` lives under `deploy-workbench/` (for example
    `deploy-workbench/bifrost/config.json`) and holds the providers, the
-   client settings, and the `governance` block — teams, budgets and virtual
-   keys — with an `env.` reference everywhere a secret would otherwise be.
+   client settings, and the `governance` block — teams and virtual keys, and
+   budgets when there are any — with an `env.` reference everywhere a secret
+   would otherwise be.
    Pulumi stores it as a plain SSM `String` parameter (`/bifrost/config`) and
    injects it as `BIFROST_CONFIG`; the container entrypoint writes it to
    `/app/data/config.json`, which is the shape the upstream ECS guide
@@ -638,8 +639,9 @@ surface".
 The `governance` block supports `value: "env.VK_ENGINEER"` on a virtual key
 (`docs/deployment-guides/config-json/governance.mdx`), which is what makes the
 structure code and the token a secret: the key's id, provider/model scope and
-team live in the file; the `sk-bf-*` value comes from Secrets Manager. Teams
-and budgets are declarative in the same block. Rotating a declared key is
+team live in the file; the `sk-bf-*` value comes from Secrets Manager. Teams,
+and budgets when there are any, are declarative in the same block. Rotating a
+declared key is
 changing one secret value, not editing the file. This is the mechanism for a
 key that is *declared* — a shared caller, not a person: per-person keys are
 minted and stored in Bifrost, so they appear in neither the file nor Secrets
@@ -811,7 +813,8 @@ Virtual keys are Bifrost's primary governance entity
   pricing should be checked against the catalog and overridden with
   `custom_pricing`/pricing overrides if it is wrong or missing — a gateway
   whose per-key cost numbers are wrong is worse than one with none, because
-  the budgets enforce against them.
+  those numbers are the whole answer to "who spent what" now that budgets are
+  deferred, and what a budget would enforce against when one comes back.
 - **Budgets and alerts.** The account already has `workbench-monthly-spend` in
   `deploy-workbench/index.ts` with actual and forecasted email notifications,
   and that is the only cap in place for now: per-key and per-team budgets
@@ -1156,13 +1159,14 @@ network or a permission can land before the item that creates it.
     known marker string and show it is absent from the log store and any
     connector. The upstream docs are explicit that the layers compose, so this
     is a test, not a reading.
-14. Create the `engineering` team and its budget declaratively in
-    `config.json`, and write the issue/rotate/revoke runbook next to the other
-    runbooks. **Superseded in part** by
+14. Create the `engineering` team declaratively in `config.json` — the team and
+    no budget, since Bifrost-side budgets and rate limits were dropped by
+    agreement on #404 — and write the issue/rotate/revoke runbook next to the
+    other runbooks. **Superseded in part** by
     [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a per-person key is
     minted from Identity Center membership rather than declared here, so this
-    file carries the team and its budget and no key per person, and the runbook
-    becomes the design document beside `gp-pi bifrost-key`.
+    file carries the team and no key per person, and the runbook becomes the
+    design document beside `gp-pi bifrost-key`.
 
 **Phase 3 — observability and cost**
 
@@ -1192,7 +1196,7 @@ network or a permission can land before the item that creates it.
 21. Credential distribution and `gp-pi` wiring (phase E above), gated on the
     gateway having proven out. **Designed** in
     [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), whose own numbered
-    steps 1–5 are the implementation plan for it; a PR implementing one of
+    steps 1–6 are the implementation plan for it; a PR implementing one of
     them names that document and its step, not this item.
 22. Tighten `WorkbenchAccess`/`EngineerAccess` Bedrock invoke and remove
     direct provider keys, in a separate PR, after a full cycle on the gateway.

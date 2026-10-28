@@ -96,9 +96,10 @@ a later tag. It holds:
   password references stay for that reason: turning auth back on should be one
   decision, not a config-shape change with no credential. Re-enabling needs
   proof of operator control, and the setup token is it. The `engineering`
-  team and its budget are **item 14** and are deliberately absent, not empty:
-  under `source_of_truth: "config.json"` a present-but-empty section would
-  prune rows created later. Per-person virtual keys are not declared in this
+  team is **item 14** and is deliberately absent, not empty: under
+  `source_of_truth: "config.json"` a present-but-empty section would prune rows
+  created later. It carries no budget, because Bifrost-side budgets and rate
+  limits were dropped on #404. Per-person virtual keys are not declared in this
   file at all: they are minted through the gateway's admin API and live only in
   Bifrost, which returns its own plaintext value
   ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md)), so
@@ -142,9 +143,8 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's team
-and its budget, and past that it needs `tier: "Advanced"` rather than a silent
-truncation.
+holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's team,
+and past that it needs `tier: "Advanced"` rather than a silent truncation.
 
 **A change to this file reaches the gateway.** The container's `secrets` entry
 names the parameter's ARN, and an ARN does not change when the value does, so
