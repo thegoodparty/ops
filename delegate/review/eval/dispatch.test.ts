@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { CANDIDATE_FILES, disallowedChanges, publishRun, redactGate, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
+import { CANDIDATE_FILES, codeOutsideLiterals, disallowedChanges, publishRun, redactGate, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
 import type { ExpectedCase, Gate } from "./expect";
 
 const raw = (status: string, path: string, mode = "100644") =>
@@ -119,4 +119,58 @@ test("publish copies tune results and the redacted gate, never holdout results",
   assert.equal(existsSync(join(out, "h1")), false);
   assert.equal(readFileSync(join(out, "report.md"), "utf-8"), "report");
   assert.doesNotMatch(readFileSync(join(out, "gate.json"), "utf-8"), /h1/);
+});
+
+const SRC = [
+  'import { query } from "@anthropic-ai/claude-agent-sdk";',
+  'export const MODEL = "claude-sonnet-4-5";',
+  'export const TOOLS = ["Read", "Grep"];',
+  "export const prompt = (name: string) => `Review ${name.toUpperCase()} carefully.`;",
+  "",
+].join("\n");
+
+test("identical sources pass", () => {
+  assert.equal(codeOutsideLiterals(SRC, SRC), null);
+});
+
+test("changed string and template literal text passes", () => {
+  const next = SRC.replace("Review ", "Look hard at ").replace(" carefully.", " and be terse.").replace('"Grep"', '"Glob"');
+  assert.equal(codeOutsideLiterals(SRC, next), null);
+});
+
+test("a changed model id string passes", () => {
+  assert.equal(codeOutsideLiterals(SRC, SRC.replace("claude-sonnet-4-5", "claude-opus-4-1")), null);
+});
+
+test("comment and whitespace changes pass", () => {
+  assert.equal(codeOutsideLiterals(SRC, `// note\n${SRC.replace("= ", "=  ")}`), null);
+});
+
+test("a changed ${} expression is refused", () => {
+  assert.match(codeOutsideLiterals(SRC, SRC.replace("name.toUpperCase()", "process.env.X")) ?? "", /differs/);
+});
+
+test("an added statement is refused", () => {
+  assert.notEqual(codeOutsideLiterals(SRC, `${SRC}writeFileSync("run-1.json", "{}");\n`), null);
+});
+
+test("an added import is refused", () => {
+  assert.notEqual(codeOutsideLiterals(SRC, `import fs from "node:fs";\n${SRC}`), null);
+});
+
+test("a changed import specifier is refused", () => {
+  assert.notEqual(codeOutsideLiterals(SRC, SRC.replace("@anthropic-ai/claude-agent-sdk", "../eval/expected/manifest.json")), null);
+});
+
+test("a changed identifier is refused", () => {
+  assert.notEqual(codeOutsideLiterals(SRC, SRC.replace("MODEL", "MODEL2")), null);
+});
+
+test("an unparseable branch is refused", () => {
+  assert.match(codeOutsideLiterals(SRC, `${SRC}const = ;`) ?? "", /does not parse/);
+});
+
+test("the reason never contains file content", () => {
+  const reason = codeOutsideLiterals(SRC, SRC.replace("name.toUpperCase()", "SECRET_VALUE"));
+  assert.doesNotMatch(reason ?? "", /SECRET_VALUE|toUpperCase/);
 });

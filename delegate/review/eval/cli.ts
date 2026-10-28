@@ -4,7 +4,7 @@ import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scena
 import { pullCache, pushCache, replayKey } from "./cache";
 import type { CacheLayout } from "./cache";
 import { SplitSchema, readManifest as readExpectedManifest, selectCases } from "./expect";
-import { disallowedChanges, parseIds, publishRun, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
+import { CANDIDATE_FILES, codeOutsideLiterals, disallowedChanges, parseIds, publishRun, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
 import { ModeSchema, addEntry, chargedUsd, checkBudget, estimateUsd, readLedger, sumResultCosts } from "./ledger";
 import { loadRunResults, replayAll, resultFromRecord } from "./replay";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
@@ -50,6 +50,7 @@ const usage = () => {
       "  review:eval ledger add --run-id <id> --mode <m> --budget <usd> --branch-sha <sha> --cost-file <cost.json> --estimate-usd <usd> --gh-run-id <n> --gh-run-attempt <n>",
       "  review:eval dispatch validate --manifest <expected/manifest.json>   (reads MODE BRANCH RUN_ID BUDGET CASES TARGETS from the environment)",
       "  review:eval dispatch allowlist --raw <git-diff-raw.txt>",
+      "  review:eval dispatch literals --main-dir <dir> --branch-dir <dir>",
       "  review:eval dispatch publish --manifest <expected/manifest.json> --in <dir> --out <dir>",
       "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
@@ -253,6 +254,20 @@ const main = async () => {
       const bad = disallowedChanges(readFileSync(raw, "utf-8"));
       if (bad.length > 0) {
         console.error(`::error::The branch changes files outside the two reviewer files: ${bad.join(", ")}`);
+        process.exit(1);
+      }
+      return;
+    }
+    if (subcommand === "literals") {
+      const mainDir = flag(flags, "main-dir");
+      const branchDir = flag(flags, "branch-dir");
+      if (!mainDir || !branchDir) { console.error("--main-dir and --branch-dir are required"); process.exit(1); }
+      const failures = CANDIDATE_FILES.flatMap((f) => {
+        const reason = codeOutsideLiterals(readFileSync(join(mainDir, f), "utf-8"), readFileSync(join(branchDir, f), "utf-8"));
+        return reason === null ? [] : [`${f}: ${reason}`];
+      });
+      if (failures.length > 0) {
+        for (const f of failures) console.error(`::error::The branch changes more than string literal text. ${f}`);
         process.exit(1);
       }
       return;

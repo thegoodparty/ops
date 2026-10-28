@@ -1,5 +1,6 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import ts from "typescript";
 import type { ExpectedCase, Gate, GateCase } from "./expect";
 import { RUN_ID_PATTERN } from "./ledger";
 
@@ -110,4 +111,59 @@ export const publishRun = (manifest: ExpectedCase[], inDir: string, outDir: stri
     const gate = JSON.parse(readFileSync(gatePath, "utf-8")) as Gate;
     writeFileSync(join(outDir, "gate.json"), JSON.stringify(redactGate(gate), null, 2));
   }
+};
+
+const LITERAL_TEXT_KINDS = new Set<ts.SyntaxKind>([
+  ts.SyntaxKind.StringLiteral,
+  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+  ts.SyntaxKind.TemplateHead,
+  ts.SyntaxKind.TemplateMiddle,
+  ts.SyntaxKind.TemplateTail,
+]);
+
+// A string that picks what gets loaded or which property is read is code, not
+// prompt text: "../eval/expected/manifest.json" or obj["x"] would change what runs.
+const isCodeString = (node: ts.Node): boolean => {
+  const p = node.parent;
+  if (!p || !ts.isStringLiteral(node)) return false;
+  if (ts.isImportDeclaration(p) || ts.isExportDeclaration(p) || ts.isExternalModuleReference(p)) return true;
+  if (ts.isImportTypeNode(p) || ts.isLiteralTypeNode(p) || ts.isElementAccessExpression(p)) return true;
+  return (
+    ts.isCallExpression(p) &&
+    (p.expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(p.expression) && p.expression.text === "require"))
+  );
+};
+
+const tokenStream = (source: string): string[] | null => {
+  const parsed = ts.transpileModule(source, { reportDiagnostics: true, compilerOptions: { target: ts.ScriptTarget.ESNext } });
+  if ((parsed.diagnostics ?? []).length > 0) return null;
+  const sf = ts.createSourceFile("candidate.ts", source, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS);
+  const out: string[] = [];
+  const walk = (node: ts.Node) => {
+    if (node.kind >= ts.SyntaxKind.FirstJSDocNode && node.kind <= ts.SyntaxKind.LastJSDocNode) return;
+    const children = node.getChildren(sf);
+    if (children.length > 0) {
+      children.forEach(walk);
+      return;
+    }
+    if (node.kind === ts.SyntaxKind.EndOfFileToken) return;
+    out.push(LITERAL_TEXT_KINDS.has(node.kind) && !isCodeString(node) ? `${node.kind}:*` : `${node.kind}:${node.getText(sf)}`);
+  };
+  walk(sf);
+  return out;
+};
+
+// Returns a reason (never file content) when the two sources differ anywhere but
+// in the text of string and template literals. Whitespace and comments cannot
+// run, so they may change. `${...}` expressions are code and must match.
+export const codeOutsideLiterals = (mainSrc: string, branchSrc: string): string | null => {
+  const main = tokenStream(mainSrc);
+  if (main === null) return "main's copy does not parse";
+  const branch = tokenStream(branchSrc);
+  if (branch === null) return "the branch's copy does not parse";
+  const shared = Math.min(main.length, branch.length);
+  for (let i = 0; i < shared; i++) {
+    if (main[i] !== branch[i]) return `code outside string literals differs at token ${i + 1}`;
+  }
+  return main.length === branch.length ? null : "code outside string literals was added or removed";
 };
