@@ -33,15 +33,15 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
-// Four repositories. Ops is pinned to `main` and to one workflow file in its
-// own statement; the other three keep the captured `:*` pattern, which includes
-// pull_request refs.
+// Four repositories in three statements. Ops is pinned to `main` and to one
+// workflow file; gpvpn is pinned to `main`; gp-terraform-dataplatform and omni
+// keep the captured `:*` pattern, which includes pull_request refs.
 //
-// Why two statements rather than one list. `sub` under both `StringEquals` and
-// `StringLike` in the same statement is not "either": IAM ANDs the condition
-// operators for one key, so the subject would have to be both the exact main
-// ref and one of the wildcard patterns at once, and no request would match. The
-// exact pin therefore needs its own statement.
+// Why the exact pins are not in the wildcard list. `sub` under both
+// `StringEquals` and `StringLike` in the same statement is not "either": IAM
+// ANDs the condition operators for one key, so the subject would have to be
+// both the exact main ref and one of the wildcard patterns at once, and no
+// request would match. Each exact pin therefore needs its own statement.
 //
 // Why the ops statement pins `job_workflow_ref` too. `sub` is per-ref, not
 // per-workflow: every workflow on main presents the same subject, so a
@@ -59,7 +59,7 @@ export type TrustPolicyDocument = {
 // campaign-plan-service. An archived repository cannot run a workflow, so
 // their entries granted nothing and only made the list look load bearing.
 //
-// The three that remain are live and do assume this role. Correcting an
+// The three left after step 2 are live and do assume this role. Correcting an
 // earlier version of this comment, which said the other eight stay wildcarded
 // because omni's `publish-experiments.yml` assumes the role on
 // `pull_request`: it does not, and has not since that workflow's publish job
