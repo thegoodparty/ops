@@ -1,5 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
@@ -543,23 +544,58 @@ export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
 export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
 
 /**
- * The parameter's version, carried into the task definition as an environment
- * variable so that a `config.json` change reaches the running gateway.
+ * A digest of the configuration's contents, carried into the task definition as
+ * an environment variable so that a `config.json` change reaches the running
+ * gateway.
  *
  * Without it the seam is dead: the container's `secrets` entry names the
  * parameter's ARN (`valueFrom: configParameterArn`), and an ARN does not change
  * when the value does. A PR that edits `config.json` would update the parameter
  * and leave every running task on the file it booted with, which defeats
  * "configuration is a reviewed PR" — the apply would look like it had
- * converged. `aws.ssm.Parameter.version` increments whenever the value changes,
- * so depending on it registers a new task-definition revision, and the
- * service's stop-before-start rollout picks the new config up.
+ * converged. A value that changes with the file registers a new
+ * task-definition revision, and the service's stop-before-start rollout picks
+ * the new config up.
  *
- * It is also the only way to answer "which config is this task running" from
- * `describe-task-definition`, which is what an operator asks when a config
- * change appears not to have taken.
+ * The digest, not the parameter resource's `version` output. That version is
+ * assigned by AWS, so at preview time it is an unknown for any apply that
+ * changes the file: Pulumi renders the whole `containerDefinitions` string as
+ * its unknown sentinel (`04da6b54-80e4-46f7-96ec-b56ff0331ba9`), and the
+ * pre-apply secret check in `scripts/preflight-secrets.ts` then has no task
+ * definition to read. That is what failed run 40725087936 (the merge of #393):
+ * the preflight could not parse the sentinel, the apply never ran, and the
+ * bug looked like a preflight defect rather than the unknown it was. A digest
+ * of the same bytes is computed here, in the program, so it is known at
+ * preview; it also answers "which config is this task running" from
+ * `describe-task-definition` more precisely than a counter does, because the
+ * value identifies the content rather than the number of writes.
+ *
+ * The dependency on the parameter itself is unchanged: `BIFROST_CONFIG`'s
+ * `valueFrom` names `configParameterArn`, so the task definition still waits
+ * for the parameter update before it is registered.
  */
 export const BIFROST_CONFIG_VERSION_ENV_NAME = "BIFROST_CONFIG_VERSION";
+
+/**
+ * How much of the digest is carried: enough that a collision is not a concern,
+ * short enough to read in `describe-task-definition`.
+ */
+const BIFROST_CONFIG_VERSION_LENGTH = 12;
+
+/**
+ * The digest carried as `BIFROST_CONFIG_VERSION`: a prefix of the SHA-256 of the
+ * configuration's own bytes.
+ *
+ * Pure and computed from the file, so a test can pin it without a Pulumi
+ * runtime and `pulumi preview` can know it before anything is applied.
+ */
+export const bifrostConfigVersion = (
+  config: string = readBifrostConfig(),
+): string =>
+  createHash("sha256")
+    .update(config, "utf8")
+    .digest("hex")
+    .slice(0, BIFROST_CONFIG_VERSION_LENGTH);
 
 /** Where upstream's own container reads it from, and `APP_DIR` in its image. */
 export const BIFROST_APP_DIR = "/app/data";
@@ -891,13 +927,22 @@ export const createBifrostEcs = (args: {
    * The file is read here rather than imported as an asset: the parameter's
    * value is a string, and an asset would make the diff depend on an uploaded
    * object key instead of the file's contents.
+   *
+   * Read once, into a constant, because the same bytes are also hashed into
+   * `BIFROST_CONFIG_VERSION` below; two reads could in principle disagree and
+   * put a version on the task definition that does not describe the parameter.
+   * The hash is computed here rather than in the task-definition block for the
+   * same reason, and it is known at preview, which the parameter's own version
+   * is not. See `BIFROST_CONFIG_VERSION_ENV_NAME`.
    */
+  const bifrostConfig = readBifrostConfig();
+  const configVersion = bifrostConfigVersion(bifrostConfig);
   const configParameter = new aws.ssm.Parameter(
     "bifrostConfigParameter",
     {
       name: BIFROST_CONFIG_PARAMETER_NAME,
       type: "String",
-      value: readBifrostConfig(),
+      value: bifrostConfig,
       description:
         "Bifrost gateway config.json (docs/bifrost-gateway.md phase 2 item 10); injected as BIFROST_CONFIG.",
       tags: { Name: BIFROST_CONFIG_PARAMETER_NAME },
@@ -1058,7 +1103,6 @@ export const createBifrostEcs = (args: {
       database.port.apply(String),
       logGroup.name,
       configParameter.arn,
-      configParameter.version.apply(String),
     ])
     .apply(
       ([
@@ -1070,7 +1114,6 @@ export const createBifrostEcs = (args: {
         databasePort,
         resolvedLogGroupName,
         configParameterArn,
-        configParameterVersion,
       ]) => [
         {
           name: BIFROST_CONTAINER_NAME,
@@ -1097,10 +1140,15 @@ export const createBifrostEcs = (args: {
             { name: PG_PORT_ENV_NAME, value: databasePort },
             { name: PG_USER_ENV_NAME, value: DATABASE_USERNAME },
             { name: PG_DATABASE_ENV_NAME, value: DATABASE_NAME },
-            // A config change has to roll the task; see the constant.
+            // A config change has to roll the task; see the constant. This is
+            // a digest computed from the file in this program, deliberately
+            // not the parameter's preview-unknown version output: an unknown
+            // here collapses the whole `containerDefinitions` string into
+            // Pulumi's unknown sentinel, which is unreadable to the pre-apply
+            // secret check.
             {
               name: BIFROST_CONFIG_VERSION_ENV_NAME,
-              value: configParameterVersion,
+              value: configVersion,
             },
           ],
           secrets: [
