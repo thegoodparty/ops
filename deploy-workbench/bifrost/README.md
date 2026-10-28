@@ -21,8 +21,9 @@ files that belong in review:
   from the Identity Center `Admins` group, which `sheriff` mutates at runtime,
   so the two are expected to drift. The owner is **jagoda for now**.
 - `Dockerfile` — the derivative of the stock oauth2-proxy image: it bakes the
-  allowlist in, bakes the alpha configuration in, and builds the static
-  entrypoint wrapper in a stage of its own.
+  allowlist and the alpha configuration in, and keeps upstream's own
+  `ENTRYPOINT`. The Go entrypoint wrapper it used to build in a stage of its
+  own is gone with Bifrost's Basic login (see "The image").
 - `alpha-config.yaml` — oauth2-proxy's alpha configuration, loaded with
   `--alpha-config`: the Google provider, the upstream, the listen address and
   the `injectRequestHeaders` entry that presents Bifrost's setup token on every
