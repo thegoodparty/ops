@@ -96,10 +96,14 @@ a later tag. It holds:
   password references stay for that reason: turning auth back on should be one
   decision, not a config-shape change with no credential. Re-enabling needs
   proof of operator control, and the setup token is it. The `engineering`
-  team, its
-  budget and the first virtual keys are **item 14** and are deliberately
-  absent, not empty: under `source_of_truth: "config.json"` a present-but-empty
-  section would prune rows created later.
+  team is **item 14** and is deliberately absent, not empty: under
+  `source_of_truth: "config.json"` a present-but-empty section would prune rows
+  created later. It carries no budget, because Bifrost-side budgets and rate
+  limits were dropped on #404. Per-person virtual keys are not declared in this
+  file at all: they are minted through the gateway's admin API and live only in
+  Bifrost, which returns its own plaintext value
+  ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md)), so
+  there is never a key here to name or to prune.
 - **The first-run claim.** Top-level `"setup_token":
   "env.BIFROST_SETUP_TOKEN"` (phase 2 item 11). It is top-level and not under
   `governance` because that is where `transports/config.schema.json` puts it at
@@ -139,9 +143,8 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's teams
-and virtual key names, and past that it needs `tier: "Advanced"` rather than a
-silent truncation.
+holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's team,
+and past that it needs `tier: "Advanced"` rather than a silent truncation.
 
 **A change to this file reaches the gateway.** The container's `secrets` entry
 names the parameter's ARN, and an ARN does not change when the value does, so
@@ -170,10 +173,12 @@ Two consequences worth knowing before a deploy:
   this landed, every deploy took the admin account with it and the dashboard
   went back to the setup page.
 - `client.enforce_auth_on_inference: true` becomes effective with the same
-  apply, and item 14's virtual keys do not exist yet, so inference refuses
-  everything until they do. That is the plan's phase A order ("inference
-  succeeds with a virtual key and fails without one"), not a defect — but the
-  two items have to land close together.
+  apply, and no virtual key exists yet, so inference refuses everything until
+  one does — minted for a person by the path in
+  [`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md), or
+  declared here for a caller that is not a person. That is the plan's phase A
+  order ("inference succeeds with a virtual key and fails without one"), not a
+  defect — but the two have to land close together.
 
 ## The image
 
@@ -292,8 +297,10 @@ the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
 `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are also accepted, from the prompts or
 the env file, but never required: they exist only for the direct providers
 "Provider configuration" in the plan allows to be added later. `VK_*` virtual
-keys are deliberately absent here — they belong to the `engineering` team in
-phase 2 item 14, and their names follow the keys `config.json` declares. The RDS
+keys are deliberately absent here and stay absent: a per-person key is created
+through the gateway's admin API and lives only in Bifrost, which returns its
+own plaintext value, so there is no secret for this script to write
+([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md)). The RDS
 master credentials are managed by RDS in its own secret (phase 1 item 7).
 
 Item 8 wires `bifrost/gateway` into the task definition's `secrets` list and
