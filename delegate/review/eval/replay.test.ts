@@ -4,7 +4,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { replayCase, replayAll, resultFromRecord, loadRunResults } from "./replay";
+import { replayCase, replayAll, replayToolGuard, resultFromRecord, loadRunResults } from "./replay";
+import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
 import type { SubagentCall } from "../../framework/types";
@@ -632,4 +633,31 @@ test("loadRunResults still parses a result file written without leads", () => {
   };
   writeFileSync(join(dir, "c1", "run-1.json"), JSON.stringify(old));
   assert.equal(loadRunResults(dir).get("c1")?.get(1)?.leads, undefined);
+});
+
+const toolCall = (tool: string) =>
+  ({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: {} }) as never;
+const hookOpts = { signal: new AbortController().signal };
+const isDenied = (out: unknown) =>
+  (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
+    ?.permissionDecision === "deny";
+
+test("replayToolGuard allows only the reviewer's read-only tools", async () => {
+  for (const tool of ["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", "mcp__git__git_show"]) {
+    assert.equal(isDenied(await replayToolGuard(toolCall(tool), undefined, hookOpts)), false, tool);
+  }
+  for (const tool of ["Bash", "Write", "Edit", "WebFetch", "mcp__other__x"]) {
+    assert.equal(isDenied(await replayToolGuard(toolCall(tool), undefined, hookOpts)), true, tool);
+  }
+});
+
+test("replayCase denies Bash even when the reviewer config allows it", async () => {
+  let hooks: HookCallback[] = [];
+  const capture: RunAgentImpl = async (config, prompt, overrides) => {
+    hooks = overrides.preToolUseHooks ?? [];
+    return fakeRunAgent({ ...config, tools: ["Bash"], allowedTools: ["Bash"] }, prompt, overrides);
+  };
+  await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, capture, fakeCheckout);
+  const outs = await Promise.all(hooks.map((h) => h(toolCall("Bash"), undefined, hookOpts)));
+  assert.ok(outs.some(isDenied));
 });

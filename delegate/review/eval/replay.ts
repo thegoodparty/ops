@@ -10,7 +10,7 @@ import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
 import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
-import { createGitTool } from "../git-tool";
+import { GIT_TOOL_NAMES, createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
 import { FindingSchema } from "../schema";
@@ -279,6 +279,24 @@ const getVariant = (): string => {
   }
 };
 
+// The tool lists in pr-reviewer.ts are string literals a candidate branch may
+// change, so replay holds its own list. A candidate that names Bash or Write
+// would otherwise reach the run's result files and the holdout manifest.
+const REPLAY_TOOLS = new Set<string>(["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", ...GIT_TOOL_NAMES]);
+
+export const replayToolGuard: HookCallback = async (input) => {
+  const i = input as { hook_event_name?: string; tool_name?: string };
+  if (i.hook_event_name !== "PreToolUse" || REPLAY_TOOLS.has(i.tool_name ?? "")) return { continue: true };
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: `Tool not allowed in replay: ${i.tool_name}`,
+    },
+  };
+};
+
 export const replayCase = async (
   record: ReviewRecord,
   opts: { workDir: string; variant?: string },
@@ -335,7 +353,7 @@ export const replayCase = async (
       cwd: repoDir,
       mcpServers: { git: createGitTool(repoDir) },
       env: agentEnv(),
-      preToolUseHooks: [pathGuardHook(repoDir)],
+      preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

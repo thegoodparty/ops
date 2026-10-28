@@ -174,3 +174,26 @@ test("the reason never contains file content", () => {
   const reason = codeOutsideLiterals(SRC, SRC.replace("name.toUpperCase()", "SECRET_VALUE"));
   assert.doesNotMatch(reason ?? "", /SECRET_VALUE|toUpperCase/);
 });
+
+const LOADS = [
+  'const a = require("./a");',
+  'const b = await import("./b");',
+  'const c = cfg["key"];',
+  "const d = require(`./d`);",
+  "const e = await import(`./e/${a}`);",
+  "const f = cfg[`key`];",
+  "",
+].join("\n");
+
+for (const [from, to] of [
+  ['"./a"', '"../eval/expected/manifest.json"'],
+  ['"./b"', '"./other"'],
+  ['"key"', '"other"'],
+  ["`./d`", "`../eval/expected/manifest.json`"],
+  ["`./e/", "`./other/"],
+  ["`key`", "`other`"],
+]) {
+  test(`a changed load or lookup string ${from} is refused`, () => {
+    assert.notEqual(codeOutsideLiterals(LOADS, LOADS.replace(from, to)), null);
+  });
+}

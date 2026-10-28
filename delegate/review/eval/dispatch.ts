@@ -124,8 +124,12 @@ const LITERAL_TEXT_KINDS = new Set<ts.SyntaxKind>([
 // A string that picks what gets loaded or which property is read is code, not
 // prompt text: "../eval/expected/manifest.json" or obj["x"] would change what runs.
 const isCodeString = (node: ts.Node): boolean => {
-  const p = node.parent;
-  if (!p || !ts.isStringLiteral(node)) return false;
+  const literal =
+    ts.isTemplateHead(node) ? node.parent
+    : ts.isTemplateMiddle(node) || ts.isTemplateTail(node) ? node.parent.parent
+    : node;
+  const p = literal.parent;
+  if (!p) return false;
   if (ts.isImportDeclaration(p) || ts.isExportDeclaration(p) || ts.isExternalModuleReference(p)) return true;
   if (ts.isImportTypeNode(p) || ts.isLiteralTypeNode(p) || ts.isElementAccessExpression(p)) return true;
   return (
