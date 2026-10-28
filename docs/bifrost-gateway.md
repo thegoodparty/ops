@@ -32,9 +32,11 @@ Success, in the order it should be proven:
    `https://bifrost.workbench.goodparty.org` with a gateway credential, and
    never with a provider key. `gp-pi`, Claude Code and Codex CLI are the first
    three harnesses to prove it.
-2. **One credential model.** An engineer gets a gateway virtual key, not a
-   Fireworks key and not a Bedrock session. Revoking the key stops the traffic;
-   nothing else has to be rotated.
+2. **One credential model.** A person gets their own gateway virtual key, not
+   a Fireworks key and not a Bedrock session. Revoking the key stops that
+   person's traffic and nothing else has to be rotated; who gets one, and what
+   takes it away, is
+   [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md).
 3. **Budgets that bind.** Per-engineer and per-team spend is visible in the
    gateway and capped by it, independent of the account's billing alert.
 4. **Metadata only.** Prompt and completion bodies are not persisted by the
@@ -183,6 +185,8 @@ Cited so the next session can check them rather than trust this document:
 | Account budget `workbench-monthly-spend` | `deploy-workbench/index.ts` |
 | Bedrock invocation logging, metadata only, 365-day retention | `deploy-workbench/index.ts` |
 | Identity Center `WorkbenchAccess`/`Engineers`, `AdministratorAccess`/`Admins` | `deploy/components/identity-center.ts`, `docs/workbench-account.md` |
+| Virtual-key admin routes and their search semantics at the pinned tag | `transports/bifrost-http/handlers/governance.go`, `framework/configstore/rdb.go`; the facts are collected in `docs/bifrost-virtual-keys.md` |
+| An engineer's container identity is `assumed-role/AWSReservedSSO_WorkbenchAccess_<hash>/<email>` | `aws sts get-caller-identity` in the container; `docs/bifrost-virtual-keys.md` |
 | Secrets live in Secrets Manager, written out of band | `docs/workbench-account.md` (`gp-pi/brave-search`), `deploy-infrastructure/agent-swarm.ts` (`DELEGATE_SWARM`) |
 | Delegated DNS subzone pattern | `deploy-infrastructure/dns.ts`, `deploy/components/infra-zone-delegation.ts` |
 | Delegate image push to ECR | `.github/workflows/deploy.yml` (`delegate-worker`) |
@@ -530,6 +534,13 @@ dynamically linked Go runtime to share. So the allowlist plus the proxy is the
 whole of what this design gets, and per-person attribution stays an
 Enterprise question.
 
+**That is about the admin surface, not about inference.** A model request is
+attributable to a person because it carries that person's own virtual key
+([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)), so "who spent what"
+does not need Enterprise. What Enterprise would add is a per-person identity
+for *dashboard actions* — who changed a provider, who edited a budget — which
+is a different question and not the one the cost record answers.
+
 **Prerequisite, manual.** A Google Cloud OAuth client of type Web
 application, consent screen Internal, redirect URI
 `https://bifrost.workbench.goodparty.org/oauth2/callback`. This is the same
@@ -605,11 +616,14 @@ third holds secret values:
    watch (an omitted section is left alone, an empty one prunes).
 3. **Secrets are in Secrets Manager, written out of band.** Provider keys
    (`FIREWORKS_API_KEY`, and any other provider), `BIFROST_ENCRYPTION_KEY`,
-   the admin credential and the virtual-key values (`VK_*`) are secret values.
-   Pulumi creates the secret containers and the read grants; the values are
-   written out of band with the same procedure `DELEGATE_SWARM` and
-   `gp-pi/brave-search` use. Nothing secret is committed, and nothing secret
-   appears in this document.
+   the admin credential and any virtual-key value declared in the file
+   (`VK_*`) are secret values. Pulumi creates the secret containers and the
+   read grants; the values are written out of band with the same procedure
+   `DELEGATE_SWARM` and `gp-pi/brave-search` use. Nothing secret is committed,
+   and nothing secret appears in this document. A **per-person** key does not
+   use this layer at all: it is created through the admin API and its value
+   lives in Bifrost, which returns it, so there is no secret for anyone to
+   write ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)).
 
 The oauth2-proxy admin allowlist is a fourth repo file,
 `deploy-workbench/bifrost/allowed-emails.txt`, baked into the sidecar image
@@ -620,8 +634,11 @@ The `governance` block supports `value: "env.VK_ENGINEER"` on a virtual key
 (`docs/deployment-guides/config-json/governance.mdx`), which is what makes the
 structure code and the token a secret: the key's id, provider/model scope and
 team live in the file; the `sk-bf-*` value comes from Secrets Manager. Teams
-and budgets are declarative in the same block. Rotating a key is changing one
-secret value, not editing the file.
+and budgets are declarative in the same block. Rotating a declared key is
+changing one secret value, not editing the file. This is the mechanism for a
+key that is *declared* — a shared caller, not a person: per-person keys are
+minted and stored in Bifrost, so they appear in neither the file nor Secrets
+Manager ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)).
 
 ## Provider configuration
 
@@ -674,20 +691,26 @@ Virtual keys are Bifrost's primary governance entity
   `client.enforce_auth_on_inference: true`, so a request with no virtual key
   is refused. The OSS default is permissive, and a gateway that forwards
   anonymous traffic to a provider key is worse than no gateway.
-- **One virtual key per engineer**, named with the engineer's username, plus
-  one per non-human caller (the delegate worker, any CI job). The key is
-  `sk-bf-*` and is presented via the header each harness expects — the same
-  key can be used as `x-bf-vk`, `Authorization: Bearer`, `x-api-key` or
-  `x-goog-api-key`, which is why one key works across Claude Code, Codex and
-  Gemini CLI.
+- **One virtual key per person**, named with the person's lowercase email —
+  not their username, and not one per harness. A non-human caller (a CI job, a
+  shared worker) is deliberately not a case here: it has no person to
+  attribute to, and a key per tool for one person divides the number the key
+  exists to produce. The key is `sk-bf-*` and is presented via the header each
+  harness expects — the same key can be used as `x-bf-vk`,
+  `Authorization: Bearer`, `x-api-key` or `x-goog-api-key`, which is why one
+  key works across Claude Code, Codex and Gemini CLI.
 - **A team per group of humans.** An `engineering` team owns the human keys
   and a monthly budget; per-key budgets sit under it. Budget enforcement is a
   rationing tool: it stops one engineer starving the others, and it caps the
   fleet's spend. It does not raise the provider ceiling, which is the account
   and quota argument `workbench-account.md` already makes.
-- **Expiry and offboarding.** Keys carry an `expires_at` where a contractor or
-  temporary key is involved, and offboarding is "deactivate the virtual key",
-  which is one action and does not touch a provider.
+- **Expiry and offboarding.** Offboarding is "deactivate the virtual key",
+  which is one action and does not touch a provider. Who does it, and when,
+  is [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a scheduled
+  janitor deactivates a key whose owner has left the Identity Center group,
+  and sets `expires_at` plus `delete_after_expire` so the key is removed after
+  a retention window rather than losing its spend history on the day someone
+  leaves.
 - **Admin auth is off; the proxy is the gate.** `governance.auth_config` is
   present with `is_enabled: false`. Turning the shared OSS login off is what
   makes oauth2-proxy plus the allowlist the only gate a human passes (see
@@ -699,9 +722,11 @@ Virtual keys are Bifrost's primary governance entity
   (`env.BIFROST_ENCRYPTION_KEY`). Losing it means re-entering every provider
   key. It is the single most important secret in this deployment and belongs
   in Secrets Manager with versioning, and in the restore runbook.
-- **Ownership.** A human — jagoda — issues and revokes virtual keys for now,
-  and the process is expected to iterate once the gateway is in use. This is
-  a follow-up, not a blocker, and it is recorded rather than left implicit.
+- **Ownership.** No human issues or revokes a per-person key: minting is an
+  on-demand call from the engineer's own session and revocation is the
+  janitor's reconcile loop, both designed in
+  [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md). The Bifrost admin
+  allowlist is still a human's list, owned by jagoda for now.
 
 ## Persistence, backup and upgrade
 
@@ -812,11 +837,13 @@ long as the direct path is kept.
   Remove direct provider keys from engineer environments and from the
   container's default env. Keep the break-glass direct key in Secrets Manager,
   documented and audited, for the duration of one full cycle.
-- **Phase E — close the credential loop.** Design and implement how virtual
-  keys are distributed to engineer machines and the `gp-pi` container, how
-  they are rotated, and how offboarding works. This is deliberately gated on
-  the gateway being proven out in phase A and exercised in phases B–D; it is
-  not designed in this document.
+- **Phase E — close the credential loop.** How virtual keys reach a person's
+  harnesses and the `gp-pi` container, and how offboarding takes them away.
+  **Designed** in [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a key
+  is minted on demand from Identity Center membership and deactivated by a
+  scheduled janitor when that membership ends. Rotation is deferred there and
+  recorded, not designed. Implementation is still gated on the gateway proving
+  out in phase A and being exercised in phases B–D.
 - **Phase F — tighten.** Narrow `WorkbenchAccess`'s Bedrock invoke to what the
   gateway's task role needs (or remove it from engineers entirely), which is
   the payoff the workbench document's open question about removing
@@ -854,6 +881,15 @@ OSS over Enterprise clustering.
   most likely incident is an admin who was removed from `Admins` but not from
   the Bifrost list, or a new admin who cannot get in. The list is the control,
   and its owner is named above.
+- **The mint path holds an admin-level credential.** The per-user key Lambda
+  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)) reads the setup
+  token from Secrets Manager and calls the admin API from inside the VPC. It
+  is the second holder of that token after the oauth2-proxy sidecar, and the
+  first holder that *writes* with it — the sidecar only presents it on a
+  request a human already made — which is why that design keeps the function
+  small, forbids logging request or response bodies, and scopes the secret
+  read to one grant. A bug there is an admin-surface bug, not an inference
+  one.
 - **The SCP relaxation.** Removing `rds:*` from `DenyDataStores` widens what
   the workbench account can run. It is deliberate and reviewed, and the
   remaining denies (`dynamodb`, `redshift`, cross-account S3, non-`us-west-2`)
@@ -903,6 +939,12 @@ Review settled most of the earlier questions. What genuinely remains:
 - **Model allowlist and Fireworks pricing.** Which models the fleet is allowed
   to reach, and whether Bifrost's catalog pricing for them is correct. Wrong
   pricing makes the budgets wrong.
+- **How a person is designated for a higher tier.** One key per person and one
+  default tier are designed; "who may reach the higher-grade models" is
+  deliberately deferred, with the two candidate shapes — a second Identity
+  Center group, or an edited per-person record — recorded in
+  [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred, recorded
+  and not designed".
 - **Does the Bedrock invocation log stay?** Once the gateway routes Bedrock,
   the workbench step 17 log still records the calls, but attribution moves
   from `identity.arn` to the virtual key. Decide whether the log is kept for
@@ -916,8 +958,10 @@ Review settled most of the earlier questions. What genuinely remains:
   SCIM, `vault_store` secret references, clustering (real multi-node HA) and
   access profiles, at a licensing cost and a procurement step. Nothing here
   depends on it.
-- Designing virtual-key distribution and `gp-pi` wiring. That is phase E,
-  gated on the gateway being proven out.
+- Implementing virtual-key distribution and `gp-pi` wiring. The design is
+  [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) (phase E) and this
+  document stops at naming it; the implementation is gated on the gateway
+  being proven out.
 - Replacing or re-scoping `WorkbenchAccess`, removing `bedrock:*` from
   `EngineerAccess`, or changing the workbench SCP beyond the `rds:*` relaxation
   described above. Those are follow-ups with their own PRs.
@@ -1090,7 +1134,8 @@ network or a permission can land before the item that creates it.
 11. Add the secret containers and the read grants, and write the secret
     values out of band (provider keys, `BIFROST_ENCRYPTION_KEY`, admin
     credential, `OAUTH2_PROXY_CLIENT_ID`, `OAUTH2_PROXY_CLIENT_SECRET`,
-    `OAUTH2_PROXY_COOKIE_SECRET`, `VK_*`).
+    `OAUTH2_PROXY_COOKIE_SECRET`, and `VK_*` only for a key declared here —
+    per-person keys are minted, not written, so they have no `VK_*`).
 12. Bring the service up and prove phase A: `/health` green through the ALB
     over TLS, inference succeeds with a virtual key and fails without one, a
     Bedrock request succeeds through the task role, and the admin path
@@ -1099,9 +1144,13 @@ network or a permission can land before the item that creates it.
     known marker string and show it is absent from the log store and any
     connector. The upstream docs are explicit that the layers compose, so this
     is a test, not a reading.
-14. Create the `engineering` team, its budget, and the first virtual keys
-    declaratively in `config.json`; write the issue/rotate/revoke runbook next
-    to the other runbooks. The owner is jagoda for now.
+14. Create the `engineering` team and its budget declaratively in
+    `config.json`, and write the issue/rotate/revoke runbook next to the other
+    runbooks. **Superseded in part** by
+    [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a per-person key is
+    minted from Identity Center membership rather than declared here, so this
+    file carries the team and its budget and no key per person, and the runbook
+    becomes the design document beside `gp-pi bifrost-key`.
 
 **Phase 3 — observability and cost**
 
@@ -1127,7 +1176,10 @@ network or a permission can land before the item that creates it.
 **Phase 5 — close the loop and harden**
 
 21. Credential distribution and `gp-pi` wiring (phase E above), gated on the
-    gateway having proven out.
+    gateway having proven out. **Designed** in
+    [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), whose own numbered
+    steps 1–6 are the implementation plan for it; a PR implementing one of
+    them names that document and its step, not this item.
 22. Tighten `WorkbenchAccess`/`EngineerAccess` Bedrock invoke and remove
     direct provider keys, in a separate PR, after a full cycle on the gateway.
 23. A restore rehearsal from an RDS snapshot, recorded with its date and the
