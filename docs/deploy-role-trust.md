@@ -494,6 +494,44 @@ it also lets one drop the cluster. Scope to `rds:CreateDBInstance` and the
 specific cluster ARN, with no `Delete` on the cluster itself, and let the
 teardown path use the existing `ecs run-task` route for dropping the database.
 
+## What step 6 found
+
+Two things changed on omni's `main` between the audit and the role, and the
+role follows the code rather than the audit.
+
+**The preview stack no longer creates an ALB.** Every preview now routes
+through `gp-api-previews`, a shared ALB the **dev** stack owns, so a preview
+creates a target group and one host-header rule on that ALB's HTTPS listener.
+The listener is tagged `Environment=dev`, so `CreateRule` is granted on it by
+ARN, with the preview tags required in the request. The per-PR ALB, its two
+listeners, its security group and its two Route53 records survive only as a
+fallback for a missing shared ALB, so their creates are not granted: the
+fallback fails closed. Their deletes are, tag- or name-scoped, for stacks
+still carrying a per-PR ALB from before. The Route53 grant is held to
+`DELETE` of `A` and `AAAA` records under `pr-*.preview.goodparty.org`.
+
+**Step 6c had already landed** (thegoodparty/omni#2173): `infra-cli.ts`
+skips the Grafana tokens on preview, so the role holds no grant for them.
+
+Three choices the design left open:
+
+- **State is scoped to the stack, not the project.** The plan's audit names
+  `.pulumi/stacks/gp-api/*`, but gp-api's dev and prod stacks share that
+  prefix and their state holds the Aurora master passwords under the shared
+  passphrase. Every state grant stops at `gp-api-pr-*`.
+- **ECS is scoped by name, the rest of the routing by tag.** The tag
+  condition is what reaches the target group, as designed. ECS resources all
+  carry the `pr-<n>` stage in their names, and the service reference lists no
+  tag condition for `DeleteCluster` or `UpdateService`, so the name is the
+  bound that holds for every ECS action. Queues, buckets, log groups and IAM
+  roles are name-scoped for the same reason.
+- **A blanket deny on `aws:ResourceTag/Environment=prod`.** The design's "no
+  write to any resource carrying the production tags", as a deny so it holds
+  whatever is added later. The shared VPC carries that tag; the role acts on
+  nothing in it.
+
+The teardown question is answered under "Open questions".
+
 ## Design: the workflows that should not hold credentials at all
 
 Three cases, all of them the pattern PR #90 applied to this repo's
@@ -555,7 +593,18 @@ consumer to sequence against.
   `masterPassword` on the Aurora cluster is a real value, so that half needs
   its own answer (AWS-managed master password, or keeping the cluster out of
   the previewed program). (step 4b)
-- Can teardown drop the preview database without running a task on the dev
-  cluster's task definition? (step 7)
+- ~~Can teardown drop the preview database without running a task on the dev
+  cluster's task definition?~~ Settled at step 6: yes. The preview's own task
+  definition already carries everything the drop needs (`GP_API_DEV`'s
+  `DB_PASSWORD`, the shared cluster's `DB_USER` and `DB_HOST`), so teardown
+  runs `drop-preview-db.ts` on it, in the preview's own cluster, before the
+  destroy. The role's `RunTask` is limited to `gp-pr-*` task definitions in
+  `gp-pr-*` clusters and holds no `PassRole` on a dev role. The old reason for
+  the dev cluster, a drop task outliving its work and blocking the cluster's
+  delete, is covered by the script's 15s connect and 60s statement timeouts
+  and by teardown stopping a task still running when the wait gives up. The
+  scheduled orphan sweep in `gp-api-cleanup-preview.yml` still uses the dev
+  task definition, but it runs from `main` under the deploy role, not from a
+  pull request. (step 7)
 - Does `gpvpn` still deploy anything, or is step 9 a removal rather than a
   narrowing? Last push was June.
