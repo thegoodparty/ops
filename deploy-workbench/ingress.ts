@@ -152,7 +152,24 @@ export const HEALTH_PATH_PATTERNS = ["/health"] as const;
 export const OAUTH2_CALLBACK_RULE_PRIORITY = 10;
 export const ADMIN_RULE_PRIORITY = 20;
 export const INFERENCE_RULE_PRIORITY = 30;
-export const HEALTH_RULE_PRIORITY = 40;
+
+/**
+ * The health rule's priority, which is deliberately **not** 40.
+ *
+ * 40 was the telemetry rule this one replaces (`/health` and `/metrics`). The
+ * rule's Pulumi logical name comes from its `key`, and the key had to change
+ * with the paths: leaving it `telemetry` for a rule that carries only `/health`
+ * would keep the deploy quiet at the cost of a name that lies. But a renamed
+ * resource is a create and a delete, and Pulumi creates before it deletes — so
+ * a new rule at priority 40 would be rejected by the ALB with
+ * `PriorityInUse` while the old rule still holds 40. Taking the next free
+ * priority makes the create succeed first and the old rule be deleted after,
+ * which the PR's `pulumi preview` shows as `+1 create / -1 delete` rather than
+ * an apply-time failure. The final listener is identical either way; the
+ * absolute number is not load bearing, only its uniqueness and its order above
+ * the inference rule.
+ */
+export const HEALTH_RULE_PRIORITY = 50;
 
 /** Which target group a rule forwards to, by the key `TARGET_GROUPS` uses. */
 export type ListenerRuleTarget = "bifrost" | "oauth2Proxy";

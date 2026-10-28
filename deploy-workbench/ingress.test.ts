@@ -262,6 +262,12 @@ describe("bifrost ingress", () => {
     const priorities = HTTPS_LISTENER_RULES.map((rule) => rule.priority);
     assert.equal(new Set(priorities).size, priorities.length);
     assert.deepEqual(priorities, [...priorities].sort((a, b) => a - b));
+    // The health rule must not take 40 back. 40 was the telemetry rule this
+    // one replaced, and a renamed rule is create-then-delete in Pulumi: a new
+    // rule at the old priority would be rejected with `PriorityInUse` while
+    // the old rule still holds it. See HEALTH_RULE_PRIORITY's comment.
+    assert.equal(HEALTH_RULE_PRIORITY, 50);
+    assert.ok(HEALTH_RULE_PRIORITY > INFERENCE_RULE_PRIORITY);
   });
 
   it("leaves no admin or login path that reaches Bifrost without oauth2-proxy", () => {
