@@ -725,7 +725,7 @@ Everything else:
    reading of the route table.
 2. **The create call against the deployed gateway.** The request and response
    shapes are read from the pinned source and recorded above; nobody has
-   exercised them against `bifrost.workbench.goodparty.org`. Step 2 proves
+   exercised them against `bifrost.workbench.goodparty.org`. Step 3 proves
    three things with a hand-written request before the code depends on them:
    the `409` on a duplicate name, that a created key authenticates against
    `/v1` immediately, and that `key_ids: ["*"]` is what makes a pinned
