@@ -54,6 +54,7 @@ import {
   TASK_CPU,
   TASK_MEMORY,
   TASK_ROLE_NAME,
+  bifrostConfigVersion,
   executionRoleConfigParameterPolicyDocument,
   executionRoleSecretsPolicyDocument,
   readBifrostConfig,
@@ -1140,7 +1141,7 @@ describe("bifrost ecs", () => {
     );
     const parameterBlock = resourceBlock("bifrostConfigParameter");
     assert.ok(parameterBlock.includes("type: \"String\""), parameterBlock);
-    assert.ok(parameterBlock.includes("value: readBifrostConfig()"), parameterBlock);
+    assert.ok(parameterBlock.includes("value: bifrostConfig,"), parameterBlock);
     assert.ok(
       !parameterBlock.includes("SecureString"),
       "a SecureString would need a KMS decrypt grant on a file that holds no secret",
@@ -1174,29 +1175,49 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("rolls the task when config.json changes, not only when its ARN does", () => {
+  it("rolls the task when config.json changes, with a value known at preview", () => {
     // The ARN is stable across value changes, so a `secrets` entry alone leaves
     // every running task on the config it booted with: a merged `config.json`
-    // PR would update the parameter and change nothing that is running. The
-    // parameter's version increments on each value change, so carrying it as an
-    // environment value registers a new task-definition revision and the
-    // service's stop-before-start rollout picks the new file up.
+    // PR would update the parameter and change nothing that is running. A
+    // value that changes with the file registers a new task-definition revision
+    // and the service's stop-before-start rollout picks the new file up.
+    //
+    // The value is a digest computed from the file in this program, NOT
+    // `configParameter.version`. AWS assigns the parameter's version, so a
+    // preview of the apply that changes the file cannot know it: Pulumi renders
+    // the entire containerDefinitions string as its unknown sentinel, the
+    // pre-apply secret check has no definition to read, and the deploy stops
+    // before the apply that would have rolled the task (2026-10-28, run
+    // 40725087936, the merge of #393). A digest is known at preview and says
+    // which config a task is running by its content rather than by a counter.
     assert.equal(BIFROST_CONFIG_VERSION_ENV_NAME, "BIFROST_CONFIG_VERSION");
-    assert.ok(
-      ECS_SOURCE.includes("configParameter.version.apply(String)"),
-      "the task definition must depend on the parameter's version, not only its ARN",
+    assert.equal(
+      bifrostConfigVersion(),
+      bifrostConfigVersion(BIFROST_CONFIG_SOURCE),
+      "the default must be the reviewed config.json",
     );
+    assert.match(bifrostConfigVersion(), /^[0-9a-f]{12}$/);
+    assert.notEqual(
+      bifrostConfigVersion(BIFROST_CONFIG_SOURCE),
+      bifrostConfigVersion(`${BIFROST_CONFIG_SOURCE} `),
+      "a changed config.json must produce a different version, or the task never rolls",
+    );
+    assert.ok(
+      !ECS_SOURCE.includes("configParameter.version"),
+      "the parameter's version is unknown at preview; carrying it collapses containerDefinitions",
+    );
+
     const bifrostBlock = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(
       bifrostBlock.includes("name: BIFROST_CONFIG_VERSION_ENV_NAME") &&
-        bifrostBlock.includes("value: configParameterVersion"),
+        bifrostBlock.includes("value: configVersion"),
       `the gateway container does not carry the config version\n${bifrostBlock}`,
     );
-    // The value comes from the parameter resource, so the dependency edge is
-    // real rather than a constant that never changes.
+    // The dependency edge is still real: the task definition names the
+    // parameter's ARN, so Pulumi finishes the parameter update first.
     assert.ok(
-      containerBlock().includes("configParameterVersion,"),
-      "the version must be destructured out of the pulumi.all above the containers",
+      containerBlock().includes("configParameter.arn,"),
+      "the task definition must still depend on the parameter resource",
     );
   });
 

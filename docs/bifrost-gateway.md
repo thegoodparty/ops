@@ -592,9 +592,9 @@ third holds secret values:
    resolved from Secrets Manager, and the database password reaches the task
    through `secrets` — which `deploy-workbench/bifrost/config.test.ts`
    checks: no credential-shaped literal, and every `env.` name is one the
-   deployment actually provides. The mechanism, including the parameter's
-   version in the task definition so an edit rolls the task, is documented in
-   `deploy-workbench/bifrost/README.md`.
+   deployment actually provides. The mechanism, including a digest of the
+   file's contents carried in the task definition so an edit rolls the task,
+   is documented in `deploy-workbench/bifrost/README.md`.
    `source_of_truth: "config.json"` makes the file authoritative for the
    sections it declares, so a redeploy converges to the repo instead of
    preserving UI drift; the upstream "missing vs empty" caveat in

@@ -42,6 +42,25 @@ import { assumeRoleEnvironment, runAws } from "./aws-role";
  * no `:secret:` marker, so the fields shifted and the "secret" became `arn` -
  * and the next deploy failed on `ResourceNotFoundException` from a
  * `get-secret-value` for a secret named `arn`. Both halves are pinned by tests.
+ *
+ * Unknowns at preview time are rejected, not tolerated. Pulumi serializes an
+ * output it cannot know before the apply as the string
+ * `04da6b54-80e4-46f7-96ec-b56ff0331ba9` (`unknownValue` in
+ * `@pulumi/pulumi/runtime/rpc.js`). When such an output feeds the container
+ * definitions, `pulumi.jsonStringify` makes the whole value unknown, so the
+ * preview carries that bare sentinel where the JSON string should be. The
+ * guard must not treat that as "nothing to check": the stack export holds the
+ * task definition that is already running, so validating it would compare the
+ * old keys and miss exactly the new one this check exists for. It fails closed
+ * instead, saying that the definition could not be validated at preview time.
+ * The 2026-10-28 failure (deploy run 40725087936, the merge of #393) was this:
+ * `BIFROST_CONFIG_VERSION` was fed from `aws.ssm.Parameter.version`, which is
+ * assigned by AWS and therefore unknown for the apply that changes
+ * `config.json`. The value now comes from a digest computed in the program
+ * (`bifrostConfigVersion` in `ecs.ts`), so it is known at preview. The
+ * messages below name the container and field when the sentinel is somewhere
+ * the message can see, which is what makes the next occurrence a one-read
+ * diagnosis.
  */
 
 export type SecretReference = {
@@ -60,6 +79,21 @@ export type SecretReference = {
 };
 
 type JsonRecord = Record<string, unknown>;
+
+/**
+ * What Pulumi serializes a value it cannot know before the apply as. Exported
+ * so a test can pin the real shape that failed rather than a paraphrase.
+ */
+export const PULUMI_UNKNOWN_SENTINEL =
+  "04da6b54-80e4-46f7-96ec-b56ff0331ba9";
+
+/** Long enough to recognize a value, short enough to stay one line. */
+const SNIPPET_LENGTH = 160;
+
+const snippetOf = (value: string): string =>
+  value.length <= SNIPPET_LENGTH
+    ? value
+    : `${value.slice(0, SNIPPET_LENGTH)}...(truncated, ${value.length} chars)`;
 
 const isRecord = (value: unknown): value is JsonRecord =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -169,24 +203,122 @@ const containerDefinitionsFrom = (document: unknown): unknown[] => {
   return found;
 };
 
+/**
+ * Where the preview unknown sits, as `<container>: field <path>`, so a human
+ * knows which container and which of its fields to fix. A container is named
+ * by its own `name` when that is readable; an unknown in the name itself is
+ * reported against the container's index in the list.
+ */
+const findPreviewUnknowns = (definitions: unknown[]): string[] => {
+  const found: string[] = [];
+
+  const visit = (
+    node: unknown,
+    path: string,
+    container: string | undefined,
+  ): void => {
+    if (typeof node === "string") {
+      if (node.includes(PULUMI_UNKNOWN_SENTINEL)) {
+        found.push(`${container ?? "<unnamed container>"}: field ${path}`);
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => visit(item, `${path}[${index}]`, container));
+      return;
+    }
+    if (!isRecord(node)) return;
+
+    // Only a container's own `name` names the container. A nested object with
+    // a `name` is an environment variable or a secret entry, and taking that
+    // as the container would point a human at the wrong thing.
+    const named =
+      path === "" && typeof node.name === "string" ? node.name : container;
+    for (const [key, value] of Object.entries(node)) {
+      visit(value, path ? `${path}.${key}` : key, named);
+    }
+  };
+
+  definitions.forEach((definition, index) => {
+    const name =
+      isRecord(definition) && typeof definition.name === "string"
+        ? definition.name
+        : `containerDefinitions[${index}]`;
+    visit(definition, "", name);
+  });
+
+  return found;
+};
+
 const parseContainerDefinitions = (
   raw: unknown,
 ): Array<{ secrets?: unknown }> => {
   let definitions = raw;
 
   if (typeof raw === "string") {
+    const isUnknownSentinel = raw.trim() === PULUMI_UNKNOWN_SENTINEL;
     try {
       definitions = JSON.parse(raw);
-    } catch {
-      throw new Error(
+    } catch (error) {
+      const parseError =
+        error instanceof Error ? error.message : String(error);
+      const detail = [
         "the synthesized task definition's containerDefinitions is not valid JSON",
-      );
+        `  containerDefinitions typeof: ${typeof raw}`,
+        `  Pulumi preview unknown sentinel: ${isUnknownSentinel ? "yes" : "no"}`,
+        `  JSON.parse error: ${parseError}`,
+        `  value (first ${SNIPPET_LENGTH} chars, no secret values): ${JSON.stringify(snippetOf(raw))}`,
+      ];
+
+      if (isUnknownSentinel || raw.includes(PULUMI_UNKNOWN_SENTINEL)) {
+        throw new Error(
+          [
+            "the task definition could not be validated at preview time: containerDefinitions is",
+            `Pulumi's preview unknown value (${PULUMI_UNKNOWN_SENTINEL}), so no container or field in it`,
+            "can be read and its Secrets Manager keys cannot be compared against the real secrets.",
+            "An input to the task definition is only known after the apply that drains the running task;",
+            "this check will not approve a definition it could not read, and will not fall back to the",
+            "exported stack state, which describes the task definition that is already running.",
+            "Find the preview-unknown Output feeding the container definitions and make it known at",
+            "preview time (the 2026-10-28 instance was BIFROST_CONFIG_VERSION fed from",
+            "aws.ssm.Parameter.version; see bifrostConfigVersion in deploy-workbench/ecs.ts).",
+            ...detail.slice(1),
+          ].join("\n"),
+        );
+      }
+
+      throw new Error(detail.join("\n"));
     }
   }
 
   if (!Array.isArray(definitions)) {
     throw new Error(
-      "the synthesized task definition's containerDefinitions is not a list",
+      [
+        "the synthesized task definition's containerDefinitions is not a list",
+        `  containerDefinitions typeof: ${typeof definitions}`,
+        `  value (first ${SNIPPET_LENGTH} chars, no secret values): ${JSON.stringify(
+          snippetOf(
+            typeof definitions === "string"
+              ? definitions
+              : (JSON.stringify(definitions) ?? String(definitions)),
+          ),
+        )}`,
+      ].join("\n"),
+    );
+  }
+
+  const unknowns = findPreviewUnknowns(definitions);
+  if (unknowns.length > 0) {
+    throw new Error(
+      [
+        "the task definition could not be validated at preview time: it carries Pulumi's preview",
+        `unknown value (${PULUMI_UNKNOWN_SENTINEL}) at the paths below, so the value that will be`,
+        "applied is not the one in the preview and its Secrets Manager keys cannot be compared.",
+        "This check will not approve a definition it could not read, and will not fall back to the",
+        "exported stack state, which describes the task definition that is already running.",
+        "Make the value known at preview time:",
+        ...unknowns.map((location) => `  ${location}`),
+      ].join("\n"),
     );
   }
 

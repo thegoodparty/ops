@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  PULUMI_UNKNOWN_SENTINEL,
   extractRequiredSecretReferences,
   formatMissingSecretKeys,
   missingSecretKeys,
@@ -191,6 +192,180 @@ describe("extractRequiredSecretReferences", () => {
       () => extractRequiredSecretReferences({ steps: [] }),
       /could not find an ECS task definition/i,
     );
+  });
+});
+
+describe("extractRequiredSecretReferences on a preview unknown", () => {
+  /**
+   * The preview that failed deploy run 40725087936 (the merge of #393).
+   *
+   * `containerDefinitions` is built with `pulumi.jsonStringify` over a
+   * `pulumi.all` that carried `aws.ssm.Parameter.version`, and #393 changed
+   * `config.json`. The version is assigned by AWS, so at preview it is an
+   * unknown, and Pulumi serializes the whole stringified value as this bare
+   * sentinel. `typeof` is `"string"`, so the old parse path fell straight into
+   * `JSON.parse` and reported "not valid JSON" with nothing else.
+   */
+  const unknownPreview = (containerDefinitions: unknown) => ({
+    steps: [
+      {
+        op: "update",
+        urn: "urn:pulumi:main::workbench::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+        newState: {
+          type: "aws:ecs/taskDefinition:TaskDefinition",
+          inputs: { containerDefinitions },
+        },
+      },
+    ],
+  });
+
+  it("fails closed on the bare sentinel, saying it could not be validated at preview time", () => {
+    assert.throws(
+      () =>
+        extractRequiredSecretReferences(
+          unknownPreview(PULUMI_UNKNOWN_SENTINEL),
+        ),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /could not be validated at preview time/);
+        assert.ok(
+          message.includes(PULUMI_UNKNOWN_SENTINEL),
+          `the message must name the sentinel it saw:\n${message}`,
+        );
+        // Everything an operator needs to diagnose it in one read.
+        assert.match(message, /containerDefinitions typeof: string/);
+        assert.match(message, /Pulumi preview unknown sentinel: yes/);
+        assert.match(message, /JSON.parse error: /);
+        assert.match(
+          message,
+          /value \(first \d+ chars, no secret values\): "04da6b54/,
+        );
+        return true;
+      },
+    );
+  });
+
+  it("does not fall back to the exported state, which describes the running task", () => {
+    // The guard exists because a new key is missing from a secret. The export
+    // holds the task definition that is already serving, so validating it
+    // would compare the old keys and pass while the apply drained the task
+    // onto a definition naming the missing one.
+    const exported = {
+      deployment: {
+        resources: [
+          {
+            urn: "urn:pulumi:main::workbench::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+            inputs: {
+              containerDefinitions: JSON.stringify(
+                containerDefinitions([
+                  {
+                    name: "BIFROST_SETUP_TOKEN",
+                    valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
+                  },
+                ]),
+              ),
+            },
+          },
+        ],
+      },
+    };
+
+    assert.throws(
+      () =>
+        extractRequiredSecretReferences(
+          unknownPreview(PULUMI_UNKNOWN_SENTINEL),
+          exported,
+        ),
+      /could not be validated at preview time/,
+    );
+  });
+
+  it("names the container and field when the sentinel is inside a definition", () => {
+    // A partially-unknown definition, where the JSON string survives and only
+    // one field is the sentinel. It reaches the same fail-closed path, and
+    // this is the case where the message can point at the field to fix.
+    const preview = unknownPreview(
+      JSON.stringify([
+        {
+          name: "bifrost",
+          environment: [
+            { name: "BIFROST_CONFIG_VERSION", value: PULUMI_UNKNOWN_SENTINEL },
+          ],
+          secrets: [
+            {
+              name: "BIFROST_SETUP_TOKEN",
+              valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
+            },
+          ],
+        },
+      ]),
+    );
+
+    assert.throws(
+      () => extractRequiredSecretReferences(preview),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /could not be validated at preview time/);
+        assert.match(
+          message,
+          /bifrost: field environment\[0\]\.value/,
+          `the message must name the container and field:\n${message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  it("still reports genuinely broken JSON as broken JSON, not as an unknown", () => {
+    assert.throws(
+      () => extractRequiredSecretReferences(unknownPreview("[{not json")),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /is not valid JSON/);
+        assert.match(message, /Pulumi preview unknown sentinel: no/);
+        assert.match(message, /JSON.parse error: /);
+        assert.match(message, /value \(first \d+ chars/);
+        assert.ok(
+          !/could not be validated at preview time/.test(message),
+          "a parse failure that is not an unknown must not be described as one",
+        );
+        return true;
+      },
+    );
+  });
+
+  it("accepts the definition the fix synthesizes: the config version is a plain digest", () => {
+    // What `ecs.ts` now produces: `BIFROST_CONFIG_VERSION` is a SHA-256 prefix
+    // computed in the program, so the preview carries the JSON string rather
+    // than the sentinel and the keys can be compared.
+    const preview = unknownPreview(
+      JSON.stringify([
+        {
+          name: "bifrost",
+          environment: [
+            { name: "BIFROST_CONFIG_VERSION", value: "9f2c1ab34d5e" },
+          ],
+          secrets: [
+            {
+              name: "BIFROST_CONFIG",
+              valueFrom: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/bifrost/config`,
+            },
+            {
+              name: "BIFROST_SETUP_TOKEN",
+              valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
+            },
+          ],
+        },
+      ]),
+    );
+
+    assert.deepEqual(extractRequiredSecretReferences(preview), [
+      {
+        secretId: "bifrost/gateway",
+        secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost/gateway`,
+        key: "BIFROST_SETUP_TOKEN",
+      },
+    ]);
   });
 });
 

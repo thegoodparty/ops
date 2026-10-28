@@ -135,13 +135,23 @@ silent truncation.
 
 **A change to this file reaches the gateway.** The container's `secrets` entry
 names the parameter's ARN, and an ARN does not change when the value does, so
-the task definition also carries the parameter's *version* as
+the task definition also carries a digest of the file's contents as
 `BIFROST_CONFIG_VERSION`. A merged edit to `config.json` therefore registers a
 new task-definition revision and the service's stop-before-start rollout picks
 it up; without that, the apply would update the parameter and leave every
-running task on the file it booted with. The version is also how an operator
-answers "which config is this task running" from
-`describe-task-definition`.
+running task on the file it booted with. The digest is also how an operator
+answers "which config is this task running" from `describe-task-definition`:
+the value names the content, not a write counter.
+
+The digest is computed in the Pulumi program (`bifrostConfigVersion` in
+`ecs.ts`), not read from the parameter resource. `aws.ssm.Parameter.version` is
+assigned by AWS, so a preview of the apply that changes the file cannot know
+it: Pulumi collapses the whole stringified `containerDefinitions` into its
+unknown sentinel (`04da6b54-80e4-46f7-96ec-b56ff0331ba9`), and the pre-apply
+secret check in `scripts/preflight-secrets.ts` has no definition to read. That
+is what failed the deploy on the merge of #393 (run 40725087936): the check
+refused, correctly, and no task was drained because the apply never ran. The
+digest is known at preview, so the check sees the definition again.
 
 Two consequences worth knowing before a deploy:
 
