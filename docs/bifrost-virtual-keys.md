@@ -167,13 +167,14 @@ consequences, both requirements rather than advice:
   setup token; it makes one or two calls; it returns a key. It must not log
   request or response bodies — a virtual key appears in both, in plaintext —
   and a thrown error must not carry the body into CloudWatch.
-- **Only the Lambda and the oauth2-proxy sidecar may read the secret.** No
-  human, no other task, no CI job. `bifrost/gateway` also holds the encryption
-  key and the Fireworks key, so the Lambda's `secretsmanager:GetSecretValue`
-  grant on that container reaches more than the token it uses; a dedicated
-  `bifrost/vk-mint` container holding only `BIFROST_SETUP_TOKEN` would close
-  that gap, at the cost of a second copy of one credential the design never
-  rotates. Recorded as an open item rather than decided here.
+- **Only the mint Lambda, the janitor (decision 6) and the oauth2-proxy
+  sidecar may read the secret.** No human, no other task, no CI job.
+  `bifrost/gateway` also holds the encryption key and the Fireworks key, so the
+  Lambda's `secretsmanager:GetSecretValue` grant on that container reaches more
+  than the token it uses; a dedicated `bifrost/vk-mint` container holding only
+  `BIFROST_SETUP_TOKEN` would close that gap, at the cost of a second copy of
+  one credential the design never rotates. Recorded as an open item rather than
+  decided here.
 
 **The function must reach Bifrost from inside the VPC.** The ALB routes `/api`
 through oauth2-proxy and Google SSO, which a Lambda cannot pass; there is no
@@ -314,13 +315,12 @@ Rules, each of which is a decision:
   same account-root-plus-`aws:PrincipalArn` trust, the same fixed session
   name, and two actions rather than five — `ListGroupMemberships` on the
   group and `GetUserId` on the store, with nothing that writes to the
-  directory. `ListGroupMemberships` returns user ids
-  and not emails, and the job deliberately does not gain `DescribeUser`: it
-  resolves each managed key's owner with `GetUserId` on `emails.value` (the
-  lookup `deploy-infrastructure/sheriff/identity.ts` already makes) and
-  intersects on user id. A key whose owner resolves to no user is not a member,
-  and is deactivated — the fail-closed direction.
-
+  directory. `ListGroupMemberships` returns user ids and not emails, and the
+  job deliberately does not gain `DescribeUser`: it resolves each managed
+  key's owner with `GetUserId` on `emails.value` (the lookup
+  `deploy-infrastructure/sheriff/identity.ts` already makes) and intersects on
+  user id. A key whose owner resolves to no user is not a member, and is
+  deactivated — the fail-closed direction.
 - **The janitor holds the setup token too**, for the same reason the mint
   function does (decision 3): it is the second caller of the admin API, so it
   reads the same secret, is granted the same one container, and is under the

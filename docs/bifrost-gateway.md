@@ -882,14 +882,15 @@ OSS over Enterprise clustering.
   the Bifrost list, or a new admin who cannot get in. The list is the control,
   and its owner is named above.
 - **The mint path holds an admin-level credential.** The per-user key Lambda
-  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)) reads the setup
-  token from Secrets Manager and calls the admin API from inside the VPC. It
-  is the second holder of that token after the oauth2-proxy sidecar, and the
-  first holder that *writes* with it — the sidecar only presents it on a
-  request a human already made — which is why that design keeps the function
-  small, forbids logging request or response bodies, and scopes the secret
-  read to one grant. A bug there is an admin-surface bug, not an inference
-  one.
+  and the janitor
+  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)) both read the setup
+  token from Secrets Manager and call the admin API from inside the VPC. They
+  are the second and third holders of that token after the oauth2-proxy
+  sidecar, and the first holders that *write* with it — the sidecar only
+  presents it on a request a human already made — which is why that design
+  keeps both functions small, forbids logging request or response bodies, and
+  scopes the secret read to one grant each. A bug there is an admin-surface
+  bug, not an inference one.
 - **The SCP relaxation.** Removing `rds:*` from `DenyDataStores` widens what
   the workbench account can run. It is deliberate and reviewed, and the
   remaining denies (`dynamodb`, `redshift`, cross-account S3, non-`us-west-2`)
