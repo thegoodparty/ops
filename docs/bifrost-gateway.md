@@ -134,8 +134,11 @@ provider that project requires:
   supports "Inherited AWS Credentials / IAM Role"
   (`docs/providers/supported-providers/bedrock.mdx`), and on Fargate that is
   the task role. No static AWS key is stored anywhere. The role is scoped to
-  the model list in `utils/bedrock-models.ts`, and the SCP's existing
-  `bedrock` exemption keeps geo-profile calls working.
+  the model list in `utils/bedrock-models.ts`, plus the one account-wide read
+  that renders the provider's model list — `bedrock:ListFoundationModels`,
+  which Bedrock gives no resource type to scope and which the dashboard's
+  provider page needs — and the SCP's existing `bedrock` exemption keeps
+  geo-profile calls working.
 
 Alternatives considered and not chosen: the EC2 + EBS + DLM host pattern in
 `deploy-infrastructure/agent-swarm.ts` (the engineer's direction is Fargate,
@@ -635,10 +638,20 @@ are referenced by name, never written down here or in git.
 - **Bedrock** is the second provider. Upstream supports inherited IAM-role
   authentication (`docs/providers/supported-providers/bedrock.mdx`), and on
   Fargate that is the ECS task role, so no static AWS key is stored anywhere.
-  The task role is scoped to the model list in `utils/bedrock-models.ts`, and
-  the SCP's existing `bedrock` exemption keeps geo-profile calls working. This
-  is what lets the gateway take over Bedrock entirely, including the per-user
-  attribution the invocation log provides today.
+  The task role is scoped to the model list in `utils/bedrock-models.ts` for
+  invoking, and holds `bedrock:ListFoundationModels` on `*` for the model list
+  itself: Bifrost's provider renders that page from a signed
+  `GET /foundation-models` (AWS's `ListFoundationModels`) and not from the key
+  list, so an invoke-only role serves inference and shows the provider warning
+  where the models should be. Bedrock defines no resource type for that action,
+  which is the one wildcard in the role. The pinned provider calls no
+  `ListInferenceProfiles`/`GetInferenceProfile`: the `us.`/`global.` profiles
+  the config allows are listed from the key's own `models` allowlist (the list
+  pipeline backfills allowlist entries the foundation-model response does not
+  contain) and invoked through their profile ARNs, which the invoke statement
+  already grants. The SCP's existing `bedrock` exemption keeps geo-profile
+  calls working. This is what lets the gateway take over Bedrock entirely,
+  including the per-user attribution the invocation log provides today.
 - **Other providers** (Anthropic direct, OpenAI direct) are added only if a
   harness needs them, each with its own `env.` reference. Provider fallback
   between Fireworks and Bedrock is a configuration choice; it is the main
@@ -981,7 +994,10 @@ network or a permission can land before the item that creates it.
    deliberate differences. The task role is a separate identity holding only
    `bedrock:Converse`, `bedrock:ConverseStream`, `bedrock:InvokeModel` and
    `bedrock:InvokeModelWithResponseStream` on `bedrockInvokeResources()`
-   (`utils/bedrock-models.ts`), where the delegate's task role carries five
+   (`utils/bedrock-models.ts`), plus `bedrock:ListFoundationModels` on `*` so
+   the provider's model list renders (see "Compute: ECS Fargate" and "Provider
+   configuration"; that action has no resource type, so it is the single
+   wildcard in the role), where the delegate's task role carries five
    AWS-managed read policies and wildcard resources, because the gateway is a
    proxy rather than an agent that explores the account. And the execution
    role reads three secrets, not one: `bifrost/gateway`, `bifrost/oauth2-proxy`

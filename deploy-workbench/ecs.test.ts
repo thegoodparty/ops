@@ -51,6 +51,8 @@ import {
   PG_USER_ENV_NAME,
   RDS_PASSWORD_JSON_KEY,
   TASK_BEDROCK_ACTIONS,
+  TASK_BEDROCK_READ_ACTIONS,
+  TASK_BEDROCK_READ_RESOURCES,
   TASK_CPU,
   TASK_MEMORY,
   TASK_ROLE_NAME,
@@ -274,6 +276,13 @@ describe("bifrost ecs", () => {
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
     ]);
+    assert.deepEqual([...TASK_BEDROCK_READ_ACTIONS], [
+      "bedrock:ListFoundationModels",
+    ]);
+    assert.deepEqual(taskActions, [
+      ...TASK_BEDROCK_ACTIONS,
+      ...TASK_BEDROCK_READ_ACTIONS,
+    ]);
     assert.ok(taskActions.every((a) => a.startsWith("bedrock:")));
     assert.ok(
       taskActions.every((a) => !a.includes("secretsmanager")),
@@ -281,12 +290,52 @@ describe("bifrost ecs", () => {
     );
   });
 
+  it("lets the task role list the catalog so the model list renders", () => {
+    // The gateway can serve inference with only the invoke actions and still
+    // show a warning where the model list should be. Bifrost's Bedrock provider
+    // renders that page from a signed `GET /foundation-models`
+    // (`core/providers/bedrock/bedrock.go`, `listModelsByKey` at `v2.3.0`),
+    // i.e. `bedrock:ListFoundationModels`, and the role had no read at all.
+    const policy = taskRolePolicyDocument(bedrockInvokeResources());
+    const catalog = policy.Statement.filter((s) =>
+      s.Action.includes("bedrock:ListFoundationModels"),
+    );
+    assert.equal(catalog.length, 1, "one statement must carry the catalog read");
+    assert.deepEqual(catalog[0].Action, [...TASK_BEDROCK_READ_ACTIONS]);
+    assert.equal(catalog[0].Sid, "ReadBedrockFoundationModelCatalog");
+
+    // `ListFoundationModels` has no resource type in Bedrock's service
+    // authorization reference, so the resource is `*` and nothing narrower is
+    // valid. That is the only reason this role holds a wildcard.
+    assert.deepEqual(catalog[0].Resource, ["*"]);
+    assert.deepEqual([...TASK_BEDROCK_READ_RESOURCES], ["*"]);
+
+    // The read is not folded into the invoke statement, whose resources are
+    // the model ARNs, and nothing blanket (`bedrock:Get*`, `bedrock:List*`) is
+    // granted: the provider calls this one listing and no per-model describe.
+    const invoke = policy.Statement.find(
+      (s) => s.Sid === "InvokeSelectedBedrockModels",
+    );
+    assert.ok(invoke);
+    assert.deepEqual(invoke.Action, [...TASK_BEDROCK_ACTIONS]);
+    assert.deepEqual(invoke.Resource, bedrockInvokeResources());
+    for (const action of policy.Statement.flatMap((s) => s.Action)) {
+      assert.ok(!action.includes("Get"), action);
+      assert.ok(!/^bedrock:List(InferenceProfiles|CustomModels)/.test(action), action);
+    }
+  });
+
   it("scopes the task role to the model list, not to wildcard resources", () => {
     // The plan: "The role is scoped to the model list in
     // utils/bedrock-models.ts". Composed here from the same function
     // WorkbenchAccess uses, so adding a model there reaches the gateway too.
     const policy = taskRolePolicyDocument(bedrockInvokeResources());
-    const resources = policy.Statement.flatMap((s) => s.Resource);
+    const invoke = policy.Statement.find(
+      (s) => s.Sid === "InvokeSelectedBedrockModels",
+    );
+    assert.ok(invoke);
+    const resources = invoke.Resource;
+    assert.deepEqual(resources, bedrockInvokeResources());
     assert.ok(resources.length > 0);
     for (const arn of resources) {
       assert.match(arn, /^arn:aws:bedrock:/);
@@ -325,6 +374,13 @@ describe("bifrost ecs", () => {
           assert.ok(!action.includes("*"), `wildcard action ${action}`);
         }
         assert.ok(statement.Resource.length > 0);
+        // The catalog read is the one statement that may name `*`, because
+        // `bedrock:ListFoundationModels` has no resource type to scope to.
+        // Everything else is an enumerated ARN.
+        if (statement.Sid === "ReadBedrockFoundationModelCatalog") {
+          assert.deepEqual(statement.Resource, ["*"]);
+          continue;
+        }
         for (const resource of statement.Resource) {
           assert.notEqual(resource, "*", "a resource must not be *");
         }
@@ -360,13 +416,16 @@ describe("bifrost ecs", () => {
     }
     assert.equal(executionResources[2], rdsSecretArn);
 
-    // The task role's are model ARNs. They carry exactly one wildcard, the
-    // region, and that is deliberate: the destination set differs per model
-    // (`utils/bedrock-models.ts`), so enumerating regions fails intermittently
-    // and looks identical to missing model access.
-    for (const resource of taskPolicy.Statement.flatMap(
-      (statement) => statement.Resource,
-    )) {
+    // The task role's invoke resources are model ARNs. They carry exactly one
+    // wildcard, the region, and that is deliberate: the destination set differs
+    // per model (`utils/bedrock-models.ts`), so enumerating regions fails
+    // intermittently and looks identical to missing model access.
+    const invokeResources =
+      taskPolicy.Statement.find(
+        (statement) => statement.Sid === "InvokeSelectedBedrockModels",
+      )?.Resource ?? [];
+    assert.equal(invokeResources.length, bedrockInvokeResources().length);
+    for (const resource of invokeResources) {
       assert.match(resource, /^arn:aws:bedrock:\*:/, resource);
       assert.equal(
         resource.split("*").length - 1,
@@ -379,13 +438,17 @@ describe("bifrost ecs", () => {
       !/Action:\s*(\[?\s*)?["'][a-z0-9]+:\*["']/.test(ECS_SOURCE),
       "ecs.ts must not contain a service-wildcard action",
     );
+    // The one bare wildcard the module may contain is the catalog read's
+    // resource, which Bedrock gives no resource type to scope. Anything else is
+    // a widening, and this is the assertion that keeps it to one.
+    assert.deepEqual(ECS_SOURCE.match(/"\*"/g), ["\"*\""]);
     assert.ok(
-      !/Resource:\s*(\[?\s*)?["']\*["']/.test(ECS_SOURCE),
-      "ecs.ts must not contain a wildcard resource",
+      ECS_SOURCE.includes('export const TASK_BEDROCK_READ_RESOURCES = ["*"]'),
+      "the wildcard must be the catalog read's resource",
     );
     assert.ok(
-      !/"\*"/.test(ECS_SOURCE),
-      "ecs.ts must not contain a bare wildcard",
+      !/Resource:\s*(\[?\s*)?["']\*["']/.test(ECS_SOURCE),
+      "a resource must be named rather than written as a literal wildcard",
     );
   });
 
