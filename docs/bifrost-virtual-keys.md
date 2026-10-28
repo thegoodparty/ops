@@ -216,7 +216,13 @@ Every part of that is checked against the pinned source rather than assumed:
 - **An inactive key still holds its name**, so a returning user is a
   reactivation, not a create: `PUT /api/governance/virtual-keys/{vk_id}` with
   `is_active: true`, rather than a delete-and-recreate that would lose the
-  key's budgets and spend history.
+  key's budgets and spend history. The same call **clears the janitor's
+  deletion timer** — `expires_at: ""` (the update path reads an empty string as
+  "no expiry") and `delete_after_expire: null` (back to inheriting
+  `client.delete_expired_virtual_keys`) — because an expiry that has passed
+  rejects the key whatever `is_active` says, and the deletion would take the
+  history the reactivation exists to keep. A reactivation that sets only
+  `is_active` is a key that dies on the old timer.
 - **A create takes effect immediately**, not at the next restart: the handler
   reloads the key into the running gateway's governance manager before it
   answers.
@@ -289,10 +295,18 @@ Rules, each of which is a decision:
   its spend history with it. A key that is deactivated also gets
   `expires_at` set to a retention window and `delete_after_expire: true`, so
   Bifrost's own daily cleanup deletes it rather than the janitor growing a
-  delete path. **The retention window is 90 days**, matching the gateway's own
-  log retention: past that point the request records that make the history
-  worth keeping have rolled off anyway, and a returning person is a reactivation
+  delete path. **The timer is set once, on the transition**, and the janitor
+  leaves a key that is already inactive with an expiry set alone — otherwise an
+  hourly run pushes the window forward every hour and nothing is ever
+  deleted. **The retention window is 90 days**, matching the gateway's own log
+  retention: past that point the request records that make the history worth
+  keeping have rolled off anyway, and a returning person is a reactivation
   rather than a resurrection.
+- **The janitor only ever takes access away; the mint gives it back.** It never
+  reactivates a key, including when the owner is a member again. Getting a key
+  back is a mint, which is the path that also clears the deletion timer
+  (decision 4), so there is one code path that grants and one that revokes and
+  neither undoes the other by accident.
 - **Touch only marker-bearing keys.** Not "keys that look like emails": a
   person's own test key, or a key a human made in the dashboard, is never
   deactivated by a job. The marker is the whole safety property.
@@ -501,8 +515,10 @@ not decided here.
    for one large page) and keeps the ones with the description marker.
 5. For each managed key it resolves the owner email to a user id with
    `GetUserId` on `emails.value`, and checks the member set.
-6. A key whose owner is not a member: `PUT` with `is_active: false`,
-   `expires_at: now + 90 days`, `delete_after_expire: true`.
+6. A key whose owner is not a member **and which is still active** gets one
+   `PUT`: `is_active: false`, `expires_at: now + 90 days`,
+   `delete_after_expire: true`. A key that is already inactive with an expiry
+   set is skipped, so an hourly run does not restart the 90-day clock.
 7. Nothing else is touched, and a failed or empty group read means no writes.
 
 ## The key, as the Lambda sends it
@@ -588,7 +604,8 @@ Step: 2
    `bifrostTaskSecurityGroup` for 8080, the SSM-backed template, the read grant
    on `bifrost/gateway` (or a dedicated `bifrost/vk-mint`, per the open item),
    the log group, and the idempotency logic with its unit tests (exact-match
-   filter, reactivation, `409`-then-reread). **Depends on steps 1 and the
+   filter, reactivation that also clears `expires_at` and
+   `delete_after_expire`, `409`-then-reread). **Depends on steps 1 and the
    gateway being deployed**; the network path is the thing to prove first,
    because everything else is ordinary.
 3. **The invoke grant for people.** In `deploy/`: `WorkbenchAccess` gets
@@ -631,7 +648,7 @@ In Bifrost, at the pinned tag `transports/v2.3.0`:
 | Create body and response; duplicate name is `409` | same file, `CreateVirtualKeyRequest` (~371) and `createVirtualKey` (~2067); the response is `{"virtual_key": …}` |
 | A create is live immediately | same handler, `h.governanceManager.ReloadVirtualKey` before it answers |
 | Provider config with no keys allows none; `"*"` allows all | `framework/configstore/tables/virtualkey.go`, `TableVirtualKeyProviderConfig` (`AllowAllKeys`, `Keys`) |
-| Update accepts `is_active`, `expires_at`, `delete_after_expire` (tri-state) | `transports/bifrost-http/handlers/governance.go`, `UpdateVirtualKeyRequest` (~426) |
+| Update accepts `is_active`, `expires_at`, `delete_after_expire` (tri-state; an empty `expires_at` clears the expiry, a null `delete_after_expire` returns to inheriting) | `transports/bifrost-http/handlers/governance.go`, `UpdateVirtualKeyRequest` (~426) |
 | Rotation endpoints and the previous-value grace window | routes 1808 and 1811; `PreviousValue`, `PreviousValueExpiresAt`, `HasActivePreviousValue` in `virtualkey.go` |
 | The OSS setup lock needs `X-Bifrost-Setup-Token` on non-public `/api` calls | `transports/bifrost-http/handlers/middlewares.go`, `SetupLockMiddleware`; `bifrost-gateway.md`, "Protecting the admin surface" |
 
