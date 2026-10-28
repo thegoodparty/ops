@@ -1,0 +1,35 @@
+{
+  "target": "delegate-pr-reviewer",
+  "editable": [
+    "delegate/agents/pr-reviewer.ts",
+    "delegate/agents/pr-reviewer-subagents.ts"
+  ],
+  "neverTouch": [
+    "delegate/review/eval/",
+    "delegate/review/",
+    "delegate/framework/",
+    ".github/",
+    "package.json",
+    "package-lock.json"
+  ],
+  "ref": "main",
+  "branchPattern": "delegate-optimize/{run_id}-{n}",
+  "runIdPattern": "<target>-<yyyymmdd>-<4 random chars [a-z0-9]>",
+  "triedLog": ".hill-climb/{run_id}.md",
+  "readme": "delegate/review/eval/README.md",
+  "mine": "npm run -s review:mine",
+  "innerLocal": "npm run -s review:expect -- --case {case} --split tune --runs 1",
+  "dryRun": "gh workflow run delegate-eval-run.yml --ref main -f mode=dry-run -f branch={branch} -f run_id={run_id}",
+  "inner": "gh workflow run delegate-eval-run.yml --ref main -f mode=inner -f branch={branch} -f cases={cases} -f run_id={run_id} -f budget_usd={budget_usd}",
+  "tune": "gh workflow run delegate-eval-run.yml --ref main -f mode=tune -f branch={branch} -f targets={cases} -f run_id={run_id} -f budget_usd={budget_usd}",
+  "gate": "gh workflow run delegate-eval-run.yml --ref main -f mode=gate -f branch={branch} -f targets={cases} -f run_id={run_id} -f budget_usd={budget_usd}",
+  "watch": "gh run watch {gh_run_id} --exit-status",
+  "download": "gh run download {gh_run_id} -n eval-run-{run_id}-{mode}-{attempt} -D .hill-climb/{run_id}/{mode}",
+  "artifacts": {
+    "results": "<dir>/<case>/run-<n>.json, each with output.findings and leads[]",
+    "gate": "gate.json: pass, regressions, targetsMissed, costRatio, costOver, cases (tune only), holdout {total, passed, regressions}"
+  },
+  "holdoutPerCaseReadable": false,
+  "frozen": ["judge model", "judge rubric", "expected-result cases and manifest", "holdout split"],
+  "budgetUsd": 150
+}

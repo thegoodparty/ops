@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentConfig, AgentResult, RunOverrides } from "./types";
+import { recordSubagentResults, recordSubagentUses } from "./subagent-calls";
+import type { AgentConfig, AgentResult, RunOverrides, SubagentCall } from "./types";
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
@@ -57,6 +58,7 @@ export const runAgent = async (
   let resultTurns: number | undefined;
   let structuredOutput: unknown;
   let errorSubtype: string | undefined;
+  const subagentCalls = new Map<string, SubagentCall>();
 
   for await (const msg of query({
     prompt: message,
@@ -123,6 +125,7 @@ export const runAgent = async (
 
       const blocks = msg.message.content as Array<{
         type: string;
+        id?: string;
         name?: string;
         input?: Record<string, unknown>;
         text?: string;
@@ -168,6 +171,8 @@ export const runAgent = async (
           return summary;
         });
 
+      recordSubagentUses(subagentCalls, blocks);
+
       log(config.name, "turn", {
         turn: turnCount,
         model: msg.message.model,
@@ -196,6 +201,10 @@ export const runAgent = async (
       if (parts.length > 0) {
         log(config.name, "tool_results", { results: parts });
       }
+      recordSubagentResults(
+        subagentCalls,
+        msg.message.content as Array<{ type: string; tool_use_id?: string; content?: unknown }>,
+      );
     }
 
     if (msg.type === "result" && msg.subtype === "success") {
@@ -267,5 +276,6 @@ export const runAgent = async (
     turns: resultTurns,
     structuredOutput,
     errorSubtype,
+    ...(subagentCalls.size > 0 ? { subagentCalls: [...subagentCalls.values()] } : {}),
   };
 };
