@@ -106,6 +106,9 @@ describe("gpApiPreviewRoleBoundary", () => {
 
   it("reaches only the preview's own queues", () => {
     const queues = resources().filter((r) => r.startsWith("arn:aws:sqs:"));
-    assert.deepEqual(queues, ["arn:aws:sqs:us-west-2:333022194791:pr-*"]);
+    assert.deepEqual(queues, [
+      "arn:aws:sqs:us-west-2:333022194791:pr-*-Queue.fifo",
+      "arn:aws:sqs:us-west-2:333022194791:pr-*-DLQ.fifo",
+    ]);
   });
 });

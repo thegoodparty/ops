@@ -1345,6 +1345,11 @@ const PREVIEW_SHARED_DEV_BUCKETS = [
 
 const PREVIEW_READ_ONLY_DEV_BUCKETS = ["arn:aws:s3:::gp-agent-artifacts-dev"];
 
+const PREVIEW_QUEUES = [
+  "arn:aws:sqs:us-west-2:333022194791:pr-*-Queue.fifo",
+  "arn:aws:sqs:us-west-2:333022194791:pr-*-DLQ.fifo",
+];
+
 const objectsIn = (buckets: string[]) => buckets.map((b) => `${b}/*`);
 
 export const gpApiPreviewRoleBoundary: PolicyDocument = {
@@ -1414,10 +1419,10 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
       ],
     },
     {
-      // The preview's own FIFO queue and its dead-letter queue,
-      // `pr-<n>-Queue.fifo` and `pr-<n>-DLQ.fifo`. Dev and prod queues are
-      // named `develop-*` and `master-*`, and a preview gets no agent
-      // dispatch queue.
+      // The preview's own FIFO queue and its dead-letter queue, by their full
+      // name shape rather than `pr-*`, so a queue someone else names `pr-...`
+      // is not reached. Dev and prod queues are `develop-*` and `master-*`,
+      // and a preview gets no agent dispatch queue.
       Sid: "OwnQueues",
       Effect: "Allow",
       Action: [
@@ -1428,7 +1433,7 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
         "sqs:GetQueueAttributes",
         "sqs:ChangeMessageVisibility",
       ],
-      Resource: "arn:aws:sqs:us-west-2:333022194791:pr-*",
+      Resource: PREVIEW_QUEUES,
     },
     {
       // Actions that take no resource, copied from the task role's preview
