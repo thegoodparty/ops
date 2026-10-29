@@ -1,11 +1,11 @@
 # Who must approve what in this repo.
 #
 # The default is a human on @thegoodparty/gp-contrib: `*` below owns every
-# path, and the opt-out list after it -- empty, deliberately -- is the entire
-# set of paths that can merge on a bot approval. The ruleset on the default
-# branch requires one approving review and code-owner review, and a path with
-# no owner satisfies the code-owner half vacuously, so a pattern with no owners
-# opts a path out.
+# path, and the opt-out list after it -- one path, deliberately -- is the
+# entire set of paths that can merge on a bot approval. The ruleset on the
+# default branch requires one approving review and code-owner review, and a
+# path with no owner satisfies the code-owner half vacuously, so a pattern with
+# no owners opts a path out.
 #
 # Deliberately opt-out rather than opt-in. An opt-in list has to be extended
 # every time a tree is added, and forgetting is silent: a new Pulumi project
@@ -18,7 +18,7 @@
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
 #
-# ## The opt-out list is empty, deliberately
+# ## The opt-out list, one path long
 #
 # It is the only mechanism that grants the `delegate` reviewer authority to
 # approve. A PR merges on a bot approval only where the last pattern matching
@@ -27,15 +27,26 @@
 # human-reviewed file answers both "does a human have to approve this" and
 # "may the bot approve this", so the two cannot drift apart.
 #
-# There is nothing on that list today, and this repo is strictly harder to
-# merge into because of it. `/docs/`, `/README.md`, `/.gitignore`,
-# `/CLAUDE.md` and `**/CLAUDE.md` used to merge on a bot approval; now nothing
-# does, and every path here needs a human code owner, documentation included.
+# One entry is on it:
 #
-# It stays empty until evals and a shadow run support a path. An entry that
-# eventually lands says which path was de-owned, on what evidence, and when,
-# and that entry is the record; there is no other. Background:
-# `docs/plan-gated-merges.md` and `CLAUDE.md`'s "Review and approval" section.
+# `deploy-workbench/` -- de-owned 2026-10-29, by the first increment of step 6
+# of `docs/plan-gated-merges.md`. That step was taken ahead of the evidence bar
+# the plan set for it, deliberately; the plan records what the evidence is and
+# is not, and the tripwire for a false approve. In short: over the last 100
+# merged PRs here the reviewer's findings held up 31 times out of 32 (median 4
+# minutes to the fix commit), 9 of 9 on this tree, but its recall is not
+# measured, and the shadow window had no would-approves at all to measure a
+# false-approve rate against. It went first because it is the workbench
+# account -- the one the team would rebuild rather than defend -- and because
+# removing this line is a one-line revert in a human-owned file.
+#
+# An entry says which path was de-owned, on what evidence, and when, and that
+# entry is the record; there is no other. This is the only entry the list has
+# held since step 2 emptied it. `/docs/`, `/README.md`, `/.gitignore`, `/CLAUDE.md` and
+# `**/CLAUDE.md` used to merge on a bot approval; they no longer do, and every
+# path outside `deploy-workbench/` needs a human code owner, documentation
+# included. Background: `docs/plan-gated-merges.md` and `CLAUDE.md`'s "Review
+# and approval" section.
 #
 # ## The test for an opt-out
 #
@@ -59,9 +70,11 @@
 # - `docs/` -- the plans and specs a change is reviewed against. They stay
 #   owned permanently, so the reviewer cannot be the approver of its own
 #   instructions.
-# - `deploy/`, `deploy-org/`, `deploy-workbench/`, `deploy-infrastructure/` --
-#   every Pulumi project, not just the role and permission-set files. A new
-#   component that mints an IAM role is one `index.ts` import away.
+# - `deploy/`, `deploy-org/`, `deploy-infrastructure/` -- every Pulumi
+#   project, not just the role and permission-set files. A new component that
+#   mints an IAM role is one `index.ts` import away. `deploy-workbench/` is the
+#   fourth and is the one path that is no longer owned: the test did not stop
+#   applying to it, the evidence decision is in `docs/plan-gated-merges.md`.
 # - `utils/` -- `deploy/components/identity-center/policies.ts` imports
 #   `bedrockInvokeResources` from `utils/bedrock-models.ts`, and the account
 #   ids in `utils/accounts.ts` feed the same permission set's resource ARNs.
@@ -85,15 +98,17 @@
 # `deploy/components/ci-roles/policies.ts`. A repository-root file is the one
 # case with no directory to scope by; treat it as the exception it is.
 #
-# Before adding a path to the opt-out side, check what executes it. The
-# ordering in `deploy.yml` -- install, test and build strictly before the
-# credentials step -- would be load-bearing for any opt-out path in this
-# repo, and is the only reason an unowned test file would not be an
-# admin-credentialled shell.
+# Before adding a path to the opt-out side, check what executes it. In this
+# repo the thing that executes arbitrary repository code is `npm test`, and it
+# runs in the `test` job of `deploy.yml`, which holds no credentials and no
+# `id-token: write`. The job that assumes the near-admin deploy role installs
+# and builds but executes no repository code. That split is what keeps an
+# unowned test file from being an admin-credentialled shell, and it is
+# load-bearing for every opt-out path.
 #
 # Widening this list is a security change. It is also, by construction, a
 # change to a path the default owns, so it needs a human. Adding an entry is
-# exactly the change that would give the bot authority it does not have
-# today.
+# exactly the change that widens the bot's authority.
 
 *                                @thegoodparty/gp-contrib
+/deploy-workbench/
