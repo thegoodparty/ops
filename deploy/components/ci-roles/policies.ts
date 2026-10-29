@@ -1138,26 +1138,6 @@ export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
   ],
 };
 
-// Every secret value a plan on this role may read, allowed below and reused
-// as the NotResource of the deny, so the two cannot drift.
-//
-// All three are dev. Two of them are reached in a way that is easy to miss:
-// `broker-dev` and `broker-service-tokens-dev` are managed
-// `aws_secretsmanager_secret_version` **resources**, not data sources, and
-// Terraform refreshes a managed resource during plan, which calls
-// GetSecretValue. Searching for data sources alone finds only AI_SECRETS_DEV
-// and produces a role that fails on the first real plan.
-//
-// Adding a secret to a gp-ai dev root therefore needs a grant here first, in
-// its own merged-and-applied change, per the ordering rule in
-// docs/deploy-role-trust.md. The failure without one is a clean AccessDenied
-// on the plan, which is the intended fail-closed behaviour.
-const PLAN_READABLE_SECRETS = [
-  "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
-  "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-dev-??????",
-  "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-service-tokens-dev-??????",
-];
-
 /**
  * Inline half of the plan role. The other half is the AWS-managed
  * `ReadOnlyAccess`, attached in ci-roles.ts.
@@ -1244,32 +1224,22 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Resource: [BUCKET, `${BUCKET}/*`],
     },
     {
-      // The one secret a plan on this role may read, and the reason the deny
-      // below is a NotResource rather than a blanket `*`.
+      // Blanket. No plan on this role reads a secret value: gp-ai's
+      // `shared-infra` roots take SERVE_API_KEY as a variable that
+      // ci-plan-root.sh fills from the root's own state, and no gp-ai root
+      // manages an `aws_secretsmanager_secret_version`, which Terraform would
+      // refresh during plan. gp-terraform-dataplatform reads none either.
       //
-      // gp-ai's `dev/shared-infra` root and its `autopilot-bot` module both
-      // carry `data "aws_secretsmanager_secret_version" "ai_secrets"` with
-      // `secret_id = "AI_SECRETS_${upper(var.environment)}"`, and jsondecode
-      // the result. A data source is read at plan time, so a plan cannot run
-      // without this. It is gp-ai's version of the gp-api problem recorded in
-      // docs/deploy-role-trust.md under "What step 4 found", and it has the
-      // same right answer: stop reading the value at plan time. Until then
-      // this is the honest grant, and it is the whole residual risk of this
-      // role. Scoped to DEV: the prod blob is unreachable because gp-ai plans
-      // only its dev roots on a pull request.
-      Sid: "AiSecretsDevForPlan",
-      Effect: "Allow",
-      Action: ["secretsmanager:GetSecretValue"],
-      Resource: PLAN_READABLE_SECRETS,
-    },
-    {
-      // Everything except the one secret above. NotResource rather than a
-      // blanket deny because an explicit Deny beats the Allow above, so a
-      // `Resource: "*"` here would refuse the plan it is meant to permit.
+      // So a root that starts reading a secret at plan time fails here with
+      // a clean AccessDenied, rather than widening this role. The fix belongs
+      // in the root, as in step 4c of docs/deploy-role-trust.md.
+      //
+      // BatchGetSecretValue needs GetSecretValue on each secret it returns,
+      // so this deny covers it too.
       Sid: "DenySecretValues",
       Effect: "Deny",
       Action: ["secretsmanager:GetSecretValue"],
-      NotResource: PLAN_READABLE_SECRETS,
+      Resource: "*",
     },
     {
       // Blanket, matching the shape above. `ReadOnlyAccess` grants

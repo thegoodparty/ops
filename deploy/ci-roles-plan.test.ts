@@ -64,33 +64,27 @@ describe("githubActionsPulumiPlan", () => {
     ]);
   });
 
-  const PLAN_SECRETS = [
-    "arn:aws:secretsmanager:us-west-2:333022194791:secret:AI_SECRETS_DEV-??????",
-    "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-dev-??????",
-    "arn:aws:secretsmanager:us-west-2:333022194791:secret:broker-service-tokens-dev-??????",
-  ];
-
-  // The documented exceptions, and the whole residual risk of the role. All
-  // dev: gp-ai plans only its dev roots on a pull request, so no prod secret
-  // may appear here however the list grows.
-  it("allows only the listed dev secret values", () => {
-    const allow = statement("AiSecretsDevForPlan");
-    assert.equal(allow.Effect, "Allow");
-    assert.deepEqual(asList(allow.Resource), PLAN_SECRETS);
-    for (const one of asList(allow.Resource)) {
-      assert.equal(/PROD|prod/.test(one), false, `not dev: ${one}`);
-    }
+  // No plan on this role reads a secret value (step 4c of
+  // docs/deploy-role-trust.md). A root that starts needing one is fixed in the
+  // root, not by allowing it here.
+  it("allows no secret value read", () => {
+    const allows = githubActionsPulumiPlan.Statement.filter(
+      (s) =>
+        s.Effect === "Allow" &&
+        "Action" in s &&
+        asList(s.Action).some((a) => a.startsWith("secretsmanager:"))
+    );
+    assert.deepEqual(allows, []);
   });
 
-  // NotResource, not Resource: an explicit Deny beats the Allow above, so a
-  // blanket deny here would refuse the plan the role exists to run. The two
-  // lists must stay identical or one of them is a lie.
-  it("denies every other secret value", () => {
+  // Blanket, because ReadOnlyAccess is attached alongside and an explicit
+  // Deny is the only thing that narrows it.
+  it("denies every secret value", () => {
     const deny = statement("DenySecretValues");
     assert.equal(deny.Effect, "Deny");
-    assert.ok(asList(deny.Action).includes("secretsmanager:GetSecretValue"));
-    assert.equal(deny.Resource, undefined);
-    assert.deepEqual(asList(deny.NotResource), PLAN_SECRETS);
+    assert.deepEqual(asList(deny.Action), ["secretsmanager:GetSecretValue"]);
+    assert.equal(deny.Resource, "*");
+    assert.equal(deny.NotResource, undefined);
   });
 
   // Blanket, and including GetParameterHistory: it returns prior versions
