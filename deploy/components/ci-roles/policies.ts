@@ -1309,3 +1309,172 @@ export const githubActionsPulumiPlan: PolicyDocument = {
     },
   ],
 };
+
+// ---------------------------------------------------------------------------
+// The gp-api preview role boundary (step 6a of docs/deploy-role-trust.md)
+//
+// A permissions boundary, not a grant. omni's gp-api preview stack creates two
+// IAM roles per pull request, an ECS execution role and a task role, and
+// writes their policies from the pull request's own branch. A role's effective
+// permissions are the intersection of its identity policies and its boundary,
+// so whatever a pull request writes into those roles, they can do no more than
+// this document allows.
+//
+// Sized to what the preview task already holds on main, not to what a dev
+// task holds: the union of the execution role's needs (pull the gp-api image,
+// write its own log stream, read GP_API_DEV at task start) and the preview
+// branch of the task role's statements in omni's
+// `packages/gp-api/deploy/index.ts`. A grant the preview task gains in omni
+// therefore needs this document widened first, in its own merged and applied
+// change, per the ordering rule in docs/deploy-role-trust.md. The failure
+// without it is an AccessDenied inside the running preview, which is the
+// intended fail-closed behaviour.
+//
+// Nothing here reaches IAM, STS, SSM parameters, any secret but GP_API_DEV, or
+// any bucket or queue a dev or prod task owns rather than shares with preview.
+//
+// A managed policy rather than an inline one, because a boundary has to be
+// one: `PutRolePermissionsBoundary` takes a policy ARN. See ci-roles.ts.
+
+export const GP_API_PREVIEW_ROLE_BOUNDARY_NAME = "GpApiPreviewRoleBoundary";
+
+export const GP_API_PREVIEW_ROLE_BOUNDARY_ARN = `arn:aws:iam::333022194791:policy/${GP_API_PREVIEW_ROLE_BOUNDARY_NAME}`;
+
+// The two buckets each preview stack creates for itself, named
+// `<prefix>-pr-<n>` from the stack's stage.
+const PREVIEW_OWNED_BUCKETS = [
+  "arn:aws:s3:::tevyn-poll-csvs-pr-*",
+  "arn:aws:s3:::zip-to-area-code-mappings-pr-*",
+];
+
+// Dev buckets a preview shares rather than owns, named one by one. A pattern
+// such as `*-dev` would also reach every dev bucket added later, by anyone.
+const PREVIEW_SHARED_DEV_BUCKETS = [
+  "arn:aws:s3:::annotation-attachments-dev",
+  "arn:aws:s3:::goodparty-chat-attachments-dev",
+  "arn:aws:s3:::campaign-plan-shares-dev",
+  "arn:aws:s3:::robocall-audio-dev",
+  "arn:aws:s3:::gp-agent-run-inputs-dev",
+  "arn:aws:s3:::meeting-pipeline-dev",
+  "arn:aws:s3:::serve-analyze-data-dev",
+  "arn:aws:s3:::assets-dev.goodparty.org",
+];
+
+const PREVIEW_READ_ONLY_DEV_BUCKETS = ["arn:aws:s3:::gp-agent-artifacts-dev"];
+
+const PREVIEW_QUEUES = [
+  "arn:aws:sqs:us-west-2:333022194791:pr-*-Queue.fifo",
+  "arn:aws:sqs:us-west-2:333022194791:pr-*-DLQ.fifo",
+];
+
+const objectsIn = (buckets: string[]) => buckets.map((b) => `${b}/*`);
+
+export const gpApiPreviewRoleBoundary: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      // The execution role's half. AmazonECSTaskExecutionRolePolicy grants
+      // these on "*"; the boundary narrows them to the one repository the
+      // preview image comes from and the preview's own log groups.
+      // GetAuthorizationToken takes no resource.
+      Sid: "PullGpApiImage",
+      Effect: "Allow",
+      Action: [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+      ],
+      Resource: "arn:aws:ecr:us-west-2:333022194791:repository/gp-api",
+    },
+    {
+      Sid: "EcrLogin",
+      Effect: "Allow",
+      Action: ["ecr:GetAuthorizationToken"],
+      Resource: "*",
+    },
+    {
+      Sid: "OwnLogStreams",
+      Effect: "Allow",
+      Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      Resource: "arn:aws:logs:us-west-2:333022194791:log-group:/sst/cluster/gp-pr-*",
+    },
+    {
+      // Every container secret on a preview comes from GP_API_DEV. This is
+      // the ceiling, whatever the execution role's own policy says: today
+      // that policy is `*` over secrets and SSM parameters (step 6b of the
+      // plan), and under this boundary it reaches this one secret.
+      Sid: "DevAppSecret",
+      Effect: "Allow",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource: "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    },
+    {
+      Sid: "OwnAndSharedBucketObjects",
+      Effect: "Allow",
+      Action: [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+      ],
+      Resource: objectsIn([...PREVIEW_OWNED_BUCKETS, ...PREVIEW_SHARED_DEV_BUCKETS]),
+    },
+    {
+      Sid: "ReadOnlyBucketObjects",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: objectsIn(PREVIEW_READ_ONLY_DEV_BUCKETS),
+    },
+    {
+      Sid: "BucketListing",
+      Effect: "Allow",
+      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+      Resource: [
+        ...PREVIEW_OWNED_BUCKETS,
+        ...PREVIEW_SHARED_DEV_BUCKETS,
+        ...PREVIEW_READ_ONLY_DEV_BUCKETS,
+      ],
+    },
+    {
+      // The preview's own FIFO queue and its dead-letter queue, by their full
+      // name shape rather than `pr-*`, so a queue someone else names `pr-...`
+      // is not reached. Dev and prod queues are `develop-*` and `master-*`,
+      // and a preview gets no agent dispatch queue.
+      Sid: "OwnQueues",
+      Effect: "Allow",
+      Action: [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility",
+      ],
+      Resource: PREVIEW_QUEUES,
+    },
+    {
+      // Actions that take no resource, copied from the task role's preview
+      // statements as they stand. ssmmessages is ECS Exec's channel into the
+      // container, not SSM parameter access.
+      Sid: "UnscopableServiceCalls",
+      Effect: "Allow",
+      Action: [
+        "route53domains:List*",
+        "route53domains:Get*",
+        "route53domains:CheckDomainAvailability",
+        "ssmmessages:OpenDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:CreateControlChannel",
+        "transcribe:StartTranscriptionJob",
+        "transcribe:GetTranscriptionJob",
+        "transcribe:StartStreamTranscription",
+        "transcribe:StartStreamTranscriptionWebSocket",
+        "polly:SynthesizeSpeech",
+        "textract:DetectDocumentText",
+        "textract:AnalyzeDocument",
+      ],
+      Resource: "*",
+    },
+  ],
+};

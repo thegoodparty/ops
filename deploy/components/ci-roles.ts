@@ -18,6 +18,8 @@ import {
   githubActionsDelegateEvalCachePushTrust,
   githubActionsDelegateEvalLedger,
   githubActionsDelegateEvalLedgerTrust,
+  GP_API_PREVIEW_ROLE_BOUNDARY_NAME,
+  gpApiPreviewRoleBoundary,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -268,7 +270,29 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsDelegateEvalLedger),
   });
 
+  // The ceiling on every role omni's gp-api preview stack creates, step 6a of
+  // docs/deploy-role-trust.md. Not attached to anything here: omni's
+  // `packages/gp-api/deploy` sets it as the permissions boundary on its
+  // preview roles, and the preview deploy role (step 6) may create a role
+  // only when the request names it.
+  //
+  // A managed policy, unlike every document above, because a boundary has to
+  // be one. The inline-only reasoning above predates the AdministratorAccess
+  // attachment: the role applying this stack can now create and version a
+  // managed policy like any other resource.
+  //
+  // No protect, like the other scoped resources here while the steps that
+  // use them are in flight. Nothing refers to it until omni's half of step 6a
+  // merges.
+  const gpApiPreviewBoundary = new aws.iam.Policy("gpApiPreviewRoleBoundary", {
+    name: GP_API_PREVIEW_ROLE_BOUNDARY_NAME,
+    description:
+      "Permissions boundary for the IAM roles omni's gp-api preview stack creates per pull request.",
+    policy: JSON.stringify(gpApiPreviewRoleBoundary),
+  });
+
   return {
+    gpApiPreviewBoundary,
     deployRole,
     deployPolicy,
     orgDeployRole,
