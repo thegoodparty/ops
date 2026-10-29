@@ -75,9 +75,45 @@ describe("decide with the gate on", () => {
         binding: { path: "docs/plan-gated-merges.md", step: 4 },
         baseRef: "main",
         plan: clearGating.plan,
+        consistency: {
+          verdict: "consistent",
+          reasoning: "step 4 of the plan",
+          additions: [],
+          planDefects: [],
+        },
         flags: [],
         ownedPaths: [],
       },
+    });
+  });
+
+  it("carries the additions and plan defects of a consistent answer", () => {
+    // Case 5's vocabulary, recorded rather than flattened into the verdict: a
+    // step's list is exemplary, so the answer names what it added anyway, and a
+    // stale plan sentence is recorded as the document's defect. Neither may
+    // change the verdict -- `consistent` is still the only answer that does not
+    // flag -- they are what a human checks.
+    const d = decide(
+      {
+        status: "complete",
+        findings: [],
+        summary: "clean",
+        planConsistency: {
+          verdict: "consistent",
+          reasoning: "step 3 requires it",
+          additions: [{ item: "deploy-workbench/discovery.ts", why: "the function needs an address" }],
+          planDefects: [{ text: "calls the task directly", problem: "there is no stable address" }],
+        },
+      },
+      { gating: clearGating },
+    );
+    assert.equal(d.verdict, "approve");
+    assert.deepEqual(d.gates, []);
+    assert.deepEqual(d.gating?.consistency, {
+      verdict: "consistent",
+      reasoning: "step 3 requires it",
+      additions: [{ item: "deploy-workbench/discovery.ts", why: "the function needs an address" }],
+      planDefects: [{ text: "calls the task directly", problem: "there is no stable address" }],
     });
   });
 
@@ -182,7 +218,11 @@ describe("decide with the gate on", () => {
         status: "complete",
         findings: [],
         summary: "clean",
-        planConsistency: { verdict: "inconsistent", reasoning: "the plan names another component" },
+        planConsistency: {
+          verdict: "inconsistent",
+          reasoning: "the plan names another component",
+          departure: { plan: "the worker log group", diff: "rewrites the playwright bucket" },
+        },
       },
       { gating: clearGating },
     );
@@ -196,7 +236,11 @@ describe("decide with the gate on", () => {
         status: "complete",
         findings: [],
         summary: "clean",
-        planConsistency: { verdict: "unclear", reasoning: "not enough detail" },
+        planConsistency: {
+          verdict: "unclear",
+          reasoning: "not enough detail",
+          uncertainty: { unknown: "which component the step means", settle: "the plan's file list" },
+        },
       },
       { gating: clearGating },
     );

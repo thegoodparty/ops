@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   consistencyFlag,
   evaluateGating,
+  findPlanSteps,
   hasStarDefault,
   isGatedRepo,
   isPlanPath,
@@ -395,5 +396,113 @@ describe("consistencyFlag", () => {
     assert.equal(consistencyFlag("inconsistent"), "inconsistent");
     assert.equal(consistencyFlag("unclear"), "unclear_consistency");
     assert.equal(consistencyFlag(undefined), "no_consistency_answer");
+  });
+});
+
+// The prompt's spec is the bound step's own text, located here rather than by
+// the model, so the template has to find the same step a reader would.
+describe("findPlanSteps", () => {
+  const checklist = [
+    "## Progress",
+    "",
+    "- [ ] 1. Evals first: the two consistency cases.",
+    "      They join the existing expected-result job.",
+    "- [ ] 2. `CODEOWNERS`: empty the opt-out list.",
+    "- [ ] 3. Freeze the plans.",
+    "",
+    "Ordering is the point of the order.",
+    "",
+    "## Decisions",
+    "",
+    "1. Not a step: a decision numbered the same way.",
+  ].join("\n");
+
+  it("locates a checklist step and stops at the next item", () => {
+    const found = findPlanSteps(checklist, 1);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].section, "Progress");
+    assert.match(found[0].text, /^- \[ \] 1\. Evals first/);
+    assert.match(found[0].text, /They join the existing expected-result job\./);
+    assert.ok(!found[0].text.includes("CODEOWNERS"), "must not run into step 2");
+    // A numbered list under "## Decisions" is not the step, even when the
+    // number matches: plans number their decisions the same way.
+    assert.ok(!found[0].text.includes("Not a step"));
+  });
+
+  it("prefers the implementation-plan list over an earlier numbered list", () => {
+    // `docs/bifrost-virtual-keys.md` numbers its decisions `### 3. ...` before
+    // its implementation plan numbers the steps `3. ...`. The step is the list
+    // item, and a bare numbered heading is not a step.
+    const plan = [
+      "### 3. The Lambda holds the gateway's setup token",
+      "",
+      "This is a decision, not a step.",
+      "",
+      "## Implementation plan",
+      "",
+      "1. **The template.** Committed JSON.",
+      "2. **The role.** Read-only, in `deploy/`.",
+      "3. **The mint Lambda.** In `deploy-workbench/`: the function,",
+      "   its execution role and the read grant on the secret.",
+      "4. **The invoke grant.** In `deploy/`.",
+      "",
+      "## Cited so the next session can check",
+      "",
+      "1. A numbered list outside the plan is not a step.",
+    ].join("\n");
+    const found = findPlanSteps(plan, 3);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].section, "Implementation plan");
+    assert.match(found[0].text, /^3\. \*\*The mint Lambda\.\*\*/);
+    assert.match(found[0].text, /read grant on the secret/);
+    assert.ok(!found[0].text.includes("invoke grant"), "must stop at step 4");
+    assert.ok(!found[0].text.includes("This is a decision"));
+  });
+
+  it("returns every place a plan states the same step", () => {
+    // Real plans combine shapes: a checklist line is the status, the
+    // implementation-plan entry is the detail. Choosing one is how the wrong
+    // text ends up as the spec, so both are returned, in document order.
+    const plan = [
+      "## Progress",
+      "",
+      "- [ ] 5. The rest of the corpus and the shadow run.",
+      "",
+      "## Implementation plan",
+      "",
+      "1. Evals first.",
+      "5. **The rest of the corpus.** The deterministic cases move to unit",
+      "   tests, and the two plan cases switch to their outcomes.",
+    ].join("\n");
+    const found = findPlanSteps(plan, 5);
+    assert.deepEqual(found.map((f) => f.section), ["Progress", "Implementation plan"]);
+    assert.match(found[0].text, /^- \[ \] 5\./);
+    assert.match(found[1].text, /^5\. \*\*The rest of the corpus\.\*\*/);
+  });
+
+  it("returns a named step heading and the checklist entry that goes with it", () => {
+    const plan = [
+      "## Progress",
+      "",
+      "- [x] 5. Preview mode, done (PR #101).",
+      "",
+      "### Step 5: preview mode and the workflow",
+      "",
+      "Preview mode is an explicit variable.",
+      "",
+      "### Secrets in the diff",
+      "",
+      "Not part of step 5.",
+    ].join("\n");
+    const found = findPlanSteps(plan, 5);
+    assert.deepEqual(found.map((f) => f.section), ["Progress", "Step 5: preview mode and the workflow"]);
+    assert.match(found[1].text, /^### Step 5/);
+    assert.match(found[1].text, /Preview mode is an explicit variable\./);
+    assert.ok(!found[1].text.includes("Not part of step 5"));
+  });
+
+  it("returns nothing when the plan does not state the step", () => {
+    assert.deepEqual(findPlanSteps(checklist, 7), []);
+    assert.deepEqual(findPlanSteps("# A plan with no numbered steps", 1), []);
   });
 });

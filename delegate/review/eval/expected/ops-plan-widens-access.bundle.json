@@ -1,0 +1,20 @@
+{
+  "repo": "thegoodparty/ops",
+  "prNumber": 99004,
+  "baseRef": "main",
+  "baseSha": "efbaa873ef0d608e8d23f3bf7b733a6c42090fd0",
+  "headSha": "6e4dcf9d4861670bca30838b55d7be11574399dd",
+  "author": "delegate-eval",
+  "title": "Add the mint function's ingress rule to the task group",
+  "body": "## Why\n\nStep 1 of `docs/example-mint-ingress.md`: the ingress rule that lets the mint\nfunction reach the gateway task on 8080.\n\nPlan: docs/example-mint-ingress.md\nStep: 1\n\n## What changed\n\nOne rule on `bifrostTaskSecurityGroup`, tcp/8080. Nothing else in the network\nchanges: not the other rules, not the other two groups, not the task's egress.\n",
+  "diff": "diff --git a/deploy-workbench/network.ts b/deploy-workbench/network.ts\nindex 6e26a4e..bbb036f 100644\n--- a/deploy-workbench/network.ts\n+++ b/deploy-workbench/network.ts\n@@ -435,6 +435,20 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {\n     { provider },\n   );\n \n+  // The mint function reaches the task on 8080.\n+  new aws.vpc.SecurityGroupIngressRule(\n+    \"bifrostTaskIngressVkMint\",\n+    {\n+      securityGroupId: taskSecurityGroup.id,\n+      description: \"8080 from inside the VPC, for the mint function\",\n+      ipProtocol: \"tcp\",\n+      fromPort: 8080,\n+      toPort: 8080,\n+      cidrIpv4: VPC_CIDR,\n+    },\n+    { provider },\n+  );\n+\n   /**\n    * Task egress: everything, to the internet through the NAT and to RDS\n    * inside the VPC. ECR pulls, Secrets Manager reads, CloudWatch writes and\n",
+  "changedFiles": [
+    "deploy-workbench/network.ts"
+  ],
+  "plan": {
+    "path": "docs/example-mint-ingress.md",
+    "blobSha": "6c4d4a4b18834a60d3ca919ede74fefeeea86ae0",
+    "text": "# The mint function's path to the gateway\n\n> **Status: approved.** One step.\n\n## Why\n\nThe mint Lambda runs in the workbench VPC and has to reach the gateway task on\n8080. Those are the only two principals in the path, and neither the task nor\nthe function is reachable from anywhere else.\n\n## Implementation plan\n\n1. **The ingress rule.** Add an ingress rule on `bifrostTaskSecurityGroup`\n   that admits the mint function's own security group on tcp/8080, and nothing\n   else. Other rules, the two other security groups and the task's egress are\n   unchanged, and the rule's source is a security group reference rather than a\n   CIDR block.\n\n## Out of scope\n\n- The function itself.\n- The invoke grant for people.\n"
+  },
+  "priorFindings": []
+}

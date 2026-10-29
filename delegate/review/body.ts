@@ -46,6 +46,47 @@ const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
     : "The findings are why this is not an approval.";
 };
 
+// Case 5's answer, in the same line as the gate, with the justification the
+// schema requires of it. A `consistent` answer names the pieces it added and
+// why, so a human checks the addition instead of trusting the verdict. An
+// `inconsistent` answer names the step's words and the diff's departure: a flag
+// with no plan sentence and no hunk is one a reviewer can neither check nor
+// rebut, which is ops#414's review 5701013152. An `unclear` answer names what
+// it could not determine and what would settle it, so "I cannot tell" is a
+// question rather than a shrug. The schema rejects a verdict without its
+// detail, so every branch here has one.
+const asClause = (s: string): string => s.trim().replace(/[.!?]+$/, "");
+
+const renderConsistency = (g: DecisionGating): string => {
+  const c = g.consistency;
+  if (c === undefined) return "";
+  const step = g.binding.step !== undefined ? `step ${g.binding.step}` : "the plan";
+
+  if (c.verdict === "consistent") {
+    const n = c.additions.length;
+    const additions =
+      n === 0
+        ? ""
+        : ` ${n} addition${n === 1 ? "" : "s"} the step does not name: ${c.additions
+            .map((a) => `\`${a.item}\` (${a.why})`)
+            .join("; ")}.`;
+    const d = c.planDefects.length;
+    const defects =
+      d === 0
+        ? ""
+        : ` ${d} plan defect${d === 1 ? "" : "s"}, which belong${d === 1 ? "s" : ""} to the plan and not the diff: ${c.planDefects
+            .map((x) => `"${x.text}" — ${x.problem}`)
+            .join("; ")}.`;
+    return ` Consistent with ${step}.${additions}${defects}`;
+  }
+
+  if (c.verdict === "inconsistent") {
+    return ` Not consistent with ${step}: the step says "${asClause(c.departure.plan)}". The diff instead ${asClause(c.departure.diff)}.`;
+  }
+
+  return ` Unclear against ${step}: ${asClause(c.uncertainty.unknown)}. What would settle it: ${asClause(c.uncertainty.settle)}.`;
+};
+
 // One line, in the same body a reviewer already reads for findings, carrying
 // the verdict, what it was checked against and why it is not an approval. A
 // reader should not have to open the run record to learn why the bot declined,
@@ -58,21 +99,26 @@ const renderGating = (g: DecisionGating): string => {
     g.flags.length > 0
       ? ` Flags: ${g.flags.map((f) => flagText(f, g)).join("; ")}.`
       : "";
+  const consistency = renderConsistency(g);
 
   if (g.mode === "shadow") {
     const head = g.wouldApprove
       ? `**Gate: shadow, would have approved** ${target}.`
       : `**Gate: shadow, would have commented** ${target}.`;
-    return `${head}${why} Shadow mode records the decision and posts a comment, never an approval.`;
+    return `${head}${why}${consistency} Shadow mode records the decision and posts a comment, never an approval.`;
   }
 
   const head = g.wouldApprove
     ? `**Gate: approve** ${target}.`
     : `**Gate: comment** ${target}.`;
+  // The consistency detail carries the "and it is consistent" half when the
+  // model answered; without it the sentence is the whole statement, as before.
   const tail = g.wouldApprove
-    ? " Every changed path is unowned in `CODEOWNERS` on `main`, and the change is consistent with the plan."
+    ? consistency
+      ? " Every changed path is unowned in `CODEOWNERS` on `main`."
+      : " Every changed path is unowned in `CODEOWNERS` on `main`, and the change is consistent with the plan."
     : "";
-  return `${head}${why}${tail}`;
+  return `${head}${why}${tail}${consistency}`;
 };
 
 // The top line is the bot's judgement of the code, not the review event. When

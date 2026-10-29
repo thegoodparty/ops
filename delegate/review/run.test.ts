@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
-import { ReviewRecordSchema } from "./schema";
+import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema } from "./schema";
 import type { ReviewRecord } from "./schema";
 
 test("gatingFor defaults to off and cannot be loosened by a bad value", () => {
@@ -278,7 +278,11 @@ test("parseReviewOutput rejects a verdict the agent is not allowed to emit", () 
 });
 
 test("parseReviewOutput keeps a valid planConsistency on the tolerant path", () => {
-  const answer = { verdict: "inconsistent", reasoning: "the plan names worker.ts" };
+  const answer = {
+    verdict: "inconsistent",
+    reasoning: "the plan names worker.ts",
+    departure: { plan: "raise the worker log group's retention", diff: "rewrites the playwright bucket" },
+  };
   const kept = parseReviewOutput({
     output: JSON.stringify({ status: "complete", findings: [], summary: "clean", planConsistency: answer }),
   });
@@ -290,18 +294,104 @@ test("parseReviewOutput keeps a valid planConsistency on the tolerant path", () 
     planConsistency: answer,
   });
 
-  // A malformed answer must not fail an otherwise complete review; it just
-  // does not survive as a consistency answer.
-  const dropped = parseReviewOutput({
+  const unclear = {
+    verdict: "unclear",
+    reasoning: "the plan names no address",
+    uncertainty: { unknown: "whether the task has a stable address", settle: "the task's service registration" },
+  };
+  const keptUnclear = parseReviewOutput({
+    output: JSON.stringify({ status: "complete", findings: [], summary: "clean", planConsistency: unclear }),
+  });
+  assert.ok(!("error" in keptUnclear));
+  assert.ok(keptUnclear.output?.status === "complete");
+  assert.deepEqual(keptUnclear.output.planConsistency, unclear);
+
+  // An absent answer is still a complete review: an ungated run never asks the
+  // question, and a gated one treats no answer as its own flag.
+  const absent = parseReviewOutput({
+    output: JSON.stringify({ status: "complete", findings: [], summary: "clean" }),
+  });
+  assert.ok(!("error" in absent));
+  assert.deepEqual(absent.output, { status: "complete", findings: [], summary: "clean" });
+});
+
+// ops#414's review 5701013152 is the case this exists for: an `inconsistent`
+// with no plan sentence and no hunk cannot be checked or rebutted. The schema
+// requires the justification, so the answer is rejected and the run retries
+// instead of posting the bare verdict.
+test("parseReviewOutput rejects a verdict without its justification", () => {
+  const withoutDeparture = parseReviewOutput({
     output: JSON.stringify({
       status: "complete",
       findings: [],
       summary: "clean",
-      planConsistency: { verdict: "mostly" },
+      planConsistency: { verdict: "inconsistent", reasoning: "the plan names worker.ts" },
     }),
   });
-  assert.ok(!("error" in dropped));
-  assert.deepEqual(dropped.output, { status: "complete", findings: [], summary: "clean" });
+  assert.ok("error" in withoutDeparture);
+  assert.match(withoutDeparture.error, /planConsistency failed schema/);
+  assert.match(withoutDeparture.error, /departure/);
+
+  const withoutUncertainty = parseReviewOutput({
+    output: JSON.stringify({
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "unclear", reasoning: "not enough detail" },
+    }),
+  });
+  assert.ok("error" in withoutUncertainty);
+  assert.match(withoutUncertainty.error, /uncertainty/);
+
+  // The same through the structured-output path the SDK supplies, so the rule
+  // does not depend on which parse path the run happens to take.
+  const structured = parseReviewOutput({
+    structuredOutput: {
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "inconsistent", reasoning: "the plan names worker.ts" },
+    },
+    output: "",
+  });
+  assert.ok("error" in structured);
+  assert.match(structured.error, /departure/);
+
+  // Half a justification is not one: an empty string fails the same way.
+  const emptyHalf = parseReviewOutput({
+    output: JSON.stringify({
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "inconsistent", reasoning: "r", departure: { plan: "p", diff: "" } },
+    }),
+  });
+  assert.ok("error" in emptyHalf);
+});
+// The model-output schema is strict and the record schema is not, and the pair
+// is what makes this a rule rather than a migration: a run cannot post a bare
+// verdict, and a record written before the requirement still parses and
+// replays.
+test("a stored answer written before the requirement still parses; new output does not", () => {
+  const legacy = {
+    status: "complete",
+    findings: [],
+    summary: "s",
+    planConsistency: { verdict: "inconsistent", reasoning: "the plan names worker.ts" },
+  };
+  assert.equal(StoredReviewOutputSchema.safeParse(legacy).success, true);
+  assert.equal(ReviewOutputSchema.safeParse(legacy).success, false);
+
+  const justified = {
+    ...legacy,
+    planConsistency: {
+      verdict: "inconsistent",
+      reasoning: "the plan names worker.ts",
+      departure: { plan: "keep worker.ts", diff: "rewrites the playwright bucket" },
+    },
+  };
+  assert.equal(StoredReviewOutputSchema.safeParse(justified).success, true);
+  assert.equal(ReviewOutputSchema.safeParse(justified).success, true);
 });
 
 test("parseReviewOutput finds the JSON when the model wraps it in prose", () => {

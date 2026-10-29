@@ -21,16 +21,85 @@ export const FindingSchema = z.object({
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
-// The one model judgement in a plan-gated review: is the diff consistent with
-// the plan the PR names? Everything else about the gate is deterministic, and
-// the verdict does not read this yet — step 1 of `docs/plan-gated-merges.md`
-// adds the field and the eval cases that score it, step 4 wires it into the
-// verdict. Optional so a run with no plan (every production run today) and
-// every record written before this landed still parse and still replay.
-export const PlanConsistencySchema = z.object({
-  verdict: z.enum(["consistent", "inconsistent", "unclear"]),
-  reasoning: z.string().min(1),
+// An addition a `consistent` diff makes that the bound step does not name: a
+// path or an AWS resource, plus why the step's own goal needs it. A step's
+// enumeration is exemplary rather than exhaustive (case 5's vocabulary in
+// `docs/plan-gated-merges.md`), and this is where the model has to name the
+// pieces it added anyway, so a human can check the addition instead of taking
+// it on trust. Only meaningful on a `consistent` answer; the verdict
+// deliberately did not gain a fourth member, because `unclear` still has to
+// mean "I cannot tell".
+export const PlanAdditionSchema = z.object({
+  item: z.string().min(1),
+  why: z.string().min(1),
 });
+export type PlanAddition = z.infer<typeof PlanAdditionSchema>;
+
+// A plan sentence that is stale, or that contradicts the design's own diagram
+// or decisions. That is a defect in the document, not a difference in the
+// diff, so it does not make a change inconsistent: it is recorded for the
+// human who owns `docs/` while the answer stays `consistent`.
+export const PlanDefectSchema = z.object({
+  text: z.string().min(1),
+  problem: z.string().min(1),
+});
+export type PlanDefect = z.infer<typeof PlanDefectSchema>;
+
+// The justification an `inconsistent` answer owes the reader: what the bound
+// step actually says, in its own words, and what the diff does instead. A
+// verdict with no departure is unfalsifiable -- ops#414's review 5701013152
+// posted "not consistent with the plan" with no plan sentence and no diff
+// hunk, which a human can neither check nor rebut -- so the schema requires
+// the two halves rather than letting the body fall back to a generic sentence.
+export const PlanDepartureSchema = z.object({
+  plan: z.string().min(1),
+  diff: z.string().min(1),
+});
+export type PlanDeparture = z.infer<typeof PlanDepartureSchema>;
+
+// The justification an `unclear` answer owes: what could not be determined,
+// and what would settle it. `unclear` is a question, not a shrug: it says
+// enough that the next reader knows what to look at.
+export const PlanUncertaintySchema = z.object({
+  unknown: z.string().min(1),
+  settle: z.string().min(1),
+});
+export type PlanUncertainty = z.infer<typeof PlanUncertaintySchema>;
+
+// The one model judgement in a plan-gated review: is the diff consistent with
+// the plan the PR names? Everything else about the gate is deterministic.
+// `gates.ts` reads this only when a plan reached the model, and anything
+// other than `consistent` -- including a missing answer -- is a flag (case 5
+// of `docs/plan-gated-merges.md`). Optional so a run with no plan (every
+// ungated run) simply omits it; stored records use the looser
+// StoredPlanConsistencySchema below, so a record written before this landed
+// still parses and still replays.
+//
+// The three answers are a discriminated union because each owes the reader a
+// different justification, and requiring it here is what makes the rule fail
+// closed: an `inconsistent` or `unclear` answer without its detail is a schema
+// failure, so the run retries or fails instead of posting an unfalsifiable
+// verdict. The enum deliberately stays at three members.
+export const PlanConsistencySchema = z.discriminatedUnion("verdict", [
+  z.object({
+    verdict: z.literal("consistent"),
+    reasoning: z.string().min(1),
+    // Optional: a consistent answer with nothing to add carries neither, and a
+    // record written before they existed still parses.
+    additions: z.array(PlanAdditionSchema).optional(),
+    planDefects: z.array(PlanDefectSchema).optional(),
+  }),
+  z.object({
+    verdict: z.literal("inconsistent"),
+    reasoning: z.string().min(1),
+    departure: PlanDepartureSchema,
+  }),
+  z.object({
+    verdict: z.literal("unclear"),
+    reasoning: z.string().min(1),
+    uncertainty: PlanUncertaintySchema,
+  }),
+]);
 export type PlanConsistency = z.infer<typeof PlanConsistencySchema>;
 
 export const ReviewOutputSchema = z.discriminatedUnion("status", [
@@ -46,6 +115,37 @@ export const ReviewOutputSchema = z.discriminatedUnion("status", [
   }),
 ]);
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema>;
+
+// Records written before the justification requirement carry an `inconsistent`
+// or `unclear` answer with only a verdict and reasoning. They still parse and
+// still replay -- the verdict is what the gate and the eval scorer read, and a
+// review body is never rendered from a stored record -- so the record schema is
+// deliberately looser than the model-output schema above. A new answer is a
+// subset of this shape, so nothing written after this lands needs the second
+// schema.
+export const StoredPlanConsistencySchema = z.object({
+  verdict: z.enum(["consistent", "inconsistent", "unclear"]),
+  reasoning: z.string().min(1),
+  additions: z.array(PlanAdditionSchema).optional(),
+  planDefects: z.array(PlanDefectSchema).optional(),
+  departure: PlanDepartureSchema.optional(),
+  uncertainty: PlanUncertaintySchema.optional(),
+});
+export type StoredPlanConsistency = z.infer<typeof StoredPlanConsistencySchema>;
+
+export const StoredReviewOutputSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("complete"),
+    findings: z.array(FindingSchema),
+    summary: z.string().min(1),
+    planConsistency: StoredPlanConsistencySchema.optional(),
+  }),
+  z.object({
+    status: z.literal("failed"),
+    reason: z.string().min(1),
+  }),
+]);
+export type StoredReviewOutput = z.infer<typeof StoredReviewOutputSchema>;
 
 // A prior finding as the agent sees it on re-review: where it was posted and
 // what it said. Deliberately carries no id — the agent re-emits every finding
@@ -146,7 +246,7 @@ export const ReviewRecordSchema = z.object({
   wallTimeMs: z.number(),
   costUsd: z.number().nullable(),
   bundle: BundleSchema,
-  output: ReviewOutputSchema.nullable(),
+  output: StoredReviewOutputSchema.nullable(),
   verdict: z.enum(["approve", "comment", "failed"]),
   action: z.enum(["approved", "commented", "failed", "skipped"]),
   gates: z.array(z.string()),

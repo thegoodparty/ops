@@ -1,6 +1,13 @@
 import type { GatingFlag, GatingMode, GatingResult } from "./gating";
 import { consistencyFlag } from "./gating";
-import type { ReviewOutput } from "./schema";
+import type {
+  PlanAddition,
+  PlanConsistency,
+  PlanDefect,
+  PlanDeparture,
+  PlanUncertainty,
+  ReviewOutput,
+} from "./schema";
 
 // The verdict is now two questions, in this order.
 //
@@ -57,6 +64,45 @@ export type DecisionGating = {
   plan?: { path: string; blobSha: string };
   flags: GatingFlag[];
   ownedPaths: string[];
+  /**
+   * The model's consistency answer, present when a plan was put in front of it
+   * and it answered. Each answer carries what a human needs to check it: a
+   * `consistent` answer names the pieces it added and any plan defect; an
+   * `inconsistent` one names the step's words and the diff's departure; an
+   * `unclear` one names what is unknown and what would settle it. Absent on an
+   * ungated run, when no plan was read, and when the model gave no answer (a
+   * flag says that instead, and a missing answer still flags).
+   */
+  consistency?: DecisionConsistency;
+};
+
+// The consistency answer after the schema has required its justification. The
+// union is deliberate: the body renders a different sentence for each, and a
+// verdict that cannot name its detail never reaches here (it is a schema
+// failure), so no branch has to fall back to the generic flag text.
+export type DecisionConsistency =
+  | {
+      verdict: "consistent";
+      reasoning: string;
+      additions: PlanAddition[];
+      planDefects: PlanDefect[];
+    }
+  | { verdict: "inconsistent"; reasoning: string; departure: PlanDeparture }
+  | { verdict: "unclear"; reasoning: string; uncertainty: PlanUncertainty };
+
+const toDecisionConsistency = (c: PlanConsistency): DecisionConsistency => {
+  if (c.verdict === "consistent") {
+    return {
+      verdict: c.verdict,
+      reasoning: c.reasoning,
+      additions: c.additions ?? [],
+      planDefects: c.planDefects ?? [],
+    };
+  }
+  if (c.verdict === "inconsistent") {
+    return { verdict: c.verdict, reasoning: c.reasoning, departure: c.departure };
+  }
+  return { verdict: c.verdict, reasoning: c.reasoning, uncertainty: c.uncertainty };
 };
 
 // `unparseableCount` is the number of findings the model emitted that failed
@@ -119,6 +165,9 @@ export const decide = (
       binding: gating.binding,
       baseRef: gating.baseRef,
       ...(gating.plan !== undefined ? { plan: gating.plan } : {}),
+      ...(gating.plan !== undefined && output.planConsistency !== undefined
+        ? { consistency: toDecisionConsistency(output.planConsistency) }
+        : {}),
       flags,
       ownedPaths: gating.authority.ownedPaths,
     },

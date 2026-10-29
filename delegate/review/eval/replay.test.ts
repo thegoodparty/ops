@@ -92,7 +92,12 @@ const answeringAgent =
       status: "complete" as const,
       findings: [],
       summary: "ok from fake",
-      planConsistency: { verdict, reasoning: "because" },
+      planConsistency:
+        verdict === "consistent"
+          ? { verdict, reasoning: "because" }
+          : verdict === "inconsistent"
+            ? { verdict, reasoning: "because", departure: { plan: "p", diff: "d" } }
+            : { verdict, reasoning: "because", uncertainty: { unknown: "u", settle: "s" } },
     };
     return {
       agent: "pr-reviewer",

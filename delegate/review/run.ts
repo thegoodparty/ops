@@ -254,17 +254,36 @@ const parseCandidate = (candidate: unknown): ParsedReviewOutput | undefined => {
   if (findings.length === 0 && summary === "") return undefined;
 
   // This path rebuilds the object field by field, so a valid planConsistency
-  // has to be carried over explicitly or a fallback parse would read as "the
-  // model gave no answer" in the gating eval. An invalid one is dropped rather
-  // than failing the review: findings and summary are what make it usable.
+  // has to be carried over explicitly. A *present* answer that does not match
+  // the schema is a failure, not something to drop: an `inconsistent` or
+  // `unclear` verdict without its detail is exactly the unfalsifiable answer
+  // the schema exists to stop, and letting it degrade to a generic flag would
+  // post the verdict without the justification. An absent field is different:
+  // the gate treats "no answer" as its own flag, because an ungated run never
+  // asks the question.
+  if (obj.planConsistency === undefined) {
+    return {
+      output: {
+        status: "complete",
+        findings,
+        summary: summary || "The reviewer returned findings without a summary.",
+      },
+      droppedFindingCount,
+    };
+  }
   const planConsistency = PlanConsistencySchema.safeParse(obj.planConsistency);
+  if (!planConsistency.success) {
+    return {
+      error: `planConsistency failed schema: ${planConsistency.error.message}`,
+    };
+  }
 
   return {
     output: {
       status: "complete",
       findings,
       summary: summary || "The reviewer returned findings without a summary.",
-      ...(planConsistency.success ? { planConsistency: planConsistency.data } : {}),
+      planConsistency: planConsistency.data,
     },
     droppedFindingCount,
   };

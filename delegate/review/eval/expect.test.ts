@@ -57,11 +57,11 @@ test("the manifest parses and every simulated bundle matches its diff", () => {
   }
 });
 
-// The two plan cases are simulated PRs in the same corpus, and each carries the
+// The plan cases are simulated PRs in the same corpus, and each carries the
 // plan the model is judged against inside its bundle: nothing fetches it, so a
 // case replays with no GitHub access. Step 5 scores their outcomes and keeps
 // the consistency answer as a diagnostic.
-test("the two plan cases assert an outcome and keep consistency as a diagnostic", () => {
+test("the plan cases assert an outcome and keep consistency as a diagnostic", () => {
   const cases = readManifest(MANIFEST).filter((c) => c.id.startsWith("ops-plan-"));
   const byId = new Map(cases.map((c) => [c.id, c]));
   assert.deepEqual(byId.get("ops-plan-consistent-change")?.expect, {
@@ -73,6 +73,28 @@ test("the two plan cases assert an outcome and keep consistency as a diagnostic"
     reason: "inconsistent",
     consistency: "inconsistent",
   });
+  // The three cases added with case 5's vocabulary: an addition the step does
+  // not name is still an approval, an amendment the harness flags is still a
+  // consistent diagnostic, and a widening is a flag on the model's answer.
+  assert.deepEqual(byId.get("ops-plan-addition-unnamed")?.expect, {
+    verdict: "approve",
+    consistency: "consistent",
+  });
+  assert.deepEqual(byId.get("ops-plan-amends-itself")?.expect, {
+    verdict: "flag",
+    reason: "touches_docs",
+    consistency: "consistent",
+  });
+  assert.deepEqual(byId.get("ops-plan-widens-access")?.expect, {
+    verdict: "flag",
+    reason: "inconsistent",
+    consistency: "inconsistent",
+  });
+  // Each one names the PR its shape came from, so a case cannot drift into an
+  // anecdote with no provenance.
+  for (const id of ["ops-plan-addition-unnamed", "ops-plan-amends-itself", "ops-plan-widens-access"]) {
+    assert.match(byId.get(id)!.tests, /#41[14]/, `${id} must name the PR it came from`);
+  }
   for (const c of cases) {
     assert.ok(c.bundle, `${c.id} must be a simulated bundle`);
     const bundle = readBundleFile(MANIFEST, c.bundle!);
@@ -138,10 +160,12 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
   }
 });
 
-test("the checked-in manifest holds out a third, with block and approve on both sides", () => {
+test("the checked-in manifest holds out a quarter, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 9);
+  assert.equal(cases.length, 12);
   const holdout = selectCases(cases, { split: "holdout" });
+  // The three vocabulary cases are tune: the prompt's worked examples are their
+  // shapes, so none of them can honestly claim holdout independence.
   assert.equal(holdout.length, 3);
   for (const split of ["tune", "holdout"]) {
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
@@ -170,6 +194,16 @@ test("scoreDir with a holdout filter scores only holdout cases", () => {
   assert.deepEqual(reports.map((r) => r.c.id), holdout.map((c) => c.id));
 });
 
+// Every answer carries the justification its verdict requires; a verdict
+// without one is a schema failure, so a test helper that omitted it would be
+// building an output the parser can never produce.
+const justified = (verdict: "consistent" | "inconsistent" | "unclear", reasoning = "r") =>
+  verdict === "consistent"
+    ? { verdict, reasoning }
+    : verdict === "inconsistent"
+      ? { verdict, reasoning, departure: { plan: "the step's words", diff: "does something else" } }
+      : { verdict, reasoning, uncertainty: { unknown: "what is missing", settle: "the file that would show it" } };
+
 const withConsistency = (
   verdict?: "consistent" | "inconsistent" | "unclear",
   findings: Finding[] = [],
@@ -179,7 +213,7 @@ const withConsistency = (
       status: "complete",
       findings,
       summary: "s",
-      ...(verdict ? { planConsistency: { verdict, reasoning: "r" } } : {}),
+      ...(verdict ? { planConsistency: justified(verdict) } : {}),
     },
   });
 
@@ -196,7 +230,7 @@ const withGating = (
       status: "complete",
       findings: [],
       summary: "s",
-      planConsistency: { verdict: answer, reasoning: "r" },
+      planConsistency: justified(answer),
     },
     gating: {
       mode: "enforce",

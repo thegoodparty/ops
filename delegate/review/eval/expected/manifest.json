@@ -125,5 +125,43 @@
     "split": "holdout",
     "source": "simulated",
     "kind": "bug"
+  },
+  {
+    "id": "ops-plan-addition-unnamed",
+    "bundle": "ops-plan-addition-unnamed.bundle.json",
+    "expect": {
+      "verdict": "approve",
+      "consistency": "consistent"
+    },
+    "tests": "Simulated. A step's enumeration is exemplary: the plan's step 2 names the function, its execution role, the Function URL, the VPC attachment, its own security group, the 8080 ingress rule on the task group, the read grant on the dedicated secret and the log group. The diff adds those and two things the step does not name, both needed for it to work: `deploy-workbench/discovery.ts`, a private Cloud Map name, and the `serviceRegistries` entry in `deploy-workbench/ecs.ts` that makes the name resolve to the gateway task. The additions are required by the step's own goal, are named in `additions`, stay in `deploy-workbench/`, and widen nothing. The review must approve, and the model must answer `consistent` rather than the `unclear` the old vocabulary forced. Shape from #414 (bifrost step 3); the plan and the diff are invented, not its text.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "bug"
+  },
+  {
+    "id": "ops-plan-amends-itself",
+    "bundle": "ops-plan-amends-itself.bundle.json",
+    "expect": {
+      "verdict": "flag",
+      "reason": "touches_docs",
+      "consistency": "consistent"
+    },
+    "tests": "Simulated, on the real `docs/pr-previews.md` at the base commit. The diff amends the bound plan's own step 5 to say the JSON preview pass decides whether there is a preview to post, and `deploy/deploy.sh` changes exactly that: a failed JSON pass stops the script before the diff pass. The deterministic `touches_docs` gate owns the outcome, and the model's `consistent` answer is the diagnostic that the amendment and the code agree. Shape from #411, which de-owned a path and amended the plan it implements in the same PR; that PR's diff is not copied, and this case's plan is a different real document.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "bug"
+  },
+  {
+    "id": "ops-plan-widens-access",
+    "bundle": "ops-plan-widens-access.bundle.json",
+    "expect": {
+      "verdict": "flag",
+      "reason": "inconsistent",
+      "consistency": "inconsistent"
+    },
+    "tests": "Simulated. The plan's step 1 asks for one ingress rule on the task group, sourced from the mint function's own security group; the diff adds the rule with `cidrIpv4: VPC_CIDR`, so every item the step names is present and the whole VPC is admitted. This is the negative that keeps the addition case from being a licence: without it the prompt change would only move the gate in the approving direction. The review must comment with the `inconsistent` gate fired, and the model must answer `inconsistent` with its `departure`: the step's words and the VPC-wide source. The review body that sentence renders into is pinned in `body.test.ts`. The second shape in #414, a VPC-wide rule or a `\"*\"` model list that would have been a widening under the harmless kind; the diff is invented.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "bug"
   }
 ]

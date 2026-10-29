@@ -112,6 +112,95 @@ export const parsePlanBinding = (body: string): PlanBinding => {
 };
 
 /**
+ * Every place the plan states the bound step, located from the PR's `Step:`
+ * line. Case 5's vocabulary (a step's enumeration is exemplary rather than
+ * exhaustive) only means something if the model is reading the step and not
+ * the whole document, so the prompt makes these the spec. The harness locates
+ * them rather than the model, for the same reason the harness picks the plan:
+ * the spec must not be negotiable.
+ *
+ * A plan often states a step twice: once as a line in a checklist and once as
+ * the detailed entry in its implementation plan, or as a `### Step 5` design
+ * section beside the checklist. Returning both, rather than choosing one, is
+ * deliberate: picking the shorter summary would make a diff look larger than
+ * the spec and push the answer toward `unclear` or `consistent` on the wrong
+ * text, and picking whichever comes first is the arbitrary version of the same
+ * mistake. Everything under a heading that says implementation plan, steps or
+ * progress is the spec; a numbered list under any other heading is only used
+ * when nothing better exists, because plans number their decisions the same
+ * way ("## Decisions", 5. ...).
+ *
+ * Two shapes cover the plans in `docs/` today. A numbered list item --
+ * `1. **The mint Lambda.** ...`, or `- [ ] 1. ...` in a checklist -- runs until
+ * the next item at the same indentation or the next unindented line. A heading
+ * that literally says `Step 3` runs until the next heading. A bare
+ * `### 3. ...` heading is deliberately not a step: plans use numbered
+ * headings for decisions, and `docs/bifrost-virtual-keys.md` has eight of them
+ * before its implementation plan. Returning nothing is not an error --
+ * `Step:` never affects the gate -- and the prompt then falls back to the whole
+ * document as the spec.
+ */
+export const findPlanSteps = (
+  planText: string,
+  step: number,
+): Array<{ section: string; text: string }> => {
+  const lines = planText.split(/\r?\n/);
+  const namedStepHeading = new RegExp(`^#{1,6}\\s*step\\s+${step}\\b`, "i");
+  const listItem = new RegExp(
+    `^(\\s*)(?:(?:[-*+]\\s+\\[[ xX]\\]\\s*)|(?:[-*+]\\s+))?${step}[.)]\\s+`,
+  );
+  const stepSection = /implementation plan|\bsteps?\b|progress/i;
+
+  type Match = { index: number; section: string; kind: "heading" | "list"; indent: number; level: number };
+  const headings: Match[] = [];
+  const strong: Match[] = [];
+  const weak: Match[] = [];
+
+  let section = "";
+  for (let i = 0; i < lines.length; i++) {
+    const heading = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+    if (heading) {
+      const text = heading[2].trim();
+      if (namedStepHeading.test(lines[i])) {
+        headings.push({ index: i, section: text, kind: "heading", indent: 0, level: heading[1].length });
+      }
+      section = text;
+      continue;
+    }
+    const item = listItem.exec(lines[i]);
+    if (item) {
+      const match: Match = { index: i, section, kind: "list", indent: item[1].length, level: 0 };
+      if (stepSection.test(section)) strong.push(match);
+      else weak.push(match);
+    }
+  }
+
+  // A named heading, then every list entry under a step-shaped section. The
+  // weak list is only the fallback, and only its first match, because a
+  // numbered decision list has no claim to be the step.
+  const chosen = headings.length > 0 || strong.length > 0 ? [...headings, ...strong] : weak.slice(0, 1);
+  chosen.sort((a, b) => a.index - b.index);
+
+  const blockEnd = (m: Match): number => {
+    for (let j = m.index + 1; j < lines.length; j++) {
+      if (m.kind === "heading") {
+        const next = /^(#{1,6})\s+/.exec(lines[j]);
+        if (next && next[1].length <= m.level) return j;
+        continue;
+      }
+      if (lines[j].trim() === "") continue;
+      const indent = lines[j].length - lines[j].trimStart().length;
+      if (indent <= m.indent) return j;
+    }
+    return lines.length;
+  };
+
+  return chosen
+    .map((m) => ({ section: m.section, text: lines.slice(m.index, blockEnd(m)).join("\n").trim() }))
+    .filter((m) => m.text.length > 0);
+};
+
+/**
  * A plan is a document a reviewer can approve as one. It lives under `docs/`,
  * it is markdown, and it is repo-relative: no absolute path, no `..` escape
  * out of the repository.
