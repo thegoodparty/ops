@@ -2,7 +2,8 @@
 # Gives every address in allowed-emails.txt an agent-swarm user with its own
 # dashboard token, and revokes the dashboard token of anyone no longer listed.
 # Caddy maps the signed-in address to that token (Caddyfile, sso snippet), so
-# the swarm attributes each person's dashboard actions to them.
+# the swarm attributes each person's dashboard actions to them. Then sets
+# every user's RBAC role from admin-emails.txt (admin) or requester.
 # The tokens live only in dashboard-tokens.caddy: owner-only, not in git, not
 # in the config bucket. Run by up.sh with Google login on; safe to run again.
 set -euo pipefail
@@ -101,3 +102,31 @@ done < <(api GET '/api/users?recentEvents=0' | jq -r --arg l "$LABEL" '
   .users[] | select(. != null) | . as $u
   | .tokens[] | select(.label == $l and .revokedAt == null)
   | "\($u.id) \(.id) \($u.email // "")"')
+
+# RBAC: the addresses in admin-emails.txt hold the admin role and every other
+# user holds requester, whether they came from the dashboard or from Slack.
+# Admins sort first, so a demotion never trips the API's last-admin check.
+# Extra, non-primary roles are kept.
+admins="$(sed -e 's/#.*//' -e 's/[[:space:]]//g' admin-emails.txt | tr '[:upper:]' '[:lower:]' | grep . | sort -u | jq -R . | jq -s .)"
+users="$(api GET '/api/users?recentEvents=0')"
+
+jq -r --argjson a "$admins" '
+  [.users[] | select(. != null) | [.email // empty] + (.emailAliases // []) | map(ascii_downcase)[]] as $known
+  | $a[] | select(IN($known[]) | not)' <<<"$users" | while IFS= read -r email; do
+  echo "dashboard users: admin $email has no swarm user yet" >&2
+done
+
+while IFS=' ' read -r want id email; do
+  held="$(api GET "/api/users/$id/roles")"
+  current="$(jq -r '[.roles[].name | select(IN("admin", "requester", "viewer"))] | join(",")' <<<"$held")"
+  if [[ "$current" == "$want" ]]; then
+    continue
+  fi
+  jq --arg w "$want" '{roles: ([$w] + [.roles[].name | select(IN("admin", "requester", "viewer") | not)])}' <<<"$held" \
+    | api PUT "/api/users/$id/roles" -d @- >/dev/null
+  echo "dashboard users: ${email:-$id} is now $want (was ${current:-none})"
+done < <(jq -r --argjson a "$admins" '
+  .users[] | select(. != null)
+  | ([.email // empty] + (.emailAliases // []) | map(ascii_downcase)) as $addrs
+  | (if any($addrs[]; IN($a[])) then "admin" else "requester" end) as $want
+  | "\($want) \(.id) \(.email // "")"' <<<"$users" | sort)
