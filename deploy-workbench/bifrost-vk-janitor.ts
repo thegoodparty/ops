@@ -253,7 +253,7 @@ export const createBifrostVkJanitor = (args: {
     {
       securityGroupId: network.taskSecurityGroup.id,
       description:
-        "bifrost admin API from the vk-janitor Lambda (step 5 of docs/bifrost-virtual-keys.md); the second exception to 'from the ALB only', because /api through the ALB is behind Google SSO",
+        "bifrost admin API from the vk-janitor Lambda (step 5 of docs/bifrost-virtual-keys.md); the second exception to the ALB-only rule, because /api through the ALB is behind Google SSO",
       ipProtocol: "tcp",
       fromPort: BIFROST_PORT,
       toPort: BIFROST_PORT,
