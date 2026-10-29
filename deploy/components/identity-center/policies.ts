@@ -52,6 +52,22 @@ const BEDROCK_SERVICE_PREFIXES = [
   "bedrock-websearch",
 ] as const;
 
+/**
+ * The Bifrost virtual-key mint function's ARN.
+ *
+ * A literal rather than an Output: the function is created in
+ * `deploy-workbench/` (step 3 of `docs/bifrost-virtual-keys.md`), a different
+ * Pulumi project from this one, so there is nothing here to read it from. The
+ * plan records that this is deliberate — the two applies may land in either
+ * order, and until the function exists the grant below is simply inert. The
+ * name is the seam the two stacks share, the same way the Lambda role names
+ * are in `deploy/components/bifrost-vk-reader.ts`; renaming it on one side
+ * only is an `AccessDenied` at the first mint, not an apply-time error.
+ *
+ * Step 4 of `docs/bifrost-virtual-keys.md`.
+ */
+export const BIFROST_VK_MINT_FUNCTION_ARN = `arn:aws:lambda:us-west-2:${WORKBENCH_ACCOUNT_ID}:function:bifrost-vk-mint`;
+
 export const engineerAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -357,6 +373,68 @@ export const workbenchAccess: PolicyDocument = {
       Effect: "Allow",
       Action: ["secretsmanager:GetSecretValue"],
       Resource: `arn:aws:secretsmanager:us-west-2:${WORKBENCH_ACCOUNT_ID}:secret:gp-pi/brave-search-??????`,
+    },
+    // The Bifrost virtual-key mint function, and only the Function URL path to
+    // it. Step 4 of `docs/bifrost-virtual-keys.md`, and the one statement in
+    // this document that needs a human's sign-off because it is a change to
+    // who may mint a credential.
+    //
+    // What a `WorkbenchAccess` holder gains is exactly this: the ability to
+    // call one Function URL, which mints only the caller's own key. The
+    // function reads the caller's identity from the SigV4-verified
+    // `requestContext.authorizer.iam.userArn`, ignores any email in the body,
+    // and refuses a caller whose ARN is not an
+    // `AWSReservedSSO_WorkbenchAccess_*` role in the workbench account. Being
+    // able to call it is already the membership proof, and the function
+    // re-checks live `Engineers` membership on every call. Nothing else in the
+    // account becomes reachable: no other function, no invoke of this function
+    // that bypasses the URL.
+    //
+    // Two statements rather than one because the conditions differ, and two
+    // actions rather than one because AWS requires both from a function URL's
+    // caller since October 2025 ("Control access to Lambda function URLs").
+    //
+    // The conditions are the whole boundary, not decoration:
+    //
+    // - `lambda:FunctionUrlAuthType: AWS_IAM` keeps the grant from reaching a
+    //   URL configured with `NONE`, where anyone at all could call it and the
+    //   caller's identity would not be there to check.
+    // - `lambda:InvokedViaFunctionUrl: true` is what stops the
+    //   `lambda:InvokeFunction` half from also opening direct `Invoke`. Direct
+    //   `Invoke` delivers only the payload, so the function could not see who
+    //   called it and could not honour "your own key only" — it would be a
+    //   call that can mint a key named as somebody else. That is why there is
+    //   deliberately no bare `lambda:InvokeFunction` on this ARN, and
+    //   `deploy/identity-center-workbench-vk-mint.test.ts` fails if one is
+    //   ever added beside these.
+    //
+    // A function URL is public by design and refused without a credential, the
+    // same shape the gateway's own inference endpoint chose: reachable from
+    // anywhere a harness runs, and anonymous requests get nothing.
+    {
+      Sid: "InvokeBifrostVkMintFunctionUrl",
+      Effect: "Allow",
+      Action: ["lambda:InvokeFunctionUrl"],
+      Resource: BIFROST_VK_MINT_FUNCTION_ARN,
+      Condition: {
+        StringEquals: {
+          "lambda:FunctionUrlAuthType": "AWS_IAM",
+        },
+      },
+    },
+    {
+      Sid: "InvokeBifrostVkMintViaFunctionUrl",
+      Effect: "Allow",
+      // `Bool` rather than `StringEquals`: `InvokedViaFunctionUrl` is a
+      // boolean condition key, and a string comparison against it matches
+      // nothing.
+      Action: ["lambda:InvokeFunction"],
+      Resource: BIFROST_VK_MINT_FUNCTION_ARN,
+      Condition: {
+        Bool: {
+          "lambda:InvokedViaFunctionUrl": "true",
+        },
+      },
     },
   ],
 };
