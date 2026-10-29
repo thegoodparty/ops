@@ -16,6 +16,8 @@ import { createBifrostBootstrapRepository } from "./bootstrap-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
 import { createBifrostEcs } from "./ecs";
+import { createBifrostDiscovery } from "./discovery";
+import { createBifrostVkMint } from "./bifrost-vk-mint";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -443,6 +445,17 @@ export const bifrostBootstrapRepositoryUrl =
 const network = createWorkbenchNetwork({ provider });
 
 // ---------------------------------------------------------------------------
+// A stable name for the gateway task inside the VPC.
+//
+// Step 3 of `docs/bifrost-virtual-keys.md`: the vk-mint Lambda has to reach the
+// gateway's admin API on 8080, and `/api` through the ALB is behind oauth2-proxy
+// and Google SSO. The task's address changes on every replacement, so the
+// scheduler registers the task in a private Cloud Map namespace and the
+// function calls `bifrost.workbench.local:8080`. `discovery.ts` has the
+// alternatives that were considered and why they lost.
+const discovery = createBifrostDiscovery({ provider, vpcId: network.vpc.id });
+
+// ---------------------------------------------------------------------------
 // The ingress the gateway is reached through.
 //
 // Phase 1 item 6 of docs/bifrost-gateway.md: the internet-facing ALB, its two
@@ -534,6 +547,8 @@ const ecs = createBifrostEcs({
   repositoryUrl: bifrostRepository.repositoryUrl,
   oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl,
   bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl,
+  // The task's own name in the VPC, registered by the service below.
+  discovery,
 });
 
 /** The service's task family, for a human reading `pulumi stack output`. */
@@ -541,3 +556,35 @@ export const bifrostTaskDefinitionFamily = ecs.taskDefinition.family;
 
 /** The container log group, so item 12's first boot starts with a known name. */
 export const bifrostLogGroupName = ecs.logGroup.name;
+
+// ---------------------------------------------------------------------------
+// The virtual-key mint.
+//
+// Step 3 of `docs/bifrost-virtual-keys.md`: the Lambda a `WorkbenchAccess`
+// session calls to get its own Bifrost key. IAM-gated Function URL, attached to
+// the gateway's private subnets, one new 8080 ingress rule on the task group,
+// the template in SSM, and read on the dedicated setup-token secret. It consumes
+// the network, the discovery record above and the template file in `bifrost/`
+// rather than declaring a second copy of any of them.
+//
+// The invoke grant for people is step 4's, in `deploy/`, and is deliberately not
+// here: decision 2 shapes it as `lambda:InvokeFunctionUrl` plus a
+// `InvokedViaFunctionUrl`-conditioned `lambda:InvokeFunction`, and this stack
+// must never carry a bare `InvokeFunction` on the function.
+const vkMint = createBifrostVkMint({ provider, network, discovery });
+
+/** The IAM-gated endpoint step 4 grants people permission to call. */
+export const vkBifrostMintUrl = vkMint.functionUrl;
+
+/**
+ * The ARN step 4's `WorkbenchAccess` grant names, spelled out so the parallel
+ * stream does not re-derive it: `arn:aws:lambda:<region>:<account>:function:<name>`.
+ */
+export const vkBifrostMintFunctionArn = vkMint.function.arn;
+
+/** The task's private DNS name, so a human can resolve it from inside the VPC. */
+export const bifrostPrivateHostname = vkMint.bifrostHostname;
+
+/** The SSM parameter holding the key template, for a human reading the console. */
+export const vkBifrostMintTemplateParameterName =
+  vkMint.templateParameter.name;
