@@ -64,6 +64,9 @@ export interface Result {
   /** Absent for a repo that has not adopted gating, which is every case but
    *  the `ops` ones; also absent on a run that produced no complete review. */
   gating?: ResultGating;
+  // Kept so lead tracing can be checked and re-run offline against the
+  // prompts the orchestrator actually wrote, without paying for a replay.
+  subagentCalls?: SubagentCall[];
 }
 
 // caseId -> replay number -> result.
@@ -313,6 +316,7 @@ export const replayCase = async (
   const caseId = record.runId;
   const repoDir = join(workDir, caseId);
   const startMs = Date.now();
+  let subagentCalls: SubagentCall[] | undefined;
 
   const makeResult = (
     output: ReviewOutput | null,
@@ -332,6 +336,7 @@ export const replayCase = async (
     wallTimeMs: Date.now() - startMs,
     ...(leads ? { leads } : {}),
     ...(gating !== undefined ? { gating } : {}),
+    ...(subagentCalls ? { subagentCalls } : {}),
   });
 
   try {
@@ -364,6 +369,8 @@ export const replayCase = async (
     const message = err instanceof Error ? err.message : String(err);
     return makeResult(null, null, `agent threw: ${message}`);
   }
+
+  subagentCalls = agentResult.subagentCalls;
 
   if (agentResult.errorSubtype) {
     return makeResult(
