@@ -1,6 +1,6 @@
 import type { GatingFlag, GatingMode, GatingResult } from "./gating";
 import { consistencyFlag } from "./gating";
-import type { ReviewOutput } from "./schema";
+import type { PlanAddition, PlanConsistency, PlanDefect, ReviewOutput } from "./schema";
 
 // The verdict is now two questions, in this order.
 //
@@ -57,6 +57,21 @@ export type DecisionGating = {
   plan?: { path: string; blobSha: string };
   flags: GatingFlag[];
   ownedPaths: string[];
+  /**
+   * The model's consistency answer, present when a plan was put in front of it
+   * and it answered. `additions` and `planDefects` are case 5's vocabulary made
+   * reportable: a `consistent` answer that needed pieces the step did not name
+   * says so here, so a human reads "consistent; three additions the step does
+   * not name" rather than a flag with no theory. Absent on an ungated run, when
+   * no plan was read, and when the model gave no answer (a flag says that
+   * instead, and a missing answer still flags).
+   */
+  consistency?: {
+    verdict: PlanConsistency["verdict"];
+    reasoning: string;
+    additions: PlanAddition[];
+    planDefects: PlanDefect[];
+  };
 };
 
 // `unparseableCount` is the number of findings the model emitted that failed
@@ -119,6 +134,16 @@ export const decide = (
       binding: gating.binding,
       baseRef: gating.baseRef,
       ...(gating.plan !== undefined ? { plan: gating.plan } : {}),
+      ...(gating.plan !== undefined && output.planConsistency !== undefined
+        ? {
+            consistency: {
+              verdict: output.planConsistency.verdict,
+              reasoning: output.planConsistency.reasoning,
+              additions: output.planConsistency.additions ?? [],
+              planDefects: output.planConsistency.planDefects ?? [],
+            },
+          }
+        : {}),
       flags,
       ownedPaths: gating.authority.ownedPaths,
     },

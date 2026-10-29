@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   consistencyFlag,
   evaluateGating,
+  findPlanStep,
   hasStarDefault,
   isGatedRepo,
   isPlanPath,
@@ -395,5 +396,71 @@ describe("consistencyFlag", () => {
     assert.equal(consistencyFlag("inconsistent"), "inconsistent");
     assert.equal(consistencyFlag("unclear"), "unclear_consistency");
     assert.equal(consistencyFlag(undefined), "no_consistency_answer");
+  });
+});
+
+// The prompt's primary spec is the bound step's own text, located here rather
+// than by the model, so the template has to find the same step a reader would.
+describe("findPlanStep", () => {
+  const checklist = [
+    "## Progress",
+    "",
+    "- [ ] 1. Evals first: the two consistency cases.",
+    "      They join the existing expected-result job.",
+    "- [ ] 2. `CODEOWNERS`: empty the opt-out list.",
+    "- [ ] 3. Freeze the plans.",
+    "",
+    "Ordering is the point of the order.",
+    "",
+    "1. `deploy/` is de-owned one path at a time.",
+  ].join("\n");
+
+  it("locates a checklist step and stops at the next item", () => {
+    const found = findPlanStep(checklist, 1);
+    assert.equal(found?.section, "Progress");
+    assert.match(found!.text, /^- \[ \] 1\. Evals first/);
+    assert.match(found!.text, /They join the existing expected-result job\./);
+    assert.ok(!found!.text.includes("CODEOWNERS"), "must not run into step 2");
+  });
+
+  it("prefers the implementation-plan list over an earlier numbered list", () => {
+    // `docs/bifrost-virtual-keys.md` numbers its decisions `### 3. ...` before
+    // its implementation plan numbers the steps `3. ...`. The step is the list
+    // item, and a bare numbered heading is not a step.
+    const plan = [
+      "### 3. The Lambda holds the gateway's setup token",
+      "",
+      "This is a decision, not a step.",
+      "",
+      "## Implementation plan",
+      "",
+      "1. **The template.** Committed JSON.",
+      "2. **The role.** Read-only, in `deploy/`.",
+      "3. **The mint Lambda.** In `deploy-workbench/`: the function,",
+      "   its execution role and the read grant on the secret.",
+      "4. **The invoke grant.** In `deploy/`.",
+      "",
+      "## Cited so the next session can check",
+      "",
+      "1. A numbered list outside the plan is not a step.",
+    ].join("\n");
+    const found = findPlanStep(plan, 3);
+    assert.equal(found?.section, "Implementation plan");
+    assert.match(found!.text, /^3\. \*\*The mint Lambda\.\*\*/);
+    assert.match(found!.text, /read grant on the secret/);
+    assert.ok(!found!.text.includes("invoke grant"), "must stop at step 4");
+  });
+
+  it("locates a heading that literally names the step", () => {
+    const plan = ["## Step 2", "", "Add the role.", "", "## Step 3", "", "Add the function."].join("\n");
+    const found = findPlanStep(plan, 3);
+    assert.match(found!.text, /^## Step 3/);
+    assert.match(found!.text, /Add the function\./);
+    assert.ok(!found!.text.includes("Add the role"));
+  });
+
+  it("returns undefined when the plan has no such step", () => {
+    assert.equal(findPlanStep(checklist, 7), undefined);
+    assert.equal(findPlanStep("# A plan with no numbered steps", 1), undefined);
   });
 });

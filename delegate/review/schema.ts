@@ -21,15 +21,44 @@ export const FindingSchema = z.object({
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
+// An addition a `consistent` diff makes that the bound step does not name: a
+// path or an AWS resource, plus why the step's own goal needs it. A step's
+// enumeration is exemplary rather than exhaustive (case 5's vocabulary in
+// `docs/plan-gated-merges.md`), and this is where the model has to name the
+// pieces it added anyway, so a human can check the addition instead of taking
+// it on trust. Only meaningful on a `consistent` answer; the verdict
+// deliberately did not gain a fourth member, because `unclear` still has to
+// mean "I cannot tell".
+export const PlanAdditionSchema = z.object({
+  item: z.string().min(1),
+  why: z.string().min(1),
+});
+export type PlanAddition = z.infer<typeof PlanAdditionSchema>;
+
+// A plan sentence that is stale, or that contradicts the design's own diagram
+// or decisions. That is a defect in the document, not a difference in the
+// diff, so it does not make a change inconsistent: it is recorded for the
+// human who owns `docs/` while the answer stays `consistent`.
+export const PlanDefectSchema = z.object({
+  text: z.string().min(1),
+  problem: z.string().min(1),
+});
+export type PlanDefect = z.infer<typeof PlanDefectSchema>;
+
 // The one model judgement in a plan-gated review: is the diff consistent with
-// the plan the PR names? Everything else about the gate is deterministic, and
-// the verdict does not read this yet — step 1 of `docs/plan-gated-merges.md`
-// adds the field and the eval cases that score it, step 4 wires it into the
-// verdict. Optional so a run with no plan (every production run today) and
-// every record written before this landed still parse and still replay.
+// the plan the PR names? Everything else about the gate is deterministic.
+// `gates.ts` reads this only when a plan reached the model, and anything
+// other than `consistent` -- including a missing answer -- is a flag (case 5
+// of `docs/plan-gated-merges.md`). Optional so a run with no plan (every
+// ungated run) and every record written before this landed still parse and
+// still replay.
 export const PlanConsistencySchema = z.object({
   verdict: z.enum(["consistent", "inconsistent", "unclear"]),
   reasoning: z.string().min(1),
+  // Both optional: an `inconsistent` or `unclear` answer carries neither, and
+  // a record written before they existed still parses.
+  additions: z.array(PlanAdditionSchema).optional(),
+  planDefects: z.array(PlanDefectSchema).optional(),
 });
 export type PlanConsistency = z.infer<typeof PlanConsistencySchema>;
 

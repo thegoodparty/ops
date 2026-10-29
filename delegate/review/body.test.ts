@@ -135,6 +135,86 @@ describe("renderBody with the gate on", () => {
     assert.ok(body.includes("(delegate/review/gating.ts, deploy/index.ts)"));
   });
 
+  // Case 5's vocabulary, in the gate line rather than a flag with no theory: a
+  // consistent change that needed pieces the step did not name says so, and a
+  // stale plan sentence is attributed to the plan instead of the diff.
+  it("says consistency, how many additions the step did not name, and what they are", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({
+          wouldApprove: true,
+          binding: { path: plan.path, step: 3 },
+          consistency: {
+            verdict: "consistent",
+            reasoning: "step 3, with a DNS name the step does not name",
+            additions: [
+              { item: "deploy-workbench/discovery.ts", why: "the function needs an address to call the task" },
+            ],
+            planDefects: [],
+          },
+        }),
+      ),
+    });
+    assert.ok(
+      body.includes(
+        "**Gate: approve** against `docs/plan-gated-merges.md` at `1c7ac96`. Every changed path is unowned in `CODEOWNERS` on `main`.",
+      ),
+    );
+    assert.ok(
+      body.includes(
+        "Consistent with step 3. 1 addition the step does not name: `deploy-workbench/discovery.ts` (the function needs an address to call the task).",
+      ),
+    );
+  });
+
+  it("renders a consistent answer beside a flag, without changing the event", () => {
+    // The #411 shape: the harness flags the `docs/` edit and the model says the
+    // amendment and the code agree. The gate owns the outcome; the answer is the
+    // diagnostic, and the review is still a comment.
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({
+          flags: ["touches_docs"],
+          consistency: {
+            verdict: "consistent",
+            reasoning: "the amendment names the tree",
+            additions: [],
+            planDefects: [{ text: "step 6 removes a line", problem: "de-owning adds one" }],
+          },
+        }),
+      ),
+    });
+    assert.ok(body.startsWith("**Recommendation: approve**"));
+    assert.ok(body.includes("**Gate: comment**"));
+    assert.ok(body.includes("Flags: `touches_docs`"));
+    assert.ok(
+      body.includes(
+        "Consistent with step 4. 1 plan defect, which belongs to the plan and not the diff: \"step 6 removes a line\" — de-owning adds one.",
+      ),
+    );
+  });
+
+  it("says nothing about additions when the answer is not consistent", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({
+          flags: ["inconsistent"],
+          consistency: {
+            verdict: "inconsistent",
+            reasoning: "the diff widens the rule",
+            additions: [],
+            planDefects: [],
+          },
+        }),
+      ),
+    });
+    assert.ok(!body.includes("Consistent with step"));
+    assert.ok(body.includes("Flags: `inconsistent`"));
+  });
+
   it("says when a plan was never read", () => {
     const body = renderBody({
       ...baseArgs,
