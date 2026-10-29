@@ -25,8 +25,6 @@ files that belong in review:
   `config.json`, its Lambda-managed marker, decision 5's absences, and the same
   US-only rule from the key's side, since a key may not name a model the
   gateway would refuse.
-- `vk-mint-template.test.ts` — pins the template's provider and model lists to
-  `config.json`, its Lambda-managed marker, and decision 5's absences.
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
