@@ -321,6 +321,15 @@ What `consistent` means now, in the prompt and in the schema:
   is a plan defect, not a difference in the diff.** The answer stays
   `consistent` and records `planDefects`; the diff is not the thing that is
   wrong, and a human needs to know which.
+- **A verdict that is not `consistent` carries its justification.** An
+  `inconsistent` answer names the step's own words and the specific path,
+  resource or field the diff uses instead; an `unclear` one is a question --
+  what could not be determined, and what would settle it -- rather than a
+  shrug. The schema requires both, so a verdict without its detail is a schema
+  failure and the run retries or fails instead of posting a claim a human
+  cannot check (ops#414, review 5701013152). A widening is the clearest case: a
+  reviewer has to be able to see the plan's sentence and the source the diff
+  used instead before they can agree or disagree with the bot.
 - **A diff that edits the bound plan is never self-approving.** Case 4 flags
   every `docs/` edit deterministically and `docs/` is human-owned, so an
   amendment always goes to a human and the consistency answer cannot make one
@@ -337,7 +346,11 @@ entry, say) gives the model both, rather than the harness choosing one. The enum
 "I cannot tell", and every answer other than `consistent`, including a missing
 one, still flags. The two new fields are optional and only meaningful on a
 `consistent` answer, so a record written before them still parses and the
-gate's fail-closed direction is unchanged.
+gate's fail-closed direction is unchanged. The justification on the other two
+answers is required rather than optional: an answer present without its detail
+is a schema failure (the run retries, then fails), not a downgrade to the
+generic flag sentence, because a bare `inconsistent` is the one output a human
+can neither check nor rebut.
 
 ## Where the check lives
 
@@ -351,11 +364,11 @@ ones in "What was verified".
 | `delegate/review/gating.ts` (new) | The pure part: parse a PR body for the binding (and the optional `Step:` line, which the gate ignores), parse `CODEOWNERS` text into ordered patterns, resolve a path to owned/unowned, and return a `GatingResult`. No network, no model, no GitHub types, so it is unit-testable and the whole deterministic half can be reasoned about without a run. `findPlanSteps` (2026-10-29) locates every place the plan states the bound step; it never affects the gate. |
 | `delegate/review/github.ts` | One helper, `getFileAtRef(repo, path, ref)` returning `{ blobSha, text } \| undefined`, over the contents API. The worker's checkout is a depth-50 clone at the PR head (`delegate/worker/entrypoint.ts`), so `main` is not reliably present locally; the base ref has to be read from GitHub. |
 | `delegate/review/bundle.ts` | `buildBundle` resolves the binding, fetches the plan at the base ref, and puts the plan path, blob sha and text on the bundle. The bundle is the agent's entire input and is persisted on the record, so a gating case is replayable as an eval case with no GitHub access. |
-| `delegate/review/schema.ts` | `Bundle` gains an optional `plan: { path, blobSha, text }`. `ReviewOutputSchema` gains `planConsistency: { verdict: "consistent" \| "inconsistent" \| "unclear", reasoning }` on the `complete` branch, with optional `additions` and `planDefects` (2026-10-29; see case 5's vocabulary above). `ReviewRecord` gains a `gating` object: `{ mode, binding, baseRef, authority: { checked, ownedPaths, reason }, flags[] }`, and a `findingsVerdict` (`none` \| `findings`) beside it, so the reviewer's judgement of the code and the gate's judgement of the PR are recorded as separate facts. All new fields optional/defaulted, so records written before this lands still parse and still replay. |
+| `delegate/review/schema.ts` | `Bundle` gains an optional `plan: { path, blobSha, text }`. `ReviewOutputSchema` gains `planConsistency: { verdict: "consistent" \| "inconsistent" \| "unclear", reasoning }` on the `complete` branch, with optional `additions` and `planDefects` on a `consistent` answer and required `departure` / `uncertainty` on the other two (2026-10-29; see case 5's vocabulary above). `ReviewRecord` gains a `gating` object: `{ mode, binding, baseRef, authority: { checked, ownedPaths, reason }, flags[] }`, and a `findingsVerdict` (`none` \| `findings`) beside it, so the reviewer's judgement of the code and the gate's judgement of the PR are recorded as separate facts. The record schema (`StoredReviewOutputSchema`) stays looser than the model-output schema, so a record written before the justification requirement still parses and still replays. All new fields optional/defaulted otherwise. |
 | `delegate/agents/pr-reviewer.ts` | `buildReviewPrompt` gains a `<plan>` element and the consistency instruction, and gives the bound step its own `<step>` elements as the spec, one per place the plan states it, located from the PR's `Step:` line (2026-10-29). The plan text gets the same treatment the diff gets: a per-run boundary token or escaping, so plan content cannot close its own element and write prompt structure. The section on findings is unchanged; findings stay authoritative and a finding still blocks on its own. |
 | `delegate/review/gates.ts` | The authority gate. `decide` grows an input for the gating result and returns `comment` with a reason for each of cases 1–4, and for case 5 when the model says anything other than `consistent`. See "The comment in `gates.ts`" below. |
 | `delegate/review/body.ts` | `renderBody` renders the gating line: the verdict, the binding and blob sha it was checked against, and the reason when it is a flag. Beside it, and separate from it, the findings verdict: `none in this pass`, or the count with the reviewer's summary below. A clean PR the gate blocked says in plain words that this review flagged nothing, that the gate is the only reason for the comment, and that a human approval is still required. The findings line is deliberately about the pass, not about the code: ops#392 is the case where a clean review preceded a human finding a blocker. A reviewer reading the PR sees why the bot did not approve without opening the run record, and can tell a gate block from a finding. |
-| `delegate/review/run.ts` | Wires it: build the gating result next to the bundle, pass it to `decide`, pass the mode through, record it on the record, and emit the reason in `review_posted`. |
+| `delegate/review/run.ts` | A present but invalid `planConsistency` is a schema failure (one repair turn, then the run fails), not a dropped field; an absent one still becomes `no_consistency_answer`. Wires it: build the gating result next to the bundle, pass it to `decide`, pass the mode through, record it on the record, and emit the reason in `review_posted`. |
 | `delegate/review/gates.test.ts`, `bundle.test.ts`, `run.test.ts`, `body.test.ts`, `gating.test.ts` (new) | Unit tests for the parser (including a `CODEOWNERS` with no `*`, a path matched by two patterns, a body with two `Plan:` lines, and a `Step:` that is absent or malformed), for the flag cases, and for the approve path. |
 
 Deliberately untouched: `anchors.ts`, `match.ts`, `prompt-diff.ts`, the
@@ -469,7 +482,7 @@ row is the negative that keeps the first from being a licence.
 | a PR touching the plan it implements | diff and plan edit in one PR | flag `touches_docs` | step 5 |
 | a change with an addition the step does not name | the step names a function and a secret; the diff also adds the private DNS name the function needs to reach the task | the model answers `consistent` and names the addition, and the review approves (this is #414's shape) | step 5, added after the fact |
 | a PR that amends the plan it implements | the diff edits the bound plan's own step text and says why, and the code stays inside the amendment | flag `touches_docs` (case 4 owns the outcome), with `consistent` as the model's diagnostic (this is #411's shape) | step 5, added after the fact |
-| a change consistent with the step's words that widens access | the step names the ingress rule and the source; the diff adds it with a VPC-wide source | the model answers `inconsistent` and the review flags; the addition rules are not a licence | step 5, added after the fact |
+| a change consistent with the step's words that widens access | the step names the ingress rule and the source; the diff adds it with a VPC-wide source | the model answers `inconsistent` and the review flags, and its body names the step's words and the VPC-wide source; the addition rules are not a licence | step 5, added after the fact |
 | a commit pushed after approval | an approval recorded at sha A, then a push to sha B | the B run never approves on A's authority: either it approves only after its own consistency judgement at B, or it flags. `require_last_push_approval` is what makes A's approval not count; the case pins that the bot does not reintroduce it. | step 5 |
 
 `ExpectSchema` in `expect.ts` has one expectation type per case. `approve` and

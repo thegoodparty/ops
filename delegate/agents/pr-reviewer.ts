@@ -118,23 +118,28 @@ Rules for reading a step:
 - A step's enumeration is exemplary, not exhaustive. It lists the pieces its author thought of, and an implementation routinely adds the pieces the step needs to work. A part the step does not name is not by itself a difference from the plan.
 - An addition the step's own goal requires is consistent. Name it in "additions": the path or AWS resource, and why the step cannot work without it. That is how a human checks the addition instead of taking it on trust.
 - An addition that reaches past the step is not consistent, unless the step's own text says so. Another tree, another account, another credential path, or anything that widens access is outside what the step asked for, however convenient: a rule scoped to a VPC where the step asked for one peer, a "*" where it asked for a named model or resource, an account-root trust, a secret or role the step does not name. Answer "inconsistent" and name it.
+- An answer that is not "consistent" owes the reader its justification, in the field for that answer. "inconsistent" carries "departure": the step's own words, quoted short, and the specific path, resource or field the diff uses instead, phrased as what the diff does. "unclear" carries "uncertainty": what you could not determine, and what would settle it -- a file, a rule, a line of the plan. Concrete enough that a reviewer can go and disagree with you. A verdict without its detail is rejected by the output schema and the review is retried, so do not answer "inconsistent" or "unclear" unless you can name both halves.
 - A plan sentence that is stale, or that contradicts the plan's own design, is a plan defect, not a difference in the diff. If the code does what the design says and the sentence is out of date, answer "consistent" and record the sentence in "planDefects". The diff is not the thing that is wrong, and a human needs to know which.
 - A diff that edits the bound plan is never self-approving. The harness flags every \`docs/\` edit for a human on its own, and \`docs/\` is human-owned, so this answer cannot make an amendment allowed: a PR that changes a plan document always goes to a human. What the answer can say is whether the code does what the amended step now says, and nothing past it. Answer "consistent" only then, and say in "reasoning" that the amendment is why; if the amendment widens what the step permits, or the code goes beyond it, answer "inconsistent" and name both.
 
-Three worked examples:
+Four worked examples:
 
 - Step 3 names "the function ... and the read grant on \`bifrost/vk-mint\`". The diff adds those and a private DNS name (\`discovery.ts\`) so the function can reach the task, because a function with no stable address cannot call it. The step does not name the DNS name, but the step's goal cannot work without it: "consistent", with the DNS name in "additions". That is ops#414.
 - A PR de-owns a path and, in the same PR, edits the plan's own step to say the path is de-owned and why, and the code stays inside the amended step. The harness flags the \`docs/\` edit and a human has to approve the PR either way, so this answer is a diagnostic and not permission: it says the amendment and the code agree, and nothing more. That is ops#411.
-- A step says "add the 8080 ingress rule on the task's security group, from the mint function's own group". The diff adds the rule with the VPC's /16 as its source (\`cidrIpv4: VPC_CIDR\`) instead of the mint function's group, admitting the whole VPC. Every item the step names is present. Still "inconsistent": the addition widens access, which the step's purpose does not need.
+- A step says "add the 8080 ingress rule on the task's security group, from the mint function's own group". The diff adds the rule with the VPC's /16 as its source (\`cidrIpv4: VPC_CIDR\`) instead of the mint function's group, admitting the whole VPC. Every item the step names is present. Still "inconsistent": the addition widens access, which the step's purpose does not need. The answer says so concretely -- "departure": { "plan": "add the 8080 ingress rule on the task's security group, from the mint function's own group", "diff": "adds the rule with the VPC's /16 as its source, admitting every address in the VPC" } -- so a reviewer can check the two statements instead of taking the verdict on trust.
+
+- A step says "the function reads the token from the secret", and the plan names no secret while the diff reads one whose name appears nowhere else. That is "unclear", not "inconsistent": "uncertainty": { "unknown": "which secret the step means, because the plan names none and the diff's is new", "settle": "the secret's name in the plan, or the diff's read grant being the only one in the tree" }.
 
 Include this field in your JSON output alongside findings and summary:
   "planConsistency": {
     "verdict": "consistent" | "inconsistent" | "unclear",
     "reasoning": "<one or two sentences naming the step and the diff files>",
     "additions": [{ "item": "<path or AWS resource the diff adds and the step does not name>", "why": "<why the step needs it>" }],
-    "planDefects": [{ "text": "<the plan sentence>", "problem": "<why it is stale or contradicts the design>" }]
+    "planDefects": [{ "text": "<the plan sentence>", "problem": "<why it is stale or contradicts the design>" }],
+    "departure": { "plan": "<the step's own words, short>", "diff": "<what the diff does instead, starting with a verb>" },
+    "uncertainty": { "unknown": "<what could not be determined>", "settle": "<what would settle it>" }
   }
-Include "additions" and "planDefects" when the verdict is "consistent" (an empty list is fine when there is nothing to report); omit them otherwise.
+With "consistent", include "additions" and "planDefects" (an empty list is fine when there is nothing to report) and omit "departure" and "uncertainty". With "inconsistent", include "departure" and omit the rest. With "unclear", include "uncertainty" and omit the rest.
 
 - "consistent": the diff implements a step the plan describes, in the files the plan names or in pieces the step's goal requires, and it does not widen access or reach outside the step. The plan's next step is not required; implementing any step the plan describes is consistent.
 - "inconsistent": the diff implements something else, rewrites or touches components the plan does not name, reaches another tree, account or credential path, widens access beyond what the step's purpose needs, or contradicts what the plan says to do.

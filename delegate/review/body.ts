@@ -46,32 +46,45 @@ const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
     : "The findings are why this is not an approval.";
 };
 
-// Case 5's answer, in the same line as the gate. A `consistent` verdict that
-// needed pieces the step did not name is the shape the old vocabulary had to
-// call `unclear`, so the body names what was added and why: a human can check
-// the addition instead of trusting the verdict. A plan defect is listed
-// separately because it belongs to the document and not to the diff, and it is
-// the specific answer that replaces an `unclear`. Only a `consistent` answer
-// renders here; every other one already has its own flag line.
+// Case 5's answer, in the same line as the gate, with the justification the
+// schema requires of it. A `consistent` answer names the pieces it added and
+// why, so a human checks the addition instead of trusting the verdict. An
+// `inconsistent` answer names the step's words and the diff's departure: a flag
+// with no plan sentence and no hunk is one a reviewer can neither check nor
+// rebut, which is ops#414's review 5701013152. An `unclear` answer names what
+// it could not determine and what would settle it, so "I cannot tell" is a
+// question rather than a shrug. The schema rejects a verdict without its
+// detail, so every branch here has one.
+const asClause = (s: string): string => s.trim().replace(/[.!?]+$/, "");
+
 const renderConsistency = (g: DecisionGating): string => {
   const c = g.consistency;
-  if (c === undefined || c.verdict !== "consistent") return "";
+  if (c === undefined) return "";
   const step = g.binding.step !== undefined ? `step ${g.binding.step}` : "the plan";
-  const n = c.additions.length;
-  const additions =
-    n === 0
-      ? ""
-      : ` ${n} addition${n === 1 ? "" : "s"} the step does not name: ${c.additions
-          .map((a) => `\`${a.item}\` (${a.why})`)
-          .join("; ")}.`;
-  const d = c.planDefects.length;
-  const defects =
-    d === 0
-      ? ""
-      : ` ${d} plan defect${d === 1 ? "" : "s"}, which belong${d === 1 ? "s" : ""} to the plan and not the diff: ${c.planDefects
-          .map((x) => `"${x.text}" — ${x.problem}`)
-          .join("; ")}.`;
-  return ` Consistent with ${step}.${additions}${defects}`;
+
+  if (c.verdict === "consistent") {
+    const n = c.additions.length;
+    const additions =
+      n === 0
+        ? ""
+        : ` ${n} addition${n === 1 ? "" : "s"} the step does not name: ${c.additions
+            .map((a) => `\`${a.item}\` (${a.why})`)
+            .join("; ")}.`;
+    const d = c.planDefects.length;
+    const defects =
+      d === 0
+        ? ""
+        : ` ${d} plan defect${d === 1 ? "" : "s"}, which belong${d === 1 ? "s" : ""} to the plan and not the diff: ${c.planDefects
+            .map((x) => `"${x.text}" — ${x.problem}`)
+            .join("; ")}.`;
+    return ` Consistent with ${step}.${additions}${defects}`;
+  }
+
+  if (c.verdict === "inconsistent") {
+    return ` Not consistent with ${step}: the step says "${asClause(c.departure.plan)}". The diff instead ${asClause(c.departure.diff)}.`;
+  }
+
+  return ` Unclear against ${step}: ${asClause(c.uncertainty.unknown)}. What would settle it: ${asClause(c.uncertainty.settle)}.`;
 };
 
 // One line, in the same body a reviewer already reads for findings, carrying

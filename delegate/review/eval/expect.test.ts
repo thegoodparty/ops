@@ -194,6 +194,16 @@ test("scoreDir with a holdout filter scores only holdout cases", () => {
   assert.deepEqual(reports.map((r) => r.c.id), holdout.map((c) => c.id));
 });
 
+// Every answer carries the justification its verdict requires; a verdict
+// without one is a schema failure, so a test helper that omitted it would be
+// building an output the parser can never produce.
+const justified = (verdict: "consistent" | "inconsistent" | "unclear", reasoning = "r") =>
+  verdict === "consistent"
+    ? { verdict, reasoning }
+    : verdict === "inconsistent"
+      ? { verdict, reasoning, departure: { plan: "the step's words", diff: "does something else" } }
+      : { verdict, reasoning, uncertainty: { unknown: "what is missing", settle: "the file that would show it" } };
+
 const withConsistency = (
   verdict?: "consistent" | "inconsistent" | "unclear",
   findings: Finding[] = [],
@@ -203,7 +213,7 @@ const withConsistency = (
       status: "complete",
       findings,
       summary: "s",
-      ...(verdict ? { planConsistency: { verdict, reasoning: "r" } } : {}),
+      ...(verdict ? { planConsistency: justified(verdict) } : {}),
     },
   });
 
@@ -220,7 +230,7 @@ const withGating = (
       status: "complete",
       findings: [],
       summary: "s",
-      planConsistency: { verdict: answer, reasoning: "r" },
+      planConsistency: justified(answer),
     },
     gating: {
       mode: "enforce",

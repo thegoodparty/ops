@@ -14,7 +14,7 @@ import { createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
 import { FindingSchema } from "../schema";
-import type { Bundle, Finding, ReviewOutput, ReviewRecord } from "../schema";
+import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
 
 // not-investigated: no deep-reviewer was given the lead. dropped: it returned
 // no findings. raised: it returned findings, none of which reached the final
@@ -53,7 +53,10 @@ export interface Result {
   prNumber: number;
   headSha: string;
   variant: string;
-  output: ReviewOutput | null;
+  // A result synthesized from a production record may carry an answer written
+  // before the justification requirement, so the stored shape is allowed too;
+  // every reader here uses status, findings and the verdict.
+  output: ReviewOutput | StoredReviewOutput | null;
   error?: string;
   costUsd: number | null;
   wallTimeMs: number;

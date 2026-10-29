@@ -218,7 +218,11 @@ describe("decide with the gate on", () => {
         status: "complete",
         findings: [],
         summary: "clean",
-        planConsistency: { verdict: "inconsistent", reasoning: "the plan names another component" },
+        planConsistency: {
+          verdict: "inconsistent",
+          reasoning: "the plan names another component",
+          departure: { plan: "the worker log group", diff: "rewrites the playwright bucket" },
+        },
       },
       { gating: clearGating },
     );
@@ -232,7 +236,11 @@ describe("decide with the gate on", () => {
         status: "complete",
         findings: [],
         summary: "clean",
-        planConsistency: { verdict: "unclear", reasoning: "not enough detail" },
+        planConsistency: {
+          verdict: "unclear",
+          reasoning: "not enough detail",
+          uncertainty: { unknown: "which component the step means", settle: "the plan's file list" },
+        },
       },
       { gating: clearGating },
     );

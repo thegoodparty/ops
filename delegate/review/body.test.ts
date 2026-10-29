@@ -196,7 +196,11 @@ describe("renderBody with the gate on", () => {
     );
   });
 
-  it("says nothing about additions when the answer is not consistent", () => {
+  // ops#414's review 5701013152 posted "not consistent with the plan" with no
+  // plan sentence and no diff hunk, which a human can neither check nor rebut.
+  // The answer now owes both halves, and the gate line carries them. The plan
+  // step and the departure are the ones in the `ops-plan-widens-access` case.
+  it("renders the widening case's plan words and its departure (ops-plan-widens-access)", () => {
     const body = renderBody({
       ...baseArgs,
       decision: gated(
@@ -204,15 +208,49 @@ describe("renderBody with the gate on", () => {
           flags: ["inconsistent"],
           consistency: {
             verdict: "inconsistent",
-            reasoning: "the diff widens the rule",
-            additions: [],
-            planDefects: [],
+            reasoning: "the rule admits the whole VPC",
+            departure: {
+              plan: "add an ingress rule on bifrostTaskSecurityGroup that admits the mint function's own security group on tcp/8080, and nothing else",
+              diff: "adds the rule with cidrIpv4: VPC_CIDR as its source, admitting every address in the VPC",
+            },
           },
         }),
       ),
     });
+    assert.ok(body.startsWith("**Recommendation: approve**"));
+    assert.ok(body.includes("**Gate: comment**"));
+    assert.ok(body.includes("Flags: `inconsistent`: the change is not consistent with the plan."));
+    assert.ok(
+      body.includes(
+        'Not consistent with step 4: the step says "add an ingress rule on bifrostTaskSecurityGroup that admits the mint function\'s own security group on tcp/8080, and nothing else". The diff instead adds the rule with cidrIpv4: VPC_CIDR as its source, admitting every address in the VPC.',
+      ),
+    );
     assert.ok(!body.includes("Consistent with step"));
-    assert.ok(body.includes("Flags: `inconsistent`"));
+  });
+
+  it("renders an unclear answer as a question, not a shrug", () => {
+    const body = renderBody({
+      ...baseArgs,
+      decision: gated(
+        gating({
+          flags: ["unclear_consistency"],
+          consistency: {
+            verdict: "unclear",
+            reasoning: "the plan names no address",
+            uncertainty: {
+              unknown: "whether the task has a stable address the function can call",
+              settle: "the task's service registration at the reviewed sha",
+            },
+          },
+        }),
+      ),
+    });
+    assert.ok(body.includes("Flags: `unclear_consistency`"));
+    assert.ok(
+      body.includes(
+        "Unclear against step 4: whether the task has a stable address the function can call. What would settle it: the task's service registration at the reviewed sha.",
+      ),
+    );
   });
 
   it("says when a plan was never read", () => {

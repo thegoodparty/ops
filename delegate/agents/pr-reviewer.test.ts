@@ -361,6 +361,7 @@ describe("the plan-gated schema fields", () => {
       planConsistency: {
         verdict: "inconsistent",
         reasoning: "the plan names worker.ts",
+        departure: { plan: "retain the worker log group", diff: "rewrites the playwright bucket" },
       },
     };
     const parsed = ReviewOutputSchema.parse(withPlan);

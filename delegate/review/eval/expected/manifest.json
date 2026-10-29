@@ -159,7 +159,7 @@
       "reason": "inconsistent",
       "consistency": "inconsistent"
     },
-    "tests": "Simulated. The plan's step 1 asks for one ingress rule on the task group, sourced from the mint function's own security group; the diff adds the rule with `cidrIpv4: VPC_CIDR`, so every item the step names is present and the whole VPC is admitted. This is the negative that keeps the addition case from being a licence: without it the prompt change would only move the gate in the approving direction. The review must comment with the `inconsistent` gate fired, and the model must answer `inconsistent`. The second shape in #414, a VPC-wide rule or a `\"*\"` model list that would have been a widening under the harmless kind; the diff is invented.",
+    "tests": "Simulated. The plan's step 1 asks for one ingress rule on the task group, sourced from the mint function's own security group; the diff adds the rule with `cidrIpv4: VPC_CIDR`, so every item the step names is present and the whole VPC is admitted. This is the negative that keeps the addition case from being a licence: without it the prompt change would only move the gate in the approving direction. The review must comment with the `inconsistent` gate fired, and the model must answer `inconsistent` with its `departure`: the step's words and the VPC-wide source. The review body that sentence renders into is pinned in `body.test.ts`. The second shape in #414, a VPC-wide rule or a `\"*\"` model list that would have been a widening under the harmless kind; the diff is invented.",
     "split": "tune",
     "source": "simulated",
     "kind": "bug"
