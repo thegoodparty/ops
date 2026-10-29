@@ -130,6 +130,22 @@ jobs:
             git diff --stat --no-renames "$base" "$branch_sha"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # The two files run in-process during replay, so the branch may differ
+      # from the merge base only in string and template literal text. Main's
+      # code compares the two copies and prints no file content.
+      - name: Check the branch changes only literal text
+        env:
+          BRANCH_SHA: ${{ steps.branch.outputs.branch_sha }}
+        run: |
+          base=$(git merge-base HEAD "$BRANCH_SHA")
+          for f in delegate/agents/pr-reviewer.ts delegate/agents/pr-reviewer-subagents.ts; do
+            mkdir -p "$RUNNER_TEMP/literals-main/$(dirname "$f")" "$RUNNER_TEMP/literals-branch/$(dirname "$f")"
+            git show "${base}:${f}" > "$RUNNER_TEMP/literals-main/${f}"
+            git show "${BRANCH_SHA}:${f}" > "$RUNNER_TEMP/literals-branch/${f}"
+          done
+          npm run -s review:eval -- dispatch literals \
+            --main-dir "$RUNNER_TEMP/literals-main" --branch-dir "$RUNNER_TEMP/literals-branch"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:

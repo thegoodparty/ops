@@ -72,11 +72,7 @@ full once; it defines the suites, the gate and the budget.
    lead appear, did the deep-reviewer keep it, did the finding land? Repeat with a fresh edit
    (amend the same idea) until the target passes, or drop the idea. A dropped idea goes in the tried
    log with why it failed, then return to step 3 with a new branch (`n` + 1).
-6. **Tune, then gate.** When inner passes, stop and ask a human to confirm the candidate diff
-   before each `tune` and `gate` dispatch. Show `git diff main` of the `editable` files and say it
-   changes only literal text. Dispatch only after the human says so in this conversation; a
-   passing inner run is not that confirmation. (Until ENG-11516 makes the workflow refuse other
-   diffs, this is the only check that the gate scores real results.) Then dispatch `tune` with the
+6. **Tune, then gate.** When inner passes, dispatch `tune` with the
    target cases as `cases`, then `gate`. Both wait and download as above and read `gate.json`. The gate passes only with `pass` true
    (no `regressions`, no `targetsMissed`). On failure, stop; log why (which cases regressed, from the tune
    `cases` table; holdout only as the `holdout` counts) and drop the idea, or make one smaller

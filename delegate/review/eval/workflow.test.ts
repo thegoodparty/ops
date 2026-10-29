@@ -31,6 +31,18 @@ test("only a manual dispatch from main starts it", () => {
   assert.match(jobs(run).get("prepare") ?? "", /if: github\.ref == 'refs\/heads\/main'/);
 });
 
+test("prepare checks the branch changes only literal text before any replay job", () => {
+  const prepare = jobs(run).get("prepare") ?? "";
+  const literals = prepare.indexOf("dispatch literals");
+  assert.ok(literals > prepare.indexOf("dispatch allowlist"));
+  assert.ok(literals > 0);
+  assert.ok(literals < prepare.indexOf("Check the budget"));
+  assert.match(prepare, /BRANCH_SHA: \$\{\{ steps\.branch\.outputs\.branch_sha \}\}/);
+  for (const name of ["main-baseline", ...CANDIDATE_JOBS]) {
+    assert.match(jobs(run).get(name) ?? "", /needs:[^\n]*prepare/, name);
+  }
+});
+
 test("no expression is substituted into a shell script", () => {
   for (const text of [run, ledger]) {
     let indent = -1;
