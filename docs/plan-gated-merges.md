@@ -321,11 +321,13 @@ What `consistent` means now, in the prompt and in the schema:
   is a plan defect, not a difference in the diff.** The answer stays
   `consistent` and records `planDefects`; the diff is not the thing that is
   wrong, and a human needs to know which.
-- **A transparent amendment is part of the plan.** A PR that amends the bound
-  plan's own step text, says why, and stays inside what the amendment permits
-  is consistent. The harness still flags the `docs/` edit for a human under
-  case 4; the consistency answer is the diagnostic that the amendment and the
-  code agree (#411).
+- **A diff that edits the bound plan is never self-approving.** Case 4 flags
+  every `docs/` edit deterministically and `docs/` is human-owned, so an
+  amendment always goes to a human and the consistency answer cannot make one
+  allowed. What it can say is whether the code does what the amended step now
+  says and nothing past it: `consistent` only then, with the amendment named in
+  `reasoning`; an amendment that widens what the step permits, or code that
+  goes beyond it, is `inconsistent` (#411).
 
 The bound step's own text — located from the PR's `Step:` line against the
 plan's numbered list — is now the prompt's primary spec, with the rest of the

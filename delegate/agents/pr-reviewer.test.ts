@@ -230,6 +230,11 @@ describe("buildReviewPrompt with a plan", () => {
     assert.match(prompt, /An addition that reaches past the step is not consistent/);
     assert.match(prompt, /widens access/);
     assert.match(prompt, /is a plan defect, not a difference in the diff/);
+    // The amendment rule is diagnostic only: case 4 flags every `docs/` edit,
+    // so the prompt must not read as permission to amend a plan.
+    assert.match(prompt, /edits the bound plan is never self-approving/);
+    assert.match(prompt, /cannot make an amendment allowed/);
+    assert.match(prompt, /a human has to approve the PR either way/);
     assert.match(prompt, /ops#414/);
     assert.match(prompt, /ops#411/);
     assert.match(prompt, /"additions"/);
