@@ -202,7 +202,11 @@ is VPC-attached to the gateway's private subnets and calls the task on
 today: `bifrostTaskSecurityGroup` accepts 8080 and 4180 from the ALB's group and
 from nothing else (`deploy-workbench/network.ts`). That rule is the first
 exception to that invariant and it belongs in the PR that adds the function,
-documented where the rule is written.
+documented where the rule is written. The function addresses the task as
+`bifrost.workbench.local`, the private Cloud Map name step 3 registers: a
+task's address changes on every replacement and its `privateDnsName` is just
+that address, so the name is what makes the 8080 path stable. Step 5's janitor
+makes the same calls against the same name.
 
 **Not verified, and the whole of step 3 depends on it:** that a Lambda attached
 to those subnets can reach the task on 8080 at all, and that the gateway
@@ -503,7 +507,7 @@ not decided here.
                      │  X-Bifrost-Setup-Token from bifrost/gateway    │
                      │  read-only role -> identity store (Engineers)  │
                      └───────────────┬────────────────────────────────┘
-                                     │ http://<task>:8080/api/governance/virtual-keys
+                                     │ http://bifrost.workbench.local:8080/api/governance/virtual-keys
                                      ▼
                      ┌────────────────────────────────────────────────┐
                      │ Bifrost task (8080) ──> Bedrock as bifrost-task│
@@ -652,11 +656,15 @@ Step: 2
    role (`sts:AssumeRole` on step 2's role), the Function URL with
    `AuthType: AWS_IAM`, its VPC attachment to the private subnets, its own
    security group, the new ingress rule on `bifrostTaskSecurityGroup` for 8080,
-   the SSM-backed template, the read grant on `bifrost/gateway` (or a dedicated
-   `bifrost/vk-mint`, per the open item), the log group, the membership check,
-   and the idempotency logic with its unit tests (exact-match filter,
-   reactivation that also clears `expires_at` and `delete_after_expire`,
-   `409`-then-reread, a non-member refused, a directory read error refused).
+   a private Cloud Map name for the task (`workbench.local` namespace, `bifrost`
+   service, A records registered by the ECS service, so the function calls
+   `http://bifrost.workbench.local:8080` rather than an address that changes on
+   every deploy), the SSM-backed template, the read grant on `bifrost/gateway`
+   (or a dedicated `bifrost/vk-mint`, per the open item), the log group, the
+   membership check, and the idempotency logic with its unit tests
+   (exact-match filter, reactivation that also clears `expires_at` and
+   `delete_after_expire`, `409`-then-reread, a non-member refused, a directory
+   read error refused).
    **Depends on steps 1 and 2 and the gateway being deployed**; the network
    path is the thing to prove first, because everything else is ordinary.
 4. **The invoke grant for people.** In `deploy/`: `WorkbenchAccess` gets

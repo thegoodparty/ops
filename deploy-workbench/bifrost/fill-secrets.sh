@@ -453,7 +453,7 @@ report() {  # returns 1 if a container is missing
       missing=1
     elif [[ -n "$gateway_token" && "$mint_token" != "$gateway_token" ]]; then
       echo "bifrost/vk-mint's setup token differs from the gateway's; the gateway will refuse it."
-      echo "Re-run with --force to copy the gateway's token across."
+      echo "Re-run with --generated-only to copy the gateway's token across."
       missing=1
     fi
   fi
@@ -623,16 +623,22 @@ else
   existing_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
   if [[ "$existing_token" == "$gateway_setup_token" ]]; then
     echo "  BIFROST_SETUP_TOKEN: already matches the gateway's, keeping"
-  elif [[ -n "$existing_token" && $FORCE == 0 && $gateway_token_rewritten == 0 ]]; then
-    # The gateway's token did not change this run, so a copy that differs is
-    # older than the gateway's current token and the mint would be refused.
-    # --check reports it; --force is the repair.
-    echo "  BIFROST_SETUP_TOKEN: differs from the gateway's; keeping (--force copies it across)"
   else
+    # A copy that differs from the token this run leaves in $GATEWAY_SECRET is
+    # stale, and overwriting it is safe: the gateway's own value is not changing,
+    # so nothing needs rotating. `--force` is *not* the repair -- it regenerates
+    # BIFROST_ADMIN_PASSWORD, BIFROST_SETUP_TOKEN and OAUTH2_PROXY_COOKIE_SECRET,
+    # signing everyone out of the admin UI and rotating the gateway's token out
+    # from under the running task, which keeps the old one until it is redeployed
+    # -- and the fresh copy then gives the mint a token the gateway refuses. A
+    # plain re-run (or --generated-only) is the repair, and it copies without
+    # touching anything else. That is why this branch has no $FORCE condition.
     export BIFROST_SETUP_TOKEN="$gateway_setup_token"
     WRITE_KEYS+=("BIFROST_SETUP_TOKEN")
     if [[ $gateway_token_rewritten == 1 ]]; then
       echo "  BIFROST_SETUP_TOKEN: copied from $GATEWAY_SECRET (which this run rewrote)"
+    elif [[ -n "$existing_token" ]]; then
+      echo "  BIFROST_SETUP_TOKEN: replaced the stale copy with $GATEWAY_SECRET's"
     else
       echo "  BIFROST_SETUP_TOKEN: copied from $GATEWAY_SECRET"
     fi
