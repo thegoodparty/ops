@@ -16,6 +16,11 @@ files that belong in review:
   list matching `utils/bedrock-models.ts` (the list the task role's IAM is
   built from, alongside the `bedrock:ListFoundationModels` grant that renders
   it).
+- `vk-mint-template.json` — the default per-person virtual key shape, as data
+  ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md),
+  step 1). See "Virtual-key template" below.
+- `vk-mint-template.test.ts` — pins the template's provider and model lists to
+  `config.json`, its Lambda-managed marker, and decision 5's absences.
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -179,6 +184,44 @@ Two consequences worth knowing before a deploy:
   declared here for a caller that is not a person. That is the plan's phase A
   order ("inference succeeds with a virtual key and fails without one"), not a
   defect — but the two have to land close together.
+
+## Virtual-key template
+
+`vk-mint-template.json` is the default shape of a per-person key, committed as
+data rather than built in code (step 1 of
+[`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md); step 3's
+mint Lambda and step 5's janitor consume it). The Lambda stores it as an SSM
+`String`, reads it at run time, adds the per-call fields (the caller's lowercase
+email as `name`, and the engineering team once item 14 creates it) and `POST`s
+the result to `/api/governance/virtual-keys`. Widening a model list is therefore
+a reviewed edit here plus an apply, with no Lambda code change — the tier is
+data.
+
+What it carries, and why each is a decision (decision 5):
+
+- **A `description` starting with `lambda-managed`.** The marker is the
+  janitor's only input: a key without it is never deactivated by a job, so a
+  human's test or dashboard key is out of reach. The exact string is the
+  implementer's, in one constant matched by both Lambdas; the test's copy is
+  deliberate, so changing it is a change to the file, the test and both
+  functions together rather than one silently.
+- **`provider_configs` pinned explicitly**, to the model lists `config.json`
+  already allows for `bedrock` and `fireworks`. An empty list is deny-by-default
+  and `"*"` for a Bedrock model list is exactly the widening this design exists
+  to avoid, so the template names models. The test fails if either list drifts,
+  in either direction, because a model in one file and not the other is a `404`
+  or an `AccessDenied` at request time.
+- **`key_ids: ["*"]` on each entry**, because a provider config with no keys
+  allows none: empty is deny, and `"*"` means "use the provider's keys" — the
+  deployment's, not the person's.
+- **No `budgets` and no `rate_limit`.** Skipped for pass one: AWS and Fireworks
+  already impose provider-level limits, and a per-person number chosen before
+  there is usage data can starve a person mid-task as easily as catch a runaway.
+  Coming back is a field in this file.
+- **No `name`**, which is the caller's email and belongs to the mint, not the
+  template: one name in a shared template is one name for everyone, and
+  Bifrost's unique index on the key name would hand the first caller's key to
+  the second.
 
 ## The image
 
