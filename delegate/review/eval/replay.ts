@@ -102,6 +102,30 @@ const asStrings = (v: unknown): string[] =>
 
 const sameSpot = (a: Finding, b: Finding) => a.path === b.path && a.line === b.line;
 
+const words = (text: string): Set<string> =>
+  new Set(text.toLowerCase().match(/[a-z0-9_]{4,}/g) ?? []);
+
+const MIN_OVERLAP = 0.6;
+
+const closestCall = (hypothesis: string, calls: SubagentCall[]): SubagentCall | undefined => {
+  if (hypothesis === "") return undefined;
+  const verbatim = calls.find((c) => c.prompt.includes(hypothesis));
+  if (verbatim) return verbatim;
+  const wanted = words(hypothesis);
+  if (wanted.size === 0) return undefined;
+  let best: SubagentCall | undefined;
+  let bestScore = MIN_OVERLAP;
+  for (const c of calls) {
+    const have = words(c.prompt);
+    const score = [...wanted].filter((w) => have.has(w)).length / wanted.size;
+    if (score >= bestScore) {
+      best = c;
+      bestScore = score;
+    }
+  }
+  return best;
+};
+
 export const traceLeads = (
   calls: SubagentCall[] | undefined,
   output: ReviewOutput | null,
@@ -128,11 +152,10 @@ export const traceLeads = (
       ...(typeof lead.lineRange === "string" ? { lineRange: lead.lineRange } : {}),
     };
 
-    // The orchestrator pastes each lead's fields into the deep-reviewer's
-    // prompt, so the hypothesis text finds the call that handled it.
-    const call = deep.find(
-      (c) => !claimed.has(c) && hypothesis !== "" && c.prompt.includes(hypothesis),
-    );
+    // The orchestrator restates each lead in the deep-reviewer's prompt in its
+    // own words, so a verbatim match misses (eval run 40754736623 traced all 8
+    // leads as not-investigated). Most of the hypothesis's words still appear.
+    const call = closestCall(hypothesis, deep.filter((c) => !claimed.has(c)));
     if (!call) {
       traces.push({ ...base, outcome: "not-investigated", findings: 0 });
       continue;

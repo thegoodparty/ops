@@ -199,10 +199,17 @@ The API reads no identity from the login and only takes bearers, so:
 Machine clients on the bypass paths (`/mcp`, `/mcp-user`, webhooks) keep
 their own bearer.
 
-What a person can do is what agent-swarm lets a user token do. New users get
-the built-in `admin` role, so that is nearly everything the operator key can
-do, with tasks, config and token changes attributed to them. On v2.6.0 a
-user token cannot create or edit swarm-scope MCP servers (lead only),
+What a person can do is what agent-swarm lets a user token do, which
+depends on their role. `host/admin-emails.txt` is the admin list: after the
+token sync, `sync-dashboard-users.sh` gives those addresses the built-in
+`admin` role and every other swarm user, including people the swarm only
+knows from Slack, `requester` (create, steer and cancel their own tasks; no
+config changes, no answering approvals). Grant or revoke admin with a PR to
+that file; an address there also needs to be in `allowed-emails.txt` to
+sign in. Roles set by hand in the API are overwritten on the next deploy.
+
+An admin can do nearly everything the operator key can do, with tasks,
+config and token changes attributed to them. On v2.6.0 a user token cannot create or edit swarm-scope MCP servers (lead only),
 steer a task someone else requested, refresh the model catalog, or read the
 asset key audit. Do those with `API_KEY` from the host (as `bootstrap.sh`
 does).

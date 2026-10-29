@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { recordSubagentResults, recordSubagentUses } from "./subagent-calls";
+import { SUBAGENT_TOOLS, recordSubagentResults, recordSubagentUses } from "./subagent-calls";
 import type { AgentConfig, AgentResult, RunOverrides, SubagentCall } from "./types";
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
@@ -14,27 +14,28 @@ const phaseFromAgentName = (name: string): string | null =>
 // and producing duplicate / contradictory reviews on the same SHA.
 // Synchronous Task blocks the parent turn until the subagent's final result
 // returns, which is what every existing agent prompt assumes anyway.
-const forceSynchronousTaskHook = async (input: unknown) => {
+export const forceSynchronousTaskHook = async (input: unknown) => {
   const i = input as {
     hook_event_name?: string;
     tool_name?: string;
     tool_input?: Record<string, unknown>;
   };
-  if (i.hook_event_name !== "PreToolUse" || i.tool_name !== "Task") {
+  if (i.hook_event_name !== "PreToolUse" || !SUBAGENT_TOOLS.has(i.tool_name ?? "")) {
     return { continue: true } as const;
   }
   const ti = (i.tool_input ?? {}) as Record<string, unknown>;
-  if (ti.run_in_background !== true) {
+  if (ti.run_in_background === false) {
     return { continue: true } as const;
   }
-  const { run_in_background: _drop, ...rest } = ti;
+  // The Agent tool runs in the background when the flag is omitted, so it is
+  // set to false rather than stripped.
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: "PreToolUse" as const,
-      updatedInput: rest,
+      updatedInput: { ...ti, run_in_background: false },
       additionalContext:
-        "Task tool calls are forced synchronous in this runtime; run_in_background was stripped. Wait for this Task's result before issuing the next tool call.",
+        "Subagent calls are forced synchronous in this runtime. Wait for this call's result before issuing the next tool call.",
     },
   };
 };
@@ -161,7 +162,7 @@ export const runAgent = async (
               summary.file = b.input.file_path;
             else if (b.name?.startsWith("mcp__"))
               summary.input = JSON.stringify(b.input).slice(0, 300);
-            else if (b.name === "Task") {
+            else if (b.name && SUBAGENT_TOOLS.has(b.name)) {
               if (b.input.subagent_type)
                 summary.subagent = b.input.subagent_type;
               if (b.input.run_in_background)
