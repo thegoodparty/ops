@@ -240,6 +240,29 @@ Every one of these is a `COMMENT`, never an `APPROVE`. The PR body of the review
 says which one fired, in the same body a reader already reads for findings, and
 the run record keeps the structured reason so step 5 can count them.
 
+The body states the two halves of the verdict separately, because a reader
+cannot otherwise tell "the reviewer found nothing wrong and the gate blocked
+it" from "the reviewer found problems", and those need opposite replies. So
+it carries a findings line (`none in this pass`, or the count, with the
+reviewer's own summary below it) and, distinct from it, a gate line naming the
+case and its detail (which plan, which owned path). The findings line is about
+that pass and nothing more: a clean review is not a claim that the code is
+sound (ops#392 is why — the reviewer reported no findings and a human then
+raised three, one a blocker), so the plain-language sentence names the gate as
+the obstacle rather than calling the changes correct. When the findings line is
+`none` the body says in plain words that this review flagged nothing, that the
+gate alone is why the review is a comment, and that a human approval is still
+required: the required status check and `CODEOWNERS` are unchanged, and the
+bot's review is not a required check. The line at the top, `Recommendation:`,
+reports the same judgement of the code: it says `approve` when this pass
+flagged nothing and `comment` when it did, so a human gets the signal that the
+code is good but the approval unsanctioned, while the gate line directly below
+states the action actually taken (`COMMENT`, never an `APPROVE`). The record
+keeps the two apart as well, as `findingsVerdict` (`none` | `findings`) beside
+`gating`, so the pair can be joined without reading prose. None of this is a
+new decision: the event is
+still `COMMENT` and the bot still approves nothing it did not approve before.
+
 | # | Case | Decided by | Why it is not the bot's call |
 |---|---|---|---|
 | 1 | no `Plan:` binding | harness | nothing to be consistent with |
@@ -278,10 +301,10 @@ ones in "What was verified".
 | `delegate/review/gating.ts` (new) | The pure part: parse a PR body for the binding (and the optional `Step:` line, which the gate ignores), parse `CODEOWNERS` text into ordered patterns, resolve a path to owned/unowned, and return a `GatingResult`. No network, no model, no GitHub types, so it is unit-testable and the whole deterministic half can be reasoned about without a run. |
 | `delegate/review/github.ts` | One helper, `getFileAtRef(repo, path, ref)` returning `{ blobSha, text } \| undefined`, over the contents API. The worker's checkout is a depth-50 clone at the PR head (`delegate/worker/entrypoint.ts`), so `main` is not reliably present locally; the base ref has to be read from GitHub. |
 | `delegate/review/bundle.ts` | `buildBundle` resolves the binding, fetches the plan at the base ref, and puts the plan path, blob sha and text on the bundle. The bundle is the agent's entire input and is persisted on the record, so a gating case is replayable as an eval case with no GitHub access. |
-| `delegate/review/schema.ts` | `Bundle` gains an optional `plan: { path, blobSha, text }`. `ReviewOutputSchema` gains `planConsistency: { verdict: "consistent" \| "inconsistent" \| "unclear", reasoning }` on the `complete` branch. `ReviewRecord` gains a `gating` object: `{ mode, binding, baseRef, authority: { checked, ownedPaths, reason }, flags[] }`. All new fields optional/defaulted, so records written before this lands still parse and still replay. |
+| `delegate/review/schema.ts` | `Bundle` gains an optional `plan: { path, blobSha, text }`. `ReviewOutputSchema` gains `planConsistency: { verdict: "consistent" \| "inconsistent" \| "unclear", reasoning }` on the `complete` branch. `ReviewRecord` gains a `gating` object: `{ mode, binding, baseRef, authority: { checked, ownedPaths, reason }, flags[] }`, and a `findingsVerdict` (`none` \| `findings`) beside it, so the reviewer's judgement of the code and the gate's judgement of the PR are recorded as separate facts. All new fields optional/defaulted, so records written before this lands still parse and still replay. |
 | `delegate/agents/pr-reviewer.ts` | `buildReviewPrompt` gains a `<plan>` element and the consistency instruction. The plan text gets the same treatment the diff gets: a per-run boundary token or escaping, so plan content cannot close its own element and write prompt structure. The section on findings is unchanged; findings stay authoritative and a finding still blocks on its own. |
 | `delegate/review/gates.ts` | The authority gate. `decide` grows an input for the gating result and returns `comment` with a reason for each of cases 1–4, and for case 5 when the model says anything other than `consistent`. See "The comment in `gates.ts`" below. |
-| `delegate/review/body.ts` | `renderBody` renders the gating line: the verdict, the binding and blob sha it was checked against, and the reason when it is a flag. A reviewer reading the PR sees why the bot did not approve without opening the run record. |
+| `delegate/review/body.ts` | `renderBody` renders the gating line: the verdict, the binding and blob sha it was checked against, and the reason when it is a flag. Beside it, and separate from it, the findings verdict: `none in this pass`, or the count with the reviewer's summary below. A clean PR the gate blocked says in plain words that this review flagged nothing, that the gate is the only reason for the comment, and that a human approval is still required. The findings line is deliberately about the pass, not about the code: ops#392 is the case where a clean review preceded a human finding a blocker. A reviewer reading the PR sees why the bot did not approve without opening the run record, and can tell a gate block from a finding. |
 | `delegate/review/run.ts` | Wires it: build the gating result next to the bundle, pass it to `decide`, pass the mode through, record it on the record, and emit the reason in `review_posted`. |
 | `delegate/review/gates.test.ts`, `bundle.test.ts`, `run.test.ts`, `body.test.ts`, `gating.test.ts` (new) | Unit tests for the parser (including a `CODEOWNERS` with no `*`, a path matched by two patterns, a body with two `Plan:` lines, and a `Step:` that is absent or malformed), for the flag cases, and for the approve path. |
 
@@ -440,7 +463,9 @@ makes it safe to run against real PRs for weeks before anything is loosened.
   analysis can filter to it.
 - The review body says it in shadow explicitly ("shadow: would have approved
   against `docs/x.md` at `<sha7>`"), because a silent dry run produces an
-  argument in a PR thread about whether the bot meant it.
+  argument in a PR thread about whether the bot meant it. The body states the
+  findings verdict separately from that line, so a shadow run that would have
+  commented on a finding does not read as a clean PR the gate merely delayed.
 
 **What the comparison is.** In shadow the bot never approves, so "compared
 against what humans actually did" means: for each shadow-reviewed PR, what did
@@ -553,7 +578,18 @@ to `CODEOWNERS`.
    number instead of a vibe.
 10. **A flag is a `COMMENT`, not an error and not a failure.** The PR goes to a
     human, which is the same outcome as today for that PR. `delegate`'s status
-    check is not required, so a comment costs nothing but a review request.
+    check is not required, so a comment costs nothing but a review request. The
+    comment still says what the bot thinks of the code, in two visibly separate
+    facts: the findings verdict (`none in this pass`, or the count and the
+    summary) and the gate verdict (which case fired and its detail). A clean PR
+    the gate blocked says in plain words that this review flagged nothing, that
+    the gate alone is why it is a comment, and that a human approval is still
+    required. The `Recommendation:` line carries the same signal: `approve`
+    when this pass flagged nothing, `comment` when it did, while the review
+    event stays `COMMENT` and the gate line states that. That is a statement
+    about the bot's own judgement, of this pass and no more — never a recorded
+    approval and never a claim that the code is correct (ops#392). The record
+    carries `findingsVerdict` beside `gating` so the two can be counted apart.
 11. **Progress status is derived from git/PR history; ClickUp is optional.**
     **Decided here**, from the review question. `docs/` is human-owned from
     step 2, so a checklist update in an implementation PR would put a human
@@ -765,7 +801,8 @@ merging #339 into this branch):
   the reviewed sha, and a tip that moves during the run dismisses instead of
   approving.
 - `delegate/review/body.ts` — `renderBody` is where a reason becomes visible to a
-  human reading the PR.
+  human reading the PR, and where the findings verdict and the gate verdict are
+  rendered as two separate facts.
 - `delegate/review/github.ts` — `getPull`, `postReview`, `dismissReview` and
   `getReviewState` exist; there is still no "read a file at a ref" helper yet.
 - `delegate/lambdas/github.ts` — `REVIEW_REPOS` includes `ops` with a comment

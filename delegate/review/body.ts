@@ -1,5 +1,5 @@
 import { GATING_FLAG_REASON, type GatingFlag } from "./gating";
-import type { Decision, DecisionGating } from "./gates";
+import type { Decision, DecisionGating, FindingsVerdict } from "./gates";
 
 const flagText = (flag: GatingFlag, g: DecisionGating): string => {
   const reason = GATING_FLAG_REASON[flag];
@@ -9,6 +9,41 @@ const flagText = (flag: GatingFlag, g: DecisionGating): string => {
     return `\`${flag}\`: ${reason} (${shown}${more})`;
   }
   return `\`${flag}\`: ${reason}`;
+};
+
+// The two halves of the verdict, stated as two facts. The gate line says why
+// the bot may not approve; this one says what this pass flagged. Without it a
+// comment gated for a missing `Plan:` line and a comment carrying a finding
+// read the same to a human, and they need opposite replies. The `in this pass`
+// is load-bearing: a clean pass is not a claim that the code is sound. In
+// ops#392 the reviewer reported no findings and a human reviewer then raised
+// three, one of them a blocker (the schema-failure fallback in `replay.ts`).
+const renderFindings = (f: FindingsVerdict): string =>
+  f.verdict === "none"
+    ? "**Findings: none in this pass.**"
+    : `**Findings: ${f.count} finding(s) in this pass.**`;
+
+// The plain-language half of the same fact, short enough to scan. It says what
+// this pass found, never that the code is correct: the obstacle it names is the
+// gate, not the diff. That distinction is the whole point of ops#392, and it is
+// why the sentence does not read "the changes look approvable". A human still
+// has to approve the PR: the required check and `CODEOWNERS` do not change
+// because the bot had nothing to flag.
+const renderJudgement = (g: DecisionGating, f: FindingsVerdict): string => {
+  if (f.verdict === "none") {
+    if (g.mode === "shadow") {
+      // Shadow withholds on its own only when no flag fired. With a flag, the
+      // gate is what would have blocked an approval too, and saying shadow
+      // alone did it would contradict the gate line in the same body.
+      return g.flags.length === 0
+        ? "This review flagged nothing, and shadow mode alone is why this is a comment rather than an approval. A human still has to approve this PR."
+        : "This review flagged nothing, but the gate flagged the PR as well, and shadow mode posts a comment either way. A human still has to approve this PR.";
+    }
+    return "This review flagged nothing; the gate alone is why this is a comment rather than an approval. A human still has to approve this PR — the bot's review is not a required check and `CODEOWNERS` is unchanged.";
+  }
+  return g.flags.length > 0
+    ? "The findings are why this is not an approval, and the gate flagged the PR independently."
+    : "The findings are why this is not an approval.";
 };
 
 // One line, in the same body a reviewer already reads for findings, carrying
@@ -40,6 +75,18 @@ const renderGating = (g: DecisionGating): string => {
   return `${head}${why}${tail}`;
 };
 
+// The top line is the bot's judgement of the code, not the review event. When
+// the gate withholds an approval the event is a `COMMENT` (the bot approves
+// nothing the gate does not sanction), but a pass that flagged nothing still
+// says so: a human reading the PR needs to know the gate is the only obstacle,
+// and the gate line below states the action. Ungated, the two are one thing.
+const recommendation = (d: Decision): "approve" | "comment" =>
+  d.gating !== undefined && d.findingsVerdict !== undefined
+    ? d.findingsVerdict.verdict === "none"
+      ? "approve"
+      : "comment"
+    : d.verdict;
+
 // Findings are inline comments, never body text. The body carries the verdict,
 // the agent's reasoning for it (so a human can check that the PR description,
 // the review and the code agree), and the bookkeeping a reader needs to trust it.
@@ -56,10 +103,18 @@ export const renderBody = (args: {
   const parts: string[] = [];
   const sha7 = args.headSha.slice(0, 7);
 
-  parts.push(`**Recommendation: ${args.decision.verdict}**`);
+  parts.push(`**Recommendation: ${recommendation(args.decision)}**`);
   // Absent when the gate did not run, which is what keeps an ungated body
-  // identical to the one it rendered before this existed.
+  // identical to the one it rendered before this existed. The findings verdict
+  // and the gate verdict are separate paragraphs on purpose; an approval is
+  // unchanged, because it is not withholding anything a reader has to explain.
+  const findings =
+    args.decision.verdict === "comment" ? args.decision.findingsVerdict : undefined;
+  if (findings) parts.push(renderFindings(findings));
   if (args.decision.gating) parts.push(renderGating(args.decision.gating));
+  if (findings && args.decision.gating) {
+    parts.push(renderJudgement(args.decision.gating, findings));
+  }
   parts.push(args.summary.trim());
 
   if (args.inlineCount > 0) {

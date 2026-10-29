@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
+import { ReviewRecordSchema } from "./schema";
 import type { ReviewRecord } from "./schema";
 
 test("gatingFor defaults to off and cannot be loosened by a bad value", () => {
@@ -101,6 +102,60 @@ test("statusForRecord says why when every finding could not be posted", () => {
     statusForRecord(base).description,
     "Shadow: would comment (unplaceable_findings)",
   );
+});
+
+// The record is the machine-readable half of the comment: the findings verdict
+// and the gate's verdict are separate fields, so "clean, blocked by the gate"
+// is countable without reading English. The field is optional, because "no
+// field" (a record written before it existed) is not "no findings".
+test("a gated record carries the findings verdict beside the gating result", () => {
+  const record = {
+    runId: "a0000000-0000-4000-8000-000000000001",
+    repo: "thegoodparty/ops",
+    prNumber: 42,
+    baseSha: "aaaaaa",
+    headSha: "bbbbbb",
+    trigger: "webhook",
+    agentVersion: "1.0.0",
+    model: "claude-opus-4-5",
+    startedAt: "2024-01-01T00:00:00.000Z",
+    finishedAt: "2024-01-01T00:01:00.000Z",
+    wallTimeMs: 60000,
+    costUsd: null,
+    bundle: {
+      repo: "thegoodparty/ops",
+      prNumber: 42,
+      baseRef: "main",
+      baseSha: "aaaaaa",
+      headSha: "bbbbbb",
+      author: "swain",
+      title: "A PR with no plan line",
+      body: "No plan here.",
+      diff: "diff --git a/foo.ts b/foo.ts\n",
+      changedFiles: ["foo.ts"],
+      priorFindings: [],
+    },
+    output: { status: "complete", findings: [], summary: "clean" },
+    verdict: "comment",
+    action: "commented",
+    gates: ["no_binding"],
+    findingsVerdict: "none",
+    gating: {
+      mode: "enforce",
+      binding: {},
+      baseRef: "main",
+      authority: { checked: true, ownedPaths: [], reason: "" },
+      flags: ["no_binding"],
+    },
+    findings: [],
+    droppedFindings: [],
+  };
+  const parsed = ReviewRecordSchema.parse(record);
+  assert.equal(parsed.findingsVerdict, "none");
+  assert.deepEqual(parsed.gating?.flags, ["no_binding"]);
+
+  const { findingsVerdict: _omitted, ...older } = record;
+  assert.equal(ReviewRecordSchema.parse(older).findingsVerdict, undefined);
 });
 
 // The bug this pins: `statusForRecord` knew what a gated comment was gated on,

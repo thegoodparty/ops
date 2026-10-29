@@ -68,6 +68,7 @@ describe("decide with the gate on", () => {
       verdict: "approve",
       action: "approve",
       gates: [],
+      findingsVerdict: { verdict: "none", count: 0 },
       gating: {
         mode: "enforce",
         wouldApprove: true,
@@ -78,6 +79,40 @@ describe("decide with the gate on", () => {
         ownedPaths: [],
       },
     });
+  });
+
+  it("records the findings verdict apart from the gate's verdict", () => {
+    // The join that matters: a comment can be the gate's alone, a finding's
+    // alone, or both. `findingsVerdict` is what the finding gate said, so the
+    // record answers "did the bot find anything wrong" without the comment
+    // being parsed as English, and without `wouldApprove` standing in for it.
+    const clean = decide(
+      { status: "complete", findings: [], summary: "clean" },
+      { gating: { ...clearGating, binding: {}, plan: undefined, flags: ["no_binding"] } },
+    );
+    assert.equal(clean.verdict, "comment");
+    assert.deepEqual(clean.findingsVerdict, { verdict: "none", count: 0 });
+
+    const found = decide(
+      { status: "complete", findings: [finding], summary: "one bug" },
+      { gating: { ...clearGating, binding: {}, plan: undefined, flags: ["no_binding"] } },
+    );
+    assert.deepEqual(found.findingsVerdict, { verdict: "findings", count: 1 });
+
+    // A finding the schema dropped is not a clean result even though it never
+    // reaches `output.findings`, so it counts here too.
+    const dropped = decide(
+      { status: "complete", findings: [], summary: "lossy" },
+      { gating: clearGating, unparseableCount: 1 },
+    );
+    assert.deepEqual(dropped.findingsVerdict, { verdict: "findings", count: 1 });
+  });
+
+  it("does not record a findings verdict when the gate did not run", () => {
+    // `off` stays byte-identical to the decision it was before the gate, and
+    // there the verdict and `findings` already answer the same question.
+    const d = decide({ status: "complete", findings: [finding], summary: "one bug" });
+    assert.equal("findingsVerdict" in d, false);
   });
 
   it("never approves under shadow, even when everything is in order", () => {

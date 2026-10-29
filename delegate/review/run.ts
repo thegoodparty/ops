@@ -540,8 +540,12 @@ export const runReview = async (args: {
   // The recorded form of the decision, built once the verdict is known: it has
   // to carry case 5 too, which is the model's answer and so is folded in by
   // `decide`. Absent when the gate did not run, which is how a reader tells a
-  // gated record from an ungated one.
+  // gated record from an ungated one. `findingsRecord` is the other half, kept
+  // out of `gating` on purpose: a clean PR the gate blocked and a PR with a
+  // finding are different outcomes, and the record has to say which without the
+  // comment being read.
   let gatingRecord: ReviewRecord["gating"];
+  let findingsRecord: ReviewRecord["findingsVerdict"];
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
@@ -566,6 +570,7 @@ export const runReview = async (args: {
       verdict: partial.verdict,
       action: partial.action,
       gates: partial.gates,
+      ...(findingsRecord !== undefined ? { findingsVerdict: findingsRecord } : {}),
       ...(gatingRecord !== undefined ? { gating: gatingRecord } : {}),
       findings: partial.findings,
       droppedFindings: partial.droppedFindings ?? [],
@@ -713,6 +718,7 @@ export const runReview = async (args: {
     ...(gating !== undefined ? { gating } : {}),
   });
   if (gating !== undefined && decision.gating !== undefined) {
+    findingsRecord = decision.findingsVerdict?.verdict;
     gatingRecord = {
       mode: decision.gating.mode,
       binding: decision.gating.binding,

@@ -150,6 +150,15 @@ export const ReviewRecordSchema = z.object({
   verdict: z.enum(["approve", "comment", "failed"]),
   action: z.enum(["approved", "commented", "failed", "skipped"]),
   gates: z.array(z.string()),
+  // The findings half of the verdict, beside `gating` rather than inside it:
+  // `findingsVerdict` is what the reviewer found (or did not), `gating` is
+  // whether the bot was allowed to approve at all. Keeping them apart is what
+  // makes "clean, blocked by the gate" joinable without parsing the comment,
+  // and it is why the count and the summary are not repeated here -- they are
+  // `findings`/`droppedFindings` and `output.summary` already. Optional: absent
+  // on records written before this field and on ungated runs
+  // (`DELEGATE_GATING_MODE=off`), where the verdict already says this much.
+  findingsVerdict: z.enum(["none", "findings"]).optional(),
   // Absent when the gate did not run: `DELEGATE_GATING_MODE=off` (the default)
   // or a repo that has not adopted gating. Presence is what tells a reader the
   // verdict was gated at all.
