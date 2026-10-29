@@ -12,13 +12,19 @@ files that belong in review:
   "`config.json`" below.
 - `config.test.ts` — the checks that keep `config.json` honest: valid JSON,
   both providers, both stores in Postgres, every `env.` reference a name the
-  deployment actually provides, no credential literal, and Bedrock's model
-  list matching `utils/bedrock-models.ts` (the list the task role's IAM is
-  built from, alongside the `bedrock:ListFoundationModels` grant that renders
-  it).
+  deployment actually provides, no credential literal, the US-only model rule
+  (no `global.` id, `us.` Bedrock profiles only, Fireworks US router ids and
+  the `us.api.fireworks.ai` endpoint, and the agreed class set pinned as
+  literals), and Bedrock's US-profile subset matching
+  `utils/bedrock-models.ts` (the list the task role's IAM is built from,
+  alongside the `bedrock:ListFoundationModels` grant that renders it).
 - `vk-mint-template.json` — the default per-person virtual key shape, as data
   ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md),
   step 1). See "Virtual-key template" below.
+- `vk-mint-template.test.ts` — pins the template's provider and model lists to
+  `config.json`, its Lambda-managed marker, decision 5's absences, and the same
+  US-only rule from the key's side, since a key may not name a model the
+  gateway would refuse.
 - `vk-mint-template.test.ts` — pins the template's provider and model lists to
   `config.json`, its Lambda-managed marker, and decision 5's absences.
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
@@ -69,23 +75,31 @@ a later tag. It holds:
   task definition's `PG_*` values rather than a connection string spelled in
   this file, and `logs_store.retention_days` is explicit (90) because the
   upstream default prunes nothing.
-- **Providers.** `fireworks`, with its key read from `env.FIREWORKS_API_KEY`
-  and an explicit model allowlist (not `*`), and `bedrock`, whose key carries
-  no credential at all: Bifrost inherits the ECS **task role** through the AWS
-  default credential chain, so `bedrock_key_config` sets only the region. The
-  Bedrock model list is the same set `utils/bedrock-models.ts` derives, which
-  is what the task role's IAM policy enumerates; the test fails if the two
-  drift, because a model in one and not the other is a 404 or an
-  `AccessDenied` at runtime. Listing that list is a separate permission from
-  invoking it: the provider renders its model list from a signed
-  `GET /foundation-models`, so the task role also holds
+- **Providers.** `fireworks`, pinned to Fireworks' US-only Serverless endpoint
+  (`network_config.base_url: https://us.api.fireworks.ai/inference`, the only
+  `base_url` in the schema at the pinned tag) with its key read from
+  `env.FIREWORKS_API_KEY` and an explicit list of US router ids
+  (`accounts/fireworks/routers/<model>-us`) rather than `*`; and `bedrock`,
+  whose key carries no credential at all: Bifrost inherits the ECS **task
+  role** through the AWS default credential chain, so `bedrock_key_config`
+  sets only the region. The Bedrock model list is the `us.`-profile subset of
+  `utils/bedrock-models.ts`, which is what the task role's IAM policy
+  enumerates; the test fails if the two drift, because a model in one and not
+  the other is a 404 or an `AccessDenied` at runtime. The IAM grant is allowed
+  to be wider than the gateway's list — it is the sandbox's direct path too —
+  and that is why the config carries no bare foundation-model id and no
+  `global.` profile: US-only inference is the rule (`docs/bifrost-gateway.md`,
+  "US-only inference"), and DeepSeek V3.2 is the class it costs, since Bedrock
+  publishes no `us.deepseek.v3.2` profile. Listing that list is a separate
+  permission from invoking it: the provider renders its model list from a
+  signed `GET /foundation-models`, so the task role also holds
   `bedrock:ListFoundationModels` (on `*`, since Bedrock defines no resource
   type for it). Without it the provider page shows
   `not authorized to perform: bedrock:ListFoundationModels` instead of the
-  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The
-  `us.`/`global.` inference profiles in the list need no separate read — they
-  come from the key's own `models` allowlist and are invoked through profile
-  ARNs the invoke statement grants.
+  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The `us.`
+  inference profiles in the list need no separate read — they come from the
+  key's own `models` allowlist and are invoked through profile ARNs the invoke
+  statement grants.
 - **Client settings.** Inference auth is enforced
   (`enforce_auth_on_inference: true`), direct provider keys are refused
   (`allow_direct_keys: false`), content logging is off with no per-request
@@ -208,8 +222,9 @@ What it carries, and why each is a decision (decision 5):
 - **`provider_configs` pinned explicitly**, to the model lists `config.json`
   already allows for `bedrock` and `fireworks`. An empty list is deny-by-default
   and `"*"` for a Bedrock model list is exactly the widening this design exists
-  to avoid, so the template names models. The test fails if either list drifts,
-  in either direction, because a model in one file and not the other is a `404`
+  to avoid, so the template names models — the US-only ones, so a key can never
+  name a model the gateway refuses. The test fails if either list drifts, in
+  either direction, because a model in one file and not the other is a `404`
   or an `AccessDenied` at request time.
 - **`key_ids: ["*"]` on each entry**, because a provider config with no keys
   allows none: empty is deny, and `"*"` means "use the provider's keys" — the

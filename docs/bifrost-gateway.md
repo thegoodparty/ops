@@ -658,7 +658,8 @@ are referenced by name, never written down here or in git.
   `use_anthropic_endpoints` for harnesses that speak the Anthropic Messages
   shape. The key is `env.FIREWORKS_API_KEY`, injected from Secrets Manager,
   and the config allows only the models the fleet actually uses rather than
-  `*`.
+  `*`. It is pinned to Fireworks' US-only Serverless endpoint and US router
+  ids; see "US-only inference" below.
 - **Bedrock** is the second provider. Upstream supports inherited IAM-role
   authentication (`docs/providers/supported-providers/bedrock.mdx`), and on
   Fargate that is the ECS task role, so no static AWS key is stored anywhere.
@@ -669,18 +670,95 @@ are referenced by name, never written down here or in git.
   list, so an invoke-only role serves inference and shows the provider warning
   where the models should be. Bedrock defines no resource type for that action,
   which is the one wildcard in the role. The pinned provider calls no
-  `ListInferenceProfiles`/`GetInferenceProfile`: the `us.`/`global.` profiles
-  the config allows are listed from the key's own `models` allowlist (the list
-  pipeline backfills allowlist entries the foundation-model response does not
-  contain) and invoked through their profile ARNs, which the invoke statement
-  already grants. The SCP's existing `bedrock` exemption keeps geo-profile
-  calls working. This is what lets the gateway take over Bedrock entirely,
-  including the per-user attribution the invocation log provides today.
+  `ListInferenceProfiles`/`GetInferenceProfile`: the `us.` profiles the config
+  allows are listed from the key's own `models` allowlist (the list pipeline
+  backfills allowlist entries the foundation-model response does not contain)
+  and invoked through their profile ARNs, which the invoke statement already
+  grants. The SCP's existing `bedrock` exemption keeps geo-profile calls
+  working. This is what lets the gateway take over Bedrock entirely, including
+  the per-user attribution the invocation log provides today.
 - **Other providers** (Anthropic direct, OpenAI direct) are added only if a
   harness needs them, each with its own `env.` reference. Provider fallback
   between Fireworks and Bedrock is a configuration choice; it is the main
   reliability argument for the gateway, and it should be turned on
   deliberately with a model mapping rather than left to a default.
+
+### US-only inference
+
+**Decision: no request may be served outside the United States, and the
+enforcement is the provider model lists in
+`deploy-workbench/bifrost/config.json`.** The gateway is the only path a harness
+has to a model, so the lists are where the rule can be a property of the
+deployment rather than a convention: a model not in a key's list is refused
+before any provider call, and the virtual-key template that a minted key is
+created from carries the same lists (`bifrost-virtual-keys.md`, decision 5), so
+a person's key cannot ask for what the gateway would not route.
+
+What that means per provider, all of it checked by
+`deploy-workbench/bifrost/config.test.ts`:
+
+- **Fireworks is on US-only Serverless.** The provider block carries
+  `network_config.base_url: "https://us.api.fireworks.ai/inference"`, and the
+  models are Fireworks' US router ids, `accounts/fireworks/routers/<model>-us`
+  (for the one class the fleet uses,
+  `accounts/fireworks/routers/deepseek-v4p1-flash-us`). Both halves are
+  needed: the router id scopes the model and the endpoint scopes the traffic.
+  `network_config.base_url` is the only `base_url` in Bifrost's schema at the
+  pinned tag — there is no per-key one — and the Fireworks provider uses it
+  for every request path, defaulting to the global
+  `https://api.fireworks.ai/inference` when it is unset
+  (`core/providers/fireworks/fireworks.go`). Setting it is therefore what makes
+  the global endpoint unreachable from the gateway rather than merely
+  unchosen; leaving it out is how a future edit reintroduces global traffic
+  without touching a model list.
+- **Bedrock keeps only `us.` cross-region inference profiles.** Every
+  `global.` id is gone, because `global.` is worldwide by definition, and every
+  bare foundation-model id is gone, because a bare id is not a US commitment at
+  all. The test refuses a `global.` anywhere in the file and any Bedrock model
+  id without the `us.` prefix, so a `global.` never comes back as a quiet
+  addition to a model list.
+- **DeepSeek V3.2 is not served by the gateway**, and this is the one class the
+  US-only rule costs. Bedrock has no `us.deepseek.v3.2` inference profile —
+  `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-10-29 returned
+  `us.deepseek.r1-v1:0` as the only DeepSeek profile — so the only way to keep
+  the class would have been the bare id, which is exactly the unqualified
+  routing the rule forbids. The class is removed rather than kept as an
+  exception. It stays in `utils/bedrock-models.ts`, because that list is the
+  sandbox's direct `WorkbenchAccess` grant rather than the gateway's, and IAM
+  may be wider than what the gateway serves.
+
+Two consequences are accepted with the decision:
+
+- **The Fireworks premium.** US-only Serverless models are priced at 1.5x the
+  base model's serverless price from 2026-09-01
+  (https://docs.fireworks.ai/serverless/us-only-serverless.md), and that is
+  accepted as the price of the residency guarantee. It also puts pressure on
+  the cost record, which is the one number the deferred budget would enforce
+  against: Bifrost's catalog either prices the base model or does not know the
+  router id at all, so item 16's reconciliation against a week of real billing
+  is what proves the per-key numbers and produces the override. The DeepSeek
+  V4.1 Flash class above is the only one on this provider today, so the premium
+  is one model's worth.
+- **Fireworks Enterprise data residency is deliberately not enabled.** The
+  endpoint and the router ids scope the gateway's traffic; they do not scope
+  the account. The same `FIREWORKS_API_KEY`, used outside Bifrost, can still
+  call global models, so this decision binds the gateway and not the account's
+  residency posture. Making it an account property is Fireworks' Data Residency
+  setting (an Enterprise feature and a procurement step), which is out of scope
+  here in the same way Bifrost Enterprise is. Stated once, here, so the residual
+  is a known one: if account-wide residency is ever needed, it is a Fireworks
+  contract change, not another edit to this file.
+
+One limit of the word "US" is worth writing down rather than discovering from a
+bill or an audit. A `us.` profile is a **geo** profile: AWS routes it among the
+profile's member regions, and for the Anthropic models the model card describes
+that geography as "within US and Canada" (`utils/bedrock-models.ts` records the
+same fact for Sonnet 5.5). So on Bedrock this rule means US geography as AWS
+defines it, which is the account's existing convention, not literal US soil.
+Only in-region invocation would be narrower, and several of these models
+support no in-region profile at all (Opus 5.5, Kimi K3), so it is not available
+for the set. The Fireworks half is stricter, because US-only Serverless is US
+inference by contract.
 
 Note that Bifrost's own **AWS Secrets Manager vault integration
 (`vault_store`) is an Enterprise feature** requiring a Postgres config store
@@ -951,9 +1029,13 @@ Review settled most of the earlier questions. What genuinely remains:
   (`postgres:16-alpine`); 17 is documented as supported but never exercised
   upstream. What remains is not a decision but a test: item 23 rehearses the
   restore.
-- **Model allowlist and Fireworks pricing.** Which models the fleet is allowed
-  to reach, and whether Bifrost's catalog pricing for them is correct. Wrong
-  pricing makes the budgets wrong.
+- ~~**Model allowlist.**~~ **Settled** in "US-only inference" under "Provider
+  configuration": the lists are US-only, eight classes, and the Fireworks
+  endpoint is the US-only host. What is left of this question is the pricing
+  half, and it is now sharper rather than smaller: US-only Serverless is 1.5x
+  the base price from 2026-09-01, so a catalog entry that prices the base model
+  is wrong by that factor and every per-key cost number inherits the error.
+  Wrong pricing makes a future budget wrong. Item 16.
 - **How a person is designated for a higher tier.** One key per person and one
   default tier are designed; "who may reach the higher-grade models" is
   deliberately deferred, with the two candidate shapes — a second Identity
@@ -1175,7 +1257,12 @@ network or a permission can land before the item that creates it.
     SSO, so the scraper reads it over loopback from the task or a sidecar, with
     the setup token the OSS setup lock requires.
 16. Reconcile gateway cost numbers against a week of provider billing for the
-    pilot, and add pricing overrides if they disagree.
+    pilot, and add pricing overrides if they disagree. The US-only premium is
+    the expected first disagreement: Fireworks' US-only Serverless is 1.5x the
+    base model's price, and Bifrost's catalog may price the base model or have
+    no entry for the router id at all, so the override is the multiplier and
+    the check is that the gateway's number matches the bill rather than the
+    catalog.
 17. Confirm the account budget is wired and that a threshold crossing is
     actually delivered (the workbench document's warning about alerts that only
     prove the wire exists). The Bifrost-side budgets this item used to name

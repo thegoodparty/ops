@@ -272,10 +272,19 @@ settled.** One default tier for everyone for now, so that a first key is
 uniform and a mistake is uniform:
 
 - **`provider_configs` is pinned explicitly** to the models already allowed in
-  `deploy-workbench/bifrost/config.json` and `utils/bedrock-models.ts`.
-  `provider_configs` empty is deny-by-default, so the template never relies on
-  an empty list, and it never says `"*"` for a Bedrock model list — "all
-  Bedrock" is exactly the widening this design exists to make deliberate.
+  `deploy-workbench/bifrost/config.json`. `provider_configs` empty is
+  deny-by-default, so the template never relies on an empty list, and it never
+  says `"*"` for a Bedrock model list — "all Bedrock" is exactly the widening
+  this design exists to make deliberate. The lists are **US-only**, the same
+  ones the gateway serves: `us.` Bedrock inference profiles and Fireworks' US
+  router ids, with the Fireworks provider pointed at the US-only endpoint in
+  `config.json` (no request may be served outside the United States;
+  `bifrost-gateway.md`, "US-only inference" under "Provider
+  configuration"). A key may therefore never name a model the gateway would
+  refuse, and `utils/bedrock-models.ts` is deliberately *not* the template's
+  source: it is the sandbox's direct `WorkbenchAccess` grant, which is wider
+  than the gateway's list, and a key scoped to it would ask for a bare
+  foundation-model id the gateway no longer routes.
   Each provider entry also carries `key_ids: ["*"]`, because a provider config
   with no keys allows none: empty is deny, `"*"` is "use the provider's keys",
   and the gateway's keys are the deployment's, not the person's.
@@ -576,9 +585,11 @@ not decided here.
 ```
 
 The model lists are the gateway's own, copied by the template test from
-`deploy-workbench/bifrost/config.json`; the team is the one item 14 creates.
-There is deliberately no `budgets` or `rate_limit` entry (decision 5): adding
-one later is adding a field here.
+`deploy-workbench/bifrost/config.json`, so a key is scoped to exactly what the
+gateway routes — the US-only list, eight classes, with DeepSeek V3.2 absent
+because Bedrock has no `us.` profile for it; the team is the one item 14
+creates. There is deliberately no `budgets` or `rate_limit` entry (decision 5):
+adding one later is adding a field here.
 
 ## Deferred, recorded and not designed
 
