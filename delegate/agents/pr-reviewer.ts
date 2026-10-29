@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
 import { defineAgent } from "../framework";
-import { findPlanStep, parsePlanBinding } from "../review/gating";
+import { findPlanSteps, parsePlanBinding } from "../review/gating";
 import { GIT_TOOL_NAMES } from "../review/git-tool";
 import { promptDiff } from "../review/prompt-diff";
 import {
@@ -84,22 +84,24 @@ ${pd.inline}
   // prompt structure either. The bound step is located here, not by the model,
   // so the primary spec is a property of the harness and the PR's `Step:` line.
   const boundStep = parsePlanBinding(bundle.body).step;
-  const locatedStep =
+  const locatedSteps =
     bundle.plan && boundStep !== undefined
-      ? findPlanStep(bundle.plan.text, boundStep)
-      : undefined;
-  const stepXml = locatedStep
-    ? `
-  <step number="${boundStep}" section="${escapeAttr(locatedStep.section)}">
-${escapeText(locatedStep.text)}
+      ? findPlanSteps(bundle.plan.text, boundStep)
+      : [];
+  const stepXml = locatedSteps
+    .map(
+      (s) => `
+  <step number="${boundStep}" section="${escapeAttr(s.section)}">
+${escapeText(s.text)}
   </step>
-`
-    : "";
+`,
+    )
+    .join("");
   const stepNote =
     boundStep === undefined
       ? "The PR names no `Step:`, so the whole plan is the spec; judge the diff against the step it implements."
-      : locatedStep
-        ? `The <step> element above is step ${boundStep}'s own text, located from the PR's \`Step:\` line. It is the spec; the rest of <plan> is context.`
+      : locatedSteps.length > 0
+        ? `The <step> elements above are step ${boundStep}'s own text, one per place the plan states it (the section is in its \`section\` attribute). Together they are the spec; the rest of <plan> is context.`
         : `The PR names step ${boundStep}, but the plan's text does not let the harness locate it, so the whole plan is the spec.`;
   const planXml = bundle.plan
     ? `  <plan path="${escapeAttr(bundle.plan.path)}" blob_sha="${escapeAttr(bundle.plan.blobSha)}">

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   consistencyFlag,
   evaluateGating,
-  findPlanStep,
+  findPlanSteps,
   hasStarDefault,
   isGatedRepo,
   isPlanPath,
@@ -399,9 +399,9 @@ describe("consistencyFlag", () => {
   });
 });
 
-// The prompt's primary spec is the bound step's own text, located here rather
-// than by the model, so the template has to find the same step a reader would.
-describe("findPlanStep", () => {
+// The prompt's spec is the bound step's own text, located here rather than by
+// the model, so the template has to find the same step a reader would.
+describe("findPlanSteps", () => {
   const checklist = [
     "## Progress",
     "",
@@ -412,15 +412,21 @@ describe("findPlanStep", () => {
     "",
     "Ordering is the point of the order.",
     "",
-    "1. `deploy/` is de-owned one path at a time.",
+    "## Decisions",
+    "",
+    "1. Not a step: a decision numbered the same way.",
   ].join("\n");
 
   it("locates a checklist step and stops at the next item", () => {
-    const found = findPlanStep(checklist, 1);
-    assert.equal(found?.section, "Progress");
-    assert.match(found!.text, /^- \[ \] 1\. Evals first/);
-    assert.match(found!.text, /They join the existing expected-result job\./);
-    assert.ok(!found!.text.includes("CODEOWNERS"), "must not run into step 2");
+    const found = findPlanSteps(checklist, 1);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].section, "Progress");
+    assert.match(found[0].text, /^- \[ \] 1\. Evals first/);
+    assert.match(found[0].text, /They join the existing expected-result job\./);
+    assert.ok(!found[0].text.includes("CODEOWNERS"), "must not run into step 2");
+    // A numbered list under "## Decisions" is not the step, even when the
+    // number matches: plans number their decisions the same way.
+    assert.ok(!found[0].text.includes("Not a step"));
   });
 
   it("prefers the implementation-plan list over an earlier numbered list", () => {
@@ -444,23 +450,59 @@ describe("findPlanStep", () => {
       "",
       "1. A numbered list outside the plan is not a step.",
     ].join("\n");
-    const found = findPlanStep(plan, 3);
-    assert.equal(found?.section, "Implementation plan");
-    assert.match(found!.text, /^3\. \*\*The mint Lambda\.\*\*/);
-    assert.match(found!.text, /read grant on the secret/);
-    assert.ok(!found!.text.includes("invoke grant"), "must stop at step 4");
+    const found = findPlanSteps(plan, 3);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].section, "Implementation plan");
+    assert.match(found[0].text, /^3\. \*\*The mint Lambda\.\*\*/);
+    assert.match(found[0].text, /read grant on the secret/);
+    assert.ok(!found[0].text.includes("invoke grant"), "must stop at step 4");
+    assert.ok(!found[0].text.includes("This is a decision"));
   });
 
-  it("locates a heading that literally names the step", () => {
-    const plan = ["## Step 2", "", "Add the role.", "", "## Step 3", "", "Add the function."].join("\n");
-    const found = findPlanStep(plan, 3);
-    assert.match(found!.text, /^## Step 3/);
-    assert.match(found!.text, /Add the function\./);
-    assert.ok(!found!.text.includes("Add the role"));
+  it("returns every place a plan states the same step", () => {
+    // Real plans combine shapes: a checklist line is the status, the
+    // implementation-plan entry is the detail. Choosing one is how the wrong
+    // text ends up as the spec, so both are returned, in document order.
+    const plan = [
+      "## Progress",
+      "",
+      "- [ ] 5. The rest of the corpus and the shadow run.",
+      "",
+      "## Implementation plan",
+      "",
+      "1. Evals first.",
+      "5. **The rest of the corpus.** The deterministic cases move to unit",
+      "   tests, and the two plan cases switch to their outcomes.",
+    ].join("\n");
+    const found = findPlanSteps(plan, 5);
+    assert.deepEqual(found.map((f) => f.section), ["Progress", "Implementation plan"]);
+    assert.match(found[0].text, /^- \[ \] 5\./);
+    assert.match(found[1].text, /^5\. \*\*The rest of the corpus\.\*\*/);
   });
 
-  it("returns undefined when the plan has no such step", () => {
-    assert.equal(findPlanStep(checklist, 7), undefined);
-    assert.equal(findPlanStep("# A plan with no numbered steps", 1), undefined);
+  it("returns a named step heading and the checklist entry that goes with it", () => {
+    const plan = [
+      "## Progress",
+      "",
+      "- [x] 5. Preview mode, done (PR #101).",
+      "",
+      "### Step 5: preview mode and the workflow",
+      "",
+      "Preview mode is an explicit variable.",
+      "",
+      "### Secrets in the diff",
+      "",
+      "Not part of step 5.",
+    ].join("\n");
+    const found = findPlanSteps(plan, 5);
+    assert.deepEqual(found.map((f) => f.section), ["Progress", "Step 5: preview mode and the workflow"]);
+    assert.match(found[1].text, /^### Step 5/);
+    assert.match(found[1].text, /Preview mode is an explicit variable\./);
+    assert.ok(!found[1].text.includes("Not part of step 5"));
+  });
+
+  it("returns nothing when the plan does not state the step", () => {
+    assert.deepEqual(findPlanSteps(checklist, 7), []);
+    assert.deepEqual(findPlanSteps("# A plan with no numbered steps", 1), []);
   });
 });

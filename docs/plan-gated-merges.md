@@ -329,9 +329,11 @@ What `consistent` means now, in the prompt and in the schema:
   `reasoning`; an amendment that widens what the step permits, or code that
   goes beyond it, is `inconsistent` (#411).
 
-The bound step's own text — located from the PR's `Step:` line against the
-plan's numbered list — is now the prompt's primary spec, with the rest of the
-document as context. The enum keeps three members: `unclear` still has to mean
+The bound step's own text — every place the plan states it, located from the
+PR's `Step:` line against the plan's numbered list and its `Step N` headings —
+is now the prompt's spec, with the rest of the document as context. A plan that
+states a step twice (a checklist line and the detailed implementation-plan
+entry, say) gives the model both, rather than the harness choosing one. The enum keeps three members: `unclear` still has to mean
 "I cannot tell", and every answer other than `consistent`, including a missing
 one, still flags. The two new fields are optional and only meaningful on a
 `consistent` answer, so a record written before them still parses and the
@@ -346,11 +348,11 @@ ones in "What was verified".
 
 | File | What changes |
 |---|---|
-| `delegate/review/gating.ts` (new) | The pure part: parse a PR body for the binding (and the optional `Step:` line, which the gate ignores), parse `CODEOWNERS` text into ordered patterns, resolve a path to owned/unowned, and return a `GatingResult`. No network, no model, no GitHub types, so it is unit-testable and the whole deterministic half can be reasoned about without a run. `findPlanStep` (2026-10-29) locates the bound step's own text for the prompt; it never affects the gate. |
+| `delegate/review/gating.ts` (new) | The pure part: parse a PR body for the binding (and the optional `Step:` line, which the gate ignores), parse `CODEOWNERS` text into ordered patterns, resolve a path to owned/unowned, and return a `GatingResult`. No network, no model, no GitHub types, so it is unit-testable and the whole deterministic half can be reasoned about without a run. `findPlanSteps` (2026-10-29) locates every place the plan states the bound step; it never affects the gate. |
 | `delegate/review/github.ts` | One helper, `getFileAtRef(repo, path, ref)` returning `{ blobSha, text } \| undefined`, over the contents API. The worker's checkout is a depth-50 clone at the PR head (`delegate/worker/entrypoint.ts`), so `main` is not reliably present locally; the base ref has to be read from GitHub. |
 | `delegate/review/bundle.ts` | `buildBundle` resolves the binding, fetches the plan at the base ref, and puts the plan path, blob sha and text on the bundle. The bundle is the agent's entire input and is persisted on the record, so a gating case is replayable as an eval case with no GitHub access. |
 | `delegate/review/schema.ts` | `Bundle` gains an optional `plan: { path, blobSha, text }`. `ReviewOutputSchema` gains `planConsistency: { verdict: "consistent" \| "inconsistent" \| "unclear", reasoning }` on the `complete` branch, with optional `additions` and `planDefects` (2026-10-29; see case 5's vocabulary above). `ReviewRecord` gains a `gating` object: `{ mode, binding, baseRef, authority: { checked, ownedPaths, reason }, flags[] }`, and a `findingsVerdict` (`none` \| `findings`) beside it, so the reviewer's judgement of the code and the gate's judgement of the PR are recorded as separate facts. All new fields optional/defaulted, so records written before this lands still parse and still replay. |
-| `delegate/agents/pr-reviewer.ts` | `buildReviewPrompt` gains a `<plan>` element and the consistency instruction, and gives the bound step its own `<step>` element as the primary spec, located from the PR's `Step:` line (2026-10-29). The plan text gets the same treatment the diff gets: a per-run boundary token or escaping, so plan content cannot close its own element and write prompt structure. The section on findings is unchanged; findings stay authoritative and a finding still blocks on its own. |
+| `delegate/agents/pr-reviewer.ts` | `buildReviewPrompt` gains a `<plan>` element and the consistency instruction, and gives the bound step its own `<step>` elements as the spec, one per place the plan states it, located from the PR's `Step:` line (2026-10-29). The plan text gets the same treatment the diff gets: a per-run boundary token or escaping, so plan content cannot close its own element and write prompt structure. The section on findings is unchanged; findings stay authoritative and a finding still blocks on its own. |
 | `delegate/review/gates.ts` | The authority gate. `decide` grows an input for the gating result and returns `comment` with a reason for each of cases 1–4, and for case 5 when the model says anything other than `consistent`. See "The comment in `gates.ts`" below. |
 | `delegate/review/body.ts` | `renderBody` renders the gating line: the verdict, the binding and blob sha it was checked against, and the reason when it is a flag. Beside it, and separate from it, the findings verdict: `none in this pass`, or the count with the reviewer's summary below. A clean PR the gate blocked says in plain words that this review flagged nothing, that the gate is the only reason for the comment, and that a human approval is still required. The findings line is deliberately about the pass, not about the code: ops#392 is the case where a clean review preceded a human finding a blocker. A reviewer reading the PR sees why the bot did not approve without opening the run record, and can tell a gate block from a finding. |
 | `delegate/review/run.ts` | Wires it: build the gating result next to the bundle, pass it to `decide`, pass the mode through, record it on the record, and emit the reason in `review_posted`. |

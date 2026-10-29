@@ -210,11 +210,35 @@ describe("buildReviewPrompt with a plan", () => {
     );
     assert.ok(prompt.includes("2. **The mint Lambda.**"));
     assert.ok(
-      prompt.includes("It is the spec; the rest of <plan> is context."),
+      prompt.includes("Together they are the spec; the rest of <plan> is context."),
       "the prompt must say which text is the spec",
     );
     const step = prompt.slice(prompt.indexOf("<step number="), prompt.indexOf("</step>"));
     assert.ok(!step.includes("The invoke grant"), "the step must stop at step 3");
+  });
+
+  it("includes every place the plan states the step, not just the first", () => {
+    // A checklist line and the implementation-plan entry are both the step.
+    // Giving the model only one of them is how the wrong text becomes the spec.
+    const prompt = buildReviewPrompt({
+      ...steppedBundle,
+      plan: {
+        ...steppedBundle.plan!,
+        text: [
+          "## Progress",
+          "",
+          "- [ ] 2. The mint Lambda, not started.",
+          "",
+          "## Implementation plan",
+          "",
+          "2. **The mint Lambda.** The function and the read grant on the secret.",
+        ].join("\n"),
+      },
+    });
+    assert.equal(prompt.split("<step number=").length - 1, 2);
+    assert.ok(prompt.includes('<step number="2" section="Progress">'));
+    assert.ok(prompt.includes('<step number="2" section="Implementation plan">'));
+    assert.ok(prompt.includes("one per place the plan states it"));
   });
 
   it("omits the step element when the PR names no step", () => {
