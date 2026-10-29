@@ -405,10 +405,26 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
     { provider },
   );
 
-  // Task ingress: the two container ports, from the ALB group only. This is
-  // the "nothing else may be reachable inbound to the task" requirement:
-  // there is no rule from a CIDR, so a request that did not come through the
-  // ALB is refused at the group even before a virtual key is checked.
+  // Task ingress: the two container ports, from the ALB group, plus one
+  // exception declared elsewhere. This is the "nothing else may be reachable
+  // inbound to the task" requirement: there is no rule from a CIDR, so a
+  // request that did not come through the ALB is refused at the group even
+  // before a virtual key is checked.
+  //
+  // The exception is 8080 from the vk-mint Lambda's own group, added by
+  // `bifrost-vk-mint.ts` (step 3 of docs/bifrost-virtual-keys.md) because
+  // `/api` through the ALB is behind oauth2-proxy and Google SSO, which a
+  // Lambda cannot pass. It is still a referenced group and not a CIDR, so it
+  // admits exactly that function; the reasoning and the rejected alternatives
+  // are in that module's header.
+  //
+  // The group's own `description` above still says "from the ALB only", and is
+  // deliberately left alone. `description` is ForceNew on this resource, so
+  // editing the string replaces the group — and with it every rule below, the
+  // database's ingress and both of the ALB's egress rules, which is a gateway
+  // outage for a sentence. The accurate description of the exception is on the
+  // rule itself (`bifrostTaskIngressVkMint`); a wording fix here belongs with a
+  // change that is replacing the group anyway.
   new aws.vpc.SecurityGroupIngressRule(
     "bifrostTaskIngressBifrost",
     {

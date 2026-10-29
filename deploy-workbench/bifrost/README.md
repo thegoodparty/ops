@@ -321,10 +321,13 @@ Basic credential. Two consequences worth knowing:
 
 ## Secrets (phase 2 item 11)
 
-Two Secrets Manager containers in the workbench account. Pulumi creates them
-empty (item 11) and the read grants; `fill-secrets.sh` in this directory writes
-the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
-`DELEGATE_SWARM`. Nothing secret is committed.
+Three Secrets Manager containers in the workbench account. `fill-secrets.sh` in
+this directory writes the values out of band, the same way
+`agent-swarm/fill-secrets.sh` fills `DELEGATE_SWARM`. Nothing secret is
+committed. `bifrost/gateway` and `bifrost/oauth2-proxy` are created empty by
+Pulumi (item 11); `bifrost/vk-mint` is created by the script itself, because
+nothing in the stack reads a secret value and a Pulumi-owned container would
+only add a lifecycle to a copy of one token.
 
 | Container | Key | Filled by |
 | --- | --- | --- |
@@ -336,6 +339,7 @@ the values out of band, the same way `agent-swarm/fill-secrets.sh` fills
 | `bifrost/oauth2-proxy` | `OAUTH2_PROXY_COOKIE_SECRET` | generated, 32 bytes base64url |
 | | `OAUTH2_PROXY_CLIENT_ID` | a human, from the Google client above |
 | | `OAUTH2_PROXY_CLIENT_SECRET` | a human, from the Google client above |
+| `bifrost/vk-mint` | `BIFROST_SETUP_TOKEN` | copied from `bifrost/gateway` by this script; the vk-mint Lambda's only credential |
 
 `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are also accepted, from the prompts or
 the env file, but never required: they exist only for the direct providers
@@ -345,6 +349,14 @@ through the gateway's admin API and lives only in Bifrost, which returns its
 own plaintext value, so there is no secret for this script to write
 ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md)). The RDS
 master credentials are managed by RDS in its own secret (phase 1 item 7).
+
+`bifrost/vk-mint` is decision 3 of
+[`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md): the mint
+Lambda needs the setup token, and reading it out of `bifrost/gateway` would also
+let a request-facing function read the encryption key and the Fireworks key. The
+copy has to be the gateway's *current* token, so `fill-secrets.sh` copies it,
+follows a `--force` rotation of the gateway's token automatically, and `--check`
+reports a mismatch without printing either value.
 
 Item 8 wires `bifrost/gateway` into the task definition's `secrets` list and
 item 9 wires the three `OAUTH2_PROXY_*` keys. The sidecar also reads

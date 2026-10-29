@@ -20,6 +20,7 @@ import {
   TARGET_GROUP_HEALTHY_THRESHOLD,
 } from "./ingress";
 import type { BifrostIngress } from "./ingress";
+import type { BifrostDiscovery } from "./discovery";
 import {
   OAUTH2_PROXY_ALPHA_CONFIG_CONTAINER_PATH,
   OAUTH2_PROXY_ALLOWLIST_CONTAINER_PATH,
@@ -937,6 +938,14 @@ export const createBifrostEcs = (args: {
    * new tag and a new task definition revision.
    */
   bootstrapRepositoryUrl: pulumi.Input<string>;
+  /**
+   * The Cloud Map service the task registers itself into, so the vk-mint Lambda
+   * has a name for the task that survives a replacement (step 3 of
+   * `docs/bifrost-virtual-keys.md`; the reasoning is `discovery.ts`'s). The
+   * service's ARN is the whole input: registration is one field on the ECS
+   * service below, not a second resource here.
+   */
+  discovery: BifrostDiscovery;
 }) => {
   const {
     provider,
@@ -946,6 +955,7 @@ export const createBifrostEcs = (args: {
     repositoryUrl,
     oauth2ProxyRepositoryUrl,
     bootstrapRepositoryUrl,
+    discovery,
   } = args;
 
   const imageUri = pulumi.interpolate`${repositoryUrl}:${BIFROST_UPSTREAM_TAG}`;
@@ -1438,6 +1448,23 @@ export const createBifrostEcs = (args: {
       // constants above for why they are not the defaults.
       deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
       deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT,
+      /**
+       * The task's stable name inside the VPC, `bifrost.workbench.local`.
+       *
+       * Added by step 3 of `docs/bifrost-virtual-keys.md`, and the reason is
+       * worth stating here because this file's header used to say there was no
+       * service discovery on purpose (which was true of the ALB/sidecar hop —
+       * those two containers share a namespace and use `127.0.0.1:8080`). The
+       * vk-mint Lambda is outside the task's namespace and has to reach the
+       * admin API on 8080, which `/api` through the ALB cannot serve (Google
+       * SSO). The task's ENI address changes on every replacement, so the name
+       * has to come from the scheduler; `discovery.ts` records the
+       * alternatives that were rejected.
+       *
+       * Registration is per-task, so the record follows a replacement after the
+       * namespace's 10-second TTL.
+       */
+      serviceRegistries: { registryArn: discovery.service.arn },
       healthCheckGracePeriodSeconds: BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
       networkConfiguration: {
         subnets: network.privateSubnetIds,

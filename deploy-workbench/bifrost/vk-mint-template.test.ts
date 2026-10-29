@@ -2,6 +2,11 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+  isManagedKeyDescription,
+  VK_DESCRIPTION,
+  VK_DESCRIPTION_MARKER,
+} from "./vk-marker";
 
 /**
  * The default virtual key shape, as data: step 1 of
@@ -31,14 +36,11 @@ const TEMPLATE_PATH = path.resolve(__dirname, "vk-mint-template.json");
 const TEMPLATE_SOURCE = fs.readFileSync(TEMPLATE_PATH, "utf8");
 
 /**
- * Identifies a key as Lambda-managed. It is the janitor's only input (step 5):
- * a key without it — a test key, an experiment, one a human made in the
- * dashboard — is never deactivated by a job. The design leaves the exact
- * string to the implementer, in one constant, matched by both Lambdas; this
- * copy is deliberate, so changing the marker has to change the template, this
- * test and both Lambdas instead of one of them silently.
+ * The marker is imported from `./vk-marker`, not redeclared here: it is the
+ * janitor's only input (step 5) and the mint's (step 3), and three copies of
+ * one string is how a key the mint created stops looking managed to the job
+ * that deactivates it. This test's job is to pin the file to that constant.
  */
-const DESCRIPTION_MARKER = "lambda-managed";
 
 type ProviderConfigEntry = {
   provider: string;
@@ -91,8 +93,17 @@ describe("bifrost virtual-key template", () => {
       "the template has no description, which is where the janitor looks for the marker",
     );
     assert.ok(
-      description.startsWith(DESCRIPTION_MARKER),
-      `the description must start with "${DESCRIPTION_MARKER}"; it is the only thing that marks a key as safe for the janitor to deactivate`,
+      isManagedKeyDescription(description),
+      `the description must start with "${VK_DESCRIPTION_MARKER}"; it is the only thing that marks a key as safe for the janitor to deactivate`,
+    );
+    // The whole description, not only the prefix: the template file and the
+    // constant the mint also writes (`VK_DESCRIPTION`) are the same string, so
+    // a mint that creates from this file produces exactly what a human reading
+    // the dashboard expects.
+    assert.equal(
+      description,
+      VK_DESCRIPTION,
+      "the template's description drifted from vk-marker.ts's VK_DESCRIPTION",
     );
     // The key is created active. A template that created a deactivated key
     // would mint a key that authenticates nowhere.
