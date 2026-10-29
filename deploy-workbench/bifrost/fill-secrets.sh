@@ -19,14 +19,10 @@
 #                          FIREWORKS_API_KEY
 #   bifrost/oauth2-proxy   OAUTH2_PROXY_CLIENT_ID, OAUTH2_PROXY_CLIENT_SECRET,
 #                          OAUTH2_PROXY_COOKIE_SECRET
-#   bifrost/vk-mint        BIFROST_SETUP_TOKEN
 #
-# bifrost/vk-mint is the setup-token copy the vk-mint Lambda reads (step 3 of
-# docs/bifrost-virtual-keys.md, decision 3). It is a separate container so the
-# request-facing function can read the token without also being able to read
-# bifrost/gateway's encryption key and Fireworks key. The value has to be the
-# *same* token the gateway was started with, so this script copies it and
-# reports a mismatch rather than asking a human to paste it twice.
+# The vk-mint and vk-janitor Lambdas read BIFROST_SETUP_TOKEN from
+# bifrost/gateway itself (decision 3 of docs/bifrost-virtual-keys.md), so there
+# is no second setup-token container to fill and nothing to keep in step.
 #
 # `VK_*` virtual key values are deliberately not handled here: they arrive with
 # the `engineering` team in phase 2 item 14, and their names depend on the keys
@@ -49,17 +45,12 @@ set -euo pipefail
 
 GATEWAY_SECRET="bifrost/gateway"
 OAUTH_SECRET="bifrost/oauth2-proxy"
-# The mint Lambda's setup-token copy. The name is also a constant in
-# deploy-workbench/bifrost-vk-mint.ts (VK_MINT_SECRET_NAME), which grants read
-# on this pattern; the two have to agree.
-VK_MINT_SECRET="bifrost/vk-mint"
 ACCOUNT_ID="024901689212"
 REGION="us-west-2"
 ADMIN_USERNAME="bifrost-admin"
 
 GATEWAY_DESCRIPTION="Bifrost gateway runtime secrets. Filled out of band with deploy-workbench/bifrost/fill-secrets.sh."
 OAUTH_DESCRIPTION="oauth2-proxy credentials for the Bifrost admin surface. Filled out of band with deploy-workbench/bifrost/fill-secrets.sh."
-VK_MINT_DESCRIPTION="The Bifrost setup token, for the vk-mint Lambda only (docs/bifrost-virtual-keys.md decision 3). A copy of bifrost/gateway's BIFROST_SETUP_TOKEN; filled out of band with deploy-workbench/bifrost/fill-secrets.sh."
 
 # Keys a human supplies. Never required by --generated-only, and never taken
 # from argv: a value in argv is visible in `ps` and in shell history.
@@ -392,8 +383,7 @@ commit() {  # secret id, description
 # Names only. Never a value, never a length.
 report() {  # returns 1 if a container is missing
   local id key missing=0 unset_keys=() oauth_have=0
-  local vmint_json vmint_exists gateway_token mint_token
-  for id in "$GATEWAY_SECRET" "$OAUTH_SECRET" "$VK_MINT_SECRET"; do
+  for id in "$GATEWAY_SECRET" "$OAUTH_SECRET"; do
     bold "$id"
     fetch_current "$id"
     if [[ $CURRENT_EXISTS == 0 ]]; then
@@ -413,8 +403,6 @@ report() {  # returns 1 if a container is missing
   gateway_json="$CURRENT"; gateway_exists="$CURRENT_EXISTS"
   fetch_current "$OAUTH_SECRET"
   oauth_json="$CURRENT"; oauth_exists="$CURRENT_EXISTS"
-  fetch_current "$VK_MINT_SECRET"
-  vmint_json="$CURRENT"; vmint_exists="$CURRENT_EXISTS"
 
   for key in "${REQUIRED_KEYS[@]}"; do
     case "$key" in
@@ -435,28 +423,18 @@ report() {  # returns 1 if a container is missing
   echo
   if [[ ${#unset_keys[@]} -gt 0 ]]; then
     echo "Still unset (${#unset_keys[@]}): ${unset_keys[*]}"
+    # A required key that is not there is a failure, which used to arrive by
+    # way of the mint copy's own check. The Lambdas read the gateway's token
+    # now, so no other line would notice a gateway with none: `--check` exits
+    # non-zero for any unset required key, not only for a missing container.
+    missing=1
   else
     echo "Every required key is present."
   fi
 
-  # The mint's token must be the gateway's own, or the gateway refuses it as a
-  # wrong setup token, a failure that only shows up on the first mint. The
-  # values are compared in memory and never printed.
-  if [[ $vmint_exists == 0 ]]; then
-    echo "bifrost/vk-mint does not exist: the vk-mint Lambda has no setup token."
-    missing=1
-  else
-    gateway_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$gateway_json")"
-    mint_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$vmint_json")"
-    if [[ -z "$mint_token" ]]; then
-      echo "bifrost/vk-mint has no BIFROST_SETUP_TOKEN: the vk-mint Lambda will fail closed."
-      missing=1
-    elif [[ -n "$gateway_token" && "$mint_token" != "$gateway_token" ]]; then
-      echo "bifrost/vk-mint's setup token differs from the gateway's; the gateway will refuse it."
-      echo "Re-run with --generated-only to copy the gateway's token across."
-      missing=1
-    fi
-  fi
+  # The mint and the janitor read BIFROST_SETUP_TOKEN from bifrost/gateway, so
+  # the REQUIRED_KEYS check above is the whole of the check: a gateway with no
+  # token is a lambda that fails closed on its first call.
 
   if [[ $oauth_exists == 1 ]]; then
     for key in OAUTH2_PROXY_CLIENT_ID OAUTH2_PROXY_CLIENT_SECRET OAUTH2_PROXY_COOKIE_SECRET; do
@@ -491,7 +469,7 @@ if [[ $MODE == fill ]]; then
   fi
 fi
 
-bold "1/3  $GATEWAY_SECRET"
+bold "1/2  $GATEWAY_SECRET"
 fetch_current "$GATEWAY_SECRET"
 if [[ $CURRENT_EXISTS == 1 ]]; then
   echo "  container exists"
@@ -553,31 +531,6 @@ ensure_generated BIFROST_ADMIN_PASSWORD "$(gen_password)" 1
 # new value in Secrets Manager by the end of the run.
 ensure_generated BIFROST_SETUP_TOKEN "$(gen_secret)" 1
 
-# The value this run leaves in $GATEWAY_SECRET, captured before commit()
-# unsets the variables: the mint's copy has to be exactly this string.
-#
-# Which value depends on whether this run writes the key, not on whether the
-# variable happens to be set: `ensure_generated` exports BIFROST_SETUP_TOKEN
-# only when it is creating or (`--force`) regenerating it, and $CURRENT is
-# stale after that — it is assigned only inside `fetch_current`. So a rewritten
-# token comes from the variable (which is the generated one, never an ambient
-# one: `ensure_generated` overwrites it), and a kept token comes from $CURRENT.
-# Reading $CURRENT first is wrong on `--force`; reading the variable first
-# unconditionally is wrong because it trusts the operator's shell.
-gateway_token_rewritten=0
-for key in "${WRITE_KEYS[@]:-}"; do
-  if [[ "$key" == "BIFROST_SETUP_TOKEN" ]]; then gateway_token_rewritten=1; fi
-done
-if [[ $gateway_token_rewritten == 1 ]]; then
-  gateway_setup_token="${BIFROST_SETUP_TOKEN:-}"
-else
-  gateway_setup_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
-fi
-
-# Whether this run rewrote the gateway's token. If it did, bifrost/vk-mint must
-# follow it whatever --force says, or the mint starts sending a token the
-# gateway no longer accepts. Computed above, beside the value it selects.
-
 if [[ $MODE == fill ]]; then
   collect_human FIREWORKS_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
 else
@@ -586,7 +539,7 @@ fi
 
 commit "$GATEWAY_SECRET" "$GATEWAY_DESCRIPTION"
 
-bold "2/3  $OAUTH_SECRET"
+bold "2/2  $OAUTH_SECRET"
 fetch_current "$OAUTH_SECRET"
 if [[ $CURRENT_EXISTS == 1 ]]; then
   echo "  container exists"
@@ -607,44 +560,6 @@ else
 fi
 
 commit "$OAUTH_SECRET" "$OAUTH_DESCRIPTION"
-
-bold "3/3  $VK_MINT_SECRET"
-fetch_current "$VK_MINT_SECRET"
-if [[ $CURRENT_EXISTS == 1 ]]; then
-  echo "  container exists"
-else
-  echo "  container does not exist; it will be created"
-fi
-WRITE_KEYS=()
-
-if [[ -z "$gateway_setup_token" ]]; then
-  echo "  BIFROST_SETUP_TOKEN: $GATEWAY_SECRET has no token yet, so there is nothing to copy"
-else
-  existing_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
-  if [[ "$existing_token" == "$gateway_setup_token" ]]; then
-    echo "  BIFROST_SETUP_TOKEN: already matches the gateway's, keeping"
-  else
-    # A copy that differs from the token this run leaves in $GATEWAY_SECRET is
-    # stale, and overwriting it is safe: the gateway's own value is not changing,
-    # so nothing needs rotating. `--force` is *not* the repair -- it regenerates
-    # BIFROST_ADMIN_PASSWORD, BIFROST_SETUP_TOKEN and OAUTH2_PROXY_COOKIE_SECRET,
-    # signing everyone out of the admin UI and rotating the gateway's token out
-    # from under the running task, which keeps the old one until it is redeployed
-    # -- and the fresh copy then gives the mint a token the gateway refuses. A
-    # plain re-run (or --generated-only) is the repair, and it copies without
-    # touching anything else. That is why this branch has no $FORCE condition.
-    export BIFROST_SETUP_TOKEN="$gateway_setup_token"
-    WRITE_KEYS+=("BIFROST_SETUP_TOKEN")
-    if [[ $gateway_token_rewritten == 1 ]]; then
-      echo "  BIFROST_SETUP_TOKEN: copied from $GATEWAY_SECRET (which this run rewrote)"
-    elif [[ -n "$existing_token" ]]; then
-      echo "  BIFROST_SETUP_TOKEN: replaced the stale copy with $GATEWAY_SECRET's"
-    else
-      echo "  BIFROST_SETUP_TOKEN: copied from $GATEWAY_SECRET"
-    fi
-    commit "$VK_MINT_SECRET" "$VK_MINT_DESCRIPTION"
-  fi
-fi
 
 bold "Result"
 if report; then

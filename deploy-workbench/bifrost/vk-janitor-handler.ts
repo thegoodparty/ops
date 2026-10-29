@@ -28,7 +28,7 @@
  *
  *   BIFROST_BASE_URL          http://bifrost.workbench.local:8080 — the task,
  *                             via Cloud Map, not the ALB
- *   SETUP_TOKEN_SECRET_NAME   `bifrost/vk-mint`, the same container the mint
+ *   SETUP_TOKEN_SECRET_NAME   `bifrost/gateway`, the same container the mint
  *                             reads (decision 6)
  *   SETUP_TOKEN_SECRET_JSON_KEY  BIFROST_SETUP_TOKEN
  *   READER_ROLE_ARN           the management-account `bifrost-vk-reader`

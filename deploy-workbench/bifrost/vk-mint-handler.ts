@@ -22,7 +22,8 @@
  *                             via Cloud Map, not the ALB (`/api` there is
  *                             behind oauth2-proxy and Google SSO)
  *   TEMPLATE_PARAMETER_NAME   the SSM String parameter holding the template
- *   SETUP_TOKEN_SECRET_NAME   `bifrost/vk-mint` (decision 3's open item)
+ *   SETUP_TOKEN_SECRET_NAME   `bifrost/gateway`, the gateway's own container
+ *                             (decision 3)
  *   SETUP_TOKEN_SECRET_JSON_KEY  BIFROST_SETUP_TOKEN
  *   READER_ROLE_ARN           the management-account `bifrost-vk-reader`
  *   READER_SESSION_NAME       `VK_READER_SESSION_NAME`, imported from the role

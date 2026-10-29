@@ -186,13 +186,44 @@ consequences, both requirements rather than advice:
   request or response bodies — a virtual key appears in both, in plaintext —
   and a thrown error must not carry the body into CloudWatch.
 - **Only the mint Lambda, the janitor (decision 6) and the oauth2-proxy
-  sidecar may read the secret.** No human, no other task, no CI job.
-  `bifrost/gateway` also holds the encryption key and the Fireworks key, so the
-  Lambda's `secretsmanager:GetSecretValue` grant on that container reaches more
-  than the token it uses; a dedicated `bifrost/vk-mint` container holding only
-  `BIFROST_SETUP_TOKEN` would close that gap, at the cost of a second copy of
-  one credential the design never rotates. Recorded as an open item rather than
-  decided here.
+  sidecar may read the token.** No human, no other task, no CI job. Both
+  Lambdas read `BIFROST_SETUP_TOKEN` out of `bifrost/gateway` itself, the same
+  container the gateway task and the sidecar read, and their
+  `secretsmanager:GetSecretValue` grants name that one ARN pattern and nothing
+  else. **What that costs is accepted deliberately, not overlooked:** the
+  container also holds `BIFROST_ENCRYPTION_KEY` and `FIREWORKS_API_KEY`, so a
+  compromise of either function's execution role reaches the key that decrypts
+  every provider credential in the config store and the key that spends the
+  provider account — not just the setup token. An earlier revision of this
+  decision bought a narrower grant with a dedicated `bifrost/vk-mint` container
+  holding only the token; the two paragraphs below record why that was
+  reversed, and what it makes unnecessary.
+
+**The dedicated container, dropped — this resolves open item 4.**
+`bifrost/vk-mint` was a real boundary on paper and a copy in practice. It was
+created and filled out of band by
+`deploy-workbench/bifrost/fill-secrets.sh`, no deploy filled it on a first
+apply, and the first mint after a green deploy answered
+`500 could not read the setup token`: the infrastructure had applied and the one
+value the function existed to read was absent. A deploy cannot close that gap
+either — copying the value during `pulumi up` means reading a secret at program
+time, which `deploy-role-trust.md` rules out (`pr-previews.md` step 3 is the same
+rule from the other side), and letting Pulumi own a generated secret would put
+the token in state, which no resource in this repository does. The boundary was
+thin anyway: both containers held the same value, so the second one never
+stopped a caller who could read the first. It added a copy to keep in step, for
+a credential the design never rotates, and it moved the failure from "a
+permission too wide" to "a green deploy and a mint that cannot work".
+
+**What is now unnecessary.** Nothing copies the token, nothing compares two
+copies, and there is no out-of-band step between a successful apply and a mint
+that works. `fill-secrets.sh` no longer creates, fills or checks a
+`bifrost/vk-mint`; the gateway's own `BIFROST_SETUP_TOKEN` generation is
+unchanged, because the gateway still needs one. An account that already has
+`bifrost/vk-mint` from an older run may keep or delete it: **nothing reads it
+after this merges**, and because it was never a Pulumi resource, removing the
+grants did not remove the container. Deleting it is cleanup, not part of this
+design.
 
 **The function must reach Bifrost from inside the VPC.** The ALB routes `/api`
 through oauth2-proxy and Google SSO, which a Lambda cannot pass; there is no
@@ -368,10 +399,10 @@ Rules, each of which is a decision:
   user is not a member, and is deactivated — the fail-closed direction.
 - **The janitor holds the setup token too**, for the same reason the mint
   function does (decision 3): it is the second caller of the admin API, so it
-  reads the same secret, is granted the same one container, and is under the
-  same rule about never logging a body. It only ever sends `is_active` and
-  expiry fields, so its blast radius is narrower than the mint path's even
-  though its credential is not.
+  reads the same container — `bifrost/gateway` — is granted that one ARN
+  pattern and nothing else, and is under the same rule about never logging a
+  body. It only ever sends `is_active` and expiry fields, so its blast radius
+  is narrower than the mint path's even though its credential is not.
 
 **Revocation on offboarding is in pass one even though rotation is not.** They
 look like the same feature and they are not: rotation is scheduled hygiene with
@@ -660,9 +691,9 @@ Step: 2
    service, A records registered by the ECS service, so the function calls
    `http://bifrost.workbench.local:8080` rather than an address that changes on
    every deploy), the SSM-backed template, the read grant on `bifrost/gateway`
-   (or a dedicated `bifrost/vk-mint`, per the open item), the log group, the
-   membership check, and the idempotency logic with its unit tests
-   (exact-match filter, reactivation that also clears `expires_at` and
+   for `BIFROST_SETUP_TOKEN` (open item 4, resolved: one container, no copy),
+   the log group, the membership check, and the idempotency logic with its unit
+   tests (exact-match filter, reactivation that also clears `expires_at` and
    `delete_after_expire`, `409`-then-reread, a non-member refused, a directory
    read error refused).
    **Depends on steps 1 and 2 and the gateway being deployed**; the network
@@ -676,7 +707,10 @@ Step: 2
    that lets a person reach the mint at all, and the one that needs a human's
    sign-off, because it is an identity-policy change.
 5. **The janitor.** The Lambda plus its hourly `EventBridge` rule in
-   `deploy-workbench/`, assuming step 2's read-only role. **Depends on step 2**;
+   `deploy-workbench/`, assuming step 2's read-only role and granted the same
+   single-container read of `BIFROST_SETUP_TOKEN` from `bifrost/gateway` that
+   step 3 has (`secretsmanager:GetSecretValue` on that ARN pattern and nothing
+   else). **Depends on step 2**;
    before it the first run is an `AccessDenied` that does nothing (fail closed),
    so the two may land in either order and the schedule absorbs the race.
 6. **`gp-pi bifrost-key` and the `models.json` entry**, in
@@ -742,11 +776,16 @@ Everything else:
    revisiting if the gateway's request logs show a revoked key still being used
    after an hour, or if the janitor's own runs turn out to be the noisiest
    thing in the account.
-4. **Which secret the mint Lambda reads.** `bifrost/gateway` is one read grant
-   and one copy of the token, but it also makes the encryption key and the
-   Fireworks key readable by the function. A dedicated `bifrost/vk-mint`
-   container holding only `BIFROST_SETUP_TOKEN` closes that at the cost of a
-   second copy. The engineer's call; the design works either way.
+4. **Which secret the mint Lambda reads — resolved, not open.** Both Lambdas
+   read `BIFROST_SETUP_TOKEN` from `bifrost/gateway`, and the dedicated
+   `bifrost/vk-mint` container is gone from the design and from
+   `fill-secrets.sh`. Decision 3 records the choice and the reasoning: a deploy
+   cannot copy a secret value, the copy was never automated, and the first mint
+   failed with a `500` after a green deploy because of it. The cost is stated
+   there and not softened: each function's role can now read the encryption key
+   and the Fireworks key too, because they are in the same container. The one
+   leftover is operational — an account that already has `bifrost/vk-mint` may
+   delete it, and nothing reads it after this merges.
 5. **The command's name inside the container.** `gp-pi bifrost-key` is the
    design's name for the interface; the image has no `gp-pi` executable, so
    decision 7's two options are a new dispatcher or the `gp-bifrost-key` idiom.
