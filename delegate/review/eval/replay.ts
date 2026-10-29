@@ -110,15 +110,22 @@ const words = (text: string): Set<string> =>
 
 const MIN_OVERLAP = 0.6;
 
-const closestCall = (area: string, hypothesis: string, calls: SubagentCall[]): SubagentCall | undefined => {
+const closestCall = (
+  area: string,
+  hypothesis: string,
+  all: SubagentCall[],
+  claimed: Set<SubagentCall>,
+): SubagentCall | undefined => {
   if (hypothesis === "") return undefined;
+  const calls = all.filter((c) => !claimed.has(c));
   const verbatim = calls.find((c) => c.prompt.includes(hypothesis));
   if (verbatim) return verbatim;
   // The orchestrator rewords the hypothesis but copies the area as written
-  // (eval run 40882274151: every area in exactly one prompt). A short area
-  // found in several prompts says nothing, so it falls through.
-  const byArea = area === "" ? [] : calls.filter((c) => c.prompt.includes(area));
-  if (byArea.length === 1) return byArea[0];
+  // (eval run 40882274151: every area in exactly one prompt). Uniqueness is
+  // checked across all prompts, claimed ones too: a short area found in
+  // several says nothing, even after earlier leads claim the others.
+  const byArea = area === "" ? [] : all.filter((c) => c.prompt.includes(area));
+  if (byArea.length === 1 && !claimed.has(byArea[0])) return byArea[0];
   const wanted = words(hypothesis);
   if (wanted.size === 0) return undefined;
   let best: SubagentCall | undefined;
@@ -163,7 +170,7 @@ export const traceLeads = (
     // The orchestrator restates each lead in the deep-reviewer's prompt in its
     // own words, so a verbatim match misses (eval run 40754736623 traced all 8
     // leads as not-investigated). Most of the hypothesis's words still appear.
-    const call = closestCall(area, hypothesis, deep.filter((c) => !claimed.has(c)));
+    const call = closestCall(area, hypothesis, deep, claimed);
     if (!call) {
       traces.push({ ...base, outcome: "not-investigated", findings: 0 });
       continue;

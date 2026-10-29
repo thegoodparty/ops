@@ -727,3 +727,26 @@ test("replayCase does not match on an area that appears in several prompts", asy
   const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
   assert.equal(result.leads?.[0].outcome, "not-investigated");
 });
+
+test("replayCase does not treat an area as unique once earlier leads claimed its other prompts", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "diff",
+      result: JSON.stringify({
+        leads: [leadOf("Retry", "the retry swallows errors"), leadOf("Tests", "zzz qqq")],
+        summary: "2 leads",
+      }),
+    },
+    { subagent: "deep-reviewer", prompt: "Tests: the retry swallows errors", result: JSON.stringify({ findings: [] }) },
+    { subagent: "deep-reviewer", prompt: "Tests for the cache path", result: JSON.stringify({ findings: [] }) },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.deepEqual(
+    result.leads?.map((l) => [l.area, l.outcome]),
+    [
+      ["Retry", "dropped"],
+      ["Tests", "not-investigated"],
+    ],
+  );
+});
