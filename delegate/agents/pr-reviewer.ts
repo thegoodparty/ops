@@ -29,12 +29,27 @@ const ReviewModelOutputSchema = z.object({
   reason: z.string().optional().describe('Required when status is "failed".'),
 });
 
-export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(
-  ReviewModelOutputSchema,
-  {
+// Anthropic's structured-output grammar supports `anyOf`, `allOf` and `const`;
+// `oneOf` is not in its supported-features list, and zod emits `oneOf` for a
+// discriminated union. The branches of `planConsistency` are mutually exclusive
+// by their `verdict` literal, so `anyOf` is the same constraint in the dialect
+// the API compiles. The rewrite is applied to the whole schema and the test
+// below rejects any `oneOf` left in it.
+const toSupportedDialect = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(toSupportedDialect);
+  if (value === null || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+    out[key === "oneOf" ? "anyOf" : key] = toSupportedDialect(v);
+  }
+  return out;
+};
+
+export const REVIEW_OUTPUT_JSON_SCHEMA = toSupportedDialect(
+  z.toJSONSchema(ReviewModelOutputSchema, {
     target: "draft-7",
-  },
-);
+  }),
+) as ReturnType<typeof z.toJSONSchema>;
 
 // Author-controlled text, and model output that processed it, cannot be
 // allowed to close its own wrapper.

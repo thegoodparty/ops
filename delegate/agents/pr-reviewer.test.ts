@@ -311,6 +311,25 @@ describe("REVIEW_OUTPUT_JSON_SCHEMA", () => {
     }
   });
 
+  it("uses anyOf, not oneOf, for the consistency union", () => {
+    // Zod emits `oneOf` for a discriminated union, and Anthropic's
+    // structured-output dialect lists `anyOf` but not `oneOf`. The branches are
+    // mutually exclusive by their verdict literal, so the constraint is the
+    // same and the keyword is one the API compiles.
+    assert.ok(
+      !JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA).includes('"oneOf"'),
+      "no oneOf anywhere in the model schema",
+    );
+    const props = (REVIEW_OUTPUT_JSON_SCHEMA as Record<string, any>).properties;
+    const branches = props.planConsistency.anyOf as Array<Record<string, any>>;
+    assert.equal(branches.length, 3);
+    const requiredOf = (verdict: string) =>
+      branches.find((b) => b.properties.verdict.const === verdict)?.required ?? [];
+    assert.deepEqual(requiredOf("consistent"), ["verdict", "reasoning"]);
+    assert.ok(requiredOf("inconsistent").includes("departure"));
+    assert.ok(requiredOf("unclear").includes("uncertainty"));
+  });
+
   it("offers every ReviewOutputSchema field and requires only status", () => {
     const schema = REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>;
     const props = schema["properties"] as Record<string, unknown>;
