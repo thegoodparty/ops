@@ -24,17 +24,18 @@ export const forceSynchronousTaskHook = async (input: unknown) => {
     return { continue: true } as const;
   }
   const ti = (i.tool_input ?? {}) as Record<string, unknown>;
-  if (ti.run_in_background !== true) {
+  if (ti.run_in_background === false) {
     return { continue: true } as const;
   }
-  const { run_in_background: _drop, ...rest } = ti;
+  // The Agent tool runs in the background when the flag is omitted, so it is
+  // set to false rather than stripped.
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: "PreToolUse" as const,
-      updatedInput: rest,
+      updatedInput: { ...ti, run_in_background: false },
       additionalContext:
-        "Task tool calls are forced synchronous in this runtime; run_in_background was stripped. Wait for this Task's result before issuing the next tool call.",
+        "Subagent calls are forced synchronous in this runtime. Wait for this call's result before issuing the next tool call.",
     },
   };
 };
