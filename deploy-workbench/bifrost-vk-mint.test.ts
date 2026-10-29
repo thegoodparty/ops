@@ -147,10 +147,14 @@ describe("the function, its URL and its network", () => {
     // is that every rule names a group.
     assert.doesNotMatch(body, /cidrIpv4/);
 
-    // And the group's own description no longer claims 8080 is ALB-only: a
-    // description that lies is how the next reader reintroduces the invariant
-    // without noticing the exception.
-    assert.match(NETWORK_SOURCE, /8080 \(Bifrost\) from the ALB and from the vk-mint Lambda/);
+    // And the task group's own description is deliberately unchanged. It is
+    // ForceNew: editing the string replaces the group and, with it, every rule
+    // that references it (the database's ingress, both ALB egress rules, the
+    // two existing ingress rules) — a gateway outage for a sentence. The
+    // exception is documented where the rule is, and the rule's own
+    // description says so.
+    assert.match(NETWORK_SOURCE, /Bifrost gateway Fargate task: 8080 \(Bifrost\) and 4180 \(oauth2-proxy\) from the ALB only\./);
+    assert.match(NETWORK_SOURCE, /The exception is 8080 from the vk-mint Lambda's own group/);
   });
 
   it("is wired into the stack, and the ECS service registers itself for discovery", () => {

@@ -328,7 +328,7 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
     {
       name: "bifrost-task",
       description:
-        "Bifrost gateway Fargate task: 8080 (Bifrost) from the ALB and from the vk-mint Lambda; 4180 (oauth2-proxy) from the ALB only.",
+        "Bifrost gateway Fargate task: 8080 (Bifrost) and 4180 (oauth2-proxy) from the ALB only.",
       vpcId: vpc.id,
       tags: { Name: "bifrost-task" },
     },
@@ -417,6 +417,14 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
   // Lambda cannot pass. It is still a referenced group and not a CIDR, so it
   // admits exactly that function; the reasoning and the rejected alternatives
   // are in that module's header.
+  //
+  // The group's own `description` above still says "from the ALB only", and is
+  // deliberately left alone. `description` is ForceNew on this resource, so
+  // editing the string replaces the group — and with it every rule below, the
+  // database's ingress and both of the ALB's egress rules, which is a gateway
+  // outage for a sentence. The accurate description of the exception is on the
+  // rule itself (`bifrostTaskIngressVkMint`); a wording fix here belongs with a
+  // change that is replacing the group anyway.
   new aws.vpc.SecurityGroupIngressRule(
     "bifrostTaskIngressBifrost",
     {
