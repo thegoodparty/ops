@@ -8,12 +8,12 @@ import {
   bifrostVkReaderTrust,
   VK_READER_SESSION_NAME,
 } from "../deploy/components/bifrost-vk-reader";
-import { secretArnPattern } from "./ecs";
+import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
 import { BIFROST_PORT } from "./network";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
 import {
-  VK_MINT_SECRET_JSON_KEY,
-  VK_MINT_SECRET_NAME,
+  SETUP_TOKEN_SECRET_JSON_KEY,
+  SETUP_TOKEN_SECRET_NAME,
   VK_READER_ROLE_ARN,
 } from "./bifrost-vk-mint";
 import {
@@ -192,20 +192,27 @@ describe("the function, its schedule and its network", () => {
 
 describe("the shared secret and the grants", () => {
   it("reads the same setup-token container the mint reads (decision 6)", () => {
-    assert.equal(VK_MINT_SECRET_NAME, "bifrost/vk-mint");
-    assert.equal(vkJanitorEnvironment().SETUP_TOKEN_SECRET_NAME, VK_MINT_SECRET_NAME);
+    assert.equal(SETUP_TOKEN_SECRET_NAME, GATEWAY_SECRET_NAME);
+    assert.equal(vkJanitorEnvironment().SETUP_TOKEN_SECRET_NAME, GATEWAY_SECRET_NAME);
     assert.equal(
       vkJanitorEnvironment().SETUP_TOKEN_SECRET_JSON_KEY,
-      VK_MINT_SECRET_JSON_KEY,
+      SETUP_TOKEN_SECRET_JSON_KEY,
     );
 
     const secret = policy().Statement.find((s) => s.Sid === "ReadSetupToken");
     assert.ok(secret, "no ReadSetupToken statement");
     assert.deepEqual(secret.Action, ["secretsmanager:GetSecretValue"]);
-    assert.deepEqual(secret.Resource, [secretArnPattern(VK_MINT_SECRET_NAME)]);
-    // `bifrost/gateway` holds the encryption key and the Fireworks key as well,
-    // so the janitor is scoped to the token-only container like the mint.
-    assert.ok(!secret.Resource.includes(secretArnPattern("bifrost/gateway")));
+    assert.deepEqual(secret.Resource, [secretArnPattern(GATEWAY_SECRET_NAME)]);
+
+    // One container, named through the shared constant, and nothing broader:
+    // this grant reaches the gateway's encryption and Fireworks keys too (the
+    // cost decision 3 records), and it must not reach a second secret.
+    const secretResources = policy()
+      .Statement.flatMap((s) => s.Resource)
+      .filter((r) => r.includes(":secret:"));
+    assert.deepEqual(secretResources, [secretArnPattern(GATEWAY_SECRET_NAME)]);
+    assert.doesNotMatch(SOURCE, /VK_MINT_SECRET/);
+    assert.doesNotMatch(SOURCE, /["']bifrost\/(gateway|vk-mint)["']/);
   });
 
   it("holds the token in the secret, never in the function's environment", () => {

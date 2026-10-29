@@ -7,8 +7,8 @@ import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
 import {
   LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN,
   VK_READER_ROLE_ARN,
-  VK_MINT_SECRET_JSON_KEY,
-  VK_MINT_SECRET_NAME,
+  SETUP_TOKEN_SECRET_JSON_KEY,
+  SETUP_TOKEN_SECRET_NAME,
   type PolicyDocument,
 } from "./bifrost-vk-mint";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
@@ -39,9 +39,10 @@ import {
  *   the role below is that literal, and the test reads the trust to prove the
  *   two have not drifted.
  * - **The setup-token secret.** Decision 6 says the janitor "reads the same
- *   secret" as the mint, so `VK_MINT_SECRET_NAME` is imported rather than
- *   retyped. One container, two readers, and the same rule about never logging
- *   a body.
+ *   secret" as the mint, so `SETUP_TOKEN_SECRET_NAME` is imported rather than
+ *   retyped. It is the gateway's own container (decision 3), one name shared by
+ *   the task definition, the mint and this function; two readers of one
+ *   container, and the same rule about never logging a body.
  * - **The task's 8080 ingress.** `bifrost-vk-mint.ts` adds the first exception
  *   to `network.ts`'s "from the ALB only" invariant; this module adds the
  *   second, from its own group, because it is the second caller of the same
@@ -119,16 +120,15 @@ if (VK_JANITOR_TIMEOUT_SECONDS >= VK_JANITOR_INTERVAL_MINUTES * 60) {
 export const VK_JANITOR_RESERVED_CONCURRENCY = 1;
 
 /**
- * The non-secret configuration: the gateway's private address, the shared
- * setup-token secret's name and JSON key, and the reader role's ARN and session
- * name. The token itself is not here and never will be, because a Lambda
- * environment variable is readable by anything that can call
- * `GetFunctionConfiguration`.
+ * The non-secret configuration: the gateway's private address, the setup-token
+ * container's name and JSON key, and the reader role's ARN and session name.
+ * The token itself is not here and never will be, because a Lambda environment
+ * variable is readable by anything that can call `GetFunctionConfiguration`.
  */
 export const vkJanitorEnvironment = (): Record<string, string> => ({
   BIFROST_BASE_URL: `http://${BIFROST_DISCOVERY_DNS_NAME}:${BIFROST_PORT}`,
-  SETUP_TOKEN_SECRET_NAME: VK_MINT_SECRET_NAME,
-  SETUP_TOKEN_SECRET_JSON_KEY: VK_MINT_SECRET_JSON_KEY,
+  SETUP_TOKEN_SECRET_NAME,
+  SETUP_TOKEN_SECRET_JSON_KEY,
   READER_ROLE_ARN: VK_READER_ROLE_ARN,
   READER_SESSION_NAME: VK_READER_SESSION_NAME,
 });
@@ -182,9 +182,10 @@ export const vkJanitorExecutionPolicy = (args: {
       Effect: "Allow",
       Action: ["secretsmanager:GetSecretValue"],
       // The same container the mint reads (decision 6), named from the mint's
-      // constant rather than a second literal. Secrets Manager appends six
-      // random characters to the ARN, so the name needs a wildcard.
-      Resource: [secretArnPattern(VK_MINT_SECRET_NAME)],
+      // constant rather than a second literal: it is the gateway's own
+      // container (decision 3). Secrets Manager appends six random characters
+      // to the ARN, so the name needs a wildcard.
+      Resource: [secretArnPattern(SETUP_TOKEN_SECRET_NAME)],
     },
     {
       Sid: "WriteOwnLogs",
@@ -328,7 +329,7 @@ export const createBifrostVkJanitor = (args: {
     {
       name: VK_JANITOR_ROLE_NAME,
       description:
-        "Bifrost vk-janitor Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read the shared setup token, write its own logs. No identitystore action, no SSM template, no gateway secrets.",
+        "Bifrost vk-janitor Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read BIFROST_SETUP_TOKEN from bifrost/gateway, write its own logs. No identitystore action, no SSM template, no other secret.",
       assumeRolePolicy: JSON.stringify(vkJanitorTrust),
       managedPolicyArns: [LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN],
       tags,

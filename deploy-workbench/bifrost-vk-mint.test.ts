@@ -8,7 +8,7 @@ import {
   bifrostVkReaderTrust,
   VK_READER_SESSION_NAME,
 } from "../deploy/components/bifrost-vk-reader";
-import { secretArnPattern } from "./ecs";
+import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
 import { BIFROST_PORT } from "./network";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
 import {
@@ -16,8 +16,8 @@ import {
   VK_MINT_LOG_GROUP_NAME,
   VK_MINT_LOG_RETENTION_DAYS,
   VK_MINT_ROLE_NAME,
-  VK_MINT_SECRET_JSON_KEY,
-  VK_MINT_SECRET_NAME,
+  SETUP_TOKEN_SECRET_JSON_KEY,
+  SETUP_TOKEN_SECRET_NAME,
   VK_MINT_TEMPLATE_PARAMETER_NAME,
   VK_READER_ROLE_ARN,
   readVkMintTemplate,
@@ -177,21 +177,34 @@ describe("the template, the secret and the logs", () => {
     );
   });
 
-  it("reads the dedicated setup-token secret, not the gateway's bundle (decision 3's open item)", () => {
-    assert.equal(VK_MINT_SECRET_NAME, "bifrost/vk-mint");
-    assert.equal(vkMintEnvironment().SETUP_TOKEN_SECRET_NAME, VK_MINT_SECRET_NAME);
-    assert.equal(VK_MINT_SECRET_JSON_KEY, "BIFROST_SETUP_TOKEN");
+  it("reads the gateway's setup token, and no other secret (decision 3)", () => {
+    // The container is `ecs.ts`'s name for the gateway's own secret — the one
+    // the task definition injects from — so the Lambdas and the task cannot
+    // disagree about where the token lives. `bifrost/vk-mint` no longer exists
+    // in the design: it held the same value, was never filled on a first apply,
+    // and made the first mint fail after a green deploy.
+    assert.equal(GATEWAY_SECRET_NAME, "bifrost/gateway");
+    assert.equal(SETUP_TOKEN_SECRET_NAME, GATEWAY_SECRET_NAME);
+    assert.equal(vkMintEnvironment().SETUP_TOKEN_SECRET_NAME, GATEWAY_SECRET_NAME);
+    assert.equal(SETUP_TOKEN_SECRET_JSON_KEY, "BIFROST_SETUP_TOKEN");
 
     const secret = policy().Statement.find((s) => s.Sid === "ReadSetupToken");
     assert.ok(secret, "no ReadSetupToken statement");
     assert.deepEqual(secret.Action, ["secretsmanager:GetSecretValue"]);
-    assert.deepEqual(secret.Resource, [secretArnPattern(VK_MINT_SECRET_NAME)]);
-    // The whole point of the recommendation: `bifrost/gateway` also holds the
-    // encryption key and the Fireworks key, so a grant on it would hand this
-    // request-facing function both. Reusing it is a one-line change to
-    // VK_MINT_SECRET_NAME; this test is what would have to be argued with.
-    assert.ok(!secret.Resource.includes(secretArnPattern("bifrost/gateway")));
-    assert.ok(!policy().Statement.some((s) => s.Resource.includes(secretArnPattern("bifrost/gateway"))));
+    assert.deepEqual(secret.Resource, [secretArnPattern(GATEWAY_SECRET_NAME)]);
+
+    // Nothing else. The cost decision 3 accepts is that this grant reaches the
+    // encryption key and the Fireworks key as well; what it must not do is
+    // reach a second container, a second ARN or a wildcard.
+    const secretResources = policy()
+      .Statement.flatMap((s) => s.Resource)
+      .filter((r) => r.includes(":secret:"));
+    assert.deepEqual(secretResources, [secretArnPattern(GATEWAY_SECRET_NAME)]);
+    assert.ok(!secretResources.some((r) => r.endsWith(":*")));
+    // One constant, no second literal: the source names the secret through
+    // `GATEWAY_SECRET_NAME` and the old `VK_MINT_SECRET_*` spelling is gone.
+    assert.doesNotMatch(SOURCE, /VK_MINT_SECRET/);
+    assert.doesNotMatch(SOURCE, /["']bifrost\/(gateway|vk-mint)["']/);
   });
 
   it("holds the token in the secret, never in the function's environment", () => {

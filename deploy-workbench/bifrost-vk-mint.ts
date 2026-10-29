@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { MANAGEMENT_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
 import { BIFROST_DISCOVERY_DNS_NAME, type BifrostDiscovery } from "./discovery";
-import { secretArnPattern } from "./ecs";
+import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
 import {
   BIFROST_PORT,
   REGION,
@@ -29,17 +29,17 @@ import {
  * - its VPC attachment to the gateway's private subnets, its own security
  *   group, and the **new ingress rule on `bifrostTaskSecurityGroup` for 8080**;
  * - the SSM `String` parameter that stores the committed key template, and the
- *   read grant on the setup token.
+ *   read grant on the gateway's setup token.
  *
  * What it deliberately does not own:
  *
  * - the template file itself (`bifrost/vk-mint-template.json`, step 1) — this
  *   module stores the reviewed bytes and nothing else;
- * - `bifrost/vk-mint`, the secret container. Like `bifrost/gateway` and
- *   `bifrost/oauth2-proxy` it is filled out of band by
- *   `bifrost/fill-secrets.sh` (`ecs.ts` explains why nothing in this stack
- *   declares those containers); this module names it and grants read on the
- *   name pattern only, so `pulumi preview` needs no Secrets Manager permission;
+ * - `bifrost/gateway`, the secret container. Like `bifrost/oauth2-proxy` it is
+ *   filled out of band by `bifrost/fill-secrets.sh` (`ecs.ts` explains why
+ *   nothing in this stack declares those containers); this module names it and
+ *   grants read on the name pattern only, so `pulumi preview` needs no Secrets
+ *   Manager permission;
  * - the invoke grant for people. That is step 4, in `deploy/`, and it is
  *   deliberately absent here: `WorkbenchAccess` gets `lambda:InvokeFunctionUrl`
  *   plus the condition-guarded `lambda:InvokeFunction` there, and a bare
@@ -60,18 +60,24 @@ import {
  * The addressing half of that (`bifrost.workbench.local`) is `discovery.ts`,
  * with the reasoning for adding service discovery at all.
  *
- * ## The setup-token secret: decision 3's open item
+ * ## The setup-token secret: decision 3, decided
  *
- * The function reads `bifrost/vk-mint`, a dedicated container holding only
- * `BIFROST_SETUP_TOKEN`, rather than `bifrost/gateway`. The gateway container
- * also holds `BIFROST_ENCRYPTION_KEY` and `FIREWORKS_API_KEY`, so a read grant
- * on it would make this small, request-facing function able to decrypt every
- * stored provider key and spend the Fireworks account, for the sake of one
- * value. The cost is a second copy of a credential the design never rotates.
- * `VK_MINT_SECRET_NAME` below is the whole switch: pointing it at
- * `bifrost/gateway` (and dropping the copy in `fill-secrets.sh`) is the
- * alternative the engineer may prefer, and it is one line because the grant is
- * derived from this constant.
+ * The function reads `BIFROST_SETUP_TOKEN` out of `bifrost/gateway`, the
+ * gateway task's own container. `SETUP_TOKEN_SECRET_NAME` below is the whole
+ * switch — the environment variable, this role's grant and the janitor's
+ * identical grant all derive from it — and it is `ecs.ts`'s
+ * `GATEWAY_SECRET_NAME` rather than a second literal, so the task definition
+ * and both Lambdas cannot disagree about which container holds the token.
+ *
+ * That container also holds `BIFROST_ENCRYPTION_KEY` and `FIREWORKS_API_KEY`,
+ * so this request-facing function can reach both. That is the cost decision 3
+ * records and accepts. The dedicated `bifrost/vk-mint` container it replaced
+ * held only `BIFROST_SETUP_TOKEN`, but it was filled out of band and never on a
+ * first apply: the deploy was green and the first mint answered
+ * `500 could not read the setup token`. A deploy cannot copy the value without
+ * reading a secret (`deploy-role-trust.md`), and the two containers hold the
+ * same value, so the second one was a copy rather than a boundary. Do not add
+ * a narrower container back without a way to fill it inside the apply.
  */
 
 /**
@@ -94,13 +100,13 @@ export const VK_MINT_LOG_RETENTION_DAYS = 30;
 export const VK_MINT_TEMPLATE_PARAMETER_NAME = "/bifrost/vk-mint-template";
 
 /**
- * The dedicated secret (decision 3's open item). The container holds one key:
- * `BIFROST_SETUP_TOKEN`. `fill-secrets.sh` creates it if absent and copies the
- * gateway's token into it, because the two values have to be identical — the
- * gateway checks the token it was started with.
+ * The gateway's own container, read for `BIFROST_SETUP_TOKEN` (decision 3).
+ * Imported from `ecs.ts` rather than written again: the task definition injects
+ * from that name, this role grants read on its ARN pattern, and both Lambdas
+ * import the constant from here, so there is one name and no copy.
  */
-export const VK_MINT_SECRET_NAME = "bifrost/vk-mint";
-export const VK_MINT_SECRET_JSON_KEY = "BIFROST_SETUP_TOKEN";
+export const SETUP_TOKEN_SECRET_NAME = GATEWAY_SECRET_NAME;
+export const SETUP_TOKEN_SECRET_JSON_KEY = "BIFROST_SETUP_TOKEN";
 
 /**
  * The management-account role the function assumes for the membership check
@@ -151,8 +157,8 @@ export const readVkMintTemplate = (): string =>
 export const vkMintEnvironment = (): Record<string, string> => ({
   BIFROST_BASE_URL: `http://${BIFROST_DISCOVERY_DNS_NAME}:${BIFROST_PORT}`,
   TEMPLATE_PARAMETER_NAME: VK_MINT_TEMPLATE_PARAMETER_NAME,
-  SETUP_TOKEN_SECRET_NAME: VK_MINT_SECRET_NAME,
-  SETUP_TOKEN_SECRET_JSON_KEY: VK_MINT_SECRET_JSON_KEY,
+  SETUP_TOKEN_SECRET_NAME,
+  SETUP_TOKEN_SECRET_JSON_KEY,
   READER_ROLE_ARN: VK_READER_ROLE_ARN,
   READER_SESSION_NAME: VK_READER_SESSION_NAME,
 });
@@ -196,9 +202,10 @@ export type PolicyDocument = {
  * - `logs:CreateLogGroup` — Pulumi creates the group;
  * - `ssm:GetParameters`, `ssm:GetParametersByPath` and every write — one
  *   parameter, read one way;
- * - `secretsmanager:GetSecretValue` on anything but the dedicated container.
- *   That is the decision recorded in the header, and the test fails if the
- *   grant widens to `bifrost/gateway`.
+ * - `secretsmanager:GetSecretValue` on anything but `bifrost/gateway`'s own ARN
+ *   pattern — one container, the token's own JSON key, nothing else. That is
+ *   the decision recorded in the header, and the test fails if a second secret
+ *   appears in this document.
  */
 export const vkMintExecutionPolicy = (args: {
   templateParameterArn: string;
@@ -218,9 +225,12 @@ export const vkMintExecutionPolicy = (args: {
       Sid: "ReadSetupToken",
       Effect: "Allow",
       Action: ["secretsmanager:GetSecretValue"],
-      // Secrets Manager appends six random characters to the ARN, so the name
-      // needs a wildcard; the pattern is the repo's (`ecs.ts`).
-      Resource: [secretArnPattern(VK_MINT_SECRET_NAME)],
+      // The gateway's container (decision 3): the dedicated `bifrost/vk-mint`
+      // copy was dropped because a deploy cannot fill it, and it held the same
+      // value this one does. Secrets Manager appends six random characters to
+      // the ARN, so the name needs a wildcard; the pattern is the repo's
+      // (`ecs.ts`).
+      Resource: [secretArnPattern(SETUP_TOKEN_SECRET_NAME)],
     },
     {
       Sid: "ReadTemplate",
@@ -388,7 +398,7 @@ export const createBifrostVkMint = (args: {
     {
       name: VK_MINT_ROLE_NAME,
       description:
-        "Bifrost vk-mint Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read the setup token, read the key template, write its own logs. No identitystore action, no gateway secrets.",
+        "Bifrost vk-mint Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read BIFROST_SETUP_TOKEN from bifrost/gateway, read the key template, write its own logs. No identitystore action, no other secret.",
       assumeRolePolicy: JSON.stringify(vkMintTrust),
       managedPolicyArns: [LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN],
       tags,
