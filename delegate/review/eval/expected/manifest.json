@@ -163,5 +163,23 @@
     "split": "tune",
     "source": "simulated",
     "kind": "bug"
+  },
+  {
+    "id": "omni-prompt-text-test",
+    "bundle": "omni-prompt-text-test.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/campaignIdeology/campaignIdeology.prompt.test.ts"
+      ],
+      "categories": [
+        "tests",
+        "conventions"
+      ]
+    },
+    "tests": "Simulated. Adds a gp-api test that builds the candidate ideology prompt from empty input and asserts it contains fixed sentences, plus one not.toContain on wording it never had. The base is an omni main commit after #3392, so packages/gp-api/docs/writing-tests.md has `## Prompt and copy text`, which says these tests must not be added. The fourth test, a section present only when its input is set, is the kind that rule keeps and is not the finding. Must block on the test file.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "bug"
   }
 ]

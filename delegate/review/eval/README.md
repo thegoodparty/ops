@@ -113,7 +113,7 @@ cat report.md
 
 ## Expected-result suite
 
-Nine cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+Thirteen cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
 
 The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
 
@@ -121,13 +121,13 @@ Replay runs the gate in `enforce` for a repo on `gating.ts`'s adoption list, whi
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $35 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` as `cases[].main = { runs, completed, runsPassed, unfinished }` for the merge gate to read. `runs` is how many runs each case should have; a run that errored or never happened counts toward `unfinished`, not toward `runsPassed` or a failure, and the markdown reads `2/2 (1 of 3 runs unfinished)`. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $55 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` as `cases[].main = { runs, completed, runsPassed, unfinished }` for the merge gate to read. `runs` is how many runs each case should have; a run that errored or never happened counts toward `unfinished`, not toward `runsPassed` or a failure, and the markdown reads `2/2 (1 of 3 runs unfinished)`. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
 
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Nine cases at three runs costs a little over $35 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the two plan cases are single-file diffs).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Thirteen cases at three runs costs about $55 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
 
 ### Gate
 
