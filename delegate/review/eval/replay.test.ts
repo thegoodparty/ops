@@ -555,6 +555,15 @@ test("replayCase records each lead and what the deep-reviewer did with it", asyn
   assert.equal(result.leads?.[0].hypothesis, "formatInTimeZone ignores the schedule");
 });
 
+test("replayCase keeps the subagent calls so leads can be re-traced offline", async () => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "diff", result: JSON.stringify({ leads: [], summary: "none" }) },
+    { subagent: "deep-reviewer", prompt: "check the retry", result: JSON.stringify({ findings: [] }) },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.deepEqual(result.subagentCalls, calls);
+});
+
 test("replayCase records an empty lead list when the scout raised none", async () => {
   const calls: SubagentCall[] = [
     { subagent: "scout", prompt: "diff", result: '{"leads":[],"summary":"low risk"}' },
