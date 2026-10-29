@@ -327,6 +327,25 @@ describe("idempotent minting", () => {
     );
   });
 
+  it("falls back to the listed value when the update response carries none", async () => {
+    // The PUT at the pinned tag returns the re-read key with its plaintext
+    // value; this holds the reactivation to working even if a response shape
+    // omits it, because the value does not change on reactivation and the
+    // listing that found the key already has it.
+    const { gateway } = fakeGateway({
+      pages: [
+        {
+          keys: [key({ name: "jeff@goodparty.org", value: "sk-bf-listed", is_active: false })],
+          totalCount: 1,
+        },
+      ],
+      update: async (id) => ({ id, name: "jeff@goodparty.org", is_active: true, value: null }),
+    });
+    const result = await mintVirtualKey({ gateway, template, email: "jeff@goodparty.org" });
+    assert.equal(result.action, "reactivated");
+    assert.equal(result.key, "sk-bf-listed");
+  });
+
   it("does not return an empty value as a key", async () => {
     const { gateway } = fakeGateway({
       pages: [{ keys: [key({ name: "jeff@goodparty.org", value: "" })], totalCount: 1 }],

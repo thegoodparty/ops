@@ -326,12 +326,18 @@ const requireKeyValue = (key: VirtualKey): string => {
   }
   return value;
 };
-
 /**
  * Returns an existing key, reactivating it first when it is inactive or still
  * carries an expiry. The reactivation is the same call a returning member
  * needs; it only ever runs for a caller the membership check has just admitted,
  * so a deactivated key is never a way back in for somebody who has left.
+ *
+ * The value comes from the `PUT` response when it carries one, and from the
+ * listing otherwise. The update path at `transports/v2.3.0` returns the key it
+ * re-read after the write, plaintext value included, but the fallback is here
+ * because a reactivation must not turn a key the caller already holds into a
+ * failure over the shape of a response: the value does not change on
+ * reactivation, and the listing that found the key already has it.
  */
 const settleExisting = async (
   gateway: VirtualKeyGateway,
@@ -342,7 +348,11 @@ const settleExisting = async (
     return { key: requireKeyValue(key), email, action: "existing" };
   }
   const updated = await gateway.update(key.id, { ...REACTIVATION_BODY });
-  return { key: requireKeyValue(updated), email, action: "reactivated" };
+  const value =
+    typeof updated.value === "string" && updated.value.length > 0
+      ? updated.value
+      : requireKeyValue(key);
+  return { key: value, email, action: "reactivated" };
 };
 
 /**

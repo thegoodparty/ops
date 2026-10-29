@@ -553,13 +553,20 @@ ensure_generated BIFROST_ADMIN_PASSWORD "$(gen_password)" 1
 # new value in Secrets Manager by the end of the run.
 ensure_generated BIFROST_SETUP_TOKEN "$(gen_secret)" 1
 
-# The value this run leaves in $GATEWAY_SECRET, captured before commit() unsets
-# the variables: the mint's copy has to be exactly this string. Read back from
-# CURRENT when the key already existed (ensure_generated kept it) and from the
-# variable when it was just generated.
-gateway_setup_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
-if [[ -z "$gateway_setup_token" ]]; then
-  gateway_setup_token="${BIFROST_SETUP_TOKEN:-}"
+# The value this run leaves in $GATEWAY_SECRET, captured before commit()
+# unsets the variables: the mint's copy has to be exactly this string.
+#
+# `ensure_generated` exports BIFROST_SETUP_TOKEN exactly when this run will
+# write it (a new key, or a `--force` regeneration), and $CURRENT is stale after
+# that — it is assigned only inside `fetch_current`. So the exported value wins
+# when it is set, and the value kept from $CURRENT is the answer when it is not.
+# Reading $CURRENT first is wrong on `--force`: it copies the *old* token into
+# bifrost/vk-mint while `commit` writes the new one, and the gateway then rejects
+# every mint.
+if [[ -n "${BIFROST_SETUP_TOKEN:-}" ]]; then
+  gateway_setup_token="$BIFROST_SETUP_TOKEN"
+else
+  gateway_setup_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
 fi
 
 # Whether this run rewrote the gateway's token. If it did, bifrost/vk-mint must
