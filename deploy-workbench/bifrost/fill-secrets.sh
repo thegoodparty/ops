@@ -556,26 +556,27 @@ ensure_generated BIFROST_SETUP_TOKEN "$(gen_secret)" 1
 # The value this run leaves in $GATEWAY_SECRET, captured before commit()
 # unsets the variables: the mint's copy has to be exactly this string.
 #
-# `ensure_generated` exports BIFROST_SETUP_TOKEN exactly when this run will
-# write it (a new key, or a `--force` regeneration), and $CURRENT is stale after
-# that — it is assigned only inside `fetch_current`. So the exported value wins
-# when it is set, and the value kept from $CURRENT is the answer when it is not.
-# Reading $CURRENT first is wrong on `--force`: it copies the *old* token into
-# bifrost/vk-mint while `commit` writes the new one, and the gateway then rejects
-# every mint.
-if [[ -n "${BIFROST_SETUP_TOKEN:-}" ]]; then
-  gateway_setup_token="$BIFROST_SETUP_TOKEN"
+# Which value depends on whether this run writes the key, not on whether the
+# variable happens to be set: `ensure_generated` exports BIFROST_SETUP_TOKEN
+# only when it is creating or (`--force`) regenerating it, and $CURRENT is
+# stale after that — it is assigned only inside `fetch_current`. So a rewritten
+# token comes from the variable (which is the generated one, never an ambient
+# one: `ensure_generated` overwrites it), and a kept token comes from $CURRENT.
+# Reading $CURRENT first is wrong on `--force`; reading the variable first
+# unconditionally is wrong because it trusts the operator's shell.
+gateway_token_rewritten=0
+for key in "${WRITE_KEYS[@]:-}"; do
+  if [[ "$key" == "BIFROST_SETUP_TOKEN" ]]; then gateway_token_rewritten=1; fi
+done
+if [[ $gateway_token_rewritten == 1 ]]; then
+  gateway_setup_token="${BIFROST_SETUP_TOKEN:-}"
 else
   gateway_setup_token="$(jq -r '.BIFROST_SETUP_TOKEN // empty' <<<"$CURRENT")"
 fi
 
 # Whether this run rewrote the gateway's token. If it did, bifrost/vk-mint must
 # follow it whatever --force says, or the mint starts sending a token the
-# gateway no longer accepts.
-gateway_token_rewritten=0
-for key in "${WRITE_KEYS[@]:-}"; do
-  if [[ "$key" == "BIFROST_SETUP_TOKEN" ]]; then gateway_token_rewritten=1; fi
-done
+# gateway no longer accepts. Computed above, beside the value it selects.
 
 if [[ $MODE == fill ]]; then
   collect_human FIREWORKS_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY

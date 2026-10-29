@@ -194,6 +194,196 @@ export const createHandler =
   };
 
 /**
+ * The Identity Store client, as the directory reads use it: the SDK class's
+ * `send`, picked rather than redeclared so the real client is assignable, the
+ * same shape `deploy-infrastructure/group-sync/identity.ts` uses. A test hands
+ * in an object with the same method.
+ */
+export type IdentityStoreSender = Pick<IdentitystoreClient, "send">;
+
+/**
+ * The two directory reads, over an injected client and scoped to the
+ * `Engineers` group.
+ *
+ * `GetUserId` resolves the email the caller's session name already is;
+ * `ListGroupMemberships` returns user ids and is paged to the end, because a
+ * partial read would decide membership from half the group. Neither is a
+ * `DescribeUser`, so nothing here reads a person's name or metadata.
+ */
+export const createMembershipDirectory = (args: {
+  client: IdentityStoreSender;
+  identityStoreId?: string;
+  groupId?: string;
+}): MembershipDirectory => {
+  const identityStoreId = args.identityStoreId ?? IDENTITY_STORE_ID;
+  const groupId = args.groupId ?? ENGINEERS_GROUP_ID;
+
+  return {
+    getUserId: async (email: string) => {
+      try {
+        const response = (await args.client.send(
+          new GetUserIdCommand({
+            IdentityStoreId: identityStoreId,
+            AlternateIdentifier: {
+              UniqueAttribute: {
+                AttributePath: "emails.value",
+                AttributeValue: email,
+              },
+            },
+          }),
+        )) as { UserId?: string };
+        return response.UserId ?? null;
+      } catch (error) {
+        // No such user is "not a member", not an outage. Every other error is
+        // thrown so the caller fails closed with a 503.
+        if (error instanceof ResourceNotFoundException) return null;
+        throw error;
+      }
+    },
+
+    listMemberUserIds: async () => {
+      const ids: string[] = [];
+      let nextToken: string | undefined;
+      do {
+        const page = (await args.client.send(
+          new ListGroupMembershipsCommand({
+            IdentityStoreId: identityStoreId,
+            GroupId: groupId,
+            ...(nextToken ? { NextToken: nextToken } : {}),
+          }),
+        )) as {
+          GroupMemberships?: Array<{ MemberId?: { UserId?: string } }>;
+          NextToken?: string;
+        };
+        for (const membership of page.GroupMemberships ?? []) {
+          const userId = membership.MemberId?.UserId;
+          if (userId) ids.push(userId);
+        }
+        nextToken = page.NextToken;
+      } while (nextToken);
+      return ids;
+    },
+  };
+};
+
+/**
+ * The gateway client, over `fetch`, carrying the setup token.
+ *
+ * The header is `X-Bifrost-Setup-Token`, which is the OSS setup lock's header at
+ * the pinned tag (`SetupTokenHeader` in `handlers/middlewares.go`, checked
+ * against `transports/v2.3.0` rather than assumed). A response body is parsed
+ * and never logged; a non-2xx becomes a `GatewayFailure` that carries only the
+ * status, so no error path can put a response body — or a key — into a log.
+ *
+ * Exported so `vk-mint-handler.test.ts` can drive it against a local server:
+ * the request shapes, the `virtual_keys: null` case and the `409` are things a
+ * fake gateway cannot prove.
+ */
+export const createBifrostGateway = (args: {
+  baseUrl: string;
+  setupToken: string;
+}): VirtualKeyGateway => {
+  const base = args.baseUrl.replace(/\/+$/, "");
+
+  const call = async (
+    method: "GET" | "POST" | "PUT",
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<{ status: number; json: unknown }> => {
+    const response = await fetch(`${base}${path}`, {
+      method,
+      headers: {
+        "X-Bifrost-Setup-Token": args.setupToken,
+        ...(body ? { "content-type": "application/json" } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await response.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = undefined;
+    }
+    return { status: response.status, json: parsed };
+  };
+
+  const record = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null
+      ? (value as Record<string, unknown>)
+      : {};
+
+  const toKey = (value: unknown): VirtualKey => {
+    const raw = record(value);
+    return {
+      id: String(raw.id ?? ""),
+      name: String(raw.name ?? ""),
+      value: typeof raw.value === "string" ? raw.value : null,
+      is_active: typeof raw.is_active === "boolean" ? raw.is_active : null,
+      expires_at: typeof raw.expires_at === "string" ? raw.expires_at : null,
+      delete_after_expire:
+        typeof raw.delete_after_expire === "boolean"
+          ? raw.delete_after_expire
+          : null,
+      description:
+        typeof raw.description === "string" ? raw.description : null,
+    };
+  };
+
+  /**
+   * `virtual_keys` is `null` rather than `[]` on an empty result — observed
+   * against the deployed gateway, and handled explicitly rather than with a
+   * `??` that would hide a malformed body.
+   */
+  const listFrom = (value: unknown): VirtualKey[] =>
+    Array.isArray(value) ? value.map(toKey) : [];
+
+  return {
+    list: async ({ search, limit, offset }) => {
+      const { status, json: payload } = await call(
+        "GET",
+        `/api/governance/virtual-keys?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
+      );
+      if (status !== 200) throw new GatewayFailure(status);
+      const body = record(payload);
+      const totalCount =
+        typeof body.total_count === "number" ? body.total_count : undefined;
+      return {
+        keys: listFrom(body.virtual_keys),
+        ...(totalCount === undefined ? {} : { totalCount }),
+      };
+    },
+
+    create: async (body) => {
+      const { status, json: payload } = await call(
+        "POST",
+        "/api/governance/virtual-keys",
+        body,
+      );
+      // Decision 4: the unique name index is what makes a concurrent first
+      // call safe, and the loser's answer is a re-read.
+      if (status === 409) throw new KeyNameConflict();
+      // 201 is accepted beside 200 because "created" may reasonably answer
+      // either: the pinned handler sends 200 (`SendJSON`), and that is what the
+      // deployed gateway was observed to answer, but a 201 from a future tag is
+      // not a failure worth turning into a 502.
+      if (status !== 200 && status !== 201) throw new GatewayFailure(status);
+      return toKey(record(payload).virtual_key);
+    },
+
+    update: async (id, body) => {
+      const { status, json: payload } = await call(
+        "PUT",
+        `/api/governance/virtual-keys/${encodeURIComponent(id)}`,
+        body,
+      );
+      if (status !== 200) throw new GatewayFailure(status);
+      return toKey(record(payload).virtual_key);
+    },
+  };
+};
+
+/**
  * The real dependency set. Clients are built inside each function rather than
  * at module load, so importing this module (in a test, or in a bundler) does
  * not construct one.
@@ -249,163 +439,23 @@ export const handler = createHandler({
     ) {
       throw new Error("the reader role returned no credentials");
     }
-    const identitystore = new IdentitystoreClient({
-      region: AWS_REGION,
-      credentials: {
-        accessKeyId: credentials.AccessKeyId,
-        secretAccessKey: credentials.SecretAccessKey,
-        sessionToken: credentials.SessionToken,
-      },
-    });
-
-    return {
-      getUserId: async (email: string) => {
-        try {
-          const response = await identitystore.send(
-            new GetUserIdCommand({
-              IdentityStoreId: IDENTITY_STORE_ID,
-              AlternateIdentifier: {
-                UniqueAttribute: {
-                  AttributePath: "emails.value",
-                  AttributeValue: email,
-                },
-              },
-            }),
-          );
-          return response.UserId ?? null;
-        } catch (error) {
-          // No such user is "not a member", not an outage. Every other error
-          // is thrown so the caller fails closed with a 503.
-          if (error instanceof ResourceNotFoundException) return null;
-          throw error;
-        }
-      },
-
-      listMemberUserIds: async () => {
-        const ids: string[] = [];
-        let nextToken: string | undefined;
-        do {
-          const page = await identitystore.send(
-            new ListGroupMembershipsCommand({
-              IdentityStoreId: IDENTITY_STORE_ID,
-              GroupId: ENGINEERS_GROUP_ID,
-              ...(nextToken ? { NextToken: nextToken } : {}),
-            }),
-          );
-          for (const membership of page.GroupMemberships ?? []) {
-            const userId = membership.MemberId?.UserId;
-            if (userId) ids.push(userId);
-          }
-          nextToken = page.NextToken;
-        } while (nextToken);
-        return ids;
-      },
-    };
-  },
-
-  createGateway: (setupToken: string) => {
-    const base = requireEnv("BIFROST_BASE_URL").replace(/\/+$/, "");
-
-    /**
-     * One request. The setup token goes in `X-Bifrost-Setup-Token`, which is
-     * the header the OSS setup lock requires on every non-public `/api` call
-     * (`SetupTokenHeader` in `handlers/middlewares.go` at `transports/v2.3.0`).
-     * The response text is parsed but never logged, and a non-2xx is turned
-     * into a status-only error.
-     */
-    const call = async (
-      method: "GET" | "POST" | "PUT",
-      path: string,
-      body?: Record<string, unknown>,
-    ): Promise<{ status: number; json: unknown }> => {
-      const response = await fetch(`${base}${path}`, {
-        method,
-        headers: {
-          "X-Bifrost-Setup-Token": setupToken,
-          ...(body ? { "content-type": "application/json" } : {}),
+    return createMembershipDirectory({
+      client: new IdentitystoreClient({
+        region: AWS_REGION,
+        credentials: {
+          accessKeyId: credentials.AccessKeyId,
+          secretAccessKey: credentials.SecretAccessKey,
+          sessionToken: credentials.SessionToken,
         },
-        body: body ? JSON.stringify(body) : undefined,
-      });
-      const text = await response.text();
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = undefined;
-      }
-      return { status: response.status, json: parsed };
-    };
-
-    const record = (value: unknown): Record<string, unknown> =>
-      typeof value === "object" && value !== null
-        ? (value as Record<string, unknown>)
-        : {};
-
-    const toKey = (value: unknown): VirtualKey => {
-      const raw = record(value);
-      return {
-        id: String(raw.id ?? ""),
-        name: String(raw.name ?? ""),
-        value: typeof raw.value === "string" ? raw.value : null,
-        is_active: typeof raw.is_active === "boolean" ? raw.is_active : null,
-        expires_at: typeof raw.expires_at === "string" ? raw.expires_at : null,
-        delete_after_expire:
-          typeof raw.delete_after_expire === "boolean"
-            ? raw.delete_after_expire
-            : null,
-        description:
-          typeof raw.description === "string" ? raw.description : null,
-      };
-    };
-
-    /**
-     * `virtual_keys` is `null` rather than `[]` on an empty result — observed
-     * against the deployed gateway, and worth handling explicitly rather than
-     * with a `??` that would hide a malformed body.
-     */
-    const listFrom = (value: unknown): VirtualKey[] =>
-      Array.isArray(value) ? value.map(toKey) : [];
-
-    return {
-      list: async ({ search, limit, offset }) => {
-        const { status, json: payload } = await call(
-          "GET",
-          `/api/governance/virtual-keys?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
-        );
-        if (status !== 200) throw new GatewayFailure(status);
-        const body = record(payload);
-        const totalCount =
-          typeof body.total_count === "number" ? body.total_count : undefined;
-        return {
-          keys: listFrom(body.virtual_keys),
-          ...(totalCount === undefined ? {} : { totalCount }),
-        };
-      },
-
-      create: async (body) => {
-        const { status, json: payload } = await call(
-          "POST",
-          "/api/governance/virtual-keys",
-          body,
-        );
-        // Decision 4: the unique name index is what makes a concurrent first
-        // call safe, and the loser's answer is a re-read.
-        if (status === 409) throw new KeyNameConflict();
-        if (status !== 200) throw new GatewayFailure(status);
-        return toKey(record(payload).virtual_key);
-      },
-
-      update: async (id, body) => {
-        const { status, json: payload } = await call(
-          "PUT",
-          `/api/governance/virtual-keys/${encodeURIComponent(id)}`,
-          body,
-        );
-        if (status !== 200) throw new GatewayFailure(status);
-        return toKey(record(payload).virtual_key);
-      },
-    };
+      }),
+    });
   },
+
+  createGateway: (setupToken: string) =>
+    createBifrostGateway({
+      baseUrl: requireEnv("BIFROST_BASE_URL"),
+      setupToken,
+    }),
 
   log: (entry) => console.log(JSON.stringify(entry)),
 });
