@@ -64,6 +64,9 @@ export interface Result {
   /** Absent for a repo that has not adopted gating, which is every case but
    *  the `ops` ones; also absent on a run that produced no complete review. */
   gating?: ResultGating;
+  // Kept so lead tracing can be checked and re-run offline against the
+  // prompts the orchestrator actually wrote, without paying for a replay.
+  subagentCalls?: SubagentCall[];
 }
 
 // caseId -> replay number -> result.
@@ -107,10 +110,22 @@ const words = (text: string): Set<string> =>
 
 const MIN_OVERLAP = 0.6;
 
-const closestCall = (hypothesis: string, calls: SubagentCall[]): SubagentCall | undefined => {
+const closestCall = (
+  area: string,
+  hypothesis: string,
+  all: SubagentCall[],
+  claimed: Set<SubagentCall>,
+): SubagentCall | undefined => {
   if (hypothesis === "") return undefined;
+  const calls = all.filter((c) => !claimed.has(c));
   const verbatim = calls.find((c) => c.prompt.includes(hypothesis));
   if (verbatim) return verbatim;
+  // The orchestrator rewords the hypothesis but copies the area as written
+  // (eval run 40882274151: every area in exactly one prompt). Uniqueness is
+  // checked across all prompts, claimed ones too: a short area found in
+  // several says nothing, even after earlier leads claim the others.
+  const byArea = area === "" ? [] : all.filter((c) => c.prompt.includes(area));
+  if (byArea.length === 1 && !claimed.has(byArea[0])) return byArea[0];
   const wanted = words(hypothesis);
   if (wanted.size === 0) return undefined;
   let best: SubagentCall | undefined;
@@ -155,7 +170,7 @@ export const traceLeads = (
     // The orchestrator restates each lead in the deep-reviewer's prompt in its
     // own words, so a verbatim match misses (eval run 40754736623 traced all 8
     // leads as not-investigated). Most of the hypothesis's words still appear.
-    const call = closestCall(hypothesis, deep.filter((c) => !claimed.has(c)));
+    const call = closestCall(area, hypothesis, deep, claimed);
     if (!call) {
       traces.push({ ...base, outcome: "not-investigated", findings: 0 });
       continue;
@@ -331,6 +346,7 @@ export const replayCase = async (
   const caseId = record.runId;
   const repoDir = join(workDir, caseId);
   const startMs = Date.now();
+  let subagentCalls: SubagentCall[] | undefined;
 
   const makeResult = (
     output: ReviewOutput | null,
@@ -350,6 +366,7 @@ export const replayCase = async (
     wallTimeMs: Date.now() - startMs,
     ...(leads ? { leads } : {}),
     ...(gating !== undefined ? { gating } : {}),
+    ...(subagentCalls ? { subagentCalls } : {}),
   });
 
   try {
@@ -382,6 +399,8 @@ export const replayCase = async (
     const message = err instanceof Error ? err.message : String(err);
     return makeResult(null, null, `agent threw: ${message}`);
   }
+
+  subagentCalls = agentResult.subagentCalls;
 
   if (agentResult.errorSubtype) {
     return makeResult(

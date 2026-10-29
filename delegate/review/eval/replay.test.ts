@@ -556,6 +556,15 @@ test("replayCase records each lead and what the deep-reviewer did with it", asyn
   assert.equal(result.leads?.[0].hypothesis, "formatInTimeZone ignores the schedule");
 });
 
+test("replayCase keeps the subagent calls so leads can be re-traced offline", async () => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "diff", result: JSON.stringify({ leads: [], summary: "none" }) },
+    { subagent: "deep-reviewer", prompt: "check the retry", result: JSON.stringify({ findings: [] }) },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.deepEqual(result.subagentCalls, calls);
+});
+
 test("replayCase records an empty lead list when the scout raised none", async () => {
   const calls: SubagentCall[] = [
     { subagent: "scout", prompt: "diff", result: '{"leads":[],"summary":"low risk"}' },
@@ -695,4 +704,77 @@ test("replayCase denies Bash even when the reviewer config allows it", async () 
   await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, capture, fakeCheckout);
   const outs = await Promise.all(hooks.map((h) => h(toolCall("Bash"), undefined, hookOpts)));
   assert.ok(outs.some(isDenied));
+});
+
+// Shaped on eval run 40882274151: the orchestrator copied each area into its
+// deep-reviewer prompt but rewrote the hypothesis well below the word cutoff.
+test("replayCase finds a lead's deep-reviewer by its area when the hypothesis was rewritten", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "diff",
+      result: JSON.stringify({
+        leads: [
+          leadOf("keepFiringFor with NoData mapped to OK", "Event rules return no data when idle, so the incident closes early"),
+          leadOf("Dev early return in createGrafanaResources", "Dev skips the folder and every rule group now"),
+        ],
+        summary: "2 leads",
+      }),
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt: 'Lead: area "Dev early return in createGrafanaResources"; Hypothesis: verify nothing after the return matters outside prod.',
+      result: JSON.stringify({ findings: [] }),
+    },
+    {
+      subagent: "deep-reviewer",
+      prompt: 'Lead: area "keepFiringFor with NoData mapped to OK"; Hypothesis: a sum over an empty window yields no series, so state resets.',
+      result: JSON.stringify({ findings: [finding("src/a.ts", 5)] }),
+    },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.deepEqual(
+    result.leads?.map((l) => [l.area, l.outcome]),
+    [
+      ["keepFiringFor with NoData mapped to OK", "reported"],
+      ["Dev early return in createGrafanaResources", "dropped"],
+    ],
+  );
+});
+
+test("replayCase does not match on an area that appears in several prompts", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "diff",
+      result: JSON.stringify({ leads: [leadOf("Tests", "zzz qqq")], summary: "1 lead" }),
+    },
+    { subagent: "deep-reviewer", prompt: "Tests for the retry path", result: JSON.stringify({ findings: [] }) },
+    { subagent: "deep-reviewer", prompt: "Tests for the cache path", result: JSON.stringify({ findings: [] }) },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.equal(result.leads?.[0].outcome, "not-investigated");
+});
+
+test("replayCase does not treat an area as unique once earlier leads claimed its other prompts", async () => {
+  const calls: SubagentCall[] = [
+    {
+      subagent: "scout",
+      prompt: "diff",
+      result: JSON.stringify({
+        leads: [leadOf("Retry", "the retry swallows errors"), leadOf("Tests", "zzz qqq")],
+        summary: "2 leads",
+      }),
+    },
+    { subagent: "deep-reviewer", prompt: "Tests: the retry swallows errors", result: JSON.stringify({ findings: [] }) },
+    { subagent: "deep-reviewer", prompt: "Tests for the cache path", result: JSON.stringify({ findings: [] }) },
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  assert.deepEqual(
+    result.leads?.map((l) => [l.area, l.outcome]),
+    [
+      ["Retry", "dropped"],
+      ["Tests", "not-investigated"],
+    ],
+  );
 });

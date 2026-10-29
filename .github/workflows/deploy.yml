@@ -26,9 +26,50 @@ env:
   IMAGE_URI: 333022194791.dkr.ecr.us-west-2.amazonaws.com/delegate-worker:${{ github.sha }}
 
 jobs:
+  # Everything that executes repository code runs here, in a job with no AWS
+  # credentials and no OIDC token to mint. `npm test` is `tsx --test` over every
+  # `*.test.ts` file, including the ones under `deploy-workbench/`, whose tests
+  # import the Pulumi code they exercise. That tree is de-owned (step 6 of
+  # `docs/plan-gated-merges.md`), so a bot approval can merge it, and the place
+  # its code executes must not be able to reach a credential.
+  #
+  # Until this was a job of its own, `npm test` ran in the job below, which
+  # assumes `github-actions-pulumi-deploy` (`AdministratorAccess`). Putting the
+  # tests before the credentials step was not enough on its own: the job held
+  # `id-token: write` throughout, so a test could mint an OIDC token claiming
+  # `deploy.yml@main` -- which is exactly what that role's trust policy accepts
+  # (`deploy/components/ci-roles/policies.ts`) -- and assume the role itself.
+  # The split is what makes the ordering hold against a token minted mid-job,
+  # and it keeps any future de-owned path inside its own account.
+  test:
+    runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow's rather than merging with
+    # them, so `id-token: write` is dropped here. Do not add it back.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
   deploy:
+    needs: test
+    # Run even when `test` failed, so the required `deploy` check reports a
+    # failure rather than a skipped job. The guard below is what fails it; a
+    # failing step stops the rest of the job before any credential is assumed.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Require a green test job
+        if: ${{ needs.test.result != 'success' }}
+        run: |
+          echo "test job result: ${{ needs.test.result }}"
+          exit 1
+
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
@@ -36,20 +77,14 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      # Install, test and build BEFORE assuming the role. Every one of these
-      # executes repository code -- `npm test` is `tsx --test` over every
-      # `*.test.ts` file -- and the role carries `AdministratorAccess`
-      # (`deploy/components/ci-roles.ts`). Run them after the credentials step
-      # and any test file in the repo is an admin-credentialled shell.
-      #
-      # `.github/CODEOWNERS` can let a path it leaves unowned merge on a bot
-      # approval, so this ordering is what keeps such a merge from reaching the
-      # deploy role. No path is in that state today -- the opt-out list is
-      # empty and `*` owns everything -- but the ordering has to hold for any
-      # path that is ever de-owned. Nothing below needs AWS except the docker
-      # build's ECR Public login, the ECR push and the deploy itself.
+      # Install and build before assuming the role, as before. Neither step
+      # executes repository code: `npm ci` runs dependency install scripts,
+      # which is one reason `package.json` and `package-lock.json` stay
+      # code-owned, and `npm run build` only compiles (`tsc`, `esbuild`). The
+      # build has to happen in this job because the worker image copies
+      # `dist/delegate/` out of this checkout. Test execution, which does run
+      # repository code, is in the `test` job above and gates this one.
       - run: npm ci
-      - run: npm test
       - run: npm run build
 
       # No deploy role on pull_request. Both the ECR push and the deploy are
