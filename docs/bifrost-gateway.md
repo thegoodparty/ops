@@ -697,11 +697,22 @@ a person's key cannot ask for what the gateway would not route.
 What that means per provider, all of it checked by
 `deploy-workbench/bifrost/config.test.ts`:
 
+- **Every Bedrock id in the list is a real, active inference profile.** Checked
+  against the account on 2026-10-29 with
+  `bedrock:ListInferenceProfiles` and `GetInferenceProfile` in `us-west-2`: all
+  seven are `SYSTEM_DEFINED`, `ACTIVE`, and route to `us-east-1`,
+  `us-east-2` and `us-west-2`. `ListFoundationModels` also reports each of the
+  seven as `inferenceTypesSupported: [INFERENCE_PROFILE]` with lifecycle
+  `ACTIVE`, so the profile is not an option for these models — it is the only
+  way to invoke them, which is why a bare id would have been a dead entry.
+  `global.` variants exist for all seven, so their removal from this file is a
+  residency choice and not a cleanup of ids that never existed.
+
 - **Fireworks is on US-only Serverless.** The provider block carries
   `network_config.base_url: "https://us.api.fireworks.ai/inference"`, and the
   models are Fireworks' US router ids, `accounts/fireworks/routers/<model>-us`
   (for the one class the fleet uses,
-  `accounts/fireworks/routers/deepseek-v4p1-flash-us`). Both halves are
+  `accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`). Both halves are
   needed: the router id scopes the model and the endpoint scopes the traffic.
   `network_config.base_url` is the only `base_url` in Bifrost's schema at the
   pinned tag — there is no per-key one — and the Fireworks provider uses it
@@ -710,7 +721,21 @@ What that means per provider, all of it checked by
   (`core/providers/fireworks/fireworks.go`). Setting it is therefore what makes
   the global endpoint unreachable from the gateway rather than merely
   unchosen; leaving it out is how a future edit reintroduces global traffic
-  without touching a model list.
+  without touching a model list. The one class on this provider is pinned to
+  the dated release, `deepseek-v4p1-flash-1017-us`, and that is deliberate: the
+  undated `accounts/fireworks/routers/deepseek-v4p1-flash-us` is a separate
+  model entry (model library `createTime` 2026-09-10), not a version-tracking
+  alias — Fireworks' tracking mechanism is the `*-latest` alias family
+  (`deepseek-flash-latest`), and there is no US-only `-latest` router — so
+  naming it would freeze the gateway on the September release. `1017` is a
+  minor update to V4.1 Flash (`createTime` 2026-10-17, tagged New, the same
+  price as the base model: $0.45/$0.009/$1.80 per 1M input/cached/output on
+  the US endpoint), it is what the fleet's own container default names
+  (`accounts/fireworks/models/deepseek-v4p1-flash-1017`), and it was the newest
+  V4.1 Flash release in the model library and the changelog on 2026-10-29.
+  The cost of pinning is that the gateway does not follow the next release by
+  itself: moving to it is a reviewed edit here, which is the right trade for a
+  list that is itself the residency control.
 - **Bedrock keeps only `us.` cross-region inference profiles.** Every
   `global.` id is gone, because `global.` is worldwide by definition, and every
   bare foundation-model id is gone, because a bare id is not a US commitment at
@@ -722,10 +747,18 @@ What that means per provider, all of it checked by
   `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-10-29 returned
   `us.deepseek.r1-v1:0` as the only DeepSeek profile — so the only way to keep
   the class would have been the bare id, which is exactly the unqualified
-  routing the rule forbids. The class is removed rather than kept as an
-  exception. It stays in `utils/bedrock-models.ts`, because that list is the
-  sandbox's direct `WorkbenchAccess` grant rather than the gateway's, and IAM
-  may be wider than what the gateway serves.
+  routing the rule forbids. Worth recording precisely, because it is the
+  reason this is a rule rather than an oversight: `ListFoundationModels`
+  reports `deepseek.v3.2` as `inferenceTypesSupported: [ON_DEMAND]`, so it is
+  invocable in-region in `us-west-2` and nothing else. A bare id here would
+  therefore not route anywhere outside the US — but it would also not be
+  distinguishable in this file from a bare id that does, which is why the rule
+  is "profile-prefixed ids only" and the class is removed rather than kept as
+  an exception. Keeping it would be an explicit exception, and that is the
+  engineer's call rather than a side effect of a tightening. It stays in
+  `utils/bedrock-models.ts`, because that list is the sandbox's direct
+  `WorkbenchAccess` grant rather than the gateway's, and IAM may be wider than
+  what the gateway serves.
 
 Two consequences are accepted with the decision:
 

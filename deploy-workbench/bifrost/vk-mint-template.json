@@ -17,7 +17,7 @@
     },
     {
       "provider": "fireworks",
-      "allowed_models": ["accounts/fireworks/routers/deepseek-v4p1-flash-us"],
+      "allowed_models": ["accounts/fireworks/routers/deepseek-v4p1-flash-1017-us"],
       "key_ids": ["*"]
     }
   ]

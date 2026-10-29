@@ -145,7 +145,17 @@ const US_MODEL_CLASSES: Record<string, string[]> = {
     // Fireworks' documented US-only ids are
     // `accounts/fireworks/routers/<model>-us`
     // (https://docs.fireworks.ai/serverless/us-only-serverless.md).
-    "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+    //
+    // The dated `1017` release, not the undated
+    // `.../deepseek-v4p1-flash-us`: the undated id is a separate model entry
+    // (model library `createTime` 2026-09-10), not a version-tracking alias —
+    // Fireworks tracks versions with `*-latest` aliases, and there is no
+    // US-only `-latest` router — so naming it would freeze the gateway on the
+    // September release while the fleet's container default
+    // (`.../models/deepseek-v4p1-flash-1017`) is the October one. Pinning the
+    // dated id means the next release is a reviewed edit here, which is the
+    // trade this list makes on purpose.
+    "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
   ],
 };
 
@@ -493,10 +503,20 @@ describe("bifrost config.json", () => {
     assert.ok(
       fireworks.keys.some((key) =>
         key.models.includes(
-          "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+          "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
         ),
       ),
       "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
+    );
+    // The undated `.../deepseek-v4p1-flash-us` is a different model entry, so a
+    // list that names it serves a release behind the one the class means. The
+    // class-set test above pins the dated id; this asserts the failure reads as
+    // "wrong release" rather than only "no Fireworks model".
+    assert.ok(
+      !fireworks.keys.some((key) =>
+        key.models.includes("accounts/fireworks/routers/deepseek-v4p1-flash-us"),
+      ),
+      "the Fireworks list names the undated V4.1 Flash router, which is the September release rather than the 1017 update the fleet runs",
     );
   });
 

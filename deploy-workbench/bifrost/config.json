@@ -50,7 +50,7 @@
         {
           "name": "fireworks-primary",
           "value": "env.FIREWORKS_API_KEY",
-          "models": ["accounts/fireworks/routers/deepseek-v4p1-flash-us"],
+          "models": ["accounts/fireworks/routers/deepseek-v4p1-flash-1017-us"],
           "weight": 1
         }
       ]
