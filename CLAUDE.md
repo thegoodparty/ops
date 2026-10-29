@@ -98,11 +98,14 @@ resource ARNs from `utils/bedrock-models.ts` and its account ids from
 dynamically imports anything in `scripts/`. Before you assume a file is
 harmless, check what executes it, or what reads it.
 
-The same applies to CI ordering. `deploy.yml` runs install, test and build
-**strictly before** the Configure AWS Credentials step, because the deploy
-role carries `AdministratorAccess` and `npm test` executes repository
-code. Do not move a step that runs
-repository code below that credentials step.
+The same applies to CI. `deploy.yml` runs everything that executes repository
+code — `npm test`, which is `tsx --test` over every `*.test.ts` file — in its
+own `test` job, which holds no credentials and no `id-token: write`. The
+`deploy` job installs and builds (neither executes repository code) and only
+then assumes a role carrying `AdministratorAccess`. Do not move a step that
+runs repository code into the credentialed job: the role's OIDC trust keys on
+the workflow file, so a test running inside `deploy.yml` can mint a token that
+workflow is believed for.
 
 All of this is explained at length in `.github/CODEOWNERS`. Read it before
 adding a path to the opt-out list; scope by directory, not by file.

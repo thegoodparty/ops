@@ -98,11 +98,13 @@
 # `deploy/components/ci-roles/policies.ts`. A repository-root file is the one
 # case with no directory to scope by; treat it as the exception it is.
 #
-# Before adding a path to the opt-out side, check what executes it. The
-# ordering in `deploy.yml` -- install, test and build strictly before the
-# credentials step -- would be load-bearing for any opt-out path in this
-# repo, and is the only reason an unowned test file would not be an
-# admin-credentialled shell.
+# Before adding a path to the opt-out side, check what executes it. In this
+# repo the thing that executes arbitrary repository code is `npm test`, and it
+# runs in the `test` job of `deploy.yml`, which holds no credentials and no
+# `id-token: write`. The job that assumes the near-admin deploy role installs
+# and builds but executes no repository code. That split is what keeps an
+# unowned test file from being an admin-credentialled shell, and it is
+# load-bearing for every opt-out path.
 #
 # Widening this list is a security change. It is also, by construction, a
 # change to a path the default owns, so it needs a human. Adding an entry is

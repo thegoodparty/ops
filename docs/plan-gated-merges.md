@@ -845,6 +845,22 @@ back is a PR a human approves in minutes with no deploy; and because `*` still
 owns everything else, flipping the mode to `enforce` in the same PR cannot
 approve a PR that touches anything outside this tree.
 
+**What review found, and what it changed.** The first version of that paragraph
+said nothing in `deploy-workbench/` runs in the job that assumes the deploy
+role. It was wrong, and the reviewer on the PR caught it: `npm test` runs
+`deploy-workbench/*.test.ts`, whose tests import the Pulumi code they exercise,
+and that step ran inside the very job that assumes `github-actions-pulumi-deploy`
+(`AdministratorAccess`). Putting the tests before the credentials step was not
+enough, because the job held `id-token: write` throughout and the role's trust
+keys on `deploy.yml@main`: a test could have minted a token the role accepts, so
+the reach of a wrongly approved change to this tree was not the workbench
+account at all. `deploy.yml` now runs `npm test` in its own `test` job, with
+`permissions: contents: read` and no credentials, and the `deploy` job gates on
+it and still fails when it does. That is a tightening worth having on its own,
+and it is what makes "the blast radius is the sandbox account" true rather than
+almost true — and what the next de-owned tree inherits instead of needing the
+same repair.
+
 ### The tripwire
 
 So that this decision has a trigger and an owner rather than an assumption that
