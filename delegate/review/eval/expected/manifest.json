@@ -147,7 +147,7 @@
       "consistency": "consistent"
     },
     "tests": "Simulated, on the real `docs/pr-previews.md` at the base commit. The diff amends the bound plan's own step 5 to say the JSON preview pass decides whether there is a preview to post, and `deploy/deploy.sh` changes exactly that: a failed JSON pass stops the script before the diff pass. The deterministic `touches_docs` gate owns the outcome, and the model's `consistent` answer is the diagnostic that the amendment and the code agree. Shape from #411, which de-owned a path and amended the plan it implements in the same PR; that PR's diff is not copied, and this case's plan is a different real document.",
-    "split": "holdout",
+    "split": "tune",
     "source": "simulated",
     "kind": "bug"
   },
