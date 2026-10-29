@@ -32,6 +32,12 @@ import { REGION } from "../network";
  *   `BIFROST_SETUP_TOKEN` environment variable. It arms the first-run claim,
  *   is consumed by the request that creates the first admin account and is
  *   not an API token afterwards.
+ * - there is no per-key `base_url`: the only one in the schema is
+ *   `network_config.base_url`, per provider, and the Fireworks provider uses
+ *   it for every request path (`core/providers/fireworks/fireworks.go`, which
+ *   defaults it to the global `https://api.fireworks.ai/inference`). That is
+ *   what makes US-only inference a config property rather than a convention:
+ *   the gateway has no other endpoint to fall back to.
  */
 
 const CONFIG_PATH = path.resolve(__dirname, "config.json");
@@ -46,7 +52,10 @@ type ProviderKey = {
   bedrock_key_config?: Record<string, unknown>;
 };
 
-type ProviderConfig = { keys: ProviderKey[] };
+type ProviderConfig = {
+  keys: ProviderKey[];
+  network_config?: { base_url?: string };
+};
 
 type PostgresStore = {
   enabled?: boolean;
@@ -104,6 +113,56 @@ const collectStrings = (value: unknown, out: string[] = []): string[] => {
  * test never resolves one and never sees a value.
  */
 const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
+
+/**
+ * The classes the gateway serves, pinned as literals.
+ *
+ * Everything else in this file is derived from the files or from
+ * `utils/bedrock-models.ts`, and a derivation cannot notice a class that was
+ * deleted from both the config and the template at once: it shrinks with them.
+ * This list is the independent statement of what US-only inference actually
+ * leaves, so an accidental deletion fails a test instead of quietly reducing
+ * what the fleet can reach.
+ *
+ * Eight, not gp-pi's nine: DeepSeek V3.2 is gone because Bedrock has no
+ * `us.deepseek.v3.2` inference profile (checked with
+ * `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-10-29: the only
+ * DeepSeek profile is `us.deepseek.r1-v1:0`), and a bare `deepseek.v3.2` id is
+ * not a US commitment. See `docs/bifrost-gateway.md`, "Provider
+ * configuration".
+ */
+const US_MODEL_CLASSES: Record<string, string[]> = {
+  bedrock: [
+    "us.anthropic.claude-sonnet-5-5",
+    "us.anthropic.claude-opus-5-5",
+    "us.moonshotai.kimi-k3",
+    "us.openai.gpt-6.1-sol",
+    "us.anthropic.claude-haiku-5-5",
+    "us.xai.grok-4.7",
+    "us.zai.glm-5.3",
+  ],
+  fireworks: [
+    // Fireworks' documented US-only ids are
+    // `accounts/fireworks/routers/<model>-us`
+    // (https://docs.fireworks.ai/serverless/us-only-serverless.md).
+    //
+    // The dated `1017` release, not the undated
+    // `.../deepseek-v4p1-flash-us`: the undated id is a separate model entry
+    // (model library `createTime` 2026-09-10), not a version-tracking alias —
+    // Fireworks tracks versions with `*-latest` aliases, and there is no
+    // US-only `-latest` router — so naming it would freeze the gateway on the
+    // September release while the fleet's container default
+    // (`.../models/deepseek-v4p1-flash-1017`) is the October one. Pinning the
+    // dated id means the next release is a reviewed edit here, which is the
+    // trade this list makes on purpose.
+    "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+  ],
+};
+
+const US_BEDROCK_PREFIX = "us.";
+
+/** A US-only Fireworks router id, and nothing else: not a global model id. */
+const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
 
 const envReferences = (config: Config): string[] =>
   collectStrings(config).flatMap((value) => {
@@ -308,38 +367,127 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("lists exactly the Bedrock models the task role's IAM allows", () => {
+  it("serves no model from outside the United States", () => {
+    const config = loadConfig();
+
+    // `global.` is worldwide by definition, so it may not appear anywhere in
+    // the file: not in a model list, not in a key, not in a value nobody
+    // thought of as a model. A bare id is only meaningless as a model, so that
+    // half is checked where models are named.
+    for (const value of collectStrings(config)) {
+      assert.ok(
+        !value.includes("global."),
+        `config.json carries "${value}", which names the worldwide profile; the gateway serves US-only inference`,
+      );
+    }
+
+    for (const key of provider(config, "bedrock").keys) {
+      for (const model of key.models) {
+        assert.ok(
+          model.startsWith(US_BEDROCK_PREFIX),
+          `bedrock model ${model} is not a us. inference profile; a bare or global id is not a US commitment`,
+        );
+      }
+    }
+
+    for (const key of provider(config, "fireworks").keys) {
+      for (const model of key.models) {
+        assert.match(
+          model,
+          US_FIREWORKS_ROUTER,
+          `fireworks model ${model} is not a US-only router id; use accounts/fireworks/routers/<model>-us`,
+        );
+      }
+    }
+  });
+
+  it("points Fireworks at the US-only endpoint", () => {
+    const config = loadConfig();
+    // The provider defaults `network_config.base_url` to
+    // https://api.fireworks.ai/inference (the global endpoint), so leaving it
+    // unset is what a global request looks like in this file. Setting it is the
+    // control; the path matches the default so every request path the provider
+    // appends (`/v1/chat/completions`, `/v1/messages`) still resolves.
+    const baseUrl = provider(config, "fireworks").network_config?.base_url;
+    assert.equal(
+      baseUrl,
+      "https://us.api.fireworks.ai/inference",
+      "the Fireworks provider must point at the US-only endpoint",
+    );
+    assert.equal(
+      new URL(baseUrl as string).host,
+      "us.api.fireworks.ai",
+      "the Fireworks endpoint must be the US-only host, not the global api.fireworks.ai",
+    );
+
+    // No other provider may carry an endpoint override: one that did would be
+    // a path to a model the US-only lists do not cover.
+    for (const [name, configured] of Object.entries(config.providers ?? {})) {
+      if (name === "fireworks") continue;
+      assert.ok(
+        configured.network_config?.base_url === undefined,
+        `${name} carries a base_url override; only the Fireworks endpoint is a reviewed decision`,
+      );
+    }
+  });
+
+  it("lists exactly the US Bedrock profiles the task role's IAM allows", () => {
     const config = loadConfig();
     const configured = provider(config, "bedrock").keys.flatMap((key) => key.models);
 
     // `taskRolePolicyDocument(bedrockInvokeResources())` in the ECS module is
-    // built from this list, so anything here without a matching resource is an
-    // AccessDenied, and anything in it without an entry here is a 404. Both
-    // directions are asserted, including the transient profile and the base
-    // foundation-model ids the cross-region grant needs.
-    const allowed = [
+    // built from `utils/bedrock-models.ts`, so anything here without a matching
+    // resource is an AccessDenied. The other direction is not equality: the
+    // IAM list is the sandbox's grant and is allowed to be wider than what the
+    // gateway serves, which is exactly the state the transitional `global.`
+    // Sonnet profile and the bare foundation-model ids are in. What this list
+    // must be is the `us.`-profile subset of that file, with nothing added.
+    const usProfiles = [
       ...new Set(
-        WORKBENCH_MODELS.flatMap((model) => [
-          model.id,
-          model.invokeId,
-          ...(model.transitionalInvokeIds ?? []),
-        ]),
+        WORKBENCH_MODELS.filter((model) =>
+          model.invokeId.startsWith(US_BEDROCK_PREFIX),
+        ).map((model) => model.invokeId),
       ),
     ].sort();
 
     assert.deepEqual(
       [...configured].sort(),
-      allowed,
-      "config.json's Bedrock models drifted from utils/bedrock-models.ts, which the task role's IAM is built from",
+      usProfiles,
+      "config.json's Bedrock models drifted from the us. profiles in utils/bedrock-models.ts; a missing one is a class the fleet cannot reach",
     );
 
     const resources = bedrockInvokeResources();
     for (const model of configured) {
       assert.ok(
-        resources.some((resource) => resource.endsWith(`/${model}`)),
-        `${model} has no IAM resource in bedrockInvokeResources()`,
+        resources.some(
+          (resource) =>
+            resource.includes(":inference-profile/") &&
+            resource.endsWith(`/${model}`),
+        ),
+        `${model} has no inference-profile IAM resource in bedrockInvokeResources()`,
       );
     }
+  });
+
+  it("serves exactly the agreed model classes, per provider", () => {
+    const config = loadConfig();
+    for (const [name, expected] of Object.entries(US_MODEL_CLASSES)) {
+      const configured = [
+        ...new Set(provider(config, name).keys.flatMap((key) => key.models)),
+      ];
+      assert.deepEqual(
+        [...configured].sort(),
+        [...expected].sort(),
+        `${name}'s classes drifted from the agreed eight US-only classes; a class added is a data-residency decision and one removed is a class the fleet loses`,
+      );
+    }
+    // And no provider outside that set: a third provider would be a model class
+    // nothing here has decided on.
+    assert.deepEqual(
+      Object.keys(config.providers ?? {}).sort(),
+      Object.keys(US_MODEL_CLASSES).sort(),
+      "config.json declares a provider the US-only model decision does not cover",
+    );
   });
 
   it("reaches Fireworks with the key fill-secrets.sh writes", () => {
@@ -354,9 +502,21 @@ describe("bifrost config.json", () => {
     }
     assert.ok(
       fireworks.keys.some((key) =>
-        key.models.includes("accounts/fireworks/models/deepseek-v4p1-flash"),
+        key.models.includes(
+          "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+        ),
       ),
       "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
+    );
+    // The undated `.../deepseek-v4p1-flash-us` is a different model entry, so a
+    // list that names it serves a release behind the one the class means. The
+    // class-set test above pins the dated id; this asserts the failure reads as
+    // "wrong release" rather than only "no Fireworks model".
+    assert.ok(
+      !fireworks.keys.some((key) =>
+        key.models.includes("accounts/fireworks/routers/deepseek-v4p1-flash-us"),
+      ),
+      "the Fireworks list names the undated V4.1 Flash router, which is the September release rather than the 1017 update the fleet runs",
     );
   });
 

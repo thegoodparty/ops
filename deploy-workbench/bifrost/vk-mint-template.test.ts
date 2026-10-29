@@ -55,7 +55,10 @@ type Template = {
 };
 
 type Config = {
-  providers?: Record<string, { keys: Array<{ models: string[] }> }>;
+  providers?: Record<
+    string,
+    { keys: Array<{ models: string[] }>; network_config?: { base_url?: string } }
+  >;
 };
 
 /**
@@ -66,6 +69,19 @@ const loadTemplate = (): Template => JSON.parse(TEMPLATE_SOURCE) as Template;
 
 const loadConfig = (): Config =>
   JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Config;
+
+/**
+ * US-only inference, from the key's side. `config.json` decides what the
+ * gateway will route; this file decides what a person's key may ask for, and a
+ * key that names a model the gateway does not allow is a 404 or an
+ * `AccessDenied` at request time. So the two files carry the same US-only
+ * rules and the same classes, and `config.test.ts` pins the class set that the
+ * exact-match test below then inherits.
+ */
+const US_BEDROCK_PREFIX = "us.";
+
+/** A US-only Fireworks router id, and nothing else: not a global model id. */
+const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
 
 const providerConfigs = (template: Template): ProviderConfigEntry[] => {
   const entries = template.provider_configs;
@@ -108,6 +124,57 @@ describe("bifrost virtual-key template", () => {
     // The key is created active. A template that created a deactivated key
     // would mint a key that authenticates nowhere.
     assert.equal(template.is_active, true);
+  });
+
+  it("allows nothing outside the United States", () => {
+    const template = loadTemplate();
+
+    // A JSON-parsed template has no comments to check, so every string in it is
+    // a value: `global.` anywhere is the worldwide profile named as a model.
+    const strings: string[] = [];
+    const collect = (value: unknown) => {
+      if (typeof value === "string") strings.push(value);
+      else if (Array.isArray(value)) value.forEach(collect);
+      else if (value && typeof value === "object") {
+        Object.values(value as Record<string, unknown>).forEach(collect);
+      }
+    };
+    collect(template);
+    for (const value of strings) {
+      assert.ok(
+        !value.includes("global."),
+        `the template carries "${value}", which names the worldwide profile; the gateway serves US-only inference`,
+      );
+    }
+
+    for (const entry of providerConfigs(template)) {
+      for (const model of entry.allowed_models) {
+        if (entry.provider === "bedrock") {
+          assert.ok(
+            model.startsWith(US_BEDROCK_PREFIX),
+            `${model} is not a us. inference profile; a bare or global id is not a US commitment`,
+          );
+        } else if (entry.provider === "fireworks") {
+          assert.match(
+            model,
+            US_FIREWORKS_ROUTER,
+            `${model} is not a US-only Fireworks router id; use accounts/fireworks/routers/<model>-us`,
+          );
+        }
+      }
+    }
+
+    // The endpoint is the other half of the decision and lives in config.json,
+    // because a template cannot override a provider's endpoint; the guard here
+    // is that the template may not add one and quietly point a key elsewhere.
+    const config = loadConfig();
+    for (const [provider, configured] of Object.entries(config.providers ?? {})) {
+      if (provider === "fireworks") continue;
+      assert.ok(
+        configured.network_config?.base_url === undefined,
+        `${provider} carries a base_url in config.json; only the Fireworks endpoint is a reviewed decision`,
+      );
+    }
   });
 
   it("allows exactly the models config.json allows, provider for provider", () => {

@@ -5,28 +5,19 @@
     {
       "provider": "bedrock",
       "allowed_models": [
-        "anthropic.claude-sonnet-5-5",
         "us.anthropic.claude-sonnet-5-5",
-        "global.anthropic.claude-sonnet-5-5",
-        "anthropic.claude-opus-5-5",
         "us.anthropic.claude-opus-5-5",
-        "moonshotai.kimi-k3",
         "us.moonshotai.kimi-k3",
-        "openai.gpt-6.1-sol",
         "us.openai.gpt-6.1-sol",
-        "anthropic.claude-haiku-5-5",
         "us.anthropic.claude-haiku-5-5",
-        "xai.grok-4.7",
         "us.xai.grok-4.7",
-        "zai.glm-5.3",
-        "us.zai.glm-5.3",
-        "deepseek.v3.2"
+        "us.zai.glm-5.3"
       ],
       "key_ids": ["*"]
     },
     {
       "provider": "fireworks",
-      "allowed_models": ["accounts/fireworks/models/deepseek-v4p1-flash"],
+      "allowed_models": ["accounts/fireworks/routers/deepseek-v4p1-flash-1017-us"],
       "key_ids": ["*"]
     }
   ]
