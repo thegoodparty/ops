@@ -18,6 +18,7 @@ import { createBifrostDatabase } from "./rds";
 import { createBifrostEcs } from "./ecs";
 import { createBifrostDiscovery } from "./discovery";
 import { createBifrostVkMint } from "./bifrost-vk-mint";
+import { createBifrostVkJanitor } from "./bifrost-vk-janitor";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -588,3 +589,25 @@ export const bifrostPrivateHostname = vkMint.bifrostHostname;
 /** The SSM parameter holding the key template, for a human reading the console. */
 export const vkBifrostMintTemplateParameterName =
   vkMint.templateParameter.name;
+
+// ---------------------------------------------------------------------------
+// The virtual-key janitor.
+//
+// Step 5 of `docs/bifrost-virtual-keys.md`: the hourly reconcile loop that
+// deactivates a Lambda-managed key whose owner has left `Engineers`. It consumes
+// the network and the same setup-token secret the mint reads, and it assumes the
+// read-only role step 2 created rather than carrying any directory permission of
+// its own. The marker that decides which keys it may touch is the shared
+// constant in `bifrost/vk-marker.ts`; the behaviour is
+// `bifrost/vk-janitor-core.ts`.
+//
+// It adds one more 8080 ingress rule on the task group, from its own security
+// group, because it is the second caller of the VPC-internal admin API. That is
+// the same exception the mint's module documents, not a new one.
+const vkJanitor = createBifrostVkJanitor({ provider, network });
+
+/** The function the hourly rule invokes, for a human reading the console. */
+export const vkBifrostJanitorFunctionArn = vkJanitor.function.arn;
+
+/** The EventBridge rule's name, so step 5's check does not start with a hunt. */
+export const vkBifrostJanitorScheduleRuleName = vkJanitor.rule.name;
