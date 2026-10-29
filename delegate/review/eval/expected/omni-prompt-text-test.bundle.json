@@ -1,0 +1,15 @@
+{
+  "repo": "thegoodparty/omni",
+  "prNumber": 99002,
+  "baseRef": "main",
+  "baseSha": "638f1f994fa54a6c072a7b98be99333e2f43379e",
+  "headSha": "bf2038b86296c9c6fc1eb1096630a4abac084a25",
+  "author": "delegate-eval",
+  "title": "Cover the candidate ideology prompt with tests",
+  "body": "## Why\n\nThe candidate ideology classifier has no tests on its prompt. The abstain rule is the part that keeps us from putting a wrong label on a real candidate, and the no-outside-knowledge rule is the part legal asked for. Both are one careless edit away from being softened, and nothing would tell us.\n\nThese tests pin those rules in place so a rewrite that drops them fails CI, and they cover the one piece of logic in the builder: a section only shows up when the candidate filled it in.\n",
+  "diff": "diff --git a/packages/gp-api/src/campaignIdeology/campaignIdeology.prompt.test.ts b/packages/gp-api/src/campaignIdeology/campaignIdeology.prompt.test.ts\nnew file mode 100644\nindex 0000000000..889fbcc0d4\n--- /dev/null\n+++ b/packages/gp-api/src/campaignIdeology/campaignIdeology.prompt.test.ts\n@@ -0,0 +1,39 @@\n+import { describe, expect, it } from 'vitest'\n+import { buildCandidateIdeologyMessages } from './campaignIdeology.prompt'\n+\n+const empty = { issues: null, bio: null, background: null }\n+\n+describe('buildCandidateIdeologyMessages', () => {\n+  it('tells the model to abstain instead of guessing', () => {\n+    const [system] = buildCandidateIdeologyMessages(empty)\n+\n+    expect(system.content).toContain('Abstain freely.')\n+    expect(system.content).toContain('Return bucket: null')\n+    expect(system.content).toContain('never default to \"moderate\"')\n+  })\n+\n+  it('forbids outside knowledge about the candidate', () => {\n+    const [system] = buildCandidateIdeologyMessages(empty)\n+\n+    expect(system.content).toContain('Work only from the provided text.')\n+    expect(system.content).toContain('Do not use any outside or general')\n+    expect(system.content).not.toContain('party affiliation')\n+  })\n+\n+  it('asks for cited evidence in a JSON-only reply', () => {\n+    const [system] = buildCandidateIdeologyMessages(empty)\n+\n+    expect(system.content).toContain('Cite your evidence.')\n+    expect(system.content).toContain('Respond with ONLY a JSON object')\n+  })\n+\n+  it('includes only the sections the candidate filled in', () => {\n+    const [, user] = buildCandidateIdeologyMessages({\n+      ...empty,\n+      issues: 'Fund the library',\n+    })\n+\n+    expect(user.content).toContain('Fund the library')\n+    expect(user.content).not.toContain('Why they are running')\n+  })\n+})\n",
+  "changedFiles": [
+    "packages/gp-api/src/campaignIdeology/campaignIdeology.prompt.test.ts"
+  ],
+  "priorFindings": []
+}
