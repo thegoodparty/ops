@@ -1448,3 +1448,515 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
     },
   ],
 };
+
+// ---------------------------------------------------------------------------
+// The gp-api preview deploy role (step 6 of docs/deploy-role-trust.md)
+//
+// Assumed by omni's `gp-api.yml` preview job and `gp-api-teardown-preview.yml`
+// on pull requests, which today assume the shared admin deploy role. Unlike
+// the plan and preview roles above, this one applies: a preview environment is
+// an ECS service, a target group, a listener rule, two queues, two buckets and
+// two IAM roles, and the role has to be able to create and destroy all of
+// them.
+//
+// The threat model, as the plan states it. The role is assumable by anyone
+// with push access to omni, running unreviewed code: both the workflow and the
+// Pulumi program come from the pull request. It cannot be made harmless. What
+// it can be is much smaller than administrator, and kept away from dev and
+// prod: every write is scoped to a preview name or a preview tag, the roles
+// it creates are capped by `gpApiPreviewRoleBoundary`, and it reads one
+// secret.
+//
+// Sized from the code on omni's main and from CloudTrail for one create, one
+// update and one teardown of a live preview under the shared role
+// (2026-10-28), not by enumerating services. Widened only by observed
+// failures, the discipline `pr-previews.md` step 4 set.
+
+export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // omni's pull_request subject exactly, and nothing else ever. Main
+          // runs, including the scheduled preview cleanup, keep the deploy
+          // role. No `job_workflow_ref` pin: it would name
+          // `@refs/pull/N/merge` and constrain nothing.
+          "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:pull_request",
+        },
+      },
+    },
+  ],
+};
+
+/**
+ * Backend access for one project's preview stacks, and none of its others.
+ *
+ * Not `pulumiBackendStatements("gp-api")`, which covers every gp-api stack.
+ * gp-api's dev and prod stacks share the project prefix with its previews,
+ * and their state holds the Aurora master passwords as Pulumi secrets, which
+ * the shared passphrase below decrypts. The stack-name prefix is what keeps a
+ * pull request to its own kind of stack.
+ *
+ * Read and write, unlike `pulumiBackendReadStatements`: a new pull request's
+ * stack does not exist yet, so `stack select --create` writes it, and
+ * teardown's `cancel` and `stack rm` delete the lock and the stack file.
+ */
+const pulumiBackendStackStatements = (
+  project: string,
+  stackPrefix: string,
+): PolicyStatement[] => [
+  {
+    Sid: "PulumiStateBucket",
+    Effect: "Allow",
+    Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+    Resource: BUCKET,
+  },
+  {
+    Sid: "PulumiStateObjects",
+    Effect: "Allow",
+    Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    Resource: [
+      `${BUCKET}/.pulumi/stacks/${project}/${stackPrefix}*`,
+      `${BUCKET}/.pulumi/locks/organization/${project}/${stackPrefix}*`,
+      `${BUCKET}/.pulumi/backups/${project}/${stackPrefix}*`,
+      `${BUCKET}/.pulumi/history/${project}/${stackPrefix}*`,
+    ],
+  },
+  {
+    Sid: "PulumiStateMeta",
+    Effect: "Allow",
+    Action: ["s3:GetObject"],
+    Resource: `${BUCKET}/.pulumi/meta.yaml`,
+  },
+  {
+    Sid: "PulumiStatePassphrase",
+    Effect: "Allow",
+    Action: ["ssm:GetParameter"],
+    Resource: "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
+  },
+];
+
+const PREVIEW_ROLES = "arn:aws:iam::333022194791:role/gp-pr-*";
+
+// Every resource a preview stack creates carries these, from the stack's
+// `aws:defaultTags` in omni's `infra-cli.ts`. Required on create so a new
+// resource cannot be born outside the tag scope, and required on everything
+// after so a dev or prod resource cannot be modified through it.
+const PREVIEW_REQUEST_TAGS = {
+  StringEquals: {
+    "aws:RequestTag/Environment": "preview",
+    "aws:RequestTag/Project": "gp-api",
+  },
+};
+
+const PREVIEW_RESOURCE_TAG = {
+  StringEquals: { "aws:ResourceTag/Environment": "preview" },
+};
+
+// The shared preview ALB is owned by gp-api's dev stack and tagged
+// `Environment=dev`, so its listener is reached by name, not by tag. Every
+// rule on it routes a `*.preview.goodparty.org` host to a preview.
+const SHARED_PREVIEW_LISTENER =
+  "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener/app/gp-api-previews/*";
+const SHARED_PREVIEW_LISTENER_RULES =
+  "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener-rule/app/gp-api-previews/*";
+
+export const githubActionsPreviewDeploy: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    ...pulumiBackendStackStatements("gp-api", "gp-api-pr-"),
+    {
+      // The SHA-tagged image and the `buildcache-<hash>` layer cache, both in
+      // the one repository. gp-api's tags are immutable, so a push cannot
+      // overwrite an image a dev or prod deploy already runs.
+      Sid: "PushGpApiImage",
+      Effect: "Allow",
+      Action: [
+        "ecr:DescribeImages",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+      ],
+      Resource: "arn:aws:ecr:us-west-2:333022194791:repository/gp-api",
+    },
+    {
+      // Neither login token reads or pushes anything, and neither action takes
+      // a resource. ECR Public is for the base images, as on the PR-only roles
+      // above.
+      Sid: "RegistryLogin",
+      Effect: "Allow",
+      Action: [
+        "ecr:GetAuthorizationToken",
+        "ecr-public:GetAuthorizationToken",
+        "sts:GetServiceBearerToken",
+      ],
+      Resource: "*",
+    },
+    {
+      // Read at program time. `index.ts` calls `getSecretVersion` on
+      // GP_API_DEV for every preview: the key names build the task
+      // definition's secret list. The same class as steps 4b and 4c, and the
+      // one secret this role can read. `getSecret` reads the resource policy
+      // alongside the describe.
+      Sid: "DevAppSecretForProgram",
+      Effect: "Allow",
+      Action: [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+      ],
+      Resource: "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    },
+    {
+      // `aws.rds.getCluster` on the shared preview cluster, at program time,
+      // and teardown's endpoint lookup. Describe only: previews create no RDS
+      // resource (`skipPerPrRds`), and each preview's database is created by
+      // its own container, so no RDS write is needed at all.
+      Sid: "SharedPreviewCluster",
+      Effect: "Allow",
+      Action: ["rds:DescribeDBClusters"],
+      Resource: "arn:aws:rds:us-west-2:333022194791:cluster:gp-api-preview-shared-db",
+    },
+    {
+      // Scoped by name rather than tag. Every ECS resource a preview creates
+      // carries the stack's `pr-<n>` stage in its name, which no dev or prod
+      // resource does, and ECS's tag condition support is uneven across these
+      // actions (the service reference lists none for DeleteCluster or
+      // UpdateService), so the name is the bound that holds for all of them.
+      Sid: "PreviewEcs",
+      Effect: "Allow",
+      Action: [
+        "ecs:CreateCluster",
+        "ecs:UpdateCluster",
+        "ecs:UpdateClusterSettings",
+        "ecs:DeleteCluster",
+        "ecs:DescribeClusters",
+        "ecs:RegisterTaskDefinition",
+        "ecs:CreateService",
+        "ecs:UpdateService",
+        "ecs:DeleteService",
+        "ecs:DescribeServices",
+        "ecs:TagResource",
+        "ecs:UntagResource",
+        "ecs:ListTagsForResource",
+      ],
+      Resource: [
+        "arn:aws:ecs:us-west-2:333022194791:cluster/gp-pr-*",
+        "arn:aws:ecs:us-west-2:333022194791:service/gp-pr-*/*",
+        "arn:aws:ecs:us-west-2:333022194791:task-definition/gp-pr-*",
+      ],
+    },
+    {
+      // AWS defines no resource for either. Deregistering marks a revision
+      // inactive and does not stop what is running on it.
+      Sid: "EcsTaskDefinitionsUnscoped",
+      Effect: "Allow",
+      Action: ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"],
+      Resource: "*",
+    },
+    {
+      // Teardown drops the preview's database by running the preview's own
+      // task definition in the preview's own cluster, before the destroy. Not
+      // the dev task definition on the dev cluster, which is how it was done
+      // under the shared role: that hands a pull request the dev task role and
+      // a command override. The preview task already holds everything the drop
+      // needs, so this adds no reach a running preview does not have.
+      Sid: "TeardownDropTask",
+      Effect: "Allow",
+      Action: ["ecs:RunTask"],
+      Resource: "arn:aws:ecs:us-west-2:333022194791:task-definition/gp-pr-*",
+      Condition: {
+        ArnLike: { "ecs:cluster": "arn:aws:ecs:us-west-2:333022194791:cluster/gp-pr-*" },
+      },
+    },
+    {
+      Sid: "TeardownDropTaskWait",
+      Effect: "Allow",
+      Action: ["ecs:DescribeTasks", "ecs:StopTask"],
+      Resource: "arn:aws:ecs:us-west-2:333022194791:task/gp-pr-*/*",
+    },
+    {
+      // Registering the task definition and running the drop task both pass
+      // the preview's two roles, and only to ECS tasks.
+      Sid: "PassPreviewRoles",
+      Effect: "Allow",
+      Action: ["iam:PassRole"],
+      Resource: PREVIEW_ROLES,
+      Condition: {
+        StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+      },
+    },
+    {
+      // The step 6a condition. Every action that can give a preview role a
+      // permission requires the request to name the boundary, so a role this
+      // credential creates or edits is capped by it whatever the pull request
+      // writes into its policies or its trust. For CreateRole and
+      // PutRolePermissionsBoundary the key is the boundary being set; for the
+      // rest it is the boundary the role already carries, so a role created
+      // without one, before this role existed, cannot be widened here.
+      Sid: "BoundedPreviewRoles",
+      Effect: "Allow",
+      Action: [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy",
+      ],
+      Resource: PREVIEW_ROLES,
+      Condition: {
+        StringEquals: { "iam:PermissionsBoundary": GP_API_PREVIEW_ROLE_BOUNDARY_ARN },
+      },
+    },
+    {
+      // Reads, tags, and removals. None of these can add a permission, so
+      // they need no boundary condition, and leaving it off lets a teardown
+      // delete a preview role created before the boundary existed.
+      Sid: "ManagePreviewRoles",
+      Effect: "Allow",
+      Action: [
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRoleTags",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateRoleDescription",
+        "iam:DeleteRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRole",
+      ],
+      Resource: PREVIEW_ROLES,
+    },
+    {
+      // Belt and braces for the condition above, and the plan's "must not be
+      // able to modify or remove the boundary itself". Nothing above grants
+      // these, so this only matters if a later edit widens the role.
+      Sid: "DenyBoundaryTampering",
+      Effect: "Deny",
+      Action: [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:DeletePolicy",
+        "iam:TagPolicy",
+        "iam:UntagPolicy",
+      ],
+      Resource: "*",
+    },
+    {
+      // The target group is created with `namePrefix: 'HTTP'` and an
+      // AWS-generated suffix, the same prefix dev and prod use, so no name
+      // pattern separates it. The tag condition does, which is the plan's
+      // reason for scoping by tag. The listener rule goes on the shared
+      // preview listener, named above.
+      Sid: "CreatePreviewRouting",
+      Effect: "Allow",
+      Action: ["elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:CreateRule"],
+      Resource: [
+        "arn:aws:elasticloadbalancing:us-west-2:333022194791:targetgroup/*",
+        SHARED_PREVIEW_LISTENER,
+      ],
+      Condition: PREVIEW_REQUEST_TAGS,
+    },
+    {
+      // Tagging is part of those two creates. Restricted to them so this
+      // cannot tag a dev resource `Environment=preview` and then reach it
+      // through the statement below.
+      Sid: "TagPreviewRoutingOnCreate",
+      Effect: "Allow",
+      Action: ["elasticloadbalancing:AddTags"],
+      Resource: [
+        "arn:aws:elasticloadbalancing:us-west-2:333022194791:targetgroup/*",
+        SHARED_PREVIEW_LISTENER_RULES,
+      ],
+      Condition: {
+        StringEquals: {
+          "elasticloadbalancing:CreateAction": ["CreateTargetGroup", "CreateRule"],
+        },
+      },
+    },
+    {
+      // Everything after create, on preview-tagged resources only. The load
+      // balancer and listener deletes are for stacks still on a per-PR ALB
+      // from before the shared one existed; a preview no longer creates one,
+      // so neither create is granted.
+      Sid: "ManagePreviewRouting",
+      Effect: "Allow",
+      Action: [
+        "elasticloadbalancing:ModifyTargetGroup",
+        "elasticloadbalancing:ModifyTargetGroupAttributes",
+        "elasticloadbalancing:DeleteTargetGroup",
+        "elasticloadbalancing:ModifyRule",
+        "elasticloadbalancing:DeleteRule",
+        "elasticloadbalancing:AddTags",
+        "elasticloadbalancing:RemoveTags",
+        "elasticloadbalancing:DeleteListener",
+        "elasticloadbalancing:DeleteLoadBalancer",
+      ],
+      Resource: [
+        "arn:aws:elasticloadbalancing:us-west-2:333022194791:targetgroup/*",
+        SHARED_PREVIEW_LISTENER_RULES,
+        "arn:aws:elasticloadbalancing:us-west-2:333022194791:loadbalancer/app/gpapi-pr-*",
+        "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener/app/gpapi-pr-*",
+      ],
+      Condition: PREVIEW_RESOURCE_TAG,
+    },
+    {
+      // Metadata only, and AWS defines no resource for any of them.
+      Sid: "DescribeNetworking",
+      Effect: "Allow",
+      Action: [
+        "elasticloadbalancing:Describe*",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeNetworkInterfaces",
+      ],
+      Resource: "*",
+    },
+    {
+      // A per-PR ALB stack's security group, on its way out. Same reason as
+      // the load balancer delete above.
+      Sid: "DeleteLegacyPreviewSecurityGroup",
+      Effect: "Allow",
+      Action: ["ec2:DeleteSecurityGroup"],
+      Resource: "arn:aws:ec2:us-west-2:333022194791:security-group/*",
+      Condition: PREVIEW_RESOURCE_TAG,
+    },
+    {
+      // A per-PR ALB stack's two alias records, also on their way out. The
+      // zone is goodparty.org, so the change is held to deleting A and AAAA
+      // records under `pr-*.preview.goodparty.org`: this cannot create a
+      // record, or touch one outside the preview names.
+      Sid: "DeleteLegacyPreviewRecords",
+      Effect: "Allow",
+      Action: ["route53:ChangeResourceRecordSets"],
+      Resource: "arn:aws:route53:::hostedzone/Z10392302OXMPNQLPO07K",
+      Condition: {
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsActions": ["DELETE"],
+          "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA"],
+        },
+        "ForAllValues:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            "pr-*.preview.goodparty.org",
+          ],
+        },
+      },
+    },
+    {
+      Sid: "ReadPreviewZone",
+      Effect: "Allow",
+      Action: ["route53:GetHostedZone", "route53:ListResourceRecordSets", "route53:GetChange"],
+      Resource: [
+        "arn:aws:route53:::hostedzone/Z10392302OXMPNQLPO07K",
+        "arn:aws:route53:::change/*",
+      ],
+    },
+    {
+      // The service's log group, and the Container Insights group ECS creates
+      // on its own and teardown deletes by hand.
+      Sid: "PreviewLogGroups",
+      Effect: "Allow",
+      Action: [
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DeleteRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:TagLogGroup",
+        "logs:UntagLogGroup",
+        "logs:ListTagsForResource",
+        "logs:ListTagsLogGroup",
+      ],
+      Resource: [
+        "arn:aws:logs:us-west-2:333022194791:log-group:/sst/cluster/gp-pr-*",
+        "arn:aws:logs:us-west-2:333022194791:log-group:/aws/ecs/containerinsights/gp-pr-*",
+      ],
+    },
+    {
+      Sid: "DescribeLogGroups",
+      Effect: "Allow",
+      Action: ["logs:DescribeLogGroups"],
+      Resource: "*",
+    },
+    {
+      // `pr-<n>-Queue.fifo` and `pr-<n>-DLQ.fifo`, the same shapes the
+      // boundary names. Lifecycle only: the app sends and receives through its
+      // task role, not through this one.
+      Sid: "PreviewQueues",
+      Effect: "Allow",
+      Action: [
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:SetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:TagQueue",
+        "sqs:UntagQueue",
+        "sqs:ListQueueTags",
+      ],
+      Resource: PREVIEW_QUEUES,
+    },
+    {
+      // The two buckets each preview owns. The reads are what the provider
+      // calls on every refresh of a bucket; the object deletes are
+      // `forceDestroy` emptying it at teardown. No policy or ACL writes: the
+      // stack sets neither, so the public access block it does set cannot be
+      // undercut from here.
+      Sid: "PreviewBuckets",
+      Effect: "Allow",
+      Action: [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:GetBucket*",
+        "s3:GetAccelerateConfiguration",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetReplicationConfiguration",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+      ],
+      Resource: [
+        "arn:aws:s3:::tevyn-poll-csvs-pr-*",
+        "arn:aws:s3:::zip-to-area-code-mappings-pr-*",
+      ],
+    },
+    {
+      Sid: "EmptyPreviewBuckets",
+      Effect: "Allow",
+      Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      Resource: [
+        "arn:aws:s3:::tevyn-poll-csvs-pr-*/*",
+        "arn:aws:s3:::zip-to-area-code-mappings-pr-*/*",
+      ],
+    },
+    {
+      // The plan's "no write to any resource carrying the production tags",
+      // as a deny so it holds whatever is later added above. Nothing this role
+      // legitimately touches is tagged `Environment=prod`. The shared VPC is,
+      // and this role acts on nothing in it directly: ECS places the tasks.
+      Sid: "DenyProductionTagged",
+      Effect: "Deny",
+      Action: "*",
+      Resource: "*",
+      Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
+    },
+  ],
+};

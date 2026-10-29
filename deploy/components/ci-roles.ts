@@ -20,6 +20,8 @@ import {
   githubActionsDelegateEvalLedgerTrust,
   GP_API_PREVIEW_ROLE_BOUNDARY_NAME,
   gpApiPreviewRoleBoundary,
+  githubActionsPreviewDeploy,
+  githubActionsPreviewDeployTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -291,8 +293,30 @@ export const createCiRoles = () => {
     policy: JSON.stringify(gpApiPreviewRoleBoundary),
   });
 
+  // The gp-api preview deploy role, step 6 of docs/deploy-role-trust.md.
+  // Trusted by `pull_request` runs in omni alone. It applies, unlike the plan
+  // and preview roles above, so its policy is scoped to preview names and
+  // tags, and the roles it creates must carry the boundary above.
+  //
+  // No protect. Nothing depends on it until step 7 points omni's preview and
+  // teardown workflows at it.
+  const previewDeployRole = new aws.iam.Role("githubActionsPreviewDeploy", {
+    name: "github-actions-preview-deploy",
+    description:
+      "gp-api preview deploys and teardowns from pull_request runs in thegoodparty/omni.",
+    assumeRolePolicy: JSON.stringify(githubActionsPreviewDeployTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsPreviewDeployPolicy", {
+    name: "PreviewDeploy",
+    role: previewDeployRole.id,
+    policy: JSON.stringify(githubActionsPreviewDeploy),
+  });
+
   return {
     gpApiPreviewBoundary,
+    previewDeployRole,
     deployRole,
     deployPolicy,
     orgDeployRole,
