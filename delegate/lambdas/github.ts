@@ -26,11 +26,12 @@ const REVIEW_REPOS = new Set([
   // ops: review scope only (not in WRITE_REPOS). Whether an approval here can
   // merge is decided by .github/CODEOWNERS alone: a PR touching only paths
   // that file leaves unowned satisfies the code-owner requirement vacuously,
-  // so the bot's approval is the one approval the ruleset asks for. Its
-  // opt-out list is empty, so no path in ops is in that state today and every
-  // PR needs a human code owner; a de-owned path would be the only way in.
-  // On any other path the App still cannot satisfy code-owner review, and a
-  // human must approve.
+  // so the bot's approval is the one approval the ruleset asks for. One path
+  // is unowned -- `deploy-workbench/`, de-owned in step 6 of
+  // `docs/plan-gated-merges.md` -- so a PR that touches only that tree can
+  // merge on the bot's approval. On any other path, which is every other path
+  // here, the App still cannot satisfy code-owner review, and a human must
+  // approve.
   "ops",
 ]);
 // The first reviewable state of a PR gets a run on its own; every later push

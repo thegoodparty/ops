@@ -494,6 +494,11 @@ now would be a number chosen before any of the evidence exists. What is decided
 now is that a single false approve on a path blocks de-owning that path, and
 that the rates are recorded where the next reader can see them.
 
+That bar was not met for the first path de-owned, and the bar is not lowered
+because of it. What happened instead is recorded once, with its evidence and its
+tripwire, in "The first path, and the bar it did not wait for" below; the bar
+still governs the three trees that remain owned.
+
 ## De-owning the Pulumi trees, one path at a time
 
 Each of `deploy/`, `deploy-org/`, `deploy-workbench/` and `deploy-infrastructure/`
@@ -562,6 +567,13 @@ to `CODEOWNERS`.
 6. **Only the Pulumi trees are de-owning candidates**, one at a time, after
    step 5. They are the paths where a plan's steps are the actual change and
    where the review value is highest relative to review cost.
+   **Amended 2026-10-29:** the first of them, `deploy-workbench/`, was de-owned
+   ahead of step 5's bar rather than after it, deliberately and once, on the
+   engineer's call. What that decision rests on, what it does not, and the
+   tripwire that reverses it are in "The first path, and the bar it did not
+   wait for". The rule itself is unchanged: the other three trees are still
+   candidates under the bar, each on its own evidence, and a false approve on
+   any of them still blocks de-owning it.
 7. **The bot derives authority from `CODEOWNERS` on `main`, per PR.** Not from a
    cached copy, not from configuration, not from the plan. Read at run time from
    the PR's base ref, and the base ref has to be `main`.
@@ -776,6 +788,86 @@ The Progress list is the checklist; this is the detail behind each step.
    evidence, not by size; `deploy-infrastructure/` is the one I would expect to
    go last, because it holds the runtime that acts on the identity store and the
    break-glass tool's own Lambda.
+
+## The first path, and the bar it did not wait for
+
+**2026-10-29.** `deploy-workbench/` is de-owned, and `DELEGATE_GATING_MODE` is
+`enforce` in `deploy/components/worker.ts`. This is step 6's first increment and
+it was taken *ahead of* "The bar for step 6", on the engineer's call and not on
+evidence. Saying so plainly is the reason for this section: the bar was not met,
+it is not being lowered, and three of the four Pulumi trees are still decided by
+it.
+
+Mechanically the change is the reverse of what "De-owning the Pulumi trees" says
+above: step 2 left the opt-out list empty, so de-owning a path is a line
+*added* to it with no owners. The line's presence is what grants the bot
+authority; a reader who takes "one line removed" literally would re-own the
+path instead.
+
+**What the shadow window measured.** 22 shadow-gated reviews across 11 PRs in
+the two days between `shadow` reaching the worker (#387, 2026-10-27) and this
+change: every one of them "would have commented", and not one would-approve. So
+step 5's false-approve rate is 0 out of 0, which is a count with no denominator
+and not a passing result, and its false-flag rate there is 22 out of 22, which
+is not "low enough that a human would not merge around the bot" either. The
+reason is mechanical rather than disagreement. The gate would have approved none
+of the last 100 merged PRs here: 86 of those 100 bodies carry no `Plan:` line,
+because the convention only arrived in step 3, and `*` owned every path until
+this change, which flags all of them. A two-day window on a gate that could not
+say yes is not evidence in either direction, and it is much shorter than the
+"few weeks" this plan asked for.
+
+**What the evidence is.** One number, and it is precision, not recall. Over the
+last 100 merged PRs the reviewer posted 32 findings; 31 were confirmed by the
+owner and fixed, a median of four minutes from review to fix commit. On
+`deploy-workbench/` specifically, 9 of 9. The one that was not: #288, whose
+finding — that `agent-swarm/fill-secrets.sh` omits the GitHub App's
+`Contents: write` — was merged over, and the permission is still missing on
+`main` 19 days later. Precision says the reviewer finds real problems and the
+people reading it agree. It says nothing about the problems it does not find.
+
+**What the evidence is not.** Recall is unmeasured. The only quantitative
+number is the eval corpus: 8 of 15 runs on the five must-block cases, 53%, with
+a Wilson interval of 30–75%, and two of those misses are real production PRs the
+bot approved and got wrong. That is the risk being accepted, named instead of
+rounded off: the gate can miss, and on a path it can approve, a miss merges
+without a human reading it.
+
+**Why this path, and why it is defensible anyway.** `deploy-workbench/` is the
+contents of the `goodparty-workbench` account, the sandbox account built for
+developer inner-loop tooling and treated as disposable. It is a credential
+path, not an innocent one — its CI role and the workflow that assumes it are in
+the same tree — so what makes it the right first path is not that a mistake
+there is harmless, but that the blast radius is the account the team would
+rebuild rather than defend. Two things make it reversible: the line that
+de-owns it is one line in a file that stays human-owned, so putting the path
+back is a PR a human approves in minutes with no deploy; and because `*` still
+owns everything else, flipping the mode to `enforce` in the same PR cannot
+approve a PR that touches anything outside this tree.
+
+### The tripwire
+
+So that this decision has a trigger and an owner rather than an assumption that
+someone will notice.
+
+- **A false approve** is a PR in `deploy-workbench/` that `delegate` approved,
+  that merged on that approval, and that a human then had to fix or revert, or
+  that caused an incident. A finding it flagged is not a false approve, and a
+  comment a human merged over is not one either.
+- **One is enough.** The response is to remove the `deploy-workbench/` line from
+  `.github/CODEOWNERS` immediately, in its own human-reviewed PR, and only then
+  decide whether to try again, with the false approve described in that PR's
+  body. The mode stays `enforce` through it: with no de-owned path it can only
+  comment, so it is not the thing that needs changing.
+- **Who reads them.** Jeff, who drives this plan and owns the workbench account,
+  reads the bot's approvals in `deploy-workbench/`. This document names the
+  reader so the job is a responsibility rather than a hope, and naming someone
+  else is how the job moves.
+- **Reading them needs no new tooling.** An approval is an `APPROVE` review from
+  the bot on a merged PR, which is in the review history as it stands, with no
+  label and nothing new to add: every merged PR in the tree, and
+  `gh pr view <n> --json reviews` for whether `delegate-reviewer` approved it.
+  There is nothing to build before this can be read.
 
 ## What was verified
 

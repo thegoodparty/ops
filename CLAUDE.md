@@ -55,24 +55,31 @@ decision 11 of `docs/plan-gated-merges.md`.
 
 ## Review and approval
 
-Who has to approve a PR here no longer depends on which paths it touches:
-every path needs a human. The default branch requires one approving review
-plus code-owner review. `.github/CODEOWNERS` **owns every path by default**:
-`*` is its only rule, so a human on `@thegoodparty/gp-contrib` must approve
-every PR. A path with no owner would satisfy the code-owner half vacuously, but
-the opt-out list that could leave a path unowned is deliberately empty, so
-nothing merges on a `delegate-reviewer[bot]` approval — not documentation, not
-root files, not anything else.
+Who has to approve a PR here depends on the path, and today one path differs.
+The default branch requires one approving review plus code-owner review.
+`.github/CODEOWNERS` **owns every path by default**: `*` is its rule, so a human
+on `@thegoodparty/gp-contrib` must approve everything except what the opt-out
+list leaves unowned. A path with no owner satisfies the code-owner half
+vacuously, and the opt-out list is deliberately as short as it is.
+
+The one entry is `deploy-workbench/`, de-owned on 2026-10-29 under step 6 of
+`docs/plan-gated-merges.md`, which took that step ahead of the evidence bar the
+plan set for it and records why, what the evidence does and does not show, and
+the tripwire. A PR that touches only `deploy-workbench/` can merge on a
+`delegate-reviewer[bot]` approval when it names a plan merged to `main` and the
+change is consistent with it. Touching any other path -- this file, `docs/`,
+`deploy/`, anything outside that tree -- puts the whole PR back under human
+review.
 
 The opt-out list in `.github/CODEOWNERS` is also the only mechanism that grants
 the bot authority to approve, and adding an entry to it is a security change
-that needs a human. There are no entries today.
+that needs a human.
 
-**A human on `@thegoodparty/gp-contrib` must approve** every path, `docs/`
+**A human on `@thegoodparty/gp-contrib` must approve** every other path, `docs/`
 included. The owned entries worth naming, because the file being edited does
 not obviously reach a credential:
 
-- `.github/`, `delegate/`, `deploy/`, `deploy-org/`, `deploy-workbench/`,
+- `.github/`, `delegate/`, `deploy/`, `deploy-org/`,
   `deploy-infrastructure/` — the trees that define IAM, CI and the reviewer
   itself
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling

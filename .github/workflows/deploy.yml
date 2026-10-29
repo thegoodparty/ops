@@ -44,10 +44,11 @@ jobs:
       #
       # `.github/CODEOWNERS` can let a path it leaves unowned merge on a bot
       # approval, so this ordering is what keeps such a merge from reaching the
-      # deploy role. No path is in that state today -- the opt-out list is
-      # empty and `*` owns everything -- but the ordering has to hold for any
-      # path that is ever de-owned. Nothing below needs AWS except the docker
-      # build's ECR Public login, the ECR push and the deploy itself.
+      # deploy role. One path is in that state -- `deploy-workbench/`, de-owned
+      # in step 6 of `docs/plan-gated-merges.md` -- and nothing in it runs here;
+      # the ordering has to hold for any path that is ever de-owned. Nothing
+      # below needs AWS except the docker build's ECR Public login, the ECR push
+      # and the deploy itself.
       - run: npm ci
       - run: npm test
       - run: npm run build
