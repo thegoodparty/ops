@@ -22,10 +22,19 @@ permissions:
 # Each job asks for `id-token: write` only if it assumes a role.
 jobs:
   prepare:
+    # A reaction on a pull request's conversation comment is governed by the
+    # pull-requests permission, not only issues. c85f6e5 replaced the
+    # workflow-level `pull-requests: write` every job inherited with per-job
+    # permissions and narrowed this job to `pull-requests: read`, so
+    # `React with eyes` has answered 403 "Resource not accessible by
+    # integration" on every trigger since (run 40907256472); the last run that
+    # added the reaction, 40403145125, inherited `pull-requests: write`. This
+    # job and `finish` run no repository code, so restoring the write here does
+    # not hand it to the PR's code the way the workflow-level block did.
     permissions:
       contents: read
-      pull-requests: read
       issues: write
+      pull-requests: write
     if: |
       github.event.issue.pull_request != null &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
@@ -60,6 +69,31 @@ jobs:
           echo "suite=${suite}" >> "$GITHUB_OUTPUT"
           echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
+      # The replay jobs otherwise fail on a missing repo variable or secret
+      # with an error in their own log, and the jobs that post to the PR are
+      # skipped, so nothing says why. Naming it here lets the comment below
+      # report it before anything is spent; it is also the fastest failure.
+      - name: Check the eval's settings are present
+        id: settings
+        env:
+          APP_ID: ${{ vars.DELEGATE_EVAL_APP_ID }}
+          APP_KEY: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
+          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          missing=""
+          if [ -z "$APP_ID" ]; then missing="${missing} variable DELEGATE_EVAL_APP_ID"; fi
+          if [ -z "$APP_KEY" ]; then missing="${missing} secret DELEGATE_EVAL_APP_PRIVATE_KEY"; fi
+          if [ -z "$ANTHROPIC_KEY" ]; then missing="${missing} secret ANTHROPIC_API_KEY"; fi
+          if [ -n "$missing" ]; then
+            echo "settings_missing=${missing# }" >> "$GITHUB_OUTPUT"
+            echo "::error::delegate eval is missing:${missing}. See delegate/review/eval/README.md."
+            exit 1
+          fi
+
+      # A decoration must not gate the run: ten jobs and $1-5 per case follow
+      # this step, so a reaction that cannot be added is a warning, not a
+      # failure. A permission regression here took the eval down for two days
+      # without a word.
       - name: React with eyes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,7 +101,8 @@ jobs:
           gh api \
             --method POST \
             repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
-            -f content=eyes
+            -f content=eyes || \
+            echo "::warning::Could not add the eyes reaction to the trigger comment. The eval continues without it."
 
       - name: Resolve PR head sha
         id: pr
@@ -76,6 +111,7 @@ jobs:
         run: |
           head_repo=$(gh api repos/${{ github.repository }}/pulls/${{ steps.parse.outputs.pr_number }} --jq '.head.repo.full_name')
           if [ "$head_repo" != "${{ github.repository }}" ]; then
+            echo "fork=true" >> "$GITHUB_OUTPUT"
             echo "::error::delegate eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
             exit 1
           fi
@@ -93,6 +129,44 @@ jobs:
           sha=$(gh api repos/${{ github.repository }}/commits/main --jq '.sha')
           echo "main_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "main_sha7=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      # A prepare failure used to be invisible: the job died, every job that
+      # posts to the PR was skipped, and the only one that still ran was
+      # `finish`, removing a reaction that was never added (run 40907256472).
+      # This posts one comment saying the eval did not start and why, so a
+      # broken trigger, a fork, a missing setting or anything else is visible
+      # on the PR. The reason is derived from this job's own step outcomes; the
+      # trigger comment's body is attacker-controlled text and is never part of
+      # it, and never reaches this script.
+      - name: Report that the eval did not start
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PARSE: ${{ steps.parse.outcome }}
+          SETTINGS: ${{ steps.settings.outcome }}
+          SETTINGS_MISSING: ${{ steps.settings.outputs.settings_missing }}
+          PR_LOOKUP: ${{ steps.pr.outcome }}
+          FORK: ${{ steps.pr.outputs.fork }}
+          MAIN_LOOKUP: ${{ steps.main.outcome }}
+        run: |
+          reason="prepare failed before any replay job started. See the run log for the failing step."
+          if [ "$PARSE" = "failure" ]; then
+            reason="the trigger did not parse. Comment 'delegate eval' or 'delegate eval <suite>', where the suite matches ^[a-z0-9-]+\$."
+          elif [ "$SETTINGS" = "failure" ]; then
+            reason="the workflow is not configured: missing ${SETTINGS_MISSING}. See delegate/review/eval/README.md."
+          elif [ "$FORK" = "true" ]; then
+            reason="the PR's head branch is in another repository. The eval runs the PR's code with live credentials, so it only runs on branches in this repo, not forks."
+          elif [ "$PR_LOOKUP" = "failure" ]; then
+            reason="the PR head could not be resolved."
+          elif [ "$MAIN_LOOKUP" = "failure" ]; then
+            reason="main's head could not be resolved."
+          fi
+          body=$(printf '<!-- delegate-eval-did-not-start -->\nThe delegate eval **did not start**: %s\n\nNothing was replayed and nothing was spent. The failing step is in the [workflow run](%s).\n' "$reason" "$RUN_URL")
+          gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$body" || \
+            echo "::warning::Could not post the did-not-start comment to the PR."
 
   # Main's side of the pairwise eval. Runs only main's code. The PR is checked
   # out for its scenario manifest alone (sparse, no install), which main's code
@@ -822,8 +896,12 @@ jobs:
         run: exit 1
 
   finish:
+    # Removing the reaction is the same pull-requests-governed write as adding
+    # it; c85f6e5 left this job with `issues: write` alone. It runs no
+    # repository code.
     permissions:
       issues: write
+      pull-requests: write
     needs: [prepare, pairwise-judge, expected-score]
     if: always() && needs.prepare.result != 'skipped'
     runs-on: ubuntu-latest
@@ -836,6 +914,9 @@ jobs:
             repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
             --jq '[.[] | select(.content == "eyes")] | first | .id // empty')
           if [ -n "$reaction_id" ]; then
+            # Best effort too: the results are already posted, and a leftover
+            # emoji must not turn a finished eval red.
             gh api --method DELETE \
-              repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id}
+              repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions/${reaction_id} || \
+              echo "::warning::Could not remove the eyes reaction from the trigger comment."
           fi
