@@ -446,7 +446,7 @@ jobs:
           # The ids go in a file, not a step output: in gate mode they can name
           # holdout cases, and step inputs and outputs are printed in the log.
           mkdir rerun
-          jq -r '.rerun | join(",")' ./cand/gate.json > ./rerun/ids.txt
+          jq -j '.rerun | join(",")' ./cand/gate.json > ./rerun/ids.txt
           if [ -s ./rerun/ids.txt ]; then echo "has_rerun=true" >> "$GITHUB_OUTPUT"; fi
 
       - name: Upload the rerun ids
