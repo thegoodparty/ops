@@ -26,9 +26,10 @@ const REVIEW_REPOS = new Set([
   // ops: review scope only (not in WRITE_REPOS). Whether an approval here can
   // merge is decided by .github/CODEOWNERS alone: a PR touching only paths
   // that file leaves unowned satisfies the code-owner requirement vacuously,
-  // so the bot's approval is the one approval the ruleset asks for. One path
-  // is unowned -- `deploy-workbench/`, de-owned in step 6 of
-  // `docs/plan-gated-merges.md` -- so a PR that touches only that tree can
+  // so the bot's approval is the one approval the ruleset asks for. Four
+  // Pulumi trees are unowned -- `deploy/`, `deploy-org/`, `deploy-workbench/`
+  // and `deploy-infrastructure/`, de-owned in step 6 of
+  // `docs/plan-gated-merges.md` -- so a PR that touches only those trees can
   // merge on the bot's approval. On any other path, which is every other path
   // here, the App still cannot satisfy code-owner review, and a human must
   // approve.

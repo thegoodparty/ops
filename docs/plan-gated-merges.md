@@ -957,9 +957,11 @@ same repair.
 So that this decision has a trigger and an owner rather than an assumption that
 someone will notice.
 
-- **A false approve** is a PR in `deploy-workbench/` that `delegate` approved,
+- **A false approve** is a PR in any of `deploy/`, `deploy-org/`,
+  `deploy-workbench/` or `deploy-infrastructure/` that `delegate` approved,
   that merged on that approval, and that a human then had to fix or revert, or
-  that caused an incident. A finding it flagged is not a false approve, and a
+  that caused an incident. (Amended 2026-10-30: the definition named only
+  `deploy-workbench/` before the batch; it now covers all four de-owned trees.) A finding it flagged is not a false approve, and a
   comment a human merged over is not one either.
 - **One is enough.** The response is to remove the `deploy-workbench/` line from
   `.github/CODEOWNERS` immediately, in its own human-reviewed PR, and only then
@@ -1032,10 +1034,10 @@ batch is re-owned. So:
   settle it, and the default above (re-own all four) is the conservative reading,
   not a decision that has been made about the other case.
 
-**What this does not change.** Nothing about the bar's content, the tripwire's
-definition of a false approve, or the fact that `deploy-infrastructure/` is the
-riskiest of the four. Each of the four keeps its own name in the record, so a
-later reader can see which path was approved on which PR.
+**What this does not change.** Nothing about the bar's content, or the fact that
+`deploy-infrastructure/` is the riskiest of the four. Each of the four keeps its
+own name in the record, so a later reader can see which path was approved on
+which PR.
 
 ## What was verified
 
