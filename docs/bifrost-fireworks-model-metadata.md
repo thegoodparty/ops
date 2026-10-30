@@ -114,8 +114,17 @@ aliases: models/deepseek-v4p1-flash-1017-us ->
            model_name models/deepseek-v4p1-flash-1017-us
 ```
 
-The router id is no longer served under its own name, so there is one Fireworks
-row in `/v1/models`, and it is the enriched one. Run on the v2.3.0 code
+The router id is no longer served under its own name. That is the shape of the
+change this document records. The key also serves the two role aliases
+`worker-default` and `coordinator-default`, added on top of it by the plan in
+[`bifrost-model-aliases.md`](./bifrost-model-aliases.md). Both have the same
+`model_id` and `model_name`, so `/v1/models` lists three Fireworks rows for one
+wire id. Only the catalog-named row is enriched, as below. The two role rows
+come back **without metadata** (no row exists for them in the datasheet, and
+the lookup is by listed name, then by the alias's wire id), so on their own they
+show as 128K / $0 in pi. They are safe only because `gp-pi` copies the context
+window and price from the catalog-named sibling that shares their `alias` value
+(decision 9 and item I of that plan). Run on the v2.3.0 code
 (`listModelsByKey`, then the lookup and `ApplyModelInfo` the handler uses, over
 the 2026-10-30 datasheet), the entry is:
 
@@ -127,8 +136,9 @@ the 2026-10-30 datasheet), the entry is:
  "pricing":{"prompt":"0.0000004500","completion":"0.0000018000","input_cache_read":"0.0000000090"}}
 ```
 
-That is every field `gp-bifrost.ts` reads, with the right numbers, so it needs
-**no change to the `gp-pi` extension**.
+That is every field `gp-bifrost.ts` reads, with the right numbers, so the
+catalog-named entry needs **no change to the `gp-pi` extension**. The role names
+do not get this entry; they rely on item I, above.
 
 **Cost is fixed by the same edit.** Request cost resolves the alias's
 `model_name` first (`resolvePricing`, `datasheet/cost.go:2229`), so a request
@@ -153,10 +163,17 @@ residency against the **wire id**, so an alias to a non-US id fails them.
 
 `config.test.ts` and `vk-mint-template.test.ts`:
 
-- every served Fireworks name is a catalog-named alias with `model_name` set to
-  itself, with a negative test of that detector (a router served directly, a
-  router beside a good alias, an alias with no `model_name`): the silent case
-  is an entry that is present, succeeds, and lists as 128K / $0;
+- every served Fireworks name is an alias with a non-empty `model_name`. A name
+  that is itself a catalog row must have `model_name` equal to it; any other
+  name (the two role aliases) must share its `model_id` with such a
+  catalog-named sibling that is also served, because that sibling is what
+  `gp-pi` copies metadata from. A negative test of that detector covers a
+  router served directly, a served name that is not an alias, an alias with a
+  missing or blank `model_name`, and a role alias with no catalog-named
+  sibling: the silent case is an entry that is present, succeeds, and lists as
+  128K / $0;
+- the two role names `coordinator-default` and `worker-default` exist, and the
+  router id is served under no name of its own;
 - residency on the wire id, for the config and for the template;
 - the template's Fireworks list equals the config's;
 - an invented `context_length` / `max_*_tokens` / `pricing` key is refused:
@@ -170,9 +187,9 @@ residency against the **wire id**, so an alias to a non-US id fails them.
   is no longer in the key's `models`, so anything still naming it gets a refusal
   from the gateway. That is deliberate and is the container's change to make
   (`gp-pi`'s default id), not this repository's.
-- **Existing virtual keys do not get the new name.** The mint applies the
+- **Existing virtual keys do not get the new names.** The mint applies the
   template on create only, so a key minted before this deploys can neither list
-  nor call it. Key refresh is being handled separately.
+  nor call them. Key refresh is being handled separately.
 - **It depends on the datasheet.** If upstream drops or renames the
   `models/...-us` row, the entry lists bare again and costs $0. Only a live
   `/v1/models` check can see that. The clean fix is a datasheet row for the
