@@ -239,7 +239,7 @@ rollback is the RDS snapshot again.
   to the old colour between the seed and its drain is lost: the seed happened
   before it, and the old database is dropped a cycle later. The window runs from
   the start of the seed to the old task's stop, so it includes the dump itself
-  (whose length is open item 8), and then — by the constants above — roughly
+  (which step 2 measures), and then — by the constants above — roughly
   a minute to a minute and a half: the new task's boot (23.1s measured on
   2026-10-26, the first boot after a config change against an empty RDS; this
   is a copy of a populated one, so that is a floor), the
@@ -321,8 +321,8 @@ the problem rather than solving it.
 copy and is **not usable here**: Postgres refuses it while any session is
 connected to the template database, and the template is the database the
 serving task has open. A logical dump taken in one repeatable-read transaction
-is a consistent snapshot of a database in use, which is what the seed needs; it
-is not free, and the copy's size is an open item.
+is a consistent snapshot of a database in use, which is what the seed needs.
+What it copies, what runs it and who creates the target are decisions 16–19.
 
 ### 4. Rolling update at 100/200, which the copy is what makes safe
 
@@ -457,7 +457,7 @@ see.
 The extension attempts a re-mint at most once per turn and surfaces the error if
 the retry also fails. This is what makes a wrong trigger — a `403` for a reason
 that is not a key — cost one failed call instead of a loop, and it is what lets
-the trigger set be settled empirically (open item 6) without the design being
+the trigger set be settled empirically (open item 2) without the design being
 unsafe while it is uncertain.
 
 A re-mint is safe to attempt blindly because the mint is the authorisation
@@ -491,7 +491,6 @@ between "a key was minted and lost" and "a key was minted into the new colour".
 It is cheap to add to the next step's verification and it is not worth a step.
 
 ### 15. `--refresh` documentation is replaced by the extension
-
 Decision 7 of [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) records the
 current workaround, in its step 6: "A `401` from the gateway cannot be seen by
 the command — Pi calls the command before the request — so the gateway's
@@ -505,6 +504,87 @@ step 6, the housekeeping round, which is where the rest of the stale prose this
 design creates is corrected — a separate `ops` PR from the `gp-pi` extension in
 step 5, because it is a `docs/` change in this repository and that tree is
 human-owned.
+
+### 16. The seed runs as a one-off ECS task
+
+**Decided in review.** Of the two options, the one-off ECS task in the gateway's
+own cluster, not a VPC-attached Lambda.
+
+The reason is that it needs no new network path and no new image plumbing that
+the deployment does not already have: Fargate already runs in the private
+subnets with the task security group, which is admitted to `5432`
+(`deploy-workbench/network.ts`), so the database accepts it without a rule
+change. A Lambda would need its own group and a second ingress rule on the
+database group — the shape `bifrost-vk-mint.ts` had to add on the *task* group
+for the admin API — for a job that runs once per deploy.
+
+What this leaves open is only the image (decision 17) and the plumbing that
+starts it; it is no longer a question about where it can run.
+
+### 17. A derived image, as the deployment already derives images
+
+**Decided in review:** follow the existing precedent. `pg_dump` and `psql` are
+not in the pinned Bifrost image (Alpine plus a Go binary), so the seed runs on a
+derived image built the way this deployment builds its other two:
+`bootstrap-image.ts` and `deploy-workbench/bifrost/bootstrap.Dockerfile` for the
+first-admin claim, and `oauth2-proxy-image.ts` for the proxy. That means a
+`seed-image.ts` beside them holding the pin, a committed `seed.Dockerfile` whose
+`FROM` is the same `maximhq/bifrost:v2.3.2` digest the other derived images use,
+a content-addressed tag over the committed inputs, an ECR repository with
+`imageTagMutability: IMMUTABLE`, and a test that fails when the module and the
+Dockerfile drift — all of which those two modules already do.
+
+It also means the image is built and pushed by `deploy-workbench.yml` before the
+apply, in the same slots the other two use, and the ECS task definition names the
+tag rather than a floating one.
+
+Rejected: a Node/`pg` implementation inside a Lambda, which avoids a Dockerfile
+and replaces it with a script that has to reimplement a consistent dump. The
+whole reason the tool exists is that `pg_dump` already takes one.
+
+### 18. The seed copies the config store's tables, not the whole database
+
+**Decided in review:** assume the log tables are the significant part of the
+volume and plan for that, rather than copying them.
+
+A whole-database dump would copy the shared log store's rows into a database
+that is about to be dropped — the same rows twice on a 20 GiB volume, once per
+cycle, for a table set the new colour never reads from its own copy. So the
+seed dumps the config store's own tables plus the `migrations` table. The
+config store's tables are the 66 `TableName()` methods in
+`framework/configstore/tables/`; the migration IDs of the two stores are
+disjoint but share one `migrations` table (`framework/migrator/migrator.go`,
+`DefaultOptions.TableName`), so copying that table is what records the copied
+schema as already migrated and makes the new task's startup run apply only what
+its own image adds.
+
+The dump is therefore one transaction over the config tables, which is also what
+makes it a consistent snapshot while the old task keeps writing.
+
+Rejected: `--exclude-table-data` on the log store's tables with everything else
+from the whole database, which is the same result with a list that has to track
+the log store's schema; and a whole-database dump, which is simplest and copies
+the largest thing on the volume for no reason.
+
+### 19. The seed task creates the inactive database
+
+**Decided in review:** this is not open. `aws.rds.Instance` takes one `dbName`
+at creation time and manages no sub-resources — the Pulumi AWS provider has no
+"database inside an instance" resource — so the seed task itself creates the
+target database, then restores into it.
+
+That is a deploy step Pulumi does not own, which is worth stating because
+`pulumi up` looks idempotent while the databases drift. Two consequences the
+step has to carry:
+
+- **`CREATE DATABASE` cannot run inside a transaction** and needs `CREATEDB`,
+  which the RDS master user has. So it is its own statement, before the restore,
+  and the restore is the transaction.
+- **The seed is convergent, not one-shot.** It creates the target if it does
+  not exist, refuses to overwrite one that does unless it is empty, and
+  restores. A half-restored database left by a failed deploy is the case it
+  must handle, because the retry is the next deploy rather than a human
+  cleaning up by hand.
 
 ## Client-side recovery from the overlap window
 
@@ -608,7 +688,7 @@ available at that hook. Two shapes are viable and the plan does not pick one:
 trigger on `401` alone (complete for the failure this design creates, silent for
 the rest), or trigger on `{401, 403}` and classify at `message_end`, which sees
 the parsed error, with the continuation still requested at `agent_before_settle`.
-Open item 6.
+Open item 2.
 
 ### Scope, stated plainly
 
@@ -698,59 +778,24 @@ Notes that belong with the table rather than in it:
 
 ## Open items
 
-These are recorded, not answered. Each names the check that would settle it.
+Three are recorded, not answered. The four seed questions that were open are now
+decisions 16–19, on the engineer's calls in review; the copy's size is decision
+18's shape plus whatever step 2 measures.
 
-1. **Where the seed step runs.** The deploy role cannot reach the database: the
-   RDS instance is private, its security group admits `5432` from the task's
-   group only (`deploy-workbench/network.ts`), and the private route table's
-   only route out is the NAT (`network.ts`), which carries no inbound path. So
-   the seed is a one-off ECS task in the same cluster, or a VPC-attached Lambda,
-   and **neither exists today**. The vk-mint Lambda is the nearest precedent
-   (`deploy-workbench/bifrost-vk-mint.ts`: private subnets, its own group, an
-   ingress rule on the task group) and a one-off task reusing the task security
-   group is the smaller of the two. What settles it is a decision, not a test,
-   and it is the step that decides it.
-2. **Which image carries the seed's client.** `pg_dump`/`psql` are not in the
-   pinned Bifrost image, which is Alpine with a Go binary. The precedent for a
-   derived image is `bootstrap-image.ts` plus
-   `deploy-workbench/bifrost/bootstrap.Dockerfile`, with a content-addressed tag
-   (the same shape as `oauth2-proxy-image.ts`). A Node/pg implementation inside a
-   Lambda is the alternative, and it means writing the copy rather than invoking
-   a tool that has one. Not decided.
-3. **What the seed copies.** A whole-database dump includes the log tables,
-   which are the shared store's data and the largest thing on a 20 GiB volume;
-   the alternative is to dump the config store's own tables plus the `migrations`
-   table (the config store has 66 `TableName()` methods in
-   `framework/configstore/tables/`). The two stores' migration IDs are disjoint
-   but share one `migrations` table — `framework/migrator/migrator.go`'s
-   `DefaultOptions.TableName` — so copying it is what records the copied schema
-   as already migrated, which is why the new task's startup run applies only
-   what its own image adds. Both shapes are workable; the choice depends on the
-   measured size, which nobody has. The seed must also be idempotent, including
-   over a database left behind by a failed deploy.
-4. **Who creates the inactive database.** `aws.rds.Instance` takes one `dbName`
-   at creation time and manages no sub-resources — the Pulumi AWS provider has
-   no "database inside an instance" resource — so the second one is created
-   by the seed task itself, under the RDS-managed master user. That is a deploy
-   step Pulumi does not own, which is worth stating because `pulumi up` will
-   look idempotent while the schema and the databases drift. `CREATE DATABASE`
-   cannot run inside a transaction and needs `CREATEDB`, which the master user
-   has on RDS; the seed's own check is that the database exists and is empty
-   before it restores.
-5. **Whether the colour can be a preview-known value at all.** See decision 7.
+1. **Whether the colour can be a preview-known value at all.** See decision 7.
    The design says it must be, and the preflight already fails closed on an
    unknown `containerDefinitions` (`scripts/preflight-secrets.ts`, and the
    2026-10-28 failure). What is not yet shown is that a `pulumi.Config` value
    reaches the container definitions as a known string in every mode, including
    the `DEPLOY_TARGET`-targeted first apply in `deploy-workbench/deploy.sh`. A
    preview with the colour set and the container block printed settles it.
-6. **The exact trigger set for client-side recovery.** See "What the trigger set
+2. **The exact trigger set for client-side recovery.** See "What the trigger set
    is". Confirming it against the gateway means provoking each row of that
    table — a request with a key that does not exist, one with a deactivated
    key, one for a model outside the allowlist — and recording the status and
    error type each returns. That is a step's first task, before the extension is
    written, and it decides whether the extension needs the `message_end` path.
-7. **Connection headroom during the overlap.** Each task opens two pools:
+3. **Connection headroom during the overlap.** Each task opens two pools:
    `config_store` with `max_open_conns: 50` and `logs_store` with
    `max_open_conns: 100` (`bifrost/config.json`). During the overlap two tasks
    hold those ceilings at once, and RDS's default `max_connections` for a
@@ -762,11 +807,6 @@ These are recorded, not answered. Each names the check that would settle it.
    that the overlap should be measured rather than assumed. Lowering
    `max_open_conns` for the config store, which serves a single active task, is
    the likely answer.
-8. **The seed's cost in time.** The dump is of a database whose size nobody has
-   measured, into a 20 GiB volume that already holds the log tables. A seed that
-   takes longer than the deploy's patience turns the first flip into a long
-   window rather than a short one, and it is the one number that could make the
-   window an order of magnitude bigger than the estimate above.
 
 ## Implementation plan
 
@@ -799,14 +839,16 @@ is no longer going to move under them.
    become healthy, and the Bifrost container is given 120 seconds to shut down.
 2. **The seed.** A one-off task that creates the inactive database and copies
    the active config store into it, including `governance_budgets.current_usage`,
-   `governance_virtual_keys` and the `migrations` table. Resolves open items
-   1–4 and 8 (they are the step's design work: where it runs, what image, what
-   it copies, and the measured size). Touches `deploy-workbench/` (a new module,
-   a derived image and its repository, a task definition and the IAM its role
-   needs) and adds no database client to the gateway image. Nothing calls it in
-   this step; it runs by hand, twice, against a scratch database name, and the
-   evidence is a diff of row counts and of `governance_budgets.current_usage`
-   between source and copy. Proves: the copy is faithful, the server-side
+   `governance_virtual_keys` and the `migrations` table, as decisions 16–19
+   specify: a one-off ECS task on a derived image, the config store's own tables
+   rather than the whole database, and the target database created by the task
+   itself. Touches `deploy-workbench/` (a new module, a derived image and its
+   repository, a task definition and the IAM its role needs) and adds no
+   database client to the gateway image. Nothing calls it in this step; it runs
+   by hand, twice, against a scratch database name, and the evidence is a diff of
+   row counts and of `governance_budgets.current_usage` between source and copy,
+   plus the wall-clock the dump took — which is the number the overlap estimate
+   in "Consequences" is missing. Proves: the copy is faithful, the server-side
    alternative does not work while the source serves (`TEMPLATE` needs zero
    connections), and the seed is fast enough for the window.
 3. **The colour plumbing.** A second environment name for the config store's
@@ -840,7 +882,7 @@ is no longer going to move under them.
    across a deploy sees no `503` and no reset, the new task's migrations appear
    only in the copy, and a deliberately broken image rolls back on its own.
 5. **The `gp-pi` extension.** In `thegoodparty/gp-pi`: the trigger set settled
-   against the gateway (open item 6), the `after_provider_response`
+   against the gateway (open item 2), the `after_provider_response`
    watcher, the one-attempt-per-turn cap, the continuation at
    `agent_before_settle`, and the helper's cache invalidation. Proves: with a key
    deleted from the active store out of band, a session's next turn recovers
@@ -876,6 +918,7 @@ In this repository:
 | The preflight fails closed on a preview-unknown container definition | `deploy-workbench/scripts/preflight-secrets.ts`; the 2026-10-28 failure, run 40725087936 |
 | The database is reachable only from the task group | `deploy-workbench/network.ts`, the `bifrostDatabaseIngressPostgres` rule and the private route table's NAT-only route |
 | A VPC-attached function reaching the task is the existing precedent | `deploy-workbench/bifrost-vk-mint.ts` |
+| The derived-image idiom: a module holding the pin, a committed Dockerfile, a content-addressed tag, an immutable repository, a drift test | `deploy-workbench/bootstrap-image.ts` and `deploy-workbench/bifrost/bootstrap.Dockerfile`; `deploy-workbench/oauth2-proxy-image.ts` |
 | The mint re-checks membership and refuses a non-member with 403 | `deploy-workbench/bifrost/vk-mint-core.ts` |
 | `--refresh` is the current 401 workaround | `docs/bifrost-virtual-keys.md`, decision 7; `thegoodparty/gp-pi`, `etc/gp-bifrost-key` |
 | Budgets are deferred; the account budget is the only cap | `docs/bifrost-gateway.md`, "Budgets and alerts" |
