@@ -1328,7 +1328,12 @@ const PREVIEW_SHARED_DEV_BUCKETS = [
   "arn:aws:s3:::meeting-pipeline-dev",
   "arn:aws:s3:::serve-analyze-data-dev",
   "arn:aws:s3:::assets-dev.goodparty.org",
+  "arn:aws:s3:::gp-api-contact-uploads-dev",
 ];
+
+// Import contacts keeps every version of an uploaded file, so deleting one
+// means deleting each version. Only this bucket needs version access.
+const PREVIEW_VERSIONED_PURGE_BUCKET = "arn:aws:s3:::gp-api-contact-uploads-dev";
 
 const PREVIEW_READ_ONLY_DEV_BUCKETS = ["arn:aws:s3:::gp-agent-artifacts-dev"];
 
@@ -1394,6 +1399,18 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
       Effect: "Allow",
       Action: ["s3:GetObject"],
       Resource: objectsIn(PREVIEW_READ_ONLY_DEV_BUCKETS),
+    },
+    {
+      Sid: "ContactUploadVersionPurge",
+      Effect: "Allow",
+      Action: ["s3:ListBucketVersions"],
+      Resource: PREVIEW_VERSIONED_PURGE_BUCKET,
+    },
+    {
+      Sid: "ContactUploadVersionDelete",
+      Effect: "Allow",
+      Action: ["s3:DeleteObjectVersion"],
+      Resource: `${PREVIEW_VERSIONED_PURGE_BUCKET}/*`,
     },
     {
       Sid: "BucketListing",
