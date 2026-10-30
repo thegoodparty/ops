@@ -1,15 +1,13 @@
 # Bifrost model aliases: `coordinator-default` and `worker-default`
 
-> **Status: proposal, decisions settled in review. Nothing has been
-> implemented.** This is the plan for the gateway to own which model a
-> `gp-pi` coordinator and its workers run on by default, as two named aliases
-> instead of model ids hard-coded in the container. It is a sibling of
+> This is the plan for the gateway to own which model a `gp-pi` coordinator
+> and its workers run on by default, as two named aliases instead of model ids
+> hard-coded in the container. It is a sibling of
 > [`bifrost-gateway.md`](./bifrost-gateway.md), which is the gateway's plan, and
 > [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), whose mint this plan
-> changes. It changes no code and no infrastructure. Implementation PRs follow,
-> and a PR names this document and the step it implements in its body; progress
-> is derived from those PRs and is not written here (decision 11 of
-> [`plan-gated-merges.md`](./plan-gated-merges.md)).
+> changes. A PR that implements part of it names this document and the step it
+> implements in its body; progress is derived from those PRs and is not written
+> here (decision 11 of [`plan-gated-merges.md`](./plan-gated-merges.md)).
 
 `gp-pi` currently names a model by its provider id in three places: the worker
 default in `gp-delegate` (`WORKER_MODEL`,
@@ -45,8 +43,8 @@ Success, in the order it should be proven:
 1. **Two names, no ids.** `gp-pi` pins `bifrost/coordinator-default` and
    `bifrost/worker-default`, and no residency-bearing model id remains in it.
 2. **Repointing is one ops PR.** Changing what a name resolves to edits
-   `deploy-workbench/bifrost/config.json` and reaches an *existing* engineer's
-   key and container without a re-issue, a script or a `gp-pi` change.
+   `deploy-workbench/bifrost/config.json`. The alias resolves at the gateway on
+   every request, so no key, cache or container changes with it.
 3. **Residency stays a property of the deployment.** A test in this repository
    fails if either alias target is not a US-only model the gateway allows.
 4. **A missing alias is a loud refusal.** `dispatch` stops with a message that
@@ -121,15 +119,16 @@ applies `vk-mint-template.json` when it *creates* a key. For an existing key,
 it is inactive or carries an expiry (`needsReactivation`). So editing the
 template, today, changes nobody who already has a key, and the 12-hour cache TTL
 in `gp-bifrost-key` is unrelated: it bounds "the key value went stale", not "the
-key's shape went stale". Waiting never helps.
+key's shape went stale". Today waiting never helps; once the mint converges, the
+next mint after the TTL picks the change up.
 
 **`gp-pi` discovers models from `/v1/models`**, which is scoped to the key's
 allowlist, and caches the key for 12 hours in `~/.pi/agent/bifrost-key.json`.
 `gp-bifrost.ts` registers whatever the gateway lists and gives any field the
-gateway omits pi's conservative default (context 128 000, cost 0). The cached
-key still *authorizes* a newly added alias, because the alias resolves at the
-gateway per request; what it cannot do is *discover* it, since a key whose
-allowlist predates the alias does not list it.
+gateway omits pi's conservative default (context 128 000, cost 0). A cached
+key whose allowlist predates an alias does not list it, so it cannot discover
+the alias until it is re-minted. That happens once, when the aliases are
+introduced; afterwards the names are stable and only their targets change.
 
 ## Decisions
 
@@ -143,7 +142,9 @@ Settled in review; the section after this one is the work they produce.
 2. **`gp-pi` pins alias names, not model ids.** The residency guarantee moves
    to this repository, which already owns the lists that enforce it. Local
    configuration may still override the default, as it does today with
-   `--model` and `GP_PI_WORKER_MODEL`.
+   `--model` and `GP_PI_WORKER_MODEL`. `gp-pi` does not write the
+   engineer's `settings.json`, which is theirs; the coordinator default reaches
+   the root pane some other way (item H).
 3. **No auth check and no fallback.** `pi auth check` is removed from
    `dispatch`: it cannot validate an extension-registered provider, so removing
    it removes no safeguard. One cheap assertion stays: the alias appears in
@@ -154,16 +155,14 @@ Settled in review; the section after this one is the work they produce.
    `provider_configs`, compares them to the template, and `PUT`s on drift. It
    ships **with** the alias work, not after it: without it the first rollout is
    a hand-written backfill script, and the next template change needs another.
-5. **A template version stamp forces propagation past the 12-hour TTL.** The
-   mint returns a `template_version` (a hash of the template as the mint
-   applied it). `gp-bifrost-key` stores it with the cached key and, when the
-   current version differs from the cached one, re-mints immediately and
-   bypasses the TTL. The reason is *discovery*, not authorization: the cached
-   key authorizes a new alias, but `/v1/models` is scoped to the key's
-   allowlist, so a container never sees the alias until its key is re-minted.
-   How a container learns the current version without a mint on every cache hit
-   is the one open mechanism question; see "How a container learns" and
-   work item G.
+5. **Propagation waits for the TTL.** Because the names are stable and the
+   target changes on the gateway, the only event that needs a container to hold
+   a different key is the one-time introduction of the aliases. Once the mint
+   converges (decision 4), a container picks them up at its next mint, within
+   the 12-hour TTL, and there is no version stamp or forced invalidation. The
+   other trigger is a rejection: when a model id or alias the container needs is
+   missing from its listing or refused by the gateway, it re-mints once and
+   retries (item G). `--refresh` stays as the documented manual repair.
 6. **No rollback story beyond repointing.** Moving an alias target back is one
    reviewed edit and the converging mint carries it out. A named
    `*-default-prev` alias is out of scope.
@@ -183,21 +182,29 @@ serves each default, in the rich form so `model_name` can be set:
   "name": "fireworks-primary",
   "models": [
     "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
-    "worker-default"
+    "worker-default",
+    "coordinator-default"
   ],
   "aliases": {
     "worker-default": {
       "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
       "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
       "description": "gp-pi worker default"
+    },
+    "coordinator-default": {
+      "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+      "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+      "description": "gp-pi coordinator default"
     }
   }
 } ] }
 ```
 
-and `coordinator-default` on the Bedrock key, with a `us.` inference profile as
-`model_id`. The coordinator's target is **not decided here**: the implementation
-PR names it and the engineer approves it in review (see "Decisions still needed").
+Both aliases start on the same target,
+`accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`. They are separate
+names so the two roles can be repointed independently later, and the coordinator
+is expected to move; that is one edit here and nothing in `gp-pi`. Two aliases
+may share a `model_id` (the list pipeline emits one entry per alias).
 
 The alias name is in `models` because key selection checks the requested name
 against it. The raw target stays in `models` as well, so that explicit
@@ -208,8 +215,8 @@ alias carries a `description` so it is recognisable.
 ### The key template and the converging mint
 
 `vk-mint-template.json` adds the alias names to the matching provider's
-`allowed_models`. The mint then changes in two ways, both in
-`vk-mint-core.ts`, which already holds every decision the mint makes:
+`allowed_models`. The mint then changes in `vk-mint-core.ts`, which already
+holds every decision the mint makes:
 
 - `settleExisting` fetches the key's `provider_configs`, compares the
   allowlists with the template's per provider (order-insensitive, as the
@@ -217,9 +224,6 @@ alias carries a `description` so it is recognisable.
   `provider_configs` when they differ. Reactivation and convergence are one
   `PUT` when both apply. `MintAction` gains `"converged"`, which the handler
   already logs as the outcome.
-- `MintResult` carries `template_version`, and the handler returns it with the
-  key. The handler already reads the template on every call, so the hash costs
-  nothing extra.
 
 Convergence touches only `provider_configs`. It never edits `name`,
 `description`, budgets, a team or any field a human may have set on a key, for
@@ -227,25 +231,21 @@ the same reason decision 4 of the virtual-keys document never deletes one.
 
 ### How a container learns
 
-`gp-bifrost-key` caches `template_version` beside `key` and `fetched_at`. The
-version is only known to the mint, and a cache hit makes no mint call by design
-(the hot path runs on every request). So the stamp is useful at the points where
-the container *already* talks to something that can tell it, and there is no
-such signal at v2.3.0 in the `/v1/models` response itself. What is settled:
+It waits for its cache. A cached key is re-minted at the 12-hour TTL, and the
+converging mint gives the new key the aliases. Nothing in the key helper changes
+for that.
 
-- a cache entry with **no** `template_version` (every entry written before this
-  change) is treated as stale and re-minted once, which bootstraps every existing
-  container with no other mechanism;
-- thereafter a mismatch re-mints immediately, whatever the TTL says.
+Two rejections shorten the wait, both in `gp-pi` because the key helper runs
+before the request and cannot see a refusal (its own header says so):
 
-What is **not** settled is the check that detects a mismatch between mints.
-Candidate mechanisms, none chosen here: the catalog refresh in `gp-bifrost.ts`
-(which already calls the gateway and already knows which two alias names it
-requires) re-mints once when a required alias is missing from the listing; or
-the key helper calls the mint at an interval shorter than the TTL, which is the
-load the TTL exists to avoid. Item G's PR chooses and records why. The
-first is a discovery check and needs no stamp; the stamp is what lets the second
-be cheap.
+- the catalog refresh in `gp-bifrost.ts`, or `dispatch`'s alias assertion,
+  finds a required alias missing from `pi --list-models`;
+- the gateway refuses a model id or alias with a "not allowed" or "not found".
+
+Each triggers one `gp-bifrost-key --refresh` and one retry, bounded by the
+helper's existing five-second failure cache so a gateway that is down is not
+turned into a mint per prompt. If the retry still fails, `dispatch` refuses
+(decision 3). The exact hook for each is item G's to choose.
 
 ### Residency becomes an ops test
 
@@ -261,6 +261,9 @@ second path instead of a looser first one:
   is wrong;
 - the alias names are exactly `coordinator-default` and `worker-default`, so a
   rename cannot silently strand `gp-pi`;
+- `vk-mint-template.json` and `config.json` agree on which provider declares
+  each alias, so moving a target to another provider is one reviewed change in
+  both places;
 - `vk-mint-template.json` allows each alias name for the provider whose key
   declares it, and the existing "allows exactly the models `config.json`
   allows" equality is amended to be over `models`, not over `models` minus
@@ -278,15 +281,13 @@ before it is deployed.
 **ops**
 
 - **A. Declare the aliases.** Add `aliases` and the alias names in `models` to
-  `config.json`; add the alias-aware assertions to `config.test.ts`. Resolve
-  the Bedrock coordinator target. No behaviour changes for anyone until the
-  template follows.
+  `config.json`; add the alias-aware assertions to `config.test.ts`. No
+  behaviour changes for anyone until the template follows.
 - **B. Template the aliases.** Add the alias names to `vk-mint-template.json`
   and the second assertion path to `vk-mint-template.test.ts`. Safe to merge
   with A: a key that allows a name the gateway does not know is a `404` on that
   name only, so A and B land in the same PR or A first.
-- **C. Converge on mint.** `settleExisting` diffs and `PUT`s; `template_version`
-  in the result and in the Lambda response; tests in `vk-mint-core.test.ts`
+- **C. Converge on mint.** `settleExisting` diffs and `PUT`s; tests in `vk-mint-core.test.ts`
   for drift, no drift, drift plus reactivation, and a `PUT` that fails (the key
   the caller already holds must still be returned unchanged, as reactivation
   already guarantees).
@@ -301,17 +302,17 @@ before it is deployed.
   silent fallback from `dispatch`; keep `worker_model_is_offered()` and make
   its failure a refusal that names the alias and `pi --list-models`. Update the
   `design.md` entry that records the fallback as settled.
-- **G. Honour the version stamp.** `gp-bifrost-key` stores
-  `template_version`, treats an entry without one as stale, and re-mints on a
-  mismatch. The between-mints detection mechanism is chosen in this PR (see "How
-  a container learns"); until it is, only the bootstrap re-mint and `--refresh`
-  propagate.
-- **H. Print both names.** `dispatched` and the registration record show
-  `worker-default -> <resolved id>` from `ResolvedKeyAlias.ModelID`, which keeps
-  design.md's "which model ran" property without re-pinning an id. Migrate
-  `settings.json`: the `bifrost-only` change retires the old providers but does
-  not migrate a saved `defaultModel`, so an existing volume still pins a retired
-  Fireworks id and a fresh volume starts on whichever gateway model sorts first.
+- **G. Re-mint on rejection.** On a missing required alias or a refused model
+  id, run `gp-bifrost-key --refresh` once and retry, as in "How a container
+  learns". No change to the cache format or the TTL.
+- **H. Print both names, and leave `settings.json` alone.** `dispatched` and
+  the registration record show `worker-default -> <resolved id>` from
+  `ResolvedKeyAlias.ModelID`, which keeps design.md's "which model ran"
+  property without re-pinning an id. The root pane's coordinator default is
+  supplied without writing the engineer's `settings.json` (for instance through
+  the per-session environment the launcher already sets for pi); the mechanism is
+  `gp-pi`'s to choose. A saved `defaultModel` that pins a retired Fireworks id
+  stays the engineer's to change.
 
 ## Gates
 
@@ -319,15 +320,16 @@ before it is deployed.
    right (`model_name`) but the `/v1/models` entry for `worker-default` is
    enriched from the listed name and the wire id only, and the wire id has no
    catalog row, so the listing is expected to carry no price and no context
-   window. This was read from source and **not confirmed against a live
-   gateway**. Before E merges, list models with a minted key and record what
+   window. This comes from reading the source, so the gate is the live check:
+   before E merges, list models with a minted key and record what
    `worker-default` returns. If the context window is missing, pi would compact a
    million-token model as if it had 128 000, and the fix is on the gateway side
    (give the wire id a catalog row, for example through a custom `pricing_url`
    datasheet, or pick a `model_id` that has one without losing the `-us`
    guarantee), not in `gp-pi`.
 2. **Convergence before pins.** C is deployed, and an existing engineer's key
-   has been observed to gain the aliases without a re-issue, before E ships.
+   has been observed to gain the aliases (a `gp-bifrost-key --refresh` forces
+   the mint) before E ships.
 3. **Residency test red/green.** The new assertions fail when an alias targets
    a non-US id and pass on the real file, shown in the A PR.
 4. **Refusal, not fallback.** With the alias removed from a key in a throwaway
@@ -353,9 +355,11 @@ before it is deployed.
 - **Shorten the 12-hour TTL.** A permanent Lambda and STS load on every engineer
   to solve a rare event, and it does nothing for config drift, which is not
   TTL-related.
-- **A cache-namespace bump** (a versioned cache filename). The same idea as the
-  version stamp, but cruder: it re-mints everyone on any `gp-pi` release rather
-  than on a template change.
+- **A template version stamp, or a cache-namespace bump, to force re-mints.**
+  The names are stable and targets change on the gateway, so the only event that
+  needs a different key is the one-time introduction of the aliases, which the
+  TTL and the rejection trigger cover. A stamp adds a protocol between the mint,
+  the helper and the cache for a rare event.
 - **Gateway-side deactivation of every managed key** to force a re-mint. Works
   through the existing janitor and every request `401`s until it does; it is a
   hard cutover and it also depends on converge-on-mint, since reactivation sets
@@ -368,25 +372,14 @@ before it is deployed.
 
 ## Out of scope
 
-- Implementation of any item above; this document only records the plan.
-- Any edit to `gp-pi`. Items E to H are described so that repository's PRs can
-  name this one; nothing here changes it.
+- Edits to `gp-pi` made from this repository. Items E to H describe the work
+  so that repository's PRs can name this plan.
 - Per-person or per-tier aliases (who may use the higher-grade models), which is
   already deferred in [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md).
 - Overlap-window key rotation. A leaked key wants immediate revocation, which the
   janitor and gateway-side deactivation already provide.
 - Budgets and rate limits, dropped on #404.
-- A change to the Bedrock IAM or to `utils/bedrock-models.ts`. The coordinator
-  alias targets a model already in both lists.
+- A change to the Bedrock IAM or to `utils/bedrock-models.ts`. Both aliases
+  target a model already in the gateway's lists.
+- Writing or migrating the engineer's `settings.json`.
 - Upgrading the gateway to a release with dynamic aliases.
-
-## Decisions still needed
-
-1. **The coordinator's target model.** The discussion fixed the names and the
-   mechanism but not the Bedrock model behind `coordinator-default`. Candidates
-   are the models already in the allowlist; this plan does not choose one, and
-   item A's PR must.
-2. **The between-mints version check** (item G), per "How a container learns".
-3. **Whether the root pane's default is written into `settings.json` by `gp-pi`
-   or only offered.** `design.md` records "nothing here writes `settings.json`"
-   as a decision; item H would amend it for this one key.
