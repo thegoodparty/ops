@@ -6,6 +6,7 @@ import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-mo
 import { PG_PASSWORD_ENV_NAME, GATEWAY_PLAIN_ENV_NAMES } from "../ecs";
 import { BIFROST_HOSTNAME } from "../ingress";
 import { REGION } from "../network";
+import { BIFROST_UPSTREAM_TAG } from "../bifrost-image";
 
 /**
  * The non-secret Bifrost configuration, checked against the properties a
@@ -44,10 +45,13 @@ const CONFIG_PATH = path.resolve(__dirname, "config.json");
 const FILL_SECRETS_PATH = path.resolve(__dirname, "fill-secrets.sh");
 const CONFIG_SOURCE = fs.readFileSync(CONFIG_PATH, "utf8");
 
+type KeyAlias = { model_id: string; model_name?: string; description?: string };
+
 type ProviderKey = {
   name: string;
   value?: string;
   models: string[];
+  aliases?: Record<string, KeyAlias>;
   weight: number;
   bedrock_key_config?: Record<string, unknown>;
 };
@@ -164,6 +168,15 @@ const US_BEDROCK_PREFIX = "us.";
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
 
+/**
+ * The wire id a served model name is sent to the provider as: the alias's
+ * `model_id` when the name is a key alias, the name itself otherwise. Residency
+ * is a property of this id, not of the name a client sees (`routing` resolves
+ * the alias after key selection, `core/bifrost.go` at v2.3.0).
+ */
+const wireId = (key: ProviderKey, name: string): string =>
+  key.aliases?.[name]?.model_id ?? name;
+
 const envReferences = (config: Config): string[] =>
   collectStrings(config).flatMap((value) => {
     const match = ENV_REFERENCE.exec(value);
@@ -220,6 +233,19 @@ const noSecretLiteral = (config: Config) => {
       "config.json contains a long unbroken value that looks like a generated secret",
     );
   }
+};
+
+
+const allKeys = (value: unknown, out: string[] = []): string[] => {
+  if (Array.isArray(value)) {
+    for (const entry of value) allKeys(entry, out);
+  } else if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out.push(key);
+      allKeys(entry, out);
+    }
+  }
+  return out;
 };
 
 describe("bifrost config.json", () => {
@@ -393,10 +419,16 @@ describe("bifrost config.json", () => {
     for (const key of provider(config, "fireworks").keys) {
       for (const model of key.models) {
         assert.match(
-          model,
+          wireId(key, model),
           US_FIREWORKS_ROUTER,
-          `fireworks model ${model} is not a US-only router id; use accounts/fireworks/routers/<model>-us`,
+          `fireworks model ${model} is sent as ${wireId(key, model)}, which is not a US-only router id; use accounts/fireworks/routers/<model>-us`,
         );
+      }
+      // An alias that is not served is dead config, and one whose target is not
+      // a router would be a way to reach a global model by a harmless-looking name.
+      for (const [name, alias] of Object.entries(key.aliases ?? {})) {
+        assert.ok(key.models.includes(name), `alias ${name} is not in the key's models, so it is never served`);
+        assert.match(alias.model_id, US_FIREWORKS_ROUTER, `alias ${name} points at a non-US id`);
       }
     }
   });
@@ -472,8 +504,14 @@ describe("bifrost config.json", () => {
   it("serves exactly the agreed model classes, per provider", () => {
     const config = loadConfig();
     for (const [name, expected] of Object.entries(US_MODEL_CLASSES)) {
+      // Classes are what the names resolve to on the wire, so an alias is the
+      // same class as its router and not a ninth one.
       const configured = [
-        ...new Set(provider(config, name).keys.flatMap((key) => key.models)),
+        ...new Set(
+          provider(config, name).keys.flatMap((key) =>
+            key.models.map((model) => wireId(key, model)),
+          ),
+        ),
       ];
       assert.deepEqual(
         [...configured].sort(),
@@ -502,8 +540,10 @@ describe("bifrost config.json", () => {
     }
     assert.ok(
       fireworks.keys.some((key) =>
-        key.models.includes(
-          "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+        key.models.some(
+          (model) =>
+            wireId(key, model) ===
+            "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
         ),
       ),
       "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
@@ -514,7 +554,11 @@ describe("bifrost config.json", () => {
     // "wrong release" rather than only "no Fireworks model".
     assert.ok(
       !fireworks.keys.some((key) =>
-        key.models.includes("accounts/fireworks/routers/deepseek-v4p1-flash-us"),
+        key.models.some(
+          (model) =>
+            wireId(key, model) ===
+            "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+        ),
       ),
       "the Fireworks list names the undated V4.1 Flash router, which is the September release rather than the 1017 update the fleet runs",
     );
@@ -620,4 +664,110 @@ describe("bifrost config.json", () => {
       );
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // Fireworks model metadata. docs/bifrost-fireworks-model-metadata.md
+  // ---------------------------------------------------------------------------
+
+  it("does not invent per-model metadata keys that v2.3.0 would ignore", () => {
+    // v2.3.0 has no config.json way to set context_length, max_input_tokens,
+    // max_output_tokens or a model description for a provider model: the
+    // schema's only context/metadata-looking keys are unrelated, the Fireworks
+    // adapter builds /v1/models from the key's `models` and `aliases` alone,
+    // and enrichment reads the base catalog (not overrides). A key like these
+    // would parse, do nothing, and look like a fix. See the findings document.
+    const forbidden = new Set([
+      "context_length",
+      "context_window",
+      "max_input_tokens",
+      "max_output_tokens",
+      "model_metadata",
+      "model_info",
+      "pricing",
+    ]);
+    for (const key of allKeys(loadConfig())) {
+      assert.ok(
+        !forbidden.has(key),
+        `config.json carries "${key}", which Bifrost ${BIFROST_UPSTREAM_TAG} does not read for model metadata`,
+      );
+    }
+  });
+
+  it("keeps the findings document honest about the Bifrost tag it was verified against", () => {
+    // The statements in docs/bifrost-fireworks-model-metadata.md are facts about
+    // one tag's source. A bump has to re-check them (the catalog may gain the
+    // router ids, or the Fireworks adapter may start passing metadata
+    // through), so the document names the tag and this fails when the pin moves.
+    const doc = fs.readFileSync(
+      path.resolve(__dirname, "../../docs/bifrost-fireworks-model-metadata.md"),
+      "utf8",
+    );
+    assert.ok(
+      doc.includes(`Verified against: transports/${BIFROST_UPSTREAM_TAG}`),
+      `docs/bifrost-fireworks-model-metadata.md was verified against a different tag than ${BIFROST_UPSTREAM_TAG}; re-check it and the alias before bumping`,
+    );
+  });
+
+  it("lists the Fireworks model under a catalog name, so /v1/models carries its context window and price", () => {
+    // /v1/models enriches each entry from the datasheet by the *listed name*,
+    // then by the alias's wire id (`enrichListModelsResponse`,
+    // transports/bifrost-http/handlers/inference.go at v2.3.0). The datasheet has
+    // no row for the router id, so the router's own entry is bare (128K, $0 in
+    // pi). It does have `accounts/fireworks/models/<model>-us`, so listing the
+    // model under that name with the router as the alias target gives pi a
+    // full entry while requests still go to the router. Checked on 2026-10-30
+    // against the v2.3.0 code and the public datasheet: context_length and
+    // max_input_tokens 1048576, max_output_tokens 393216, prompt $0.45/M,
+    // completion $1.80/M, cached input $0.009/M.
+    const key = provider(loadConfig(), "fireworks").keys[0];
+    const alias = key.aliases?.["accounts/fireworks/models/deepseek-v4p1-flash-1017-us"];
+    assert.ok(alias, "the catalog-named alias is missing; /v1/models would list only the bare router entry");
+    assert.equal(alias.model_id, "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us");
+    assert.ok(
+      key.models.includes("accounts/fireworks/models/deepseek-v4p1-flash-1017-us"),
+      "the alias name must be in the key's models: key selection checks the requested name, and the listing is built from this list",
+    );
+    // model_name is what request cost resolves first, so the logged price is
+    // the catalog's own US-only row ($0.45 / $1.80 per 1M), not $0. Measured on
+    // the v2.3.0 code: 1M in + 1M out through the alias costs $2.25.
+    assert.equal(alias.model_name, "accounts/fireworks/models/deepseek-v4p1-flash-1017-us");
+  });
+
+  it("detects a Fireworks entry that would list bare, and so price at \$0 and show 128K in pi", () => {
+    // Both failures are silent: the entry is present and the request succeeds.
+    // The catalog is not available to a unit test, so the property is stated on
+    // the config. Every name the key serves must be a catalog-named alias whose
+    // `model_name` is that same name: the listing is enriched by the listed
+    // name, and request cost resolves `model_name` first, so a router id served
+    // directly (the case this replaces) is bare in the listing and $0 in the log.
+    const catalogNamed = /^accounts\/fireworks\/models\/[a-z0-9.-]+-us$/;
+    const bare = (key: ProviderKey): string[] =>
+      key.models.filter((model) => {
+        const alias = key.aliases?.[model];
+        return !(
+          catalogNamed.test(model) &&
+          alias !== undefined &&
+          alias.model_name === model
+        );
+      });
+    const key = provider(loadConfig(), "fireworks").keys[0];
+    assert.deepEqual(bare(key), [], "a served Fireworks name would list bare and cost \$0");
+
+    // The detector itself: a router served directly, or an alias with no
+    // model_name, is reported.
+    const router = "accounts/fireworks/routers/x-us";
+    const named = "accounts/fireworks/models/x-us";
+    assert.deepEqual(bare({ name: "k", models: [router], weight: 1 }), [router]);
+    assert.deepEqual(
+      bare({ name: "k", models: [named, router], aliases: { [named]: { model_id: router, model_name: named } }, weight: 1 }),
+      [router],
+      "a bare router listed beside a good alias must still be reported",
+    );
+    assert.deepEqual(
+      bare({ name: "k", models: [named], aliases: { [named]: { model_id: router } }, weight: 1 }),
+      [named],
+      "an alias without model_name is priced from the router id, which has no row",
+    );
+  });
+
 });
