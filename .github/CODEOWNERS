@@ -18,7 +18,7 @@
 # repo; gp-secops has read only, and GitHub silently ignores code owners
 # without write access.
 #
-# ## The opt-out list, one path long
+# ## The opt-out list
 #
 # It is the only mechanism that grants the `delegate` reviewer authority to
 # approve. A PR merges on a bot approval only where the last pattern matching
@@ -27,26 +27,76 @@
 # human-reviewed file answers both "does a human have to approve this" and
 # "may the bot approve this", so the two cannot drift apart.
 #
-# One entry is on it:
+# Four entries are on it, all of them Pulumi trees, and they are recorded here
+# as one decision:
 #
-# `deploy-workbench/` -- de-owned 2026-10-29, by the first increment of step 6
-# of `docs/plan-gated-merges.md`. That step was taken ahead of the evidence bar
-# the plan set for it, deliberately; the plan records what the evidence is and
-# is not, and the tripwire for a false approve. In short: over the last 100
-# merged PRs here the reviewer's findings held up 31 times out of 32 (median 4
-# minutes to the fix commit), 9 of 9 on this tree, but its recall is not
-# measured, and the shadow window had no would-approves at all to measure a
-# false-approve rate against. It went first because it is the workbench
-# account -- the one the team would rebuild rather than defend -- and because
-# removing this line is a one-line revert in a human-owned file.
+# - `/deploy-workbench/` -- de-owned 2026-10-29, the first, on its own, ahead
+#   of the evidence bar the plan set.
+# - `/deploy/`, `/deploy-org/`, `/deploy-infrastructure/` -- de-owned together
+#   on 2026-10-30, in one PR, on the engineer's call to batch them. `/deploy/`
+#   is de-owned except for the carve-out below, which keeps the reviewer's own
+#   logic and authority human-owned.
+#
+# Step 6 of `docs/plan-gated-merges.md` records that the bar was not met for
+# any of the four, and why. The evidence is the same for all of them: over the
+# last 100 merged PRs here the reviewer's findings held up 31 times out of 32
+# (median 4 minutes to the fix commit), and 9 of 9 on `deploy-workbench/`. Its
+# recall is not measured, and the shadow window produced no would-approves, so
+# there is no false-approve rate to read. The gate would have approved none of
+# those 100 PRs. One PR cannot cite three separate shadow windows, so the three
+# batched trees have no per-path evidence of their own.
+# `deploy-infrastructure/` is the tree the plan expected to go last: it holds
+# the runtime that acts on the identity store and the break-glass tool's own
+# Lambda.
 #
 # An entry says which path was de-owned, on what evidence, and when, and that
-# entry is the record; there is no other. This is the only entry the list has
-# held since step 2 emptied it. `/docs/`, `/README.md`, `/.gitignore`, `/CLAUDE.md` and
-# `**/CLAUDE.md` used to merge on a bot approval; they no longer do, and every
-# path outside `deploy-workbench/` needs a human code owner, documentation
-# included. Background: `docs/plan-gated-merges.md` and `CLAUDE.md`'s "Review
-# and approval" section.
+# entry is the record; there is no other. A single line can still re-own one
+# path, but the response to a false approve in any of the four is to re-own
+# the batch and reopen the record for all of them, not to revert one line and
+# leave the other three on the strength of a decision that no longer holds.
+# `/docs/`, `/README.md`, `/.gitignore`, `/CLAUDE.md` and `**/CLAUDE.md` used
+# to merge on a bot approval; they no longer do, and every path outside those
+# four trees needs a human code owner, documentation included. Background:
+# `docs/plan-gated-merges.md` and `CLAUDE.md`'s "Review and approval" section.
+#
+# ## The carve-out: delegate logic and authority stay human-owned
+#
+# De-owning `deploy/` does not de-own the reviewer's own logic or its own
+# authority. Seven paths inside it stay human-owned. They are listed *after*
+# the owner-less lines at the bottom of this file, because the last pattern
+# matching a changed path wins: placed before `/deploy/`, the same block would
+# be overridden and silently resolve to unowned.
+#
+# - `deploy/components/worker.ts` -- the reviewer's task definition, and where
+#   its logic is bound to infrastructure. `image: config.imageUri` is what
+#   commit of `delegate/` actually runs, so the image reference is the vehicle
+#   for a logic change; `DELEGATE_GATING_MODE` is its authority; `REVIEW_BUCKET`
+#   and `AGENT_VERSION` are its record of what it decided and what ran.
+# - `deploy/components/webhooks.ts` -- the only path that starts a review. The
+#   webhook Lambda's role holds `ecs:RunTask` on the task definition,
+#   `iam:PassRole` on `*` and read of `DELEGATES`, and its environment carries
+#   the task definition ARN. Authority over what starts, and with which role.
+# - `deploy/index.ts` -- wires `createWorker` and the webhook Lambda. The image
+#   URI, the secret key list and the task definition ARN all pass through it.
+# - `deploy/deploy.sh` -- the only place `workerImageUri` is set, for apply and,
+#   for preview, resolved from the running task. A change here can pin an
+#   arbitrary image, which changes what logic runs.
+# - `deploy/delegate-secret.ts` -- `DELEGATE_SECRET_KEYS`, the source of truth
+#   for the keys injected into the agent container: the reviewer's inputs and
+#   its capability. Its own comment says adding a key is "now a reviewed change
+#   here instead of a silent edit to the secret"; a bot-approved edit would
+#   defeat that sentence.
+# - `deploy/components/ci-roles.ts` and `deploy/components/ci-roles/policies.ts`
+#   -- the IAM the delegate eval path assumes. IAM is what the reviewer is
+#   allowed to do, which is authority rather than plumbing.
+#
+# Everything else under `deploy/` stays de-owned, and that is deliberate rather
+# than an oversight: `Pulumi.yaml`, `check-secret-keys.ts`, the rest of
+# `deploy/components/` (`identity-center`, the bifrost readers) and the
+# non-delegate components. The line drawn is the engineer's: bot approval of
+# delegate *infrastructure* is accepted, and only delegate *logic* and
+# `authority` are carved out. Widening this list is a human-reviewed change
+# like any other entry.
 #
 # ## The test for an opt-out
 #
@@ -73,8 +123,8 @@
 # - `deploy/`, `deploy-org/`, `deploy-infrastructure/` -- every Pulumi
 #   project, not just the role and permission-set files. A new component that
 #   mints an IAM role is one `index.ts` import away. `deploy-workbench/` is the
-#   fourth and is the one path that is no longer owned: the test did not stop
-#   applying to it, the evidence decision is in `docs/plan-gated-merges.md`.
+#   fourth. All four are no longer owned: the test did not stop applying to
+#   them, and the evidence decision is in `docs/plan-gated-merges.md`.
 # - `utils/` -- `deploy/components/identity-center/policies.ts` imports
 #   `bedrockInvokeResources` from `utils/bedrock-models.ts`, and the account
 #   ids in `utils/accounts.ts` feed the same permission set's resource ARNs.
@@ -111,4 +161,17 @@
 # exactly the change that widens the bot's authority.
 
 *                                @thegoodparty/gp-contrib
+/deploy/
+/deploy-org/
 /deploy-workbench/
+/deploy-infrastructure/
+
+# The carve-out. After the owner-less lines above, so the last match wins and
+# these resolve to an owner. See "The carve-out" above for why each is here.
+/deploy/components/worker.ts               @thegoodparty/gp-contrib
+/deploy/components/webhooks.ts             @thegoodparty/gp-contrib
+/deploy/index.ts                           @thegoodparty/gp-contrib
+/deploy/deploy.sh                          @thegoodparty/gp-contrib
+/deploy/delegate-secret.ts                 @thegoodparty/gp-contrib
+/deploy/components/ci-roles.ts             @thegoodparty/gp-contrib
+/deploy/components/ci-roles/policies.ts    @thegoodparty/gp-contrib

@@ -232,9 +232,11 @@ export const createWorker = (config: WorkerConfig) => {
           // Enforce: the gate approves only when the deterministic checks pass
           // (a plan merged to `main`, a binding to it, no `docs/` in the diff)
           // and every changed path is unowned in `CODEOWNERS` on `main`. In this
-          // repo that is `deploy-workbench/` alone, so everywhere else the
-          // verdict is a comment exactly as it was in shadow. The default in
-          // code stays `off` (decision 13); see `docs/plan-gated-merges.md`.
+          // repo that is the four Pulumi trees, minus the carve-out that keeps
+          // this file and the rest of the reviewer's logic and authority
+          // human-owned; everywhere else the verdict is a comment exactly as it
+          // was in shadow. The default in code stays `off` (decision 13); see
+          // `docs/plan-gated-merges.md`.
           { name: "DELEGATE_GATING_MODE", value: "enforce" },
           // The image tag is the ops commit; the review record stores it as
           // agentVersion so evals can name the variant that produced a review.
