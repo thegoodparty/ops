@@ -18,7 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseCodeowners, resolveOwnership, hasStarDefault } from "./gating.ts";
+import { parseCodeowners, resolveOwnership, hasStarDefault } from "./gating";
 
 const repoRoot = join(__dirname, "..", "..");
 const codeowners = readFileSync(join(repoRoot, ".github", "CODEOWNERS"), "utf-8");
