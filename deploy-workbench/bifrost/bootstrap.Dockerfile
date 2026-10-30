@@ -25,7 +25,7 @@
 #   docker build --platform linux/amd64 \
 #     -f deploy-workbench/bifrost/bootstrap.Dockerfile deploy-workbench/bifrost
 
-FROM maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098
+FROM maximhq/bifrost:v2.3.2@sha256:f5b18826349fe9e1c402c10d19f1cbb5567a3c800ad928580d07f72e69106ec7
 
 USER root
 RUN apk add --no-cache curl jq

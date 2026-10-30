@@ -5,7 +5,8 @@
 > phase E of [`bifrost-gateway.md`](./bifrost-gateway.md), which is the
 > gateway's plan and the place to start: this document assumes the gateway, its
 > oauth2-proxy admin surface, its RDS config store and the image pinned at
-> `v2.3.0` described there. It changes no code and no infrastructure.
+> `v2.3.0` described there, re-checked at `v2.3.2`, the tag now pinned. It changes
+> no code and no infrastructure.
 > Implementation PRs follow, and a PR names this document and the step it
 > implements in its body; progress is derived from those PRs and is not written
 > here (decision 11 of [`plan-gated-merges.md`](./plan-gated-merges.md)).
@@ -281,7 +282,7 @@ Every part of that is checked against the pinned source rather than assumed:
   reloads the key into the running gateway's governance manager before it
   answers.
 
-Routes, at `transports/v2.3.0`
+Routes, at `transports/v2.3.2`
 (`transports/bifrost-http/handlers/governance.go`):
 
 | Call | Route |
@@ -732,7 +733,7 @@ Step: 2
 
 ## Cited so the next session can check
 
-In Bifrost, at the pinned tag `transports/v2.3.0`:
+In Bifrost, at the pinned tag `transports/v2.3.2`:
 
 | Fact | Source |
 | --- | --- |

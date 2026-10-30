@@ -18,7 +18,7 @@ import { BIFROST_UPSTREAM_TAG } from "../bifrost-image";
  * file, which is why the test can be strict about shape without a deploy.
  *
  * The upstream schema is `transports/config.schema.json` at the pinned
- * `maximhq/bifrost` tag (`v2.3.0`, `deploy-workbench/bifrost-image.ts`), not
+ * `maximhq/bifrost` tag (`v2.3.2`, `deploy-workbench/bifrost-image.ts`), not
  * the docs at a later tag. Two things were checked against it rather than
  * assumed:
  *
@@ -59,6 +59,15 @@ type ProviderKey = {
 type ProviderConfig = {
   keys: ProviderKey[];
   network_config?: { base_url?: string };
+  prompt_cache?: {
+    auto_inject?: boolean;
+    ttl?: string;
+    cache_control_injection_points?: {
+      location?: string;
+      role?: string;
+      index?: number;
+    }[];
+  };
 };
 
 type PostgresStore = {
@@ -172,7 +181,7 @@ const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
  * The wire id a served model name is sent to the provider as: the alias's
  * `model_id` when the name is a key alias, the name itself otherwise. Residency
  * is a property of this id, not of the name a client sees (`routing` resolves
- * the alias after key selection, `core/bifrost.go` at v2.3.0).
+ * the alias after key selection, `core/bifrost.go` at v2.3.0, unchanged at v2.3.2).
  */
 const wireId = (key: ProviderKey, name: string): string =>
   key.aliases?.[name]?.model_id ?? name;
@@ -564,6 +573,58 @@ describe("bifrost config.json", () => {
     );
   });
 
+  it("turns on Bedrock prompt caching for clients that send no markers", () => {
+    // Zero cache reads on Bedrock Claude sessions through the gateway is the
+    // bug this block fixes. Bifrost never injects a marker on its own
+    // (`PromptCacheInjectionEnabled`, `core/providers/utils/promptcache.go`), so
+    // without a provider `prompt_cache` block a harness that sends no
+    // `cache_control` gets no Bedrock `cachePoint` and pays the fresh-input
+    // rate on every turn of an agent loop.
+    //
+    // Shape checked against `transports/config.schema.json` at the pinned tag
+    // (`prompt_cache`, `cache_control_injection_point`) and the page at
+    // docs.getbifrost.ai/features/prompt-caching: `auto_inject` stays true
+    // because points REPLACE the default first-block strategy rather than
+    // merely adding to it, and a point may set role, index or both.
+    const promptCache = provider(loadConfig(), "bedrock").prompt_cache;
+    assert.ok(promptCache, "the bedrock provider has no prompt_cache block, so no cache point is ever injected");
+    assert.equal(promptCache.auto_inject, true);
+    // The 1h TTL is deliberately absent: it doubles the cache-write cost, and
+    // an agent loop's turns are seconds apart, not minutes.
+    assert.equal(promptCache.ttl, undefined);
+    const points = promptCache.cache_control_injection_points;
+    assert.ok(points && points.length > 0, "bedrock names no injection points");
+    // The two markers an agent loop wants: the system prompt (the prefix every
+    // turn replays) and the last message (everything up to the newest turn).
+    assert.deepEqual(points, [
+      { location: "message", role: "system" },
+      { location: "message", index: -1 },
+    ]);
+    // Bedrock's four-marker ceiling, and the budget a role-only point spends
+    // in one go, is why neither point is bare: `role: "user"` alone would
+    // mark every user turn.
+    assert.ok(points.length <= 4, "more than four points exceeds the Anthropic/Bedrock marker ceiling");
+    for (const point of points) {
+      assert.equal(point.location, "message", "only message targets are supported at the pinned tag");
+      assert.ok(
+        point.role !== undefined || point.index !== undefined,
+        "a point with neither role nor index matches nothing",
+      );
+    }
+  });
+
+  it("leaves Fireworks without prompt_cache, because Fireworks caches the prefix server-side", () => {
+    // Not an omission: Fireworks' serverless endpoint caches a repeated request
+    // prefix automatically, so there is no marker to place and nothing for
+    // Bifrost to inject. A block here would at best be a no-op and at worst
+    // spend a marker whose write premium is billed for nothing.
+    assert.equal(
+      provider(loadConfig(), "fireworks").prompt_cache,
+      undefined,
+      "fireworks caches prefixes implicitly; a prompt_cache block there is a no-op that reads like a fix",
+    );
+  });
+
   it("keeps both stores in the RDS instance, not in the container", () => {
     // The reason the admin account kept disappearing: with no `config_store`
     // the gateway creates a SQLite file inside the container, and a task
@@ -641,7 +702,7 @@ describe("bifrost config.json", () => {
     assert.equal(auth.is_enabled, false);
     assert.equal(auth.admin_username, "env.BIFROST_ADMIN_USERNAME");
     assert.equal(auth.admin_password, "env.BIFROST_ADMIN_PASSWORD");
-    // The v2.3.0 schema marks this deprecated and ignored; the client flag is
+    // The schema marks this deprecated and ignored (v2.3.0 through v2.3.2); the client flag is
     // the control, and setting both would suggest the file can override it.
     assert.ok(
       !("disable_auth_on_inference" in auth),
@@ -669,8 +730,8 @@ describe("bifrost config.json", () => {
   // Fireworks model metadata. docs/bifrost-fireworks-model-metadata.md
   // ---------------------------------------------------------------------------
 
-  it("does not invent per-model metadata keys that v2.3.0 would ignore", () => {
-    // v2.3.0 has no config.json way to set context_length, max_input_tokens,
+  it("does not invent per-model metadata keys the pinned tag would ignore", () => {
+    // v2.3.2 has no config.json way to set context_length, max_input_tokens,
     // max_output_tokens or a model description for a provider model: the
     // schema's only context/metadata-looking keys are unrelated, the Fireworks
     // adapter builds /v1/models from the key's `models` and `aliases` alone,
@@ -711,12 +772,12 @@ describe("bifrost config.json", () => {
   it("lists the Fireworks model under a catalog name, so /v1/models carries its context window and price", () => {
     // /v1/models enriches each entry from the datasheet by the *listed name*,
     // then by the alias's wire id (`enrichListModelsResponse`,
-    // transports/bifrost-http/handlers/inference.go at v2.3.0). The datasheet has
+    // transports/bifrost-http/handlers/inference.go at v2.3.2). The datasheet has
     // no row for the router id, so the router's own entry is bare (128K, $0 in
     // pi). It does have `accounts/fireworks/models/<model>-us`, so listing the
     // model under that name with the router as the alias target gives pi a
     // full entry while requests still go to the router. Checked on 2026-10-30
-    // against the v2.3.0 code and the public datasheet: context_length and
+    // against the v2.3.0 code (re-checked at v2.3.2) and the public datasheet: context_length and
     // max_input_tokens 1048576, max_output_tokens 393216, prompt $0.45/M,
     // completion $1.80/M, cached input $0.009/M.
     const key = provider(loadConfig(), "fireworks").keys[0];
@@ -729,7 +790,7 @@ describe("bifrost config.json", () => {
     );
     // model_name is what request cost resolves first, so the logged price is
     // the catalog's own US-only row ($0.45 / $1.80 per 1M), not $0. Measured on
-    // the v2.3.0 code: 1M in + 1M out through the alias costs $2.25.
+    // the v2.3.0 code (pricing unchanged at v2.3.2): 1M in + 1M out through the alias costs $2.25.
     assert.equal(alias.model_name, "accounts/fireworks/models/deepseek-v4p1-flash-1017-us");
   });
 

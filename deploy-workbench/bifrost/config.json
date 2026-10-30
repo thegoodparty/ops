@@ -95,7 +95,14 @@
             "region": "us-west-2"
           }
         }
-      ]
+      ],
+      "prompt_cache": {
+        "auto_inject": true,
+        "cache_control_injection_points": [
+          { "location": "message", "role": "system" },
+          { "location": "message", "index": -1 }
+        ]
+      }
     }
   },
   "governance": {

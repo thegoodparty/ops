@@ -3,7 +3,7 @@
 # inside the task's own network namespace. Phase 2 item 11 of
 # docs/bifrost-gateway.md.
 #
-# Upstream's bootstrap at the pinned tag (maximhq/bifrost:v2.3.0) is a single
+# Upstream's bootstrap at the pinned tag (maximhq/bifrost:v2.3.2) is a single
 # management call: a `PUT /api/config` whose payload carries `auth_config`
 # with `is_enabled`, `admin_username`, `admin_password` and either
 # `auth_config.setup_token` in the body or this token in the

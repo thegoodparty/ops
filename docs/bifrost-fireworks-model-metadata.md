@@ -4,7 +4,14 @@
 > of [`bifrost-gateway.md`](./bifrost-gateway.md) and changes only
 > `deploy-workbench/bifrost/config.json`, the virtual-key template and their tests.
 >
-> Verified against: transports/v2.3.0
+> Verified against: transports/v2.3.2
+
+> The source excerpts and line references below were read at `v2.3.0`, the tag
+> they were checked against when this was written; they were re-checked at
+> `v2.3.2`, the tag now pinned, where the Fireworks adapter's `/v1/models`
+> construction, the alias handling in `core/bifrost.go` and the datasheet lookup
+> are unchanged (v2.3.1 and v2.3.2 change routing rules, fallback key pinning,
+> MCP, the Bedrock converter and dependencies, not this path).
 
 ## The bug
 
