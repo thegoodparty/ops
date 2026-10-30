@@ -26,14 +26,28 @@ export const BIFROST_REPOSITORY_NAME = "bifrost";
 
 /** The upstream repository and release tag the digest below was resolved from. */
 export const BIFROST_UPSTREAM_REPOSITORY = "maximhq/bifrost";
-export const BIFROST_UPSTREAM_TAG = "v2.3.0";
+export const BIFROST_UPSTREAM_TAG = "v2.3.2";
 
 /**
- * The OCI image index digest that `maximhq/bifrost:v2.3.0` resolved to on
- * 2026-10-15. This is the multi-arch index, so it pins both the arm64 and the
+ * The OCI image index digest that `maximhq/bifrost:v2.3.2` resolved to on
+ * 2026-10-30. This is the multi-arch index, so it pins both the arm64 and the
  * amd64 manifests; the mirror pulls `--platform linux/amd64` for Fargate. The
  * amd64 manifest digest at that time was
- * `sha256:d9caa7c5babe673c11ed30c59b716a5feb429f1f3d7f932a6d5aabe81993f9e7`.
+ * `sha256:d53775fd4b1d444c350443d2487ceb8aa8c0bab722cd5dc7b0001a7fa88ecd7f`.
+ *
+ * Resolved from the Docker Hub registry API (there is no docker, crane or
+ * skopeo here): a pull token from `auth.docker.io`, then a manifest GET on
+ * `registry-1.docker.io/v2/maximhq/bifrost/manifests/v2.3.2` with the OCI index
+ * `Accept` header, reading `Docker-Content-Digest` and re-hashing the body to
+ * confirm it. Re-resolving a tag later is the only way to prove the digest a
+ * re-push would produce, so a future bump repeats that rather than guessing.
+ *
+ * v2.3.1 rather than v2.3.0 is the floor for Bedrock prompt caching: at v2.3.0
+ * the Bedrock converter dropped a top-level `cache_control` and instead nested
+ * a `cachePoint` inside `toolResult.content`, which Bedrock accepts while
+ * caching nothing (maximhq/bifrost#8541, fixed by #8595). v2.3.2 is the newest
+ * v2.3.x, so it carries that fix plus the `crypto/x509` security release, and
+ * no database migrations of its own.
  *
  * Upgrade cadence: deliberately, in a reviewed PR that bumps this digest and
  * the `BIFROST_UPSTREAM` reference in `.github/workflows/deploy-workbench.yml`
@@ -44,12 +58,12 @@ export const BIFROST_UPSTREAM_TAG = "v2.3.0";
  * monthly, or sooner when a release carries a fix the fleet needs.
  */
 export const BIFROST_UPSTREAM_DIGEST =
-  "sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098";
+  "sha256:f5b18826349fe9e1c402c10d19f1cbb5567a3c800ad928580d07f72e69106ec7";
 
 /**
  * The repository, with tag immutability on.
  *
- * Immutable tags are the point of mirroring: once `bifrost:v2.3.0` is here it
+ * Immutable tags are the point of mirroring: once `bifrost:v2.3.2` is here it
  * cannot be repointed at different content. The mirror workflow skips a push
  * when the tag already exists, because an immutable repository rejects a
  * re-push and the workflow runs on every workbench change rather than only on

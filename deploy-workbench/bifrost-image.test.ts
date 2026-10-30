@@ -35,7 +35,7 @@ const workflowEnv = (key: string): string => {
 describe("bifrost image pin", () => {
   it("pins an upstream tag and a sha256 digest", () => {
     assert.equal(BIFROST_UPSTREAM_REPOSITORY, "maximhq/bifrost");
-    assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.0");
+    assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.2");
     assert.match(BIFROST_UPSTREAM_DIGEST, /^sha256:[0-9a-f]{64}$/);
   });
 

@@ -59,9 +59,9 @@ env:
   # builds it from the ECR login registry plus BIFROST_REPOSITORY and
   # BIFROST_TAG, so it cannot point at a stale tag or repository. The upgrade
   # cadence is deliberate and reviewed, not automatic; see that file.
-  BIFROST_UPSTREAM: maximhq/bifrost:v2.3.0@sha256:8f37e33a8caa85faf59a875605c61d1d934738e517d8fe96e2d9fcf6f0ef9098
+  BIFROST_UPSTREAM: maximhq/bifrost:v2.3.2@sha256:f5b18826349fe9e1c402c10d19f1cbb5567a3c800ad928580d07f72e69106ec7
   BIFROST_REPOSITORY: bifrost
-  BIFROST_TAG: v2.3.0
+  BIFROST_TAG: v2.3.2
   # The derived oauth2-proxy image built below. The repository name and the
   # upstream tag are duplicated from `deploy-workbench/oauth2-proxy-image.ts`
   # because Actions cannot import a TypeScript module, and
