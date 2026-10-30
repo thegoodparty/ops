@@ -83,26 +83,7 @@ type Config = {
     budgets?: unknown;
     teams?: unknown;
     rate_limits?: unknown;
-    pricing_overrides?: PricingOverride[];
   };
-};
-
-/**
- * A `governance.pricing_overrides` entry as v2.3.0 reads it
- * (`provider_pricing_override` in `transports/config.schema.json`, and
- * `TablePricingOverride` in `framework/configstore/tables`). `pricing_patch`
- * is a JSON-encoded *string*, not an object.
- */
-type PricingOverride = {
-  id: string;
-  name: string;
-  scope_kind: string;
-  provider_id?: string;
-  match_type: string;
-  pattern: string;
-  request_types: string[];
-  pricing_patch: string;
-  [key: string]: unknown;
 };
 
 /**
@@ -254,102 +235,6 @@ const noSecretLiteral = (config: Config) => {
   }
 };
 
-
-/**
- * Fireworks' published serverless price for DeepSeek V4.1 Flash 1017, per 1M
- * tokens (https://docs.fireworks.ai/serverless/pricing.md, read 2026-10-30:
- * "DeepSeek V4.1 Flash 1017": $0.30 uncached input / $0.006 cached input /
- * $1.20 output). The US-only router bills 1.5x this from 2026-09-01
- * (https://docs.fireworks.ai/serverless/us-only-serverless.md), which the same
- * page lists as $0.45 / $0.009 / $1.80. Kept as the base figures and a
- * multiplier so the 1.5x is visible in the test rather than folded into three
- * literals.
- */
-const FIREWORKS_BASE_PER_MILLION = { input: 0.3, cacheRead: 0.006, output: 1.2 };
-const FIREWORKS_US_MULTIPLIER = 1.5;
-
-/** Request types the override must cover: the ones a harness uses. */
-const PRICED_REQUEST_TYPES = ["chat_completion", "responses"];
-
-/** The `provider_pricing_override` properties v2.3.0 accepts (additionalProperties: false). */
-const OVERRIDE_PROPERTIES = new Set([
-  "id",
-  "name",
-  "scope_kind",
-  "virtual_key_id",
-  "user_id",
-  "provider_id",
-  "provider_key_name",
-  "match_type",
-  "pattern",
-  "request_types",
-  "pricing_patch",
-  "config_hash",
-]);
-
-/** `pricing_override_request_type` at v2.3.0; the stream variants are rejected at load. */
-const OVERRIDE_REQUEST_TYPES = new Set([
-  "chat_completion",
-  "text_completion",
-  "responses",
-  "embedding",
-  "rerank",
-  "decisions",
-  "speech",
-  "transcription",
-  "image_generation",
-  "image_variation",
-  "image_edit",
-  "video_generation",
-  "video_remix",
-  "compaction",
-]);
-
-const OVERRIDE_SCOPES = new Set([
-  "global",
-  "provider",
-  "provider_key",
-  "virtual_key",
-  "virtual_key_provider",
-  "virtual_key_provider_key",
-]);
-
-/**
- * Models a provider serves that have no price at all: neither an override that
- * names them, nor (for Bedrock) a row in the upstream catalog.
- *
- * The catalog is not available to a unit test, so the property is stated for
- * the one provider where it is known to fail: the upstream datasheet carries
- * no row for any Fireworks `routers/...-us` id that is not in its list
- * (checked against https://getbifrost.ai/datasheet on 2026-10-30), so every
- * Fireworks model the gateway serves needs an override. A model that has
- * neither is served, and priced at $0, without any error: that is the silent
- * degradation this guards against.
- */
-const modelsWithoutOverride = (
-  models: string[],
-  overrides: PricingOverride[],
-  providerId: string,
-): string[] =>
-  models.filter(
-    (model) =>
-      !overrides.some(
-        (override) =>
-          override.provider_id === providerId &&
-          override.match_type === "exact" &&
-          override.pattern === model &&
-          PRICED_REQUEST_TYPES.every((type) => override.request_types.includes(type)),
-      ),
-  );
-
-const parsePatch = (override: PricingOverride): Record<string, unknown> => {
-  assert.equal(
-    typeof override.pricing_patch,
-    "string",
-    `${override.id}: pricing_patch is a JSON-encoded string at v2.3.0, not an object`,
-  );
-  return JSON.parse(override.pricing_patch) as Record<string, unknown>;
-};
 
 const allKeys = (value: unknown, out: string[] = []): string[] => {
   if (Array.isArray(value)) {
@@ -655,8 +540,10 @@ describe("bifrost config.json", () => {
     }
     assert.ok(
       fireworks.keys.some((key) =>
-        key.models.includes(
-          "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+        key.models.some(
+          (model) =>
+            wireId(key, model) ===
+            "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
         ),
       ),
       "the fleet's Fireworks model is no longer allowed; add the replacement in the same change",
@@ -667,7 +554,11 @@ describe("bifrost config.json", () => {
     // "wrong release" rather than only "no Fireworks model".
     assert.ok(
       !fireworks.keys.some((key) =>
-        key.models.includes("accounts/fireworks/routers/deepseek-v4p1-flash-us"),
+        key.models.some(
+          (model) =>
+            wireId(key, model) ===
+            "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+        ),
       ),
       "the Fireworks list names the undated V4.1 Flash router, which is the September release rather than the 1017 update the fleet runs",
     );
@@ -775,158 +666,8 @@ describe("bifrost config.json", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Fireworks model metadata and cost. docs/bifrost-fireworks-model-metadata.md
+  // Fireworks model metadata. docs/bifrost-fireworks-model-metadata.md
   // ---------------------------------------------------------------------------
-
-  it("prices every Fireworks model it serves, because the upstream catalog has no row for the US routers", () => {
-    // Without a row the gateway's cost calculation returns nil and "skips cost
-    // calculation" (framework/modelcatalog/datasheet/cost.go, resolvePricing at
-    // v2.3.0): the request succeeds, the log records $0, and nothing errors.
-    // The 2026-10-30 reproduction against the v2.3.0 code path gave $0 for
-    // 1M input + 1M output on accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
-    // and $2.25 once this override was loaded.
-    const config = loadConfig();
-    // By wire id: a request sent as an alias is priced from the alias's
-    // `model_name` (the catalog's own row), but a request for the router id
-    // itself has only the override, and that is the one pi's worker default uses.
-    const fireworksModels = [
-      ...new Set(
-        provider(config, "fireworks").keys.flatMap((key) =>
-          key.models.map((model) => wireId(key, model)),
-        ),
-      ),
-    ];
-    const overrides = config.governance?.pricing_overrides ?? [];
-    assert.deepEqual(
-      modelsWithoutOverride(fireworksModels, overrides, "fireworks"),
-      [],
-      "a Fireworks model is served with no pricing override; the gateway would log it at $0",
-    );
-  });
-
-  it("detects a served model with no pricing override (the silent $0 case)", () => {
-    const override: PricingOverride = {
-      id: "o",
-      name: "o",
-      scope_kind: "provider",
-      provider_id: "fireworks",
-      match_type: "exact",
-      pattern: "accounts/fireworks/routers/a-us",
-      request_types: ["chat_completion", "responses"],
-      pricing_patch: "{}",
-    };
-    assert.deepEqual(
-      modelsWithoutOverride(
-        ["accounts/fireworks/routers/a-us", "accounts/fireworks/routers/b-us"],
-        [override],
-        "fireworks",
-      ),
-      ["accounts/fireworks/routers/b-us"],
-      "a model added to the list without an override must be reported",
-    );
-    // Close misses are still misses: wrong provider, a wildcard, or a request
-    // type missing all leave the model priced at $0 for the harness that uses it.
-    for (const near of [
-      { provider_id: "bedrock" },
-      { match_type: "wildcard", pattern: "accounts/fireworks/routers/a-us*" },
-      { request_types: ["chat_completion"] },
-    ]) {
-      assert.deepEqual(
-        modelsWithoutOverride(
-          ["accounts/fireworks/routers/a-us"],
-          [{ ...override, ...near }],
-          "fireworks",
-        ),
-        ["accounts/fireworks/routers/a-us"],
-        `an override that differs by ${Object.keys(near).join("+")} does not price the model`,
-      );
-    }
-  });
-
-  it("prices DeepSeek V4.1 Flash 1017 (US) at Fireworks' published 1.5x US-only rate", () => {
-    const config = loadConfig();
-    const override = (config.governance?.pricing_overrides ?? []).find(
-      (entry) =>
-        entry.pattern === "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
-    );
-    assert.ok(override, "no pricing override names the served Fireworks router id");
-    const patch = parsePatch(override);
-    const perMillion = (value: unknown): number => {
-      assert.equal(typeof value, "number", "a rate must be a number");
-      return (value as number) * 1_000_000;
-    };
-    const close = (actual: number, expected: number, what: string) =>
-      assert.ok(
-        Math.abs(actual - expected) < 1e-9,
-        `${what}: ${actual} per 1M, expected ${expected}`,
-      );
-    close(
-      perMillion(patch.input_cost_per_token),
-      FIREWORKS_BASE_PER_MILLION.input * FIREWORKS_US_MULTIPLIER,
-      "input",
-    );
-    close(
-      perMillion(patch.output_cost_per_token),
-      FIREWORKS_BASE_PER_MILLION.output * FIREWORKS_US_MULTIPLIER,
-      "output",
-    );
-    close(
-      perMillion(patch.cache_read_input_token_cost),
-      FIREWORKS_BASE_PER_MILLION.cacheRead * FIREWORKS_US_MULTIPLIER,
-      "cached input",
-    );
-    // A patch field the v2.3.0 pricing options do not have is ignored without
-    // a warning, so a typo here would look like a price and be none.
-    assert.deepEqual(
-      Object.keys(patch).sort(),
-      [
-        "cache_read_input_token_cost",
-        "input_cost_per_token",
-        "output_cost_per_token",
-      ],
-      "pricing_patch carries a field this test does not know is a v2.3.0 pricing option",
-    );
-  });
-
-  it("writes pricing overrides in the shape v2.3.0 loads, and nothing it would ignore", () => {
-    const overrides = loadConfig().governance?.pricing_overrides ?? [];
-    assert.ok(overrides.length > 0, "governance.pricing_overrides is empty");
-    const ids = new Set<string>();
-    for (const override of overrides) {
-      for (const key of Object.keys(override)) {
-        assert.ok(
-          OVERRIDE_PROPERTIES.has(key),
-          `${override.id}: "${key}" is not a v2.3.0 pricing-override property (the schema forbids extras)`,
-        );
-      }
-      assert.ok(!ids.has(override.id), `duplicate pricing override id ${override.id}`);
-      ids.add(override.id);
-      assert.ok(OVERRIDE_SCOPES.has(override.scope_kind), `${override.id}: scope_kind`);
-      assert.equal(
-        override.scope_kind,
-        "provider",
-        `${override.id}: a model's price is a property of the provider, not of a key or a person`,
-      );
-      assert.equal(override.provider_id, "fireworks");
-      assert.ok(
-        override.match_type === "exact" || override.match_type === "wildcard",
-        `${override.id}: match_type`,
-      );
-      if (override.match_type === "exact") {
-        assert.ok(!override.pattern.includes("*"), `${override.id}: exact pattern with a wildcard`);
-      } else {
-        assert.ok(override.pattern.endsWith("*"), `${override.id}: wildcard must end with *`);
-      }
-      assert.ok(override.request_types.length > 0, `${override.id}: request_types is required`);
-      for (const type of override.request_types) {
-        assert.ok(
-          OVERRIDE_REQUEST_TYPES.has(type),
-          `${override.id}: ${type} is not a base request type (stream variants are rejected at load)`,
-        );
-      }
-      parsePatch(override);
-    }
-  });
 
   it("does not invent per-model metadata keys that v2.3.0 would ignore", () => {
     // v2.3.0 has no config.json way to set context_length, max_input_tokens,
@@ -963,10 +704,9 @@ describe("bifrost config.json", () => {
     );
     assert.ok(
       doc.includes(`Verified against: transports/${BIFROST_UPSTREAM_TAG}`),
-      `docs/bifrost-fireworks-model-metadata.md was verified against a different tag than ${BIFROST_UPSTREAM_TAG}; re-check it and the pricing override before bumping`,
+      `docs/bifrost-fireworks-model-metadata.md was verified against a different tag than ${BIFROST_UPSTREAM_TAG}; re-check it and the alias before bumping`,
     );
   });
-
 
   it("lists the Fireworks model under a catalog name, so /v1/models carries its context window and price", () => {
     // /v1/models enriches each entry from the datasheet by the *listed name*,
@@ -988,31 +728,45 @@ describe("bifrost config.json", () => {
       "the alias name must be in the key's models: key selection checks the requested name, and the listing is built from this list",
     );
     // model_name is what request cost resolves first, so the logged price is
-    // the catalog's own US-only row and agrees with the override below.
+    // the catalog's own US-only row ($0.45 / $1.80 per 1M), not $0. Measured on
+    // the v2.3.0 code: 1M in + 1M out through the alias costs $2.25.
     assert.equal(alias.model_name, "accounts/fireworks/models/deepseek-v4p1-flash-1017-us");
   });
 
-  it("detects a Fireworks entry that would list bare (the silent 128K / \$0 case)", () => {
-    // The listing degrades without an error: the entry is present and has no
-    // metadata. The catalog is not available to a unit test, so the property is
-    // stated on the config: every served Fireworks router id must be reachable
-    // from a catalog-named alias, until the datasheet gains the router rows.
+  it("detects a Fireworks entry that would list bare, and so price at \$0 and show 128K in pi", () => {
+    // Both failures are silent: the entry is present and the request succeeds.
+    // The catalog is not available to a unit test, so the property is stated on
+    // the config. Every name the key serves must be a catalog-named alias whose
+    // `model_name` is that same name: the listing is enriched by the listed
+    // name, and request cost resolves `model_name` first, so a router id served
+    // directly (the case this replaces) is bare in the listing and $0 in the log.
+    const catalogNamed = /^accounts\/fireworks\/models\/[a-z0-9.-]+-us$/;
+    const bare = (key: ProviderKey): string[] =>
+      key.models.filter((model) => {
+        const alias = key.aliases?.[model];
+        return !(
+          catalogNamed.test(model) &&
+          alias !== undefined &&
+          alias.model_name === model
+        );
+      });
     const key = provider(loadConfig(), "fireworks").keys[0];
-    const routerIdsWithCatalogName = new Set(
-      Object.entries(key.aliases ?? {})
-        .filter(([name]) => /^accounts\/fireworks\/models\/[a-z0-9.-]+-us$/.test(name))
-        .map(([, alias]) => alias.model_id),
-    );
-    const bare = (key: ProviderKey) =>
-      key.models
-        .map((model) => wireId(key, model))
-        .filter((id) => !routerIdsWithCatalogName.has(id));
-    assert.deepEqual(bare(key), [], "a served Fireworks router has no catalog-named alias");
+    assert.deepEqual(bare(key), [], "a served Fireworks name would list bare and cost \$0");
 
-    // The detector itself: a router id with no alias is reported.
+    // The detector itself: a router served directly, or an alias with no
+    // model_name, is reported.
+    const router = "accounts/fireworks/routers/x-us";
+    const named = "accounts/fireworks/models/x-us";
+    assert.deepEqual(bare({ name: "k", models: [router], weight: 1 }), [router]);
     assert.deepEqual(
-      bare({ name: "k", models: ["accounts/fireworks/routers/x-us"], weight: 1 }),
-      ["accounts/fireworks/routers/x-us"],
+      bare({ name: "k", models: [named, router], aliases: { [named]: { model_id: router, model_name: named } }, weight: 1 }),
+      [router],
+      "a bare router listed beside a good alias must still be reported",
+    );
+    assert.deepEqual(
+      bare({ name: "k", models: [named], aliases: { [named]: { model_id: router } }, weight: 1 }),
+      [named],
+      "an alias without model_name is priced from the router id, which has no row",
     );
   });
 

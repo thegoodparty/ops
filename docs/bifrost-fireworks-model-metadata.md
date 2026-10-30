@@ -87,35 +87,37 @@ miss. That is the whole bug. The seven Bedrock `us.*` profiles each have a row
 Catalog sync URL: `framework.pricing.pricing_url` is a supported config.json key
 (and accepts `file://`, `datasheet/sync.go:187`), so issue #3238's "hardcoded,
 no override" is out of date for the pricing datasheet at this tag. It is the
-heavy hook (replace the whole catalog), and I did not use it; see "Not chosen".
+heavy hook (replace the whole catalog, including Bedrock's rows with a file that
+goes stale until rebuilt), and it was not used.
 
 ## What the same gap does to cost
 
-Cost is the quieter half. With no row, `resolvePricing`
-(`datasheet/cost.go:2229`) finds no base price, falls to "override-only
-pricing", finds none and returns nil, so the request is logged with cost 0 and
-no error. Reproduced on the v2.3.0 code: 1M input + 1M output tokens on the
-served router id prices at **$0** with the catalog alone. The gateway's per-key
-cost attribution has been recording zero for every Fireworks request.
+Cost has the same gap. With no row, `resolvePricing`
+(`datasheet/cost.go:2229`) finds no base price and returns nil, so a request on
+the router id is logged at cost 0 with no error. Reproduced on the v2.3.0 code:
+1M input + 1M output tokens on the router id prices at **$0** from the catalog
+alone. The gateway's per-key cost attribution has been recording zero for every
+Fireworks request.
 
 ## What changed
 
-Two things in `deploy-workbench/bifrost/config.json`, one for each symptom.
-
-**1. A catalog-named alias, for the listing (the DX fix).** `/v1/models` is
-enriched by the *listed name*, then by the alias's wire id. The datasheet has a
-row for `accounts/fireworks/models/deepseek-v4p1-flash-1017-us` and none for
-the router id. So the key now also serves that name, as a key alias whose
-`model_id` is the router:
+One edit to `deploy-workbench/bifrost/config.json`, and the matching one to the
+virtual-key template. `/v1/models` is enriched by the *listed name*, and the
+datasheet has a row for `accounts/fireworks/models/deepseek-v4p1-flash-1017-us`
+and none for the router id. So the key now serves that name, as a key alias
+whose `model_id` is the router:
 
 ```
-models:  [ routers/deepseek-v4p1-flash-1017-us, models/deepseek-v4p1-flash-1017-us ]
-aliases: models/deepseek-v4p1-flash-1017-us -> model_id routers/deepseek-v4p1-flash-1017-us
+models:  [ models/deepseek-v4p1-flash-1017-us ]
+aliases: models/deepseek-v4p1-flash-1017-us ->
+           model_id   routers/deepseek-v4p1-flash-1017-us
+           model_name models/deepseek-v4p1-flash-1017-us
 ```
 
-Run on the v2.3.0 code (`listModelsByKey`, then the same lookup and
-`ApplyModelInfo` the handler uses, over the 2026-10-30 datasheet), the entry
-for the alias is:
+The router id is no longer served under its own name, so there is one Fireworks
+row in `/v1/models`, and it is the enriched one. Run on the v2.3.0 code
+(`listModelsByKey`, then the lookup and `ApplyModelInfo` the handler uses, over
+the 2026-10-30 datasheet), the entry is:
 
 ```json
 {"id":"fireworks/accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
@@ -125,152 +127,89 @@ for the alias is:
  "pricing":{"prompt":"0.0000004500","completion":"0.0000018000","input_cache_read":"0.0000000090"}}
 ```
 
-That is every field `gp-bifrost.ts` reads, with the right numbers, and it needs
-**no change to the `gp-pi` extension**: pi gets 1 048 576 / 393 216 and a real
-price from the same fields the Bedrock entries use.
+That is every field `gp-bifrost.ts` reads, with the right numbers, so it needs
+**no change to the `gp-pi` extension**.
 
-Residency is unchanged. The alias resolves *after* key selection
-(`core/bifrost.go:8178`) and the provider is sent the router id; Fireworks
+**Cost is fixed by the same edit.** Request cost resolves the alias's
+`model_name` first (`resolvePricing`, `datasheet/cost.go:2229`), so a request
+for the alias is priced from the catalog's own row for the `models/...-us` id.
+Measured on the v2.3.0 code: 1M in + 1M out through the alias costs **$2.25**
+($0.45 + $1.80), from $0, with no pricing override. That row is the US-only
+1.5x rate (Fireworks lists the model at $0.30 / $1.20 and the US router at
+$0.45 / $1.80, <https://docs.fireworks.ai/serverless/pricing.md>,
+2026-10-30). The earlier revision of this change also added a
+`governance.pricing_overrides` entry for the router id; it is gone, because
+nothing now sends a request under the router's own name, so nothing needed it.
+
+**Residency is unchanged.** The alias resolves *after* key selection
+(`core/bifrost.go:8178`), and the provider is sent the router id. Fireworks
 answers a request for the `models/...-us` name itself with 404 ("Model not
-found"), so the global-looking name cannot be reached by accident. I made that
-call with a real key on 2026-10-30: the router id returns 200 and is served by
-`deepseek-v4p1-flash-1017`; the `models/...-us` name returns 404. The tests
-now check residency against the *wire id*, so an alias pointing at a non-US id
-fails them.
+found"); I called it with a real key on 2026-10-30: the router id returns 200
+(served by `deepseek-v4p1-flash-1017`), the `models/...-us` name returns 404.
+So the global-looking name cannot be reached by accident. The tests check
+residency against the **wire id**, so an alias to a non-US id fails them.
 
-**2. A pricing override, for the cost.** The router id has no pricing row, so a
-request sent *as the router id* (which is what `gp-delegate`'s worker default
-does today) was priced at $0 without an error. One provider-scoped
-`governance.pricing_overrides` entry fixes that:
+## Tests
 
-```
-provider fireworks, exact accounts/fireworks/routers/deepseek-v4p1-flash-1017-us,
-chat_completion + responses + text_completion,
-input 4.5e-7, output 1.8e-6, cached input 9e-9 per token
-```
+`config.test.ts` and `vk-mint-template.test.ts`:
 
-These are Fireworks' published base price for this model ($0.30 / $0.006 / $1.20
-per 1M) times the 1.5x US-only premium
-(<https://docs.fireworks.ai/serverless/pricing.md>, 2026-10-30), which the same
-page lists as $0.45 / $0.009 / $1.80. On the v2.3.0 code the same JSON prices 1M
-in + 1M out at **$2.25** on chat and on responses, from $0. A request sent as the
-alias is priced $2.25 either way, because `model_name` points at the catalog's
-own US-only row, which carries the same number. The v2.3.0 config loader parses
-both blocks.
+- every served Fireworks name is a catalog-named alias with `model_name` set to
+  itself, with a negative test of that detector (a router served directly, a
+  router beside a good alias, an alias with no `model_name`): the silent case
+  is an entry that is present, succeeds, and lists as 128K / $0;
+- residency on the wire id, for the config and for the template;
+- the template's Fireworks list equals the config's;
+- an invented `context_length` / `max_*_tokens` / `pricing` key is refused:
+  v2.3.0 has no config key for them, so it would parse, do nothing and look
+  fixed;
+- this document names the pinned tag, so a bump has to re-check it.
 
-The virtual-key template (`vk-mint-template.json`) allows the alias name too,
-because the listing and the request are both filtered by the key's
-`allowed_models` against the requested name. A test requires the template's
-Fireworks list to equal the config's.
+## What this does not do
 
-`config.test.ts` and `vk-mint-template.test.ts` cover it: a served router with no
-catalog-named alias (the silent bare-listing case, with a negative test of the
-detector), a served router with no override (the silent $0 case, likewise), the
-rate against the published 1.5x, residency checked on the wire id, the template
-equal to the config, and a refusal of invented metadata keys.
-
-## What you still have to do, and what stays wrong
-
-- **`gp-pi` must name the new model, with no extension change.** The router id
-  still lists bare. Both ids are in the key's `models`, because the container's
-  worker default (`gp-delegate`'s `WORKER_MODEL`) and saved settings name the
-  router, and removing it would turn them into 404s the moment this deploys. So
-  `pi --list-models` shows two Fireworks rows for the same model: the bare
-  router and the enriched `models/...-us`. The DX is fixed for whoever selects
-  the enriched one. Once `gp-pi`'s default id (data, not extension code) is the
-  `models/...-us` name, delete the router from `models` and the bare row is
-  gone. That default is not set in this repository; `bifrost-model-aliases.md`
-  moves it.
-- **This collides with that plan.** Its `worker-default` alias targets the
-  router id, and the listing enriches by the listed name (`worker-default`) and
-  the alias *value* (the router): neither has a row, so that alias would list
-  bare, which its own "enrichment" gate expects. It cannot use the catalog name
-  as its target, because Fireworks 404s it. The way through is for the default
-  to be this alias rather than a second layer on top of it, or for
-  `worker-default` to point at `models/...-us` as the *listed* alias (one
-  hop, not two). I did not decide that here: it is the aliases plan's call.
-- **Existing virtual keys do not get the new model.** The mint applies the
-  template on *create* and returns an existing key unchanged. A key minted
-  before this deploys has `allowed_models` without the alias name, so the
-  governance filter hides it from that key's `/v1/models` and refuses requests
-  for it. New keys are right; for existing ones the allowlist has to be updated
-  (or the key re-minted). This is the "mint does not converge" gap that
-  `bifrost-model-aliases.md` already records, and it is not fixed here.
-- **The duplicate row is the price of not breaking the router id.** Nothing in
-  v2.3.0 hides one listed model behind another.
-
-## What does not change
-
-Overrides patch **cost only** (`patchPricing`, `datasheet/overrides.go:471`);
-there is still no config.json key for `context_length`, `max_input_tokens` or
-`max_output_tokens`, and a test refuses an invented one. The alias fixes the
-listing by routing the lookup to a row that exists, not by setting those
-fields. If the datasheet ever drops or renames the `models/...-us` row, the
-alias lists bare again: that is the silent degradation the second test watches
-for in config, but only a live `/v1/models` check can see a datasheet change.
-
-A tag bump would not help either: `transports/v2.4.0` changes the Fireworks
-provider only by a `disable_store` flag, and enrichment still uses
-`GetPricingEntryForModel`. Upstream #8914 and #9201 (open, unmerged) are about
-the live-response path of OpenAI-compatible providers, which Fireworks does not
-use.
-
-## Is the price correct?
-
-Delivering: the **US-premium price**, as the number Fireworks publishes, entered
-by hand. Not delivering: proof it matches billing. `bifrost-gateway.md` item 16
-(reconcile against a week of provider billing) **is still owed**: the number is
-the published 1.5x, the catalog's own US-only rows agree with it, but a published
-price is not an invoice, and the cached-input rate and any spot or priority
-tiers are untested. The reconciliation also has to cover the override going
-stale if Fireworks changes the price.
-
-Side effect to know about: `source_of_truth` is `config.json`, and a present
-`pricing_overrides` array is authoritative for that section
-(`pruneGovernanceConfigToFile`, `lib/config.go:4680`). An override added through
-the Bifrost UI is deleted on the next task start. That is the intended model for
-this repo.
-
-## Options considered
-
-- **a. Config override of model metadata.** Not available at v2.3.0, as above.
-  Cost-only override: used (item 2 above).
-- **b. Bump the tag.** Rejected: nothing in v2.4.0 changes this provider's
-  listing, and the plan says upgrades are deliberate.
-- **c. Alias to a catalog row.** *Used for the listing.* I first wrote this up as
-  untried and left it as a decision for the engineer; that was wrong. It is
-  supported at the pinned tag (`aliases` and `model_name` are in the key
-  schema), it needed no new artifact, and I ran it.
-- **c'. Seed the catalog** with `framework.pricing.pricing_url` pointing at a
-  datasheet we host. Would fix the listing and cost for any id, but replaces the
-  catalog Bedrock also uses with a file that is stale until rebuilt, and needs a
-  new artifact and a merge step. Worth it only if more routers need rows than
-  one alias can carry.
-- **d. Upstream.** The clean fix is a datasheet row for
-  `fireworks_ai/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`, a data
-  change on their side. Then the alias, the second `models` entry and the
-  template change can all be deleted.
+- **A request for the router id now fails.** `accounts/fireworks/routers/...-us`
+  is no longer in the key's `models`, so anything still naming it gets a refusal
+  from the gateway. That is deliberate and is the container's change to make
+  (`gp-pi`'s default id), not this repository's.
+- **Existing virtual keys do not get the new name.** The mint applies the
+  template on create only, so a key minted before this deploys can neither list
+  nor call it. Key refresh is being handled separately.
+- **It depends on the datasheet.** If upstream drops or renames the
+  `models/...-us` row, the entry lists bare again and costs $0. Only a live
+  `/v1/models` check can see that. The clean fix is a datasheet row for the
+  router id on their side; then the alias can go.
+- **Overrides patch cost only** (`patchPricing`, `datasheet/overrides.go:471`).
+  There is still no config key for context or output limits.
+- **A tag bump would not help.** `transports/v2.4.0` changes the Fireworks
+  provider only by a `disable_store` flag, and enrichment still uses
+  `GetPricingEntryForModel`. Upstream #8914 and #9201 (open, unmerged) are about
+  the live-response path of OpenAI-compatible providers, which Fireworks does not
+  use.
+- **Billing is not reconciled.** The price is Fireworks' published rate through
+  Bifrost's catalog, not an invoice, so `bifrost-gateway.md` item 16 is still
+  owed.
 
 ## What the engineer must do to see it live
 
 1. Merge, then let `deploy-workbench` deploy: `config.json` is an SSM parameter
    injected as `BIFROST_CONFIG`, and the task re-reads it on restart.
-2. `GET /v1/models` with a **new** virtual key (or one whose allowlist was
-   updated) and look for `fireworks/accounts/fireworks/models/deepseek-v4p1-flash-1017-us`
-   with `context_length` 1048576 and a `pricing` block. Then make one request
-   on each name and read the logged cost: both should be about $0.45 / $1.80 per
-   1M. **I could not run this**: the gateway is an ECS deployment, the container
-   has no cgo for a real `LoadConfig`, and verifiable-live status is a rollout
-   gate, not something to assert from here.
-3. Move `gp-pi`'s default to the `models/...-us` name, then drop the router
-   from `models`.
+2. `GET /v1/models` with a **new** virtual key and look for
+   `fireworks/accounts/fireworks/models/deepseek-v4p1-flash-1017-us` with
+   `context_length` 1048576 and a `pricing` block. Then make one request on
+   that name and read the logged cost (about $0.45 / $1.80 per 1M). **I could not
+   run this**: the gateway is an ECS deployment, the container has no cgo for a
+   real `LoadConfig`, and verifiable-live status is a rollout gate, not
+   something to assert from here.
+3. Land the `gp-pi` default-id change in step with the deploy, since the router
+   id stops being served.
 
 ## Reproducing
 
 All of this used the v2.3.0 source at `transports/v2.3.0` (commit
 `9237ec06672406e437b3cb33fc793ffd0403b3ae`), the 2026-10-30 public datasheet
 and Go 1.27.3. The probes were throwaway tests in a scratch clone, since
-removed; the three that matter are: `listModelsByKey` with this repo's key
+removed; the ones that matter are: `listModelsByKey` with the old and the new key
 config; `Store.GetPricingEntryForModel`/`GetCapabilityEntry` over the downloaded
-datasheet for the four ids above; and `Store.CalculateCost` before and after
-`SetOverrides` with the entry in `config.json`.
+datasheet for the four ids above; the handler's lookup and `ApplyModelInfo` for
+the alias; `Store.CalculateCost` for a response routed through the alias (with
+and without `ResolvedKeyAlias`); and the real `ConfigData` parser plus
+`KeyAliases.Validate` over the new `config.json`.
