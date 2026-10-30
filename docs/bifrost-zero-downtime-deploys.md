@@ -518,8 +518,8 @@ change. A Lambda would need its own group and a second ingress rule on the
 database group — the shape `bifrost-vk-mint.ts` had to add on the *task* group
 for the admin API — for a job that runs once per deploy.
 
-What this leaves open is only the image (decision 17) and the plumbing that
-starts it; it is no longer a question about where it can run.
+What is left to build is the image (decision 17) and the plumbing that starts
+the task; where it can run is settled.
 
 ### 17. A derived image, as the deployment already derives images
 
