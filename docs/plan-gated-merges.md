@@ -570,18 +570,25 @@ that the rates are recorded where the next reader can see them.
 
 That bar was not met for the first path de-owned, and the bar is not lowered
 because of it. What happened instead is recorded once, with its evidence and its
-tripwire, in "The first path, and the bar it did not wait for" below; the bar
-still governs the three trees that remain owned.
+tripwire, in "The first path, and the bar it did not wait for" below. It was not
+met for the other three either, and that is recorded in "The batch of three, and
+the bar it did not wait for". Neither departure lowers the bar. Any Pulumi path
+still owned after both is still governed by it.
 
 ## De-owning the Pulumi trees, one path at a time
 
 Each of `deploy/`, `deploy-org/`, `deploy-workbench/` and `deploy-infrastructure/`
-is its own PR, and each PR changes only its own line plus the places that
-describe it:
+is de-owned by its own PR, as the rule below says, and each PR changes only its
+own line plus the places that describe it. **Amended 2026-10-30:** three of the
+four went in one PR, `deploy/`, `deploy-org/` and `deploy-infrastructure/`,
+which is the departure recorded in "The batch of three, and the bar it did not
+wait for". The sentence above describes the rule that was set, not every PR
+that has followed it.
 
-- `.github/CODEOWNERS`: one line removed from the opt-out list, and the
+- `.github/CODEOWNERS`: one owner-less line added to the opt-out list, and the
   commentary updated to say which path was de-owned, on what evidence, and when.
-  This is the record; there is no other.
+  This is the record; there is no other. The line grants authority, so reading
+  "one line removed" literally would re-own the path (see "The first path").
 - `CLAUDE.md`: the "Review and approval" section, whose list of paths that need
   a human is now wrong. `docs/` is human-owned after step 2, which is why this
   edit rides in the same PR as the de-owning rather than needing its own: both
@@ -645,9 +652,14 @@ to `CODEOWNERS`.
    ahead of step 5's bar rather than after it, deliberately and once, on the
    engineer's call. What that decision rests on, what it does not, and the
    tripwire that reverses it are in "The first path, and the bar it did not
-   wait for". The rule itself is unchanged: the other three trees are still
-   candidates under the bar, each on its own evidence, and a false approve on
-   any of them still blocks de-owning it.
+   wait for".
+   **Amended 2026-10-30:** the other three, `deploy/`, `deploy-org/` and
+   `deploy-infrastructure/`, were de-owned in one batch, also ahead of the bar,
+   on the engineer's call. The rule that a path is de-owned only on its own
+   shadow evidence is not met for them, and this decision does not pretend it
+   is; what it records is in "The batch of three, and the bar it did not wait
+   for". The rule for any path not yet de-owned is unchanged, and a false
+   approve on any de-owned path still blocks de-owning further paths.
 7. **The bot derives authority from `CODEOWNERS` on `main`, per PR.** Not from a
    cached copy, not from configuration, not from the plan. Read at run time from
    the PR's base ref, and the base ref has to be `main`.
@@ -848,11 +860,16 @@ The Progress list is the checklist; this is the detail behind each step.
    against what humans did. The rates are recorded in the de-owning PRs' bodies
    and on a plan's ClickUp task when one exists. Step 5 ends with the numbers in
    hand and a recommendation per Pulumi tree, not with a date.
-6. **De-own, one path at a time.** Four PRs, each removing one line in
+6. **De-own, one path at a time.** Four PRs, each adding one owner-less line to
    `.github/CODEOWNERS` and updating the commentary and `CLAUDE.md` as above,
    each citing the shadow evidence for that path in its body. The first of the
    four also sets `DELEGATE_GATING_MODE=enforce` in
-   `deploy/components/worker.ts`. That is not a formality: while the mode is
+   `deploy/components/worker.ts`.
+   **Amended 2026-10-30:** the engineer chose to batch the remaining three trees
+   into one PR rather than run them one at a time. That is a departure from this
+   step's rule, recorded in "The batch of three, and the bar it did not wait
+   for"; the rule is otherwise unchanged. The mode was already `enforce` from
+   the first increment, so the batch sets nothing in `deploy/`. That is not a formality: while the mode is
    `shadow` the bot cannot approve anything, so de-owning a path with the mode
    still off would change nothing. `enforce` is safe to set at that point for
    the same reason it is safe to set now — after step 2 every path in this repo
@@ -948,9 +965,13 @@ someone will notice.
   `.github/CODEOWNERS` immediately, in its own human-reviewed PR, and only then
   decide whether to try again, with the false approve described in that PR's
   body. The mode stays `enforce` through it: with no de-owned path it can only
-  comment, so it is not the thing that needs changing.
+  comment, so it is not the thing that needs changing. **Amended 2026-10-30:**
+  this response is written for the workbench tree alone and no longer covers the
+  batch. For a false approve in any of the four de-owned trees the response is
+  to re-own the batch, not the one path. See "The batch of three" below for what
+  that means and what it costs.
 - **Who reads them.** Jeff, who drives this plan and owns the workbench account,
-  reads the bot's approvals in `deploy-workbench/`. This document names the
+  reads the bot's approvals in all four de-owned trees. This document names the
   reader so the job is a responsibility rather than a hope, and naming someone
   else is how the job moves.
 - **Reading them needs no new tooling.** An approval is an `APPROVE` review from
@@ -958,6 +979,63 @@ someone will notice.
   label and nothing new to add: every merged PR in the tree, and
   `gh pr view <n> --json reviews` for whether `delegate-reviewer` approved it.
   There is nothing to build before this can be read.
+
+## The batch of three, and the bar it did not wait for
+
+**2026-10-30.** `deploy/`, `deploy-org/` and `deploy-infrastructure/` are
+de-owned together, in one PR, on the engineer's call. Step 6 says each Pulumi
+tree is its own PR, de-owned only on its own shadow evidence, and that
+`deploy-infrastructure/` should go last. This section records why that rule is
+set aside for these three, and what it costs.
+
+**The bar was not met for them either.** The evidence is the same as for the
+workbench tree, and no more: over the last 100 merged PRs the reviewer's findings
+held up 31 of 32 times (median 4 minutes to the fix commit), its recall is
+unmeasured, and the shadow window produced no would-approves, so there is no
+false-approve denominator for any of the three. The gate would have approved none
+of those 100 PRs. The per-path rule has nothing to cite here, and this document
+does not pretend otherwise.
+
+**Per-path shadow evidence cannot be cited for them.** A single PR cannot cite
+three separate shadow windows. The shadow window also measured nothing that
+distinguishes the trees: every shadow review was a would-comment, so there is no
+per-path rate to put in the body of any of the three. The batch's PR body says
+the same, so the reviewer and the record do not read as if each tree had its own
+evidence.
+
+**Why the batch, and why the order the plan set is given up.** The engineer
+chose to batch the remaining three rather than run them one at a time. That
+gives up the plan's ordering by evidence, and it means `deploy-infrastructure/`
+goes at the same time as the other two, not last. The plan expected it to go
+last because it holds the runtime that acts on the identity store and the
+break-glass tool's own Lambda. Batching accepts that a false approve in that
+tree lands with the other two in the same record.
+
+**What the tripwire becomes.** Under the per-path design a false approve on one
+path was a one-line revert of that path, and the other paths stayed as they were.
+That is no longer true. Removing one of the three lines does not undo the
+decision, because the record covers the batch as one, and a false approve in any
+of the four leaves the decision in force for the other three unless the whole
+batch is re-owned. So:
+
+- **A false approve in any of the four** (as defined in "The tripwire") is
+  answered by re-owning all four trees in one human-reviewed PR, with the false
+  approve described in its body and this section updated in the same PR. A PR
+  that re-owns only the tree where the false approve happened needs its own
+  justification, because it leaves the record covering trees it no longer
+  describes.
+- **The mode stays `enforce`** through any re-owning. With no de-owned path it
+  can only comment, as above.
+- **What is not yet known.** Whether one false approve in the batch is enough to
+  reopen the other three trees, or whether a re-owning of only the failing tree
+  is acceptable, is a decision for the engineer when it arises. This PR does not
+  settle it, and the default above (re-own all four) is the conservative reading,
+  not a decision that has been made about the other case.
+
+**What this does not change.** Nothing about the bar's content, the tripwire's
+definition of a false approve, or the fact that `deploy-infrastructure/` is the
+riskiest of the four. Each of the four keeps its own name in the record, so a
+later reader can see which path was approved on which PR.
 
 ## What was verified
 

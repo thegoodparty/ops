@@ -62,14 +62,16 @@ on `@thegoodparty/gp-contrib` must approve everything except what the opt-out
 list leaves unowned. A path with no owner satisfies the code-owner half
 vacuously, and the opt-out list is deliberately as short as it is.
 
-The one entry is `deploy-workbench/`, de-owned on 2026-10-29 under step 6 of
-`docs/plan-gated-merges.md`, which took that step ahead of the evidence bar the
-plan set for it and records why, what the evidence does and does not show, and
-the tripwire. A PR that touches only `deploy-workbench/` can merge on a
-`delegate-reviewer[bot]` approval when it names a plan merged to `main` and the
-change is consistent with it. Touching any other path -- this file, `docs/`,
-`deploy/`, anything outside that tree -- puts the whole PR back under human
-review.
+Four Pulumi trees are de-owned under step 6 of `docs/plan-gated-merges.md`,
+so a `delegate-reviewer[bot]` approval can merge a PR that touches only them,
+when it names a plan merged to `main` and the change is consistent with it:
+`deploy-workbench/` (de-owned 2026-10-29, ahead of the evidence bar the plan
+set), and `deploy/`, `deploy-org/` and `deploy-infrastructure/` (de-owned
+together on 2026-10-30). The plan records what the evidence does and does not
+show, that the bar was not met for any of the four, and the tripwire. Every
+other path -- this file, `docs/`, `delegate/`, `.github/`, `utils/`,
+`scripts/`, anything else -- still needs a human on `@thegoodparty/gp-contrib`,
+and a PR that touches one of them puts the whole PR back under human review.
 
 The opt-out list in `.github/CODEOWNERS` is also the only mechanism that grants
 the bot authority to approve, and adding an entry to it is a security change
@@ -79,9 +81,7 @@ that needs a human.
 included. The owned entries worth naming, because the file being edited does
 not obviously reach a credential:
 
-- `.github/`, `delegate/`, `deploy/`, `deploy-org/`,
-  `deploy-infrastructure/` — the trees that define IAM, CI and the reviewer
-  itself
+- `.github/`, `delegate/` — the trees that define CI and the reviewer itself
 - `utils/`, `scripts/`, `run-script.ts` — these look like library and tooling
   code but are reached by IaC and by a credentialled workflow. See below.
 - `package.json`, `package-lock.json`, `tsconfig.json`, `.dockerignore`
