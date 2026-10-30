@@ -48,7 +48,7 @@ Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, n
 Lead categories:
 - correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
 - security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
-- tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile
+- tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
 - ai-rules: probable violation of a rule in ai-rules/*.md — cite the suspected file
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
@@ -107,7 +107,7 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 
 **security:** Missing authz on new endpoints, injection vectors (SQL, XSS, command), secret exposure in logs or responses, broken S2S JWT verification (PEOPLE_API_S2S_SECRET, Clerk M2M), CORS/cookie misconfiguration, email-domain substring checks without a delimiter guard. Blocker only when you can describe the attacker and exploit in one sentence.
 
-**tests:** New behavior without tests, tautological assertions (test passes for the wrong reason), test files that won't compile. Blocker only when the gap leaves a non-trivial path totally untested or the assertion is provably wrong.
+**tests:** New behavior without tests, tautological assertions (test passes for the wrong reason), test files that won't compile. Blocker only when the gap leaves a non-trivial path totally untested or the assertion is provably wrong. A test that the repo's written testing guide (linked from the nearest CLAUDE.md or AGENTS.md) says not to write is also blocker-grade: quote the guide's section and name the test that breaks it. The guide is the evidence; it does not also need a CI or runtime failure.
 
 **conventions:** CLAUDE.md violations or pattern divergence from 3+ existing files. Blocker only when the divergence will cause a CI failure or runtime bug — not for taste differences.
 
