@@ -4,7 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
-import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema } from "./schema";
+import { decide } from "./gates";
+import { priorFindingsFrom } from "./bundle";
+import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema, lockKey, recordKey } from "./schema";
 import type { ReviewRecord } from "./schema";
 
 test("gatingFor defaults to off and cannot be loosened by a bad value", () => {
@@ -564,3 +566,119 @@ test("no callsite after the repair pass reads result.costUsd", () => {
   assert.equal(after.includes("result.costUsd"), false);
 });
 
+
+// Case 11 of `docs/plan-gated-merges.md`'s corpus, "a commit pushed after
+// approval", is the one corpus row main never implemented. It cannot be an
+// eval replay: `replay.ts` scores one bundle at one sha through `decide()`, and
+// `decide` is handed the findings, the two blocker counts and the gating result
+// -- never an approval. A bundle for sha B has no sha-A approval to inherit, so
+// a replay case would pass whatever the harness did, which tests nothing. The
+// property is deterministic, so it is pinned here: on the two places that key
+// state by sha, and on the one function that could carry a verdict forward.
+const approvedAtA = {
+  action: "approved" as const,
+  runId: "a0000000-0000-4000-8000-00000000000a",
+  repo: "thegoodparty/ops",
+  prNumber: 42,
+  baseSha: "aaaaaa",
+  headSha: "a".repeat(40),
+  trigger: "webhook" as const,
+  agentVersion: "1.0.0",
+  model: "claude-opus-4-5",
+  startedAt: "2024-01-01T00:00:00.000Z",
+  finishedAt: "2024-01-01T00:01:00.000Z",
+  wallTimeMs: 60000,
+  costUsd: null,
+  bundle: {
+    repo: "thegoodparty/ops",
+    prNumber: 42,
+    baseRef: "main",
+    baseSha: "aaaaaa",
+    headSha: "a".repeat(40),
+    author: "swain",
+    title: "t",
+    body: "Plan: docs/x.md",
+    diff: "",
+    changedFiles: [],
+    priorFindings: [],
+  },
+  output: { status: "complete" as const, findings: [], summary: "clean" },
+  verdict: "approve" as const,
+  gates: [],
+  findings: [],
+  droppedFindings: [],
+  reviewId: 7,
+};
+
+// The per-sha S3 lock is "the whole gate": a second review of the same tree
+// would land a second, possibly different verdict on it. That is also what
+// stops a push from inheriting an approval -- B's lock and B's record key are
+// different objects from A's. Keyed on (repo, pr) alone, a push would silently
+// carry the approval over.
+test("a record and its lock are keyed by sha, so a push cannot inherit an approval", () => {
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  assert.equal(
+    recordKey("thegoodparty/ops", 42, shaA, approvedAtA.runId),
+    `reviews/thegoodparty/ops/42/${shaA}/${approvedAtA.runId}.json`,
+  );
+  assert.notEqual(
+    recordKey("thegoodparty/ops", 42, shaB, approvedAtA.runId),
+    recordKey("thegoodparty/ops", 42, shaA, approvedAtA.runId),
+  );
+  assert.notEqual(
+    lockKey("thegoodparty/ops", 42, shaB),
+    lockKey("thegoodparty/ops", 42, shaA),
+  );
+});
+
+// The bot's answer at B is computed from B's own inputs. There is no parameter
+// through which A's approval could arrive, which is *why* this is a unit test
+// and not a replay: a clean, consistent PR at B approves on its own judgement,
+// and a flagged one comments even though A was approved.
+test("the verdict at B comes from B's inputs, never from A's approval", () => {
+  const gatingAtB = {
+    mode: "enforce" as const,
+    binding: { path: "docs/x.md" },
+    baseRef: "main",
+    plan: { path: "docs/x.md", blobSha: "c".repeat(40) },
+    authority: { checked: true, ownedPaths: [], reason: "" },
+    flags: [],
+  };
+  const cleanAtB = decide(
+    {
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "consistent", reasoning: "step 1's own words" },
+    },
+    { gating: gatingAtB },
+  );
+  assert.equal(cleanAtB.action, "approve");
+
+  const flaggedAtB = decide(
+    {
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: {
+        verdict: "inconsistent",
+        reasoning: "the step names the log group",
+        departure: { plan: "the delegate log group", diff: "the playright bucket" },
+      },
+    },
+    { gating: gatingAtB },
+  );
+  assert.equal(flaggedAtB.action, "comment");
+  assert.deepEqual(flaggedAtB.gates, ["inconsistent"]);
+});
+
+// What a later run inherits from an earlier one is a prior *finding*, never a
+// prior verdict: the agent re-decides every pass. An approval records no
+// findings, so the one thing it could hand forward is nothing. That is the
+// third way A's approval could have leaked into B, and it does not.
+// (`priorFindingsFrom`'s finding-mapping is covered in `bundle.test.ts`.)
+test("an approval carries no verdict and nothing else forward to the next sha", () => {
+  const carried = priorFindingsFrom(approvedAtA as unknown as ReviewRecord);
+  assert.deepEqual(carried, []);
+});
