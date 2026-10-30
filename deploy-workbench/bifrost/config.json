@@ -50,12 +50,26 @@
         {
           "name": "fireworks-primary",
           "value": "env.FIREWORKS_API_KEY",
-          "models": ["accounts/fireworks/models/deepseek-v4p1-flash-1017-us"],
+          "models": [
+            "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+            "worker-default",
+            "coordinator-default"
+          ],
           "aliases": {
             "accounts/fireworks/models/deepseek-v4p1-flash-1017-us": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
               "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
               "description": "Catalog name for the US-only router: gives /v1/models the context window and price Bifrost's datasheet holds for this row. Requests are sent to model_id."
+            },
+            "worker-default": {
+              "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+              "description": "gp-pi worker default. Lists without metadata by itself; gp-pi copies it from the entry sharing this alias target."
+            },
+            "coordinator-default": {
+              "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+              "description": "gp-pi coordinator default. Lists without metadata by itself; gp-pi copies it from the entry sharing this alias target."
             }
           },
           "weight": 1

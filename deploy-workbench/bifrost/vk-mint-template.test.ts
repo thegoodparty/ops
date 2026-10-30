@@ -228,6 +228,37 @@ describe("bifrost virtual-key template", () => {
     }
   });
 
+  it("allows every alias name on the provider whose key declares it, and on no other", () => {
+    // The exact-match test above already compares the template to config.json's
+    // whole `models` list, aliases included. This names the provider, so moving
+    // an alias to another provider is one reviewed change in both files, and
+    // pins the two role names gp-pi relies on.
+    const config = loadConfig();
+    const declared = new Map<string, string[]>();
+    for (const [provider, configured] of Object.entries(config.providers ?? {})) {
+      declared.set(provider, configured.keys.flatMap((key) => Object.keys(key.aliases ?? {})));
+    }
+    const entries = providerConfigs(loadTemplate());
+    for (const name of ["coordinator-default", "worker-default"]) {
+      assert.deepEqual(
+        [...declared].filter(([, names]) => names.includes(name)).map(([provider]) => provider),
+        ["fireworks"],
+        `${name} must be declared by exactly one provider key, fireworks`,
+      );
+    }
+    for (const entry of entries) {
+      for (const [provider, names] of declared) {
+        for (const name of names) {
+          assert.equal(
+            entry.allowed_models.includes(name),
+            entry.provider === provider,
+            `alias ${name} is declared on ${provider}; the template must allow it there and nowhere else (checked on ${entry.provider})`,
+          );
+        }
+      }
+    }
+  });
+
   it("uses the deployment's provider keys, with no budgets, rate limit or per-person fields", () => {
     const template = loadTemplate();
     for (const entry of providerConfigs(template)) {
