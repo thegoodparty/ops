@@ -581,14 +581,14 @@ test("no callsite after the repair pass reads result.costUsd", () => {
 // B is narrower, and is these two things: B's verdict is recomputed from B's
 // own inputs, and the only thing carried across a sha is a prior *finding*,
 // which an approval does not have.
-const approvedAtA = {
-  action: "approved" as const,
+const approvedAtA: ReviewRecord = {
+  action: "approved",
   runId: "a0000000-0000-4000-8000-00000000000a",
   repo: "thegoodparty/ops",
   prNumber: 42,
   baseSha: "aaaaaa",
   headSha: "a".repeat(40),
-  trigger: "webhook" as const,
+  trigger: "webhook",
   agentVersion: "1.0.0",
   model: "claude-opus-4-5",
   startedAt: "2024-01-01T00:00:00.000Z",
@@ -608,8 +608,8 @@ const approvedAtA = {
     changedFiles: [],
     priorFindings: [],
   },
-  output: { status: "complete" as const, findings: [], summary: "clean" },
-  verdict: "approve" as const,
+  output: { status: "complete", findings: [], summary: "clean" },
+  verdict: "approve",
   gates: [],
   findings: [],
   droppedFindings: [],
@@ -621,9 +621,7 @@ const approvedAtA = {
 // key scoping is what protects the verdict, and from "fixing" the listing so it
 // also hides prior findings.
 test("a later sha can see an earlier approval, and that is not what protects the verdict", () => {
-  const approvedWhileAtB = latestCompletedRecord([
-    approvedAtA as unknown as ReviewRecord,
-  ]);
+  const approvedWhileAtB = latestCompletedRecord([approvedAtA]);
   assert.equal(approvedWhileAtB?.action, "approved");
   assert.equal(approvedWhileAtB?.headSha, "a".repeat(40));
 
@@ -673,6 +671,24 @@ test("each sha gets its own record and its own lock", () => {
 // assertion that matters is the negative one -- there is no parameter through
 // which A's verdict could arrive, which is why this is a unit test and not a
 // replay.
+//
+// The absence is asserted directly rather than left to follow from the
+// behaviour: `decide` takes the model's output and three optional blocker
+// counts, and nothing else. A parameter added here is how "a commit pushed
+// after approval" would come back, so a signature change trips this test rather
+// than silently widening the gate.
+test("decide takes no approval, so there is no channel for A's verdict", () => {
+  const source = readFileSync(join(__dirname, "gates.ts"), "utf-8");
+  const opts = source.match(/opts: \{([^}]*)\}/);
+  assert.ok(opts, "expected `decide`'s options argument");
+  const fields = opts[1].match(/[A-Za-z]+\??:/g) ?? [];
+  assert.deepEqual(
+    fields.map((f) => f.replace(/\??:$/, "")).sort(),
+    ["gating", "unparseableCount", "unplaceableCount"],
+    "an approval-shaped input here would let a new sha inherit the old verdict",
+  );
+});
+
 test("the verdict at B is recomputed from B's inputs, never taken from A", () => {
   const gatingAtB = {
     mode: "enforce" as const,
@@ -717,5 +733,5 @@ test("the verdict at B is recomputed from B's inputs, never taken from A", () =>
 // `priorFindings` -- hands nothing forward from it. This is the one way A's
 // approval could have leaked into B's bundle, and it does not.
 test("an approval puts nothing in the prior-findings channel", () => {
-  assert.deepEqual(priorFindingsFrom(approvedAtA as unknown as ReviewRecord), []);
+  assert.deepEqual(priorFindingsFrom(approvedAtA), []);
 });
