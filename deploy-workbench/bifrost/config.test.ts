@@ -733,41 +733,93 @@ describe("bifrost config.json", () => {
     assert.equal(alias.model_name, "accounts/fireworks/models/deepseek-v4p1-flash-1017-us");
   });
 
-  it("detects a Fireworks entry that would list bare, and so price at \$0 and show 128K in pi", () => {
-    // Both failures are silent: the entry is present and the request succeeds.
-    // The catalog is not available to a unit test, so the property is stated on
-    // the config. Every name the key serves must be a catalog-named alias whose
-    // `model_name` is that same name: the listing is enriched by the listed
-    // name, and request cost resolves `model_name` first, so a router id served
-    // directly (the case this replaces) is bare in the listing and $0 in the log.
+  it("serves every Fireworks name as an alias with a model_name, and every non-catalog name beside an enriched sibling", () => {
+    // Two silent failures, both with the entry present and requests working:
+    // - a name served raw (not an alias) is priced from its own id, which has no
+    //   catalog row, so it logs at \$0 and lists with no context window or price;
+    // - a role alias lists bare too, because /v1/models enriches by the listed
+    //   name and then the alias target, and neither has a row for it. That one
+    //   is only safe because gp-pi copies the metadata from a served entry that
+    //   shares its alias target (docs/bifrost-model-aliases.md), so the target
+    //   must have an enriched, catalog-named sibling in the same list.
     const catalogNamed = /^accounts\/fireworks\/models\/[a-z0-9.-]+-us$/;
-    const bare = (key: ProviderKey): string[] =>
+    const unsafe = (key: ProviderKey): string[] =>
       key.models.filter((model) => {
         const alias = key.aliases?.[model];
-        return !(
-          catalogNamed.test(model) &&
-          alias !== undefined &&
-          alias.model_name === model
+        if (alias === undefined || !alias.model_name?.trim()) return true;
+        if (catalogNamed.test(model)) return alias.model_name !== model;
+        return !key.models.some(
+          (other) =>
+            catalogNamed.test(other) &&
+            key.aliases?.[other]?.model_id === alias.model_id &&
+            key.aliases?.[other]?.model_name === other,
         );
       });
     const key = provider(loadConfig(), "fireworks").keys[0];
-    assert.deepEqual(bare(key), [], "a served Fireworks name would list bare and cost \$0");
+    assert.deepEqual(unsafe(key), [], "a served Fireworks name would list bare and cost \$0 with nothing to copy from");
 
-    // The detector itself: a router served directly, or an alias with no
-    // model_name, is reported.
+    // The detector itself.
     const router = "accounts/fireworks/routers/x-us";
     const named = "accounts/fireworks/models/x-us";
-    assert.deepEqual(bare({ name: "k", models: [router], weight: 1 }), [router]);
+    const good: ProviderKey = {
+      name: "k",
+      models: [named, "role"],
+      aliases: {
+        [named]: { model_id: router, model_name: named },
+        role: { model_id: router, model_name: named },
+      },
+      weight: 1,
+    };
+    assert.deepEqual(unsafe(good), [], "the good shape must not be reported");
+    assert.deepEqual(unsafe({ ...good, models: [named, "role", router] }), [router], "a router served raw is not an alias");
     assert.deepEqual(
-      bare({ name: "k", models: [named, router], aliases: { [named]: { model_id: router, model_name: named } }, weight: 1 }),
-      [router],
-      "a bare router listed beside a good alias must still be reported",
+      unsafe({ ...good, models: [named, "role", "stray"] }),
+      ["stray"],
+      "a served name that is not an alias at all is reported (the silent case)",
     );
     assert.deepEqual(
-      bare({ name: "k", models: [named], aliases: { [named]: { model_id: router } }, weight: 1 }),
-      [named],
+      unsafe({ ...good, aliases: { ...good.aliases, role: { model_id: router } } }),
+      ["role"],
       "an alias without model_name is priced from the router id, which has no row",
     );
+    assert.deepEqual(
+      unsafe({ ...good, aliases: { ...good.aliases, role: { model_id: router, model_name: " " } } }),
+      ["role"],
+      "a blank model_name is no model_name",
+    );
+    assert.deepEqual(
+      unsafe({ ...good, models: ["role"], aliases: { role: good.aliases!.role } }),
+      ["role"],
+      "a role alias with no catalog-named sibling has nothing to copy from",
+    );
+  });
+
+  it("declares the two role names gp-pi pins, as aliases of the same wire id", () => {
+    // gp-pi pins these two names, so a rename strands it. Other aliases are
+    // allowed (the catalog-named one), so this asserts presence, not equality.
+    const key = provider(loadConfig(), "fireworks").keys[0];
+    for (const name of ["coordinator-default", "worker-default"]) {
+      assert.ok(key.aliases?.[name], `the role alias ${name} is missing; gp-pi pins it`);
+      assert.ok(key.models.includes(name), `${name} is not in the key's models, so key selection would refuse it`);
+    }
+    const key2 = provider(loadConfig(), "bedrock").keys;
+    assert.ok(
+      key2.every((k) => !Object.keys(k.aliases ?? {}).length),
+      "the role aliases are declared on the Fireworks key; moving one is a change to the template test as well",
+    );
+  });
+
+  it("serves the router id under no name of its own", () => {
+    // A name whose /v1/models entry has no context window or price is a trap in
+    // the picker even though requests on it work, so the router appears as an
+    // alias target (model_id) and never as a served name.
+    const key = provider(loadConfig(), "fireworks").keys[0];
+    for (const name of key.models) {
+      assert.ok(
+        !US_FIREWORKS_ROUTER.test(name),
+        `${name} is a router id served under its own name; it would list bare`,
+      );
+    }
   });
 
 });
