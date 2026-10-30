@@ -13,12 +13,19 @@
         "us.xai.grok-4.7",
         "us.zai.glm-5.3"
       ],
-      "key_ids": ["*"]
+      "key_ids": [
+        "*"
+      ]
     },
     {
       "provider": "fireworks",
-      "allowed_models": ["accounts/fireworks/routers/deepseek-v4p1-flash-1017-us"],
-      "key_ids": ["*"]
+      "allowed_models": [
+        "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+        "accounts/fireworks/models/deepseek-v4p1-flash-1017-us"
+      ],
+      "key_ids": [
+        "*"
+      ]
     }
   ]
 }

@@ -50,7 +50,17 @@
         {
           "name": "fireworks-primary",
           "value": "env.FIREWORKS_API_KEY",
-          "models": ["accounts/fireworks/routers/deepseek-v4p1-flash-1017-us"],
+          "models": [
+            "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+            "accounts/fireworks/models/deepseek-v4p1-flash-1017-us"
+          ],
+          "aliases": {
+            "accounts/fireworks/models/deepseek-v4p1-flash-1017-us": {
+              "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+              "description": "Catalog name for the US-only router: gives /v1/models the context window and price Bifrost's datasheet holds for this row. Requests are sent to model_id."
+            }
+          },
           "weight": 1
         }
       ]
