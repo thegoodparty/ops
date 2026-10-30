@@ -500,9 +500,11 @@ rejection is answered by documentation: the `401` handling note says to run
 recovery from the overlap window" makes that unnecessary, because the session
 notices the rejection itself.
 
-That document is a frozen plan and is not edited here; the edit lands with the
-step that implements the extension (step 5), in that step's PR, as an amendment
-to a human-owned file.
+That document is a frozen plan and is not edited here. The amendment lands in
+step 6, the housekeeping round, which is where the rest of the stale prose this
+design creates is corrected — a separate `ops` PR from the `gp-pi` extension in
+step 5, because it is a `docs/` change in this repository and that tree is
+human-owned.
 
 ## Client-side recovery from the overlap window
 
@@ -779,8 +781,9 @@ Step: 2
 The order is the point of the order. The two knobs land first because they are
 what makes a later failure survivable; the seed lands before anything can point
 at a second database; the colour plumbing lands before the flip; the flip is the
-step that changes behaviour; and the client-side recovery lands once there is a
-window to recover from.
+step that changes behaviour; the client-side recovery lands once there is a
+window to recover from; and the document corrections land last, when the design
+is no longer going to move under them.
 
 1. **The two missing knobs.** `stopTimeout: 120` on the Bifrost container and
    `deploymentCircuitBreaker { enable: true, rollback: true }` on the service,
@@ -830,31 +833,33 @@ window to recover from.
    the colour moved to the seeded database in the same PR that runs step 2's seed
    as its first action. Also the rollback procedure, written down where an
    operator finds it: repoint the colour at the previous database, and keep it
-   for exactly one cycle. Touches `deploy-workbench/ecs.ts`, its test, and the
-   operator-facing runbook beside the other runbooks. Proves: a continuous probe
+   for exactly one cycle. Touches `deploy-workbench/ecs.ts`, its test, and
+   `docs/runbooks.md` (or a runbook it links), which is where an operator looks
+   first; `docs/` is human-owned, so those two edits need a human reviewer even
+   though the code half does not. Proves: a continuous probe
    across a deploy sees no `503` and no reset, the new task's migrations appear
    only in the copy, and a deliberately broken image rolls back on its own.
 5. **The `gp-pi` extension.** In `thegoodparty/gp-pi`: the trigger set settled
    against the gateway (open item 6), the `after_provider_response`
    watcher, the one-attempt-per-turn cap, the continuation at
-   `agent_before_settle`, the helper's cache invalidation, and the removal of the
-   `--refresh` instruction from
-   [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)'s decision 7 — an
-   amendment to a frozen, human-owned plan, in this PR because it is this PR's
-   change that makes the sentence false. Proves: with a key deleted from the
-   active store out of band, a session's next turn recovers with no user action;
-   with a model outside the allowlist, the turn fails once and surfaces the error
-   with no second attempt.
-6. **Housekeeping.** The doc corrections this design makes stale: the gateway
-   plan's "Persistence, backup and upgrade" upgrade procedure and its rollback
-   rule (it says the snapshot is the schema rollback), its "Availability"
-   paragraph under the same heading (a task replacement "is still a short
-   outage"), its "Migration from direct provider access, and rollback"
-   section, item 8's entry in its phased task list where it explains the
-   stop-before-start value, and any other step entry that describes a deploy as
-   an outage. `docs/` is human-owned, so this is a review round of its own
-   rather than a rider on an implementation PR. Proves: no document in `docs/`
-   still describes a deploy as an outage that the design removed.
+   `agent_before_settle`, and the helper's cache invalidation. Proves: with a key
+   deleted from the active store out of band, a session's next turn recovers
+   with no user action; with a model outside the allowlist, the turn fails once
+   and surfaces the error with no second attempt.
+6. **Housekeeping.** The doc corrections this design makes stale, in this
+   repository: the gateway plan's "Persistence, backup and upgrade" upgrade
+   procedure and its rollback rule (it says the snapshot is the schema
+   rollback), its "Availability" paragraph under the same heading (a task
+   replacement "is still a short outage"), its "Migration from direct provider
+   access, and rollback" section, item 8's entry in its phased task list where
+   it explains the stop-before-start value, any other step entry that describes
+   a deploy as an outage, and the `--refresh` supersession in
+   [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) (decision 15 above).
+   `docs/` is human-owned, so this is a review round of its own rather than a
+   rider on an implementation PR, and the gateway plan's edits are deliberate
+   amendments to a frozen spec, which is what that review is for. Proves: no
+   document in `docs/` still describes a deploy as an outage that the design
+   removed, and no document still documents `--refresh` as the recovery.
 
 ## Cited so the next session can check
 
