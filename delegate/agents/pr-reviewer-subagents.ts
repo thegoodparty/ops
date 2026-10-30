@@ -127,6 +127,8 @@ If evidence falsifies the finding, drop it. If not, emit it and include the fals
 
 If you cannot name a concrete falsification check, the finding is speculation — drop it.
 
+A disproof must rest on what the code reads, not on what a route declares. "This route takes no X" does not disprove an access check that reads X from the raw request (req.query, headers, body), because the caller chooses what to send. For a guard, grep every route it is applied to and check each one with an authenticated caller adding that value to the request.
+
 Examples that FAIL the disprove-it pass (drop these):
 - "Wrap this JSON.parse in try/catch" when the input is from a Zod-validated config, not request input.
 - "Add a null check" when the upstream type guarantees non-null and there is no realistic path to null.
