@@ -241,7 +241,8 @@ rollback is the RDS snapshot again.
   the start of the seed to the old task's stop, so it includes the dump itself
   (whose length is open item 8), and then — by the constants above — roughly
   a minute to a minute and a half: the new task's boot (23.1s measured on
-  2026-10-26 for an empty store, and this is a copy of a populated one), the
+  2026-10-26, the first boot after a config change against an empty RDS; this
+  is a copy of a populated one, so that is a floor), the
   target group's promotion window (about 20s), and the deregistration delay
   (30s). Everything but the dump is arithmetic from the constants, and none of
   it is a measurement.
@@ -846,14 +847,14 @@ window to recover from.
    with no second attempt.
 6. **Housekeeping.** The doc corrections this design makes stale: the gateway
    plan's "Persistence, backup and upgrade" upgrade procedure and its rollback
-   rule (it currently says the snapshot is the schema rollback, and that a
-   task replacement is a short outage), its "Migration from direct provider
-   access, and rollback" section, item 8's entry in its phased task list where
-   it explains the stop-before-start value, and any other step entry that
-   describes a deploy as an outage. `docs/` is human-owned, so this is a review
-   round of its own rather than a rider on an implementation PR. Proves: no
-   document in `docs/` still describes a deploy as an outage that the design
-   removed.
+   rule (it says the snapshot is the schema rollback), its "Availability"
+   paragraph under the same heading (a task replacement "is still a short
+   outage"), its "Migration from direct provider access, and rollback"
+   section, item 8's entry in its phased task list where it explains the
+   stop-before-start value, and any other step entry that describes a deploy as
+   an outage. `docs/` is human-owned, so this is a review round of its own
+   rather than a rider on an implementation PR. Proves: no document in `docs/`
+   still describes a deploy as an outage that the design removed.
 
 ## Cited so the next session can check
 

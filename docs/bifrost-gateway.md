@@ -1257,9 +1257,9 @@ network or a permission can land before the item that creates it.
    association and the attachment therefore belong to item 9, with the rules;
    until then the task runs with no target registered, which is the safe
    direction — the ALB's default action answers 503, and a container cannot
-   fail a health check nobody is asking for. `ingress.ts`'s note that item 8
-   registers a target into the Bifrost group predates this constraint; item 9
-   carries the registration.
+   fail a health check nobody is asking for. `ingress.ts` records item 8 as the
+   one that could not register and item 9 as the one that supplies the rules
+   and the registration together.
 9. Add the oauth2-proxy sidecar to the task definition and the
    admin/inference ALB routing: the `/oauth2/*` and admin-path rules to the
    oauth2-proxy target group on 4180, the inference-prefix rule to the Bifrost
