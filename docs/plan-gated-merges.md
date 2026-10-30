@@ -81,7 +81,17 @@ Stated as invariants, not features:
   `CODEOWNERS` on `main` leaves unowned, and (c) is consistent with that plan,
   can merge on a `delegate` approval with no human code-owner behind it.
 - **`delegate` can never approve a change to itself.** Not its code, not its
-  prompts, not its inputs, not its own authority.
+  prompts, not its inputs, not its own authority. This holds by carve-out
+  rather than by `deploy/` staying owned: seven paths inside it are named back
+  into the owned set in `.github/CODEOWNERS` -- `deploy/components/worker.ts`
+  (the image binding, the gating mode, the record bucket and the agent
+  version), `deploy/components/webhooks.ts` (the dispatcher: `ecs:RunTask`,
+  `iam:PassRole`, read of `DELEGATES`), `deploy/index.ts` (the wiring),
+  `deploy/deploy.sh` (the only place `workerImageUri` is set),
+  `deploy/delegate-secret.ts` (`DELEGATE_SECRET_KEYS`), and
+  `deploy/components/ci-roles.ts` with `ci-roles/policies.ts` (the delegate-path
+  IAM). Everything else under `deploy/` is infrastructure, and step 6 accepts
+  bot approval of it. See "The carve-out" below.
 - **No single human can change the organization's security posture.** A posture
   change still requires a human other than the author, either directly or as the
   review of a plan that the bot is then bound to.
@@ -585,6 +595,34 @@ which is the departure recorded in "The batch of three, and the bar it did not
 wait for". The sentence above describes the rule that was set, not every PR
 that has followed it.
 
+**The carve-out.** `deploy/` is de-owned except for the reviewer's own logic and
+authority, which stay human-owned. Seven paths are named back into the owned set
+in `.github/CODEOWNERS`, after the owner-less `/deploy/` line so that the last
+match wins:
+
+| Path | Why it is not de-owned |
+|---|---|
+| `deploy/components/worker.ts` | The reviewer's task definition. `image: config.imageUri` is what commit of `delegate/` runs, `DELEGATE_GATING_MODE` is its authority, `REVIEW_BUCKET` and `AGENT_VERSION` are what it decided and what ran. |
+| `deploy/components/webhooks.ts` | The only path that starts a review: the dispatcher role holds `ecs:RunTask` on the task definition, `iam:PassRole` on `*`, read of `DELEGATES`, and carries the task definition ARN. |
+| `deploy/index.ts` | Wires `createWorker` and the webhook Lambda: the image URI, the secret key list and the task definition ARN pass through it. |
+| `deploy/deploy.sh` | The only place `workerImageUri` is set. A change here can pin an arbitrary image, so it changes what logic runs. |
+| `deploy/delegate-secret.ts` | `DELEGATE_SECRET_KEYS`, the source of truth for keys injected into the agent container: its inputs and its capability. |
+| `deploy/components/ci-roles.ts`, `ci-roles/policies.ts` | The IAM the delegate eval path assumes. IAM is what the reviewer is allowed to do, which is authority, not plumbing. |
+
+Everything else under `deploy/` is de-owned on purpose, not by oversight:
+`Pulumi.yaml`, `check-secret-keys.ts`, the rest of `deploy/components/`
+(`identity-center`, the bifrost readers) and the non-delegate components. The
+line is the engineer's, stated in their words: bot approval of delegate
+*infrastructure* is accepted; only delegate *logic* and *authority* are carved
+out. Widening the carve-out is a change to a path the default owns, so it needs
+a human, like every other entry in this list.
+
+`delegate/review/codeowners.test.ts` pins the shipped file against the gate's own
+resolver: each de-owned tree resolves to unowned, each carved-out path to owned,
+and the paths the decision deliberately leaves de-owned stay that way. The order
+is part of what it pins, because a carve-out block moved above `/deploy/` is
+overridden silently rather than rejected.
+
 - `.github/CODEOWNERS`: one owner-less line added to the opt-out list, and the
   commentary updated to say which path was de-owned, on what evidence, and when.
   This is the record; there is no other. The line grants authority, so reading
@@ -704,7 +742,11 @@ to `CODEOWNERS`.
 12. **Gating is per repo, by explicit adoption, and `ops` first.** See "Which
     repos this covers".
 13. **`off` is the default for the mode, in code.** A deployed `enforce` is a
-    human-owned `deploy/` change. Nothing about a missing env var or a failed
+    human-owned change: the reviewer's image binding, gating mode, secret key
+    list, dispatcher authority and delegate-path IAM are carved out of the
+    de-owned `deploy/` tree and stay owned. **Amended 2026-10-30:** this
+    decision used to say "a human-owned `deploy/` change", which is no longer
+    true of the tree as a whole; other `deploy/` infrastructure is de-owned. Nothing about a missing env var or a failed
     deploy can make the bot more able to merge, and the mode is flipped to
     `enforce` in the same PR that de-owns the first path (step 6), so the switch
     and the first thing it enables are reviewed together.
@@ -864,12 +906,7 @@ The Progress list is the checklist; this is the detail behind each step.
    `.github/CODEOWNERS` and updating the commentary and `CLAUDE.md` as above,
    each citing the shadow evidence for that path in its body. The first of the
    four also sets `DELEGATE_GATING_MODE=enforce` in
-   `deploy/components/worker.ts`.
-   **Amended 2026-10-30:** the engineer chose to batch the remaining three trees
-   into one PR rather than run them one at a time. That is a departure from this
-   step's rule, recorded in "The batch of three, and the bar it did not wait
-   for"; the rule is otherwise unchanged. The mode was already `enforce` from
-   the first increment, so the batch sets nothing in `deploy/`. That is not a formality: while the mode is
+   `deploy/components/worker.ts`. That is not a formality: while the mode is
    `shadow` the bot cannot approve anything, so de-owning a path with the mode
    still off would change nothing. `enforce` is safe to set at that point for
    the same reason it is safe to set now — after step 2 every path in this repo
@@ -879,6 +916,22 @@ The Progress list is the checklist; this is the detail behind each step.
    evidence, not by size; `deploy-infrastructure/` is the one I would expect to
    go last, because it holds the runtime that acts on the identity store and the
    break-glass tool's own Lambda.
+   **Amended 2026-10-30:** the engineer chose to batch the remaining three trees
+   into one PR rather than run them one at a time, which is the departure
+   recorded in "The batch of three, and the bar it did not wait for". The mode
+   was already `enforce` from the first increment, so the batch changed no
+   `deploy/` file for the switch.
+   **Also amended 2026-10-30, and the part a reader needs:** `deploy/` is not
+   de-owned wholesale. Seven paths inside it are named back into the owned set in
+   the same file, each listed *after* the owner-less `/deploy/` line because the
+   last matching pattern wins: `deploy/components/worker.ts`,
+   `deploy/components/webhooks.ts`, `deploy/index.ts`, `deploy/deploy.sh`,
+   `deploy/delegate-secret.ts`, `deploy/components/ci-roles.ts` and
+   `deploy/components/ci-roles/policies.ts`. Together they are the reviewer's
+   image binding, gating mode, record bucket, agent version, secret key list,
+   dispatcher authority and delegate-path IAM — its logic and its authority. A
+   reader who believes "deploy/ is de-owned" believes something false about the
+   reviewer's own runtime. See "The carve-out" below.
 
 ## The first path, and the bar it did not wait for
 
@@ -1038,6 +1091,19 @@ batch is re-owned. So:
 `deploy-infrastructure/` is the riskiest of the four. Each of the four keeps its
 own name in the record, so a later reader can see which path was approved on
 which PR.
+
+**The carve-out, added the same day (#433 review).** Batching `deploy/` with the
+other two de-owned the reviewer's own task definition, dispatcher and image
+binding along with it, which the Goal invariant forbids and decision 13 said
+could not happen. The engineer's decision was to carve out delegate logic and
+authority, not the whole tree: seven paths in `deploy/` are named back into the
+owned set, listed in "The carve-out" above. The residual is deliberate and
+accepted -- `deploy.sh`'s image pinning is carved out, but `Pulumi.yaml`, the
+identity center, the bifrost readers and the wiring `deploy.sh` calls into are
+not, so a bot-approved `deploy/` change still reaches infrastructure. What the
+carve-out buys is that it cannot reach the reviewer's logic or authority through
+the paths named; what it does not buy is a guarantee that no indirect route
+exists, which is the same trust the rest of the de-owned trees already run on.
 
 ## What was verified
 

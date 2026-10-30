@@ -33,7 +33,9 @@
 # - `/deploy-workbench/` -- de-owned 2026-10-29, the first, on its own, ahead
 #   of the evidence bar the plan set.
 # - `/deploy/`, `/deploy-org/`, `/deploy-infrastructure/` -- de-owned together
-#   on 2026-10-30, in one PR, on the engineer's call to batch them.
+#   on 2026-10-30, in one PR, on the engineer's call to batch them. `/deploy/`
+#   is de-owned except for the carve-out below, which keeps the reviewer's own
+#   logic and authority human-owned.
 #
 # Step 6 of `docs/plan-gated-merges.md` records that the bar was not met for
 # any of the four, and why. The evidence is the same for all of them: over the
@@ -56,6 +58,45 @@
 # to merge on a bot approval; they no longer do, and every path outside those
 # four trees needs a human code owner, documentation included. Background:
 # `docs/plan-gated-merges.md` and `CLAUDE.md`'s "Review and approval" section.
+#
+# ## The carve-out: delegate logic and authority stay human-owned
+#
+# De-owning `deploy/` does not de-own the reviewer's own logic or its own
+# authority. Seven paths inside it stay human-owned. They are listed *after*
+# the owner-less lines at the bottom of this file, because the last pattern
+# matching a changed path wins: placed before `/deploy/`, the same block would
+# be overridden and silently resolve to unowned.
+#
+# - `deploy/components/worker.ts` -- the reviewer's task definition, and where
+#   its logic is bound to infrastructure. `image: config.imageUri` is what
+#   commit of `delegate/` actually runs, so the image reference is the vehicle
+#   for a logic change; `DELEGATE_GATING_MODE` is its authority; `REVIEW_BUCKET`
+#   and `AGENT_VERSION` are its record of what it decided and what ran.
+# - `deploy/components/webhooks.ts` -- the only path that starts a review. The
+#   webhook Lambda's role holds `ecs:RunTask` on the task definition,
+#   `iam:PassRole` on `*` and read of `DELEGATES`, and its environment carries
+#   the task definition ARN. Authority over what starts, and with which role.
+# - `deploy/index.ts` -- wires `createWorker` and the webhook Lambda. The image
+#   URI, the secret key list and the task definition ARN all pass through it.
+# - `deploy/deploy.sh` -- the only place `workerImageUri` is set, for apply and,
+#   for preview, resolved from the running task. A change here can pin an
+#   arbitrary image, which changes what logic runs.
+# - `deploy/delegate-secret.ts` -- `DELEGATE_SECRET_KEYS`, the source of truth
+#   for the keys injected into the agent container: the reviewer's inputs and
+#   its capability. Its own comment says adding a key is "now a reviewed change
+#   here instead of a silent edit to the secret"; a bot-approved edit would
+#   defeat that sentence.
+# - `deploy/components/ci-roles.ts` and `deploy/components/ci-roles/policies.ts`
+#   -- the IAM the delegate eval path assumes. IAM is what the reviewer is
+#   allowed to do, which is authority rather than plumbing.
+#
+# Everything else under `deploy/` stays de-owned, and that is deliberate rather
+# than an oversight: `Pulumi.yaml`, `check-secret-keys.ts`, the rest of
+# `deploy/components/` (`identity-center`, the bifrost readers) and the
+# non-delegate components. The line drawn is the engineer's: bot approval of
+# delegate *infrastructure* is accepted, and only delegate *logic* and
+# `authority` are carved out. Widening this list is a human-reviewed change
+# like any other entry.
 #
 # ## The test for an opt-out
 #
@@ -124,3 +165,13 @@
 /deploy-org/
 /deploy-workbench/
 /deploy-infrastructure/
+
+# The carve-out. After the owner-less lines above, so the last match wins and
+# these resolve to an owner. See "The carve-out" above for why each is here.
+/deploy/components/worker.ts               @thegoodparty/gp-contrib
+/deploy/components/webhooks.ts             @thegoodparty/gp-contrib
+/deploy/index.ts                           @thegoodparty/gp-contrib
+/deploy/deploy.sh                          @thegoodparty/gp-contrib
+/deploy/delegate-secret.ts                 @thegoodparty/gp-contrib
+/deploy/components/ci-roles.ts             @thegoodparty/gp-contrib
+/deploy/components/ci-roles/policies.ts    @thegoodparty/gp-contrib

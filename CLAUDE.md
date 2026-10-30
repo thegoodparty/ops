@@ -68,8 +68,22 @@ when it names a plan merged to `main` and the change is consistent with it:
 `deploy-workbench/` (de-owned 2026-10-29, ahead of the evidence bar the plan
 set), and `deploy/`, `deploy-org/` and `deploy-infrastructure/` (de-owned
 together on 2026-10-30). The plan records what the evidence does and does not
-show, that the bar was not met for any of the four, and the tripwire. Every
-other path -- this file, `docs/`, `delegate/`, `.github/`, `utils/`,
+show, that the bar was not met for any of the four, and the tripwire.
+
+`deploy/` is de-owned **except for a named carve-out**, so that the bot cannot
+approve a change to its own logic or authority. These stay human-owned:
+`deploy/components/worker.ts` (image binding, gating mode, record bucket),
+`deploy/components/webhooks.ts` (the dispatcher, and `iam:PassRole`),
+`deploy/index.ts` (the wiring), `deploy/deploy.sh` (the only place the worker
+image is set), `deploy/delegate-secret.ts` (the secret key list), and
+`deploy/components/ci-roles.ts` with `ci-roles/policies.ts` (delegate-path
+IAM). The rest of `deploy/` -- `Pulumi.yaml`, the identity center, the bifrost
+readers, the other components -- is infrastructure, and bot approval of it is
+accepted on purpose. The carve-out lines sit after the owner-less `/deploy/`
+line in `.github/CODEOWNERS` because the last match wins, and
+`delegate/review/codeowners.test.ts` pins both the paths and that order.
+
+Every other path -- this file, `docs/`, `delegate/`, `.github/`, `utils/`,
 `scripts/`, anything else -- still needs a human on `@thegoodparty/gp-contrib`,
 and a PR that touches one of them puts the whole PR back under human review.
 
