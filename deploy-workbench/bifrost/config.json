@@ -82,6 +82,18 @@
       "is_enabled": false,
       "admin_username": "env.BIFROST_ADMIN_USERNAME",
       "admin_password": "env.BIFROST_ADMIN_PASSWORD"
-    }
+    },
+    "pricing_overrides": [
+      {
+        "id": "fw-deepseek-v4p1-1017-us",
+        "name": "Fireworks US-only DeepSeek V4.1 Flash 1017 (catalog has no row for this router id)",
+        "scope_kind": "provider",
+        "provider_id": "fireworks",
+        "match_type": "exact",
+        "pattern": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+        "request_types": ["chat_completion", "responses", "text_completion"],
+        "pricing_patch": "{\"input_cost_per_token\":4.5e-7,\"output_cost_per_token\":1.8e-6,\"cache_read_input_token_cost\":9e-9}"
+      }
+    ]
   }
 }
