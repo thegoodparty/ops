@@ -1,7 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  GRAFANA_STACK_EXTERNAL_ID,
   grafanaCloudwatchReadPolicy,
   grafanaCloudwatchReadTrust,
 } from "./components/grafana-cloudwatch-read";
@@ -13,14 +12,13 @@ describe("grafanaCloudwatchReadTrust", () => {
   // Grafana's account is shared by every Grafana Cloud stack; the external ID
   // is the only thing that keeps the others out.
   it("requires our stack's external ID", () => {
-    assert.match(GRAFANA_STACK_EXTERNAL_ID, /\S/);
     assert.deepEqual(grafanaCloudwatchReadTrust.Statement, [
       {
         Effect: "Allow",
         Principal: { AWS: "arn:aws:iam::008923505280:root" },
         Action: "sts:AssumeRole",
         Condition: {
-          StringEquals: { "sts:ExternalId": GRAFANA_STACK_EXTERNAL_ID },
+          StringEquals: { "sts:ExternalId": "1532096" },
         },
       },
     ]);
