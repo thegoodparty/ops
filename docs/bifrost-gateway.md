@@ -364,7 +364,8 @@ At the pinned tag the routes Bifrost registers are `/api/*`, `/v1/*`,
 the seven `*_passthrough/*` prefixes, `/mcp` and `/mcp/{slug}`, `/agents/a2a/*`,
 `/ws`, `/realtime`, `/.well-known/*`, `/oauth2/{authorize,register,token}`,
 `/robots.txt`, `/` and `/{filepath:*}`, `/metrics` and `/health`
-(`transports/bifrost-http` route registrations at `transports/v2.3.0`). The
+(`transports/bifrost-http` route registrations at `transports/v2.3.0`; the
+route table is unchanged at `v2.3.2`). The
 per-route table, and which credential each route carries, is in the pull
 request that made this change; the only ones any rule sends to Bifrost are the
 inference prefixes and `/health`, and `deploy-workbench/ingress.test.ts` fails
@@ -418,7 +419,8 @@ options survive:
 **Bifrost's own login is off, and the OSS setup lock is satisfied by the
 sidecar.** `governance.auth_config.is_enabled` is false in `config.json`, so
 there is no shared admin login to answer and no password on the human path.
-That is not the same as "the API is open" at `v2.3.0`, and this is the detail
+That is not the same as "the API is open" at `v2.3.0` (still true at `v2.3.2`),
+and this is the detail
 a future session will otherwise get wrong:
 
 - The OSS server installs `SetupLockMiddleware` whenever dashboard auth is not
@@ -530,7 +532,7 @@ audit records, no per-person role, and no way to revoke one person without
 editing the allowlist — turning the shared password off does not create a user.
 That needs Enterprise. A plugin cannot supply it at
 this tag either, which the earlier version of this section got wrong: the
-plugin interfaces at `v2.3.0` are LLM, MCP, A2A, HTTP-transport and
+plugin interfaces at `v2.3.2` are LLM, MCP, A2A, HTTP-transport and
 observability (`core/schemas/plugin.go`), with no hook on the dashboard or
 management auth path; and the shared-object loader goes through Go's
 `plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
@@ -793,6 +795,62 @@ support no in-region profile at all (Opus 5.5, Kimi K3), so it is not available
 for the set. The Fireworks half is stricter, because US-only Serverless is US
 inference by contract.
 
+### Prompt caching
+
+**Decision: the Bedrock provider carries a `prompt_cache` block, and Fireworks
+deliberately does not.** Measured on the gateway before this: zero cache reads
+on Bedrock Claude sessions across thousands of turns and roughly 38M input
+tokens. Every turn was billed as fresh input, which is the whole cost of an
+agent loop paid repeatedly.
+
+Two causes, both now fixed:
+
+- **No markers.** Bifrost never injects a cache breakpoint on its own: a
+  provider with no `prompt_cache` block is one whose operator expressed no
+  opinion (`PromptCacheInjectionEnabled`, `core/providers/utils/promptcache.go`).
+  A harness that sends no `cache_control` therefore got no Bedrock `cachePoint`
+  at all. `config.json` now sets, on `providers.bedrock`:
+
+  ```json
+  "prompt_cache": {
+    "auto_inject": true,
+    "cache_control_injection_points": [
+      { "location": "message", "role": "system" },
+      { "location": "message", "index": -1 }
+    ]
+  }
+  ```
+
+  `auto_inject` stays `true` because the points *replace* the default
+  first-cacheable-block strategy rather than adding to it; a point list with
+  `auto_inject: false` injects nothing. The two points are the two regions an
+  agent loop replays: the system prompt, which is the prefix identical on every
+  turn, and the last message, which caches everything up to the newest turn. No
+  `ttl` is set: the only accepted value is `"1h"`, which doubles the cache-write
+  cost and buys nothing when turns are seconds apart.
+- **A converter that dropped the marker.** At `v2.3.0` the Bedrock converter
+  discarded a top-level `cache_control` and nested a `cachePoint` inside
+  `toolResult.content` instead, which Bedrock accepts while caching nothing
+  (maximhq/bifrost#8541, fixed by #8595 in `v2.3.1`). The image is pinned at
+  `v2.3.2`, so the marker that reaches the converter now becomes a `cachePoint`
+  after the last cacheable block. A config-only fix on `v2.3.0` would have
+  looked applied and cached nothing.
+
+**Fireworks needs no block, and gets none.** Its serverless endpoint caches a
+repeated request prefix automatically, so there is no marker to place and
+nothing for Bifrost to inject; a block there would be a no-op at best.
+`config.test.ts` asserts the absence, so adding one later reads as the mistake
+it is.
+
+What is verified and what is not: the block is schema-valid at the pinned tag,
+`config.test.ts` pins its shape, and the upstream fix is in the pinned image.
+Whether cache reads actually appear is not provable from this repo. The probe
+that ends the investigation is a second turn through the gateway on a Bedrock
+Claude model with `x-bf-send-back-raw-request: true`, checking for
+`usage.prompt_tokens_details.cached_read_tokens > 0` (and
+`cached_write_tokens` on the first turn). It needs a deployed task, so it
+follows the deploy rather than this change.
+
 Note that Bifrost's own **AWS Secrets Manager vault integration
 (`vault_store`) is an Enterprise feature** requiring a Postgres config store
 (`docs/deployment-guides/config-json/secret-management.mdx`). On OSS the
@@ -893,7 +951,7 @@ Virtual keys are Bifrost's primary governance entity
   "snapshot into the same VPC plus the same Secrets Manager values". A
   restore must be rehearsed once, because a backup nobody has restored is a
   belief.
-- **Upgrade.** Pin the image by tag and digest (`maximhq/bifrost:v2.3.0` at
+- **Upgrade.** Pin the image by tag and digest (`maximhq/bifrost:v2.3.2` at
   the time of writing) and update it in a PR that also bumps the digest. The
   procedure is: RDS snapshot, register a new task definition, update the
   service, watch `/health` and the logs. Bifrost runs store migrations at
@@ -1119,7 +1177,7 @@ network or a permission can land before the item that creates it.
    `deploy-workbench/` and the NS record to `deploy/`, in the
    infra-zone-delegation shape. The NS record must exist before ACM
    validation.
-3. **Mirror the image.** Mirror `maximhq/bifrost:v2.3.0` into an ECR
+3. **Mirror the image.** Mirror `maximhq/bifrost:v2.3.2` into an ECR
    repository in the workbench account, pinned by digest, following the
    delegate image's build/push pattern in `.github/workflows/deploy.yml`.
    Decide the digest upgrade cadence.
@@ -1328,8 +1386,13 @@ network or a permission can land before the item that creates it.
 ## Upstream basis and version
 
 The plan is based on the upstream repository at tag **`transports/v2.3.0`**
-(2026-10-13), the matching container image
-**`docker.io/maximhq/bifrost:v2.3.0`** (published 2026-10-13), and its docs
+(2026-10-13) and the matching container image
+**`docker.io/maximhq/bifrost:v2.3.0`** (published 2026-10-13). The image the
+gateway runs is now pinned at **`v2.3.2`**: the same release plus the v2.3.1
+Bedrock cache-point fix and a Go `crypto/x509` security release, with no
+database migrations of its own. The facts this plan states were read at
+`v2.3.0` and re-checked at `v2.3.2` where a bump could have changed them; see
+"Prompt caching" under Provider configuration. Its docs
 under `docs/`. The Helm chart at that tag is `2.1.44` with a stale
 `appVersion: 1.5.12`; the image tag, not the chart `appVersion`, is the
 version that matters. The repository's default branch is `dev`, and the

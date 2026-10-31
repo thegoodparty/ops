@@ -57,7 +57,13 @@ type Template = {
 type Config = {
   providers?: Record<
     string,
-    { keys: Array<{ models: string[] }>; network_config?: { base_url?: string } }
+    {
+      keys: Array<{
+        models: string[];
+        aliases?: Record<string, { model_id: string }>;
+      }>;
+      network_config?: { base_url?: string };
+    }
   >;
 };
 
@@ -155,10 +161,16 @@ describe("bifrost virtual-key template", () => {
             `${model} is not a us. inference profile; a bare or global id is not a US commitment`,
           );
         } else if (entry.provider === "fireworks") {
+          // A key alias is a name that resolves to a router; what the provider
+          // is sent, and so what residency depends on, is the target.
+          const aliases = Object.assign(
+            {},
+            ...(loadConfig().providers?.fireworks?.keys ?? []).map((key) => key.aliases ?? {}),
+          ) as Record<string, { model_id: string }>;
           assert.match(
-            model,
+            aliases[model]?.model_id ?? model,
             US_FIREWORKS_ROUTER,
-            `${model} is not a US-only Fireworks router id; use accounts/fireworks/routers/<model>-us`,
+            `${model} is not a US-only Fireworks router id, or an alias of one; use accounts/fireworks/routers/<model>-us`,
           );
         }
       }
@@ -213,6 +225,37 @@ describe("bifrost virtual-key template", () => {
         !entry.allowed_models.includes("*"),
         `${provider} must name models, not "*"`,
       );
+    }
+  });
+
+  it("allows every alias name on the provider whose key declares it, and on no other", () => {
+    // The exact-match test above already compares the template to config.json's
+    // whole `models` list, aliases included. This names the provider, so moving
+    // an alias to another provider is one reviewed change in both files, and
+    // pins the two role names gp-pi relies on.
+    const config = loadConfig();
+    const declared = new Map<string, string[]>();
+    for (const [provider, configured] of Object.entries(config.providers ?? {})) {
+      declared.set(provider, configured.keys.flatMap((key) => Object.keys(key.aliases ?? {})));
+    }
+    const entries = providerConfigs(loadTemplate());
+    for (const name of ["coordinator-default", "worker-default"]) {
+      assert.deepEqual(
+        [...declared].filter(([, names]) => names.includes(name)).map(([provider]) => provider),
+        ["fireworks"],
+        `${name} must be declared by exactly one provider key, fireworks`,
+      );
+    }
+    for (const entry of entries) {
+      for (const [provider, names] of declared) {
+        for (const name of names) {
+          assert.equal(
+            entry.allowed_models.includes(name),
+            entry.provider === provider,
+            `alias ${name} is declared on ${provider}; the template must allow it there and nowhere else (checked on ${entry.provider})`,
+          );
+        }
+      }
     }
   });
 

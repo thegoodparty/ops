@@ -1163,7 +1163,7 @@ describe("bifrost ecs", () => {
   it("names the pinned images from the mirror stores, not floating tags", () => {
     assert.ok(ECS_SOURCE.includes("${repositoryUrl}:${BIFROST_UPSTREAM_TAG}"));
     // The Bifrost pin itself lives in bifrost-image.ts and is asserted there.
-    assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.0");
+    assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.2");
     assert.ok(ECS_SOURCE.includes('cpuArchitecture: "X86_64"'));
     // The sidecar's tag is content-addressed on the allowlist, so it comes
     // from oauth2-proxy-image.ts rather than a literal in the task definition.

@@ -56,7 +56,7 @@ Success, in the order it should be proven:
 ## What exists, verified
 
 Everything below was read from code, not recalled. The gateway facts are from
-`maximhq/bifrost` at the pinned tag `transports/v2.3.0`
+`maximhq/bifrost` at the pinned tag `transports/v2.3.2`
 ([`bifrost-gateway.md`](./bifrost-gateway.md), "Upstream basis and version");
 the `gp-pi` facts are from the installed copies of its helpers
 (`/usr/local/bin/gp-delegate`, `/usr/local/bin/gp-bifrost-key`,
@@ -99,7 +99,12 @@ checked out where this was written.
   runs today does not (next bullet). `gp-bifrost.ts` then gives the model pi's
   defaults: cost 0 and a 128 000 context window, for a model whose catalog row
   says 1 048 576. Cost *attribution* in the gateway is right either way; what
-  pi shows and compacts against is the part at risk. See gate 1.
+  pi shows and compacts against is the part at risk. See gate 1. The lookup is
+  an exact match on the listed name (`datasheet/store.go`,
+  `GetPricingEntryForModel`), and the live datasheet has no row for
+  `worker-default`, `coordinator-default` or the router id, so those listings
+  are bare; only a name that is itself a catalog row, such as
+  `accounts/fireworks/models/deepseek-v4p1-flash-1017-us`, enriches.
 - **The pricing catalog has no row for the router id the gateway runs today.**
   The upstream datasheet carries
   `fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash-1017-us`
@@ -144,7 +149,8 @@ Settled in review; the section after this one is the work they produce.
    configuration may still override the default, as it does today with
    `--model` and `GP_PI_WORKER_MODEL`. `gp-pi` does not write the
    engineer's `settings.json`, which is theirs; the coordinator default reaches
-   the root pane some other way (item H).
+   the root pane some other way (item H). A model that is not a served name,
+   including the raw router id, is not selectable (decision 8).
 3. **No auth check and no fallback.** `pi auth check` is removed from
    `dispatch`: it cannot validate an extension-registered provider, so removing
    it removes no safeguard. One cheap assertion stays: the alias appears in
@@ -169,6 +175,24 @@ Settled in review; the section after this one is the work they produce.
 7. **Static 1:1 aliases.** Each alias maps to one wire id. The upgrade path to
    dynamic or tiered aliases (discussion #945) is a gateway upgrade and a
    `config.json` change, and needs nothing from `gp-pi`.
+8. **The raw router id is not served under its own name.** The wire id is only
+   ever an alias's `model_id`. A name whose `/v1/models` entry lacks a context
+   window and a price is a trap in the picker even though requests on it work:
+   a developer can choose it and get a poor `pi` experience because its metadata
+   is off. The key therefore serves three names, all aliases of the one wire id:
+   the catalog name `accounts/fireworks/models/deepseek-v4p1-flash-1017-us`
+   (the datasheet has a row for it, so it enriches) and the two role names.
+   This reverses an earlier version of this plan, which kept the raw target in
+   `models` so `--model bifrost/<id>` kept working. It no longer resolves, and
+   a developer who wants another model picks one of the served names.
+9. **`gp-pi` fills in the role names' metadata from their sibling.** The role
+   names list bare (decision 8 does not change that, and Bifrost v2.3.2 gives
+   config no way to attach metadata to a name). Every entry the gateway lists
+   carries `alias`, the wire id it resolves to, so `gp-bifrost.ts` groups
+   entries on it and gives an entry without a context window or price those of
+   a sibling that has them (item I). This is lighter than hosting a datasheet
+   with extra rows (rejected below), and it is why the catalog-named alias has
+   to stay served: it is the enriched sibling the role names copy from.
 
 ## Design
 
@@ -181,36 +205,41 @@ serves each default, in the rich form so `model_name` can be set:
 "fireworks": { "keys": [ {
   "name": "fireworks-primary",
   "models": [
-    "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+    "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
     "worker-default",
     "coordinator-default"
   ],
   "aliases": {
+    "accounts/fireworks/models/deepseek-v4p1-flash-1017-us": {
+      "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+      "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+      "description": "Catalog name for the US-only router ..."
+    },
     "worker-default": {
       "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
       "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-      "description": "gp-pi worker default"
+      "description": "gp-pi worker default ..."
     },
     "coordinator-default": {
       "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
       "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-      "description": "gp-pi coordinator default"
+      "description": "gp-pi coordinator default ..."
     }
   }
 } ] }
 ```
 
-Both aliases start on the same target,
-`accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`. They are separate
-names so the two roles can be repointed independently later, and the coordinator
-is expected to move; that is one edit here and nothing in `gp-pi`. Two aliases
-may share a `model_id` (the list pipeline emits one entry per alias).
+All three names start on the same wire id,
+`accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`, which appears only as
+`model_id`. The two role aliases are separate names so the two roles can be
+repointed independently later, and the coordinator is expected to move; that is
+one edit here and nothing in `gp-pi`. Aliases may share a `model_id` (the list
+pipeline emits one entry per alias).
 
-The alias name is in `models` because key selection checks the requested name
-against it. The raw target stays in `models` as well, so that explicit
-`--model bifrost/<id>` choices, which `gp-delegate`'s help advertises, keep
-working. The cost is that the picker lists both names; that is accepted, and the
-alias carries a `description` so it is recognisable.
+Every served name is in `models` because key selection checks the requested
+name against it, and every served name is an alias, so none is sent to the
+provider as itself and none lists without a reason. The router id is deliberately
+absent from `models` (decision 8).
 
 ### The key template and the converging mint
 
@@ -254,13 +283,18 @@ id in the key and the template is a `-us` router or a `us.` profile. The alias
 names are not model ids and must not be asserted that way, so the tests grow a
 second path instead of a looser first one:
 
-- for every alias in `config.json`, `model_id` is itself in the key's `models`
-  and satisfies the same US-only rule as a model id (`-us` router on
-  Fireworks, `us.` profile on Bedrock);
+- for every alias in `config.json`, `model_id` satisfies the same US-only
+  rule as a model id (`-us` router on Fireworks, `us.` profile on Bedrock), and
+  is not itself a served name (decision 8);
 - `model_name` is non-empty on every alias, because without it cost attribution
   is wrong;
-- the alias names are exactly `coordinator-default` and `worker-default`, so a
-  rename cannot silently strand `gp-pi`;
+- the two role names `coordinator-default` and `worker-default` exist, so a
+  rename cannot silently strand `gp-pi`; other aliases (the catalog name) are
+  allowed, so this asserts presence, not equality;
+- every served Fireworks name is an alias with a non-empty `model_name`, and
+  every name that is not itself a catalog row shares its `model_id` with an
+  enriched, catalog-named sibling, so a name with degraded metadata and nothing
+  to copy from cannot be served (decisions 8 and 9);
 - `vk-mint-template.json` and `config.json` agree on which provider declares
   each alias, so moving a target to another provider is one reviewed change in
   both places;
@@ -274,14 +308,15 @@ residency id nothing in this repository can check.
 
 ## Work breakdown
 
-Ordered. Items A to D are this repository; E to H are `gp-pi`. **C is a
-prerequisite of rollout**, not an optimisation: nothing in E to H may ship
+Ordered. Items A to D are this repository; E to I are `gp-pi`. **C is a
+prerequisite of rollout**, not an optimisation: nothing in E to I may ship
 before it is deployed.
 
 **ops**
 
-- **A. Declare the aliases.** Add `aliases` and the alias names in `models` to
-  `config.json`; add the alias-aware assertions to `config.test.ts`. No
+- **A. Declare the aliases.** Add the role aliases and their names in `models`
+  to `config.json`, beside the catalog-named alias that is the only other
+  served name; add the alias-aware assertions to `config.test.ts`. No
   behaviour changes for anyone until the template follows.
 - **B. Template the aliases.** Add the alias names to `vk-mint-template.json`
   and the second assertion path to `vk-mint-template.test.ts`. Safe to merge
@@ -291,8 +326,9 @@ before it is deployed.
   for drift, no drift, drift plus reactivation, and a `PUT` that fails (the key
   the caller already holds must still be returned unchanged, as reactivation
   already guarantees).
-- **D. Confirm enrichment against the live gateway** (see "Gates" 1). Not code;
-  recorded in the PR.
+- **D. Confirm enrichment against the live gateway** (see "Gates" 1): the
+  catalog-named entry carries a context window and price, and every entry
+  carries `alias`. Not code; recorded in the PR.
 
 **gp-pi** (a separate repository; read-only for this plan)
 
@@ -313,20 +349,24 @@ before it is deployed.
   the per-session environment the launcher already sets for pi); the mechanism is
   `gp-pi`'s to choose. A saved `defaultModel` that pins a retired Fireworks id
   stays the engineer's to change.
+- **I. Fill in metadata from the sibling.** `gp-bifrost.ts` groups the entries
+  of `/v1/models` by their `alias` field and, for an entry with no context
+  window, output cap or price, uses those of a sibling in the same group that
+  has them. No model ids; the group is the gateway's own statement that two
+  names are one wire id. Ships before E: without it the role names show 128K
+  and $0.
 
 ## Gates
 
-1. **Enrichment (gate for E, not an assumption).** By source, request cost is
-   right (`model_name`) but the `/v1/models` entry for `worker-default` is
-   enriched from the listed name and the wire id only, and the wire id has no
-   catalog row, so the listing is expected to carry no price and no context
-   window. This comes from reading the source, so the gate is the live check:
-   before E merges, list models with a minted key and record what
-   `worker-default` returns. If the context window is missing, pi would compact a
-   million-token model as if it had 128 000, and the fix is on the gateway side
-   (give the wire id a catalog row, for example through a custom `pricing_url`
-   datasheet, or pick a `model_id` that has one without losing the `-us`
-   guarantee), not in `gp-pi`.
+1. **Enrichment (gate for E, not an assumption).** By source and against the
+   live datasheet, request cost is right for every name (`model_name`), the
+   catalog-named entry is enriched, and the two role names are listed bare. The
+   fix is in `gp-pi` (item I), not on the gateway (decision 9). The gate is the
+   live check, before E merges: list models with a minted key and record that
+   the catalog-named entry has its context window and price, that every entry
+   carries `alias`, and that with item I `pi --list-models` shows the role names
+   with the same context window and price. If `alias` is absent from the live
+   response, item I has nothing to group on and this decision is reopened.
 2. **Convergence before pins.** C is deployed, and an existing engineer's key
    has been observed to gain the aliases (a `gp-bifrost-key --refresh` forces
    the mint) before E ships.
@@ -369,10 +409,20 @@ before it is deployed.
 - **`coordinator-default-prev` for rollback.** Repointing is one cheap edit, and
   a second alias doubles the names every picker shows.
 - **Dynamic or tiered aliases.** Not in the pinned tag; static ones do the job.
+- **Keep the raw router id served.** Its entry lists bare (no datasheet row), so
+  it is a pickable name with a 128K window and a $0 price (decision 8).
+- **Point the role aliases' `model_id` at the catalog name.** It would enrich
+  them, and it would send `models/...-us` to Fireworks, which answers 404 for
+  that name; the wire id has to stay the router.
+- **A custom `pricing_url` datasheet with rows for the role names.** The URL
+  replaces the catalog rather than adding to it, so it means hosting and
+  refreshing a full copy of upstream's datasheet for the sake of two rows.
+  Item I does the same job with no hosted artefact; revisit only if a client
+  other than `gp-pi` needs the listing enriched.
 
 ## Out of scope
 
-- Edits to `gp-pi` made from this repository. Items E to H describe the work
+- Edits to `gp-pi` made from this repository. Items E to I describe the work
   so that repository's PRs can name this plan.
 - Per-person or per-tier aliases (who may use the higher-grade models), which is
   already deferred in [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md).
