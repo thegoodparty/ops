@@ -47,7 +47,7 @@ Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, n
 
 Lead categories:
 - correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
-- security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard). For a new or changed guard or middleware, raise one lead that lists every route it is applied to and asks whether each route stays closed to a caller who sends the request values the guard reads
+- security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard). For a new or changed HTTP auth guard or middleware (one attached to endpoints by a decorator, router or app.use), raise one lead that lists every endpoint it is applied to and asks whether each endpoint stays closed to a caller who sends the request values the guard reads. Skip this for functions that are not attached to HTTP endpoints
 - tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
 - ai-rules: probable violation of a rule in ai-rules/*.md — cite the suspected file
