@@ -74,10 +74,13 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
     consistency: "inconsistent",
   });
   // The three cases added with case 5's vocabulary: an addition the step does
-  // not name is still an approval, an amendment the harness flags is still a
-  // consistent diagnostic, and a widening is a flag on the model's answer.
+  // not name is still consistent (that case blocks on a real defect in its
+  // handler), an amendment the harness flags is still a consistent diagnostic,
+  // and a widening is a flag on the model's answer.
   assert.deepEqual(byId.get("ops-plan-addition-unnamed")?.expect, {
-    verdict: "approve",
+    verdict: "block",
+    paths: ["deploy-workbench/bifrost/vk-mint-handler.ts"],
+    categories: ["security"],
     consistency: "consistent",
   });
   assert.deepEqual(byId.get("ops-plan-amends-itself")?.expect, {
