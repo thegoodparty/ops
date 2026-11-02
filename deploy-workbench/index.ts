@@ -13,8 +13,10 @@ import {
 import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 import { createBifrostBootstrapRepository } from "./bootstrap-image";
+import { createBifrostSeedRepository } from "./bifrost-seed-image";
+import { createBifrostSeedTask } from "./bifrost-seed";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
-import { createBifrostDatabase } from "./rds";
+import { createBifrostDatabase, DATABASE_NAME } from "./rds";
 import { createBifrostEcs } from "./ecs";
 import { createBifrostDiscovery } from "./discovery";
 import { createBifrostVkMint } from "./bifrost-vk-mint";
@@ -436,6 +438,23 @@ export const bifrostBootstrapRepositoryUrl =
   bifrostBootstrapRepository.repositoryUrl;
 
 // ---------------------------------------------------------------------------
+// The ECR repository the derived seed image is built into.
+//
+// Step 2 of `docs/bifrost-zero-downtime-deploys.md`: the one-off task that copies
+// the active colour's config store into the inactive one. Derived from the same
+// pinned Bifrost release plus `postgresql16-client`, because the pinned image
+// ships neither `pg_dump` nor `psql` (decision 17). The build and push live in
+// `.github/workflows/deploy-workbench.yml`, and the pin, the content-addressed
+// tag and the table list are documented in `bifrost-seed-image.ts` and
+// `seed-tables.ts`. A fourth repository for the same reason as the other two
+// derived ones: ours and rebuilt when the seed changes, not an upstream release
+// pulled by digest.
+const bifrostSeedRepository = createBifrostSeedRepository({ provider });
+
+/** The push target, for a human reading `pulumi stack output`. */
+export const bifrostSeedRepositoryUrl = bifrostSeedRepository.repositoryUrl;
+
+// ---------------------------------------------------------------------------
 // The network the gateway runs in.
 //
 // Phase 1 item 5 of docs/bifrost-gateway.md: the VPC, its public and private
@@ -557,6 +576,57 @@ export const bifrostTaskDefinitionFamily = ecs.taskDefinition.family;
 
 /** The container log group, so item 12's first boot starts with a known name. */
 export const bifrostLogGroupName = ecs.logGroup.name;
+
+// ---------------------------------------------------------------------------
+// The seed task.
+//
+// Step 2 of `docs/bifrost-zero-downtime-deploys.md`, decisions 16-19: a one-off
+// ECS task that creates the inactive colour's database and copies the active
+// colour's config store into it. **Nothing calls it in this step.** There is no
+// service, no schedule and no deploy hook; it is a task definition a human runs
+// with `aws ecs run-task`, and step 4 wires it into a deploy.
+//
+// It runs in the gateway's own cluster, private subnets and task security group
+// (decision 16: Fargate is already admitted to 5432, so there is no network
+// change) and takes the gateway's own credentials: the plain `PG_*` values and
+// `PG_PASSWORD` from the RDS-managed secret. It does not reference the gateway's
+// task definition in either direction, so a deploy of the gateway behaves
+// exactly as it does today.
+//
+// The source is the database `rds.ts` created, which is the only one that exists
+// until step 4. The target is a scratch name in this step, deliberately not a
+// colour: the plan's own verification runs the seed twice against a scratch
+// database and drops it, and leaving a colour name here would make a hand run
+// look like the flip. Step 4 replaces it with the inactive colour.
+//
+// The scratch name is spelled out rather than derived, because a derived name is
+// one an apply can change silently and a hand run would then target something
+// nobody intended. It is not `bifrost_blue`, not `bifrost_green` and not
+// `bifrost`, so a mistaken run cannot touch a colour or the live database.
+const BIFROST_SEED_SCRATCH_DATABASE_NAME = "bifrost_seed_scratch";
+const seed = createBifrostSeedTask({
+  provider,
+  cluster: ecs.cluster,
+  privateSubnetIds: network.privateSubnetIds,
+  taskSecurityGroupId: network.taskSecurityGroup.id,
+  databaseSecretArn: database.secretArn,
+  databaseHost: database.address,
+  databasePort: database.port,
+  sourceDatabase: DATABASE_NAME,
+  targetDatabase: BIFROST_SEED_SCRATCH_DATABASE_NAME,
+  repositoryUrl: bifrostSeedRepository.repositoryUrl,
+});
+/** The task family, so a hand run does not start with a console hunt. */
+export const bifrostSeedTaskFamily = seed.taskFamily;
+
+/** The revision a `run-task` names. */
+export const bifrostSeedTaskDefinitionArn = seed.taskDefinition.arn;
+
+/** The image the task resolves, for the same reason. */
+export const bifrostSeedImageUri = seed.imageUri;
+
+/** The log group a hand run's output lands in. */
+export const bifrostSeedLogGroupName = seed.logGroup.name;
 
 // ---------------------------------------------------------------------------
 // The virtual-key mint.

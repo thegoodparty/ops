@@ -80,6 +80,14 @@ env:
   # build step derives it from the committed claim script and Dockerfile, the
   # same two files the module hashes in that order.
   BIFROST_BOOTSTRAP_REPOSITORY: bifrost-bootstrap
+  # The derived one-shot image that seeds the inactive colour's config store
+  # (step 2 of docs/bifrost-zero-downtime-deploys.md). The repository name is
+  # duplicated from `deploy-workbench/bifrost-seed-image.ts` because Actions
+  # cannot import a TypeScript module, and `bifrost-seed-image.test.ts` fails if
+  # they drift. The tag is not a literal: the build step derives it from the
+  # seed script and its Dockerfile, the same two files the module hashes in that
+  # order.
+  BIFROST_SEED_REPOSITORY: bifrost-seed
 
 jobs:
   deploy:
@@ -317,6 +325,43 @@ jobs:
           fi
           docker build --platform linux/amd64 \
             -f deploy-workbench/bifrost/bootstrap.Dockerfile \
+            -t "$image_uri" deploy-workbench/bifrost
+          docker push "$image_uri"
+
+      # Build and push the derived seed image: the one-off task that copies the
+      # active colour's config store into the inactive one (step 2 of
+      # docs/bifrost-zero-downtime-deploys.md). It exists because the pinned
+      # Bifrost image is Alpine plus a Go binary and ships no `pg_dump` and no
+      # `psql` (decision 17), so the seed runs on a derivative of the same
+      # release plus `postgresql16-client`.
+      #
+      # The tag is content-addressed over both committed inputs, in the order
+      # `BIFROST_SEED_CONTENT_INPUTS` in `bifrost-seed-image.ts` lists them, so a
+      # change to the seed or its Dockerfile is a new tag and a push while a
+      # re-run with neither changed skips. Same shape as the two above, and for
+      # the same reason: the repository is immutable.
+      #
+      # Before the apply, with the other three, because the seed's task
+      # definition names this tag. Nothing calls the seed in this step -- it is
+      # run by hand -- but a tag nothing pushed would be the same class of
+      # failure the bootstrap image caused on 2026-10-26 if a later step ever
+      # starts it as part of a deploy.
+      - name: Build and push the derived seed image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          seed_digest="$(cat deploy-workbench/bifrost/seed.sh deploy-workbench/bifrost/seed.Dockerfile | sha256sum | cut -c1-12)"
+          image_tag="${BIFROST_TAG}-${seed_digest}"
+          image_uri="${ECR_REGISTRY}/${BIFROST_SEED_REPOSITORY}:${image_tag}"
+          if aws ecr describe-images \
+              --repository-name "$BIFROST_SEED_REPOSITORY" \
+              --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
+            echo "bifrost-seed:$image_tag is already built; nothing to do."
+            exit 0
+          fi
+          docker build --platform linux/amd64 \
+            -f deploy-workbench/bifrost/seed.Dockerfile \
             -t "$image_uri" deploy-workbench/bifrost
           docker push "$image_uri"
 
