@@ -131,10 +131,16 @@
     "id": "ops-plan-addition-unnamed",
     "bundle": "ops-plan-addition-unnamed.bundle.json",
     "expect": {
-      "verdict": "approve",
+      "verdict": "block",
+      "paths": [
+        "deploy-workbench/bifrost/vk-mint-handler.ts"
+      ],
+      "categories": [
+        "security"
+      ],
       "consistency": "consistent"
     },
-    "tests": "Simulated. A step's enumeration is exemplary: the plan's step 2 names the function, its execution role, the Function URL, the VPC attachment, its own security group, the 8080 ingress rule on the task group, the read grant on the dedicated secret and the log group. The diff adds those and two things the step does not name, both needed for it to work: `deploy-workbench/discovery.ts`, a private Cloud Map name, and the `serviceRegistries` entry in `deploy-workbench/ecs.ts` that makes the name resolve to the gateway task. The additions are required by the step's own goal, are named in `additions`, stay in `deploy-workbench/`, and widen nothing. The review must approve, and the model must answer `consistent` rather than the `unclear` the old vocabulary forced. Shape from #414 (bifrost step 3); the plan and the diff are invented, not its text.",
+    "tests": "Simulated. A step's enumeration is exemplary: the plan's step 2 names the function, its execution role, the Function URL, the VPC attachment, its own security group, the 8080 ingress rule on the task group, the read grant on the dedicated secret and the log group. The diff adds those and two things the step does not name, both needed for it to work: `deploy-workbench/discovery.ts`, a private Cloud Map name, and the `serviceRegistries` entry in `deploy-workbench/ecs.ts` that makes the name resolve to the gateway task. The additions are required by the step's own goal, are named in `additions`, stay in `deploy-workbench/`, and widen nothing. The model must answer `consistent` rather than the `unclear` the old vocabulary forced. The review must also block on `vk-mint-handler.ts`: it takes the key owner from the role session name and only checks for an `@`, while `docs/bifrost-virtual-keys.md` at the base requires an `AWSReservedSSO_WorkbenchAccess_` role and a live membership check, so any role in the account can mint a key in someone else's name. That defect was not intended when the case was written, but it is real, so the case scores it rather than an approval. Shape from #414 (bifrost step 3); the plan and the diff are invented, not its text.",
     "split": "tune",
     "source": "simulated",
     "kind": "bug"
