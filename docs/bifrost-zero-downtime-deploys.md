@@ -635,10 +635,11 @@ two colours in an overlap cannot disagree about the password, which is one of th
 credential hazards of the window gone rather than managed.
 
 What it costs is an image that can run the command, and that is the step's real
-work. The gateway image is Alpine with the Go binary and little else; the
-derived `bootstrap.Dockerfile` records that "the Alpine runtime has neither curl
-nor jq", and nothing in the tree has an AWS CLI, which signing a Secrets Manager
-`GetSecretValue` needs. The precedent for that is in this deployment twice over:
+work. The gateway image is Alpine with the Go binary and little else: the
+derived `bootstrap.Dockerfile` installs `curl` and `jq` because "the Alpine
+runtime has neither", and nothing in the tree has an AWS CLI, which signing a
+Secrets Manager `GetSecretValue` needs. The precedent for that is in this
+deployment twice over:
 a derived image with a committed Dockerfile, a pin held in one module, a
 content-addressed tag, an immutable ECR repository, a drift test and a build slot
 in `deploy-workbench.yml` before the apply — `bootstrap-image.ts` +
@@ -1117,7 +1118,7 @@ In this repository:
 | The snapshot is the current rollback rule | `docs/bifrost-gateway.md`, "Persistence, backup and upgrade" |
 | The RDS-managed password is injected once at task start, as `PG_PASSWORD` | `deploy-workbench/ecs.ts`, the Bifrost container's `secrets` block, `RDS_PASSWORD_JSON_KEY`, `PG_PASSWORD_ENV_NAME`; `deploy-workbench/rds.ts`, `manageMasterUserPassword` |
 | The task role holds no secrets read, and a test says so | `deploy-workbench/ecs.ts`, `taskRolePolicyDocument`; `deploy-workbench/ecs.test.ts`, "the task role must not read secrets" |
-| The Alpine runtime has neither curl nor jq | `deploy-workbench/bifrost/bootstrap.Dockerfile`, its header comment |
+| The Alpine runtime has neither curl nor jq | `deploy-workbench/bifrost/bootstrap.Dockerfile`, the header comment above `RUN apk add` |
 | A rotation costs a task replacement, and the timeline | `bifrost-restart-investigation.md` (branch `bifrost-restart`, not on `main`), 2 m 50 s outage and the 7 h 20 m silent window |
 
 In Bifrost, at the pinned tag `transports/v2.3.2`:
