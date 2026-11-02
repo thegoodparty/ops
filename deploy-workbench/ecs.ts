@@ -154,6 +154,29 @@ export const DEPLOYMENT_MINIMUM_HEALTHY_PERCENT = 0;
 export const DEPLOYMENT_MAXIMUM_PERCENT = 100;
 
 /**
+ * ECS's deployment circuit breaker, on the service below.
+ *
+ * Absent, a task definition that cannot become healthy sits at running 0 /
+ * desired 1 until a human notices — the shape the 2026-10-26 outage had.
+ * `deploy-workbench/scripts/verify-service.ts` turns that state into a red run,
+ * but it is a detector: it cannot put the service back. With the breaker
+ * enabled and set to roll back, ECS stops the failed deployment itself and
+ * returns the service to the last revision that completed successfully.
+ *
+ * `rollback: true` is the half that matters. `enable: true` alone stops the
+ * deployment and leaves the service where it is.
+ *
+ * Unlike the percentages above, this is a typed field on `aws.ecs.Service`
+ * (`ServiceDeploymentCircuitBreaker`, both members required in `@pulumi/aws`
+ * v7), so a missing or misspelt field is a compile error rather than a knob
+ * that silently does nothing. It changes nothing about a deploy that succeeds.
+ */
+export const DEPLOYMENT_CIRCUIT_BREAKER = {
+  enable: true,
+  rollback: true,
+};
+
+/**
  * The log group. Named beside the delegate's `/aws/ecs/delegate` rather than
  * with it, because this is a different account and a different stack: the two
  * are only reachable separately, and a shared name would imply otherwise.
@@ -219,6 +242,40 @@ export const BIFROST_CONTAINER_CPU = 448;
 export const BIFROST_CONTAINER_MEMORY = 896;
 export const OAUTH2_PROXY_CONTAINER_CPU = 64;
 export const OAUTH2_PROXY_CONTAINER_MEMORY = 128;
+
+/**
+ * How long ECS gives the gateway container to shut down before it is
+ * `SIGKILL`ed: 120 seconds, Fargate's maximum.
+ *
+ * Unset, the task-definition default of 30 seconds applies, and 30 is a value
+ * the container's own shutdown sequence does not fit inside. After `SIGTERM`
+ * the process drains HTTP first — `fasthttp`'s `Shutdown` waits for open
+ * connections and has no deadline of its own — and then waits up to
+ * `BIFROST_SHUTDOWN_CLEANUP_BUDGET_SECONDS` for its cleanup goroutine, whose
+ * last act is the governance plugin's final budget dump. So shutdown's budget
+ * is "however long the drain takes, plus up to 30 seconds", and a stop timeout
+ * of 30 does not merely truncate it: it overlaps it, so the final dump races
+ * the deadline that kills it.
+ *
+ * The dump is the write a deploy cannot lose — it carries every bit of usage
+ * the outgoing task recorded since its last periodic pass — so the margin is
+ * deliberately generous rather than tuned. 120 is the ceiling Fargate accepts;
+ * a larger number is rejected at the task definition rather than honoured.
+ *
+ * This sits in the container definition below, which is a single
+ * `pulumi.jsonStringify` JSON document typed by ECS and not by the Pulumi
+ * provider, so a misspelt key is not a compile error. `ecs.test.ts` pins it
+ * textually for that reason.
+ */
+export const BIFROST_STOP_TIMEOUT_SECONDS = 120;
+
+/**
+ * The cleanup budget the process gives itself after it has drained HTTP, and
+ * the term the stop timeout above has to leave room for. It is not a value this
+ * deployment can set; it is read from the pinned gateway's shutdown path and
+ * recorded here so the stop timeout's arithmetic is checkable.
+ */
+export const BIFROST_SHUTDOWN_CLEANUP_BUDGET_SECONDS = 30;
 
 /**
  * The secret containers, by the names `fill-secrets.sh` already uses. Both are
@@ -1202,6 +1259,11 @@ export const createBifrostEcs = (args: {
           memory: BIFROST_CONTAINER_MEMORY,
           essential: true,
           healthCheck: BIFROST_HEALTH_CHECK,
+          // Fargate's maximum, and the reason is the shutdown the container
+          // is given: ECS's default of 30s is the same 30s the process allows
+          // its own cleanup after draining, so the final budget dump races the
+          // kill. See `BIFROST_STOP_TIMEOUT_SECONDS`.
+          stopTimeout: BIFROST_STOP_TIMEOUT_SECONDS,
           // Upstream's documented ECS shape (`docs/deployment-guides/ecs.mdx`
           // at the pinned tag): the injected config becomes the file Bifrost
           // reads, and then the image's own entry point starts the process.
@@ -1420,6 +1482,11 @@ export const createBifrostEcs = (args: {
    * `healthCheckGracePeriodSeconds` is set for the same reason: the provider
    * default is 0, which lets the ALB's target-group check replace a task while
    * it is still running its store migrations. See the constant.
+   *
+   * The deployment circuit breaker is the one knob here that is about a deploy
+   * that has already failed rather than one in progress: a revision that cannot
+   * become healthy rolls back to the previous one by itself. See
+   * `DEPLOYMENT_CIRCUIT_BREAKER`.
    */
   const service = new aws.ecs.Service(
     "bifrostService",
@@ -1448,6 +1515,11 @@ export const createBifrostEcs = (args: {
       // constants above for why they are not the defaults.
       deploymentMinimumHealthyPercent: DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
       deploymentMaximumPercent: DEPLOYMENT_MAXIMUM_PERCENT,
+      // A revision that cannot become healthy rolls itself back to the last one
+      // that did, instead of sitting at running 0 / desired 1 until someone
+      // notices. `verify-service.ts` detects that state; only ECS can undo it.
+      // Called out in the service doc comment above.
+      deploymentCircuitBreaker: DEPLOYMENT_CIRCUIT_BREAKER,
       /**
        * The task's stable name inside the VPC, `bifrost.workbench.local`.
        *

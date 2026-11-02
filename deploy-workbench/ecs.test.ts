@@ -26,7 +26,10 @@ import {
   BIFROST_HEALTH_CHECK,
   BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS,
   BIFROST_SERVICE_NAME,
+  BIFROST_SHUTDOWN_CLEANUP_BUDGET_SECONDS,
+  BIFROST_STOP_TIMEOUT_SECONDS,
   BIFROST_TASK_FAMILY,
+  DEPLOYMENT_CIRCUIT_BREAKER,
   DEPLOYMENT_MAXIMUM_PERCENT,
   DEPLOYMENT_MINIMUM_HEALTHY_PERCENT,
   ECS_EXECUTION_MANAGED_POLICY_ARN,
@@ -70,6 +73,7 @@ import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
 import {
   BIFROST_HOSTNAME,
+  TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS,
   TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS,
   TARGET_GROUP_HEALTH_CHECK_TIMEOUT_SECONDS,
   TARGET_GROUP_HEALTHY_THRESHOLD,
@@ -1084,6 +1088,70 @@ describe("bifrost ecs", () => {
     );
     // The cap is what makes stop-before-start: never above desiredCount.
     assert.ok(DEPLOYMENT_MAXIMUM_PERCENT <= 100);
+  });
+
+  it("gives the gateway 120 seconds to shut down, outlasting its drain and its cleanup", () => {
+    // Unset, ECS applies its default of 30 seconds and `SIGKILL`s the container
+    // at it. After `SIGTERM` the process drains HTTP first — `fasthttp`'s
+    // `Shutdown` waits for open connections with no deadline of its own — and
+    // then waits up to 30 seconds for its cleanup, whose last act is the final
+    // governance budget dump. The container's own budget is therefore
+    // "however long the drain takes plus up to 30s", and a `stopTimeout` of 30
+    // overlaps it: the dump races the deadline that kills it. The dump is the
+    // write a deploy cannot lose, so the stop timeout is Fargate's maximum.
+    const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    // `containerDefinitions` is one `pulumi.jsonStringify` string typed by ECS,
+    // not by the Pulumi provider, so a misspelt key here is not a compile
+    // error; this textual assertion is what keeps it honest.
+    assert.match(
+      block,
+      /\n\s*stopTimeout: BIFROST_STOP_TIMEOUT_SECONDS,/,
+      `the gateway container does not set a stopTimeout\n${block}`,
+    );
+    // 120 is the ceiling Fargate accepts, so it is not a number to raise.
+    assert.equal(BIFROST_STOP_TIMEOUT_SECONDS, 120);
+    // It has to outlast the cleanup budget the process gives itself (30s) plus
+    // the connection drain it does first, which is the target group's
+    // deregistration delay here.
+    assert.ok(
+      BIFROST_STOP_TIMEOUT_SECONDS >
+        BIFROST_SHUTDOWN_CLEANUP_BUDGET_SECONDS +
+          TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS,
+      "the stop timeout must outlast the drain and the cleanup, not equal them",
+    );
+    // The sidecar and the claim container are not the process doing the dump.
+    for (const name of [
+      "OAUTH2_PROXY_CONTAINER_NAME",
+      "BIFROST_BOOTSTRAP_CONTAINER_NAME",
+    ]) {
+      assert.ok(
+        !containerDefinitionBlock(name).includes("stopTimeout:"),
+        `${name} must not carry the gateway's stop timeout`,
+      );
+    }
+  });
+
+  it("rolls a failed deployment back to the previous revision", () => {
+    // Absent, a revision that cannot become healthy sits at running 0 /
+    // desired 1 until a human notices; `scripts/verify-service.ts` turns that
+    // into a red run but cannot roll anything back. With the breaker on, ECS
+    // stops the deployment and returns the service to the last revision that
+    // completed successfully, which still points at a database that is still
+    // there.
+    const service = resourceBlock("bifrostService");
+    assert.ok(
+      service.includes(
+        "deploymentCircuitBreaker: DEPLOYMENT_CIRCUIT_BREAKER",
+      ),
+      `the service does not enable the deployment circuit breaker\n${service}`,
+    );
+    // `@pulumi/aws` types this block, both fields required, so this is a
+    // resource assertion rather than a textual one: a missing or misspelt
+    // field is a compile error at the resource, not a silent omission.
+    assert.deepEqual(DEPLOYMENT_CIRCUIT_BREAKER, {
+      enable: true,
+      rollback: true,
+    });
   });
 
   it("does not replace a task whose ALB checks have not passed yet", () => {
