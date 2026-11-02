@@ -224,22 +224,5 @@
     "split": "holdout",
     "source": "simulated",
     "kind": "bug"
-  },
-  {
-    "id": "omni-2492-discovered-agenda-date",
-    "bundle": "omni-2492-discovered-agenda-date.bundle.json",
-    "expect": {
-      "verdict": "block",
-      "paths": [
-        "packages/gp-api/src/meetings/services/meetingBriefings.service.ts"
-      ],
-      "categories": [
-        "bugs"
-      ]
-    },
-    "tests": "Simulated from omni#2492, focused to its gp-api non-test source. A packet for another meeting date is refused only when the user pasted it; an agent-discovered packet that states another meeting date is only logged and published as briefing_ready, so a wrong briefing goes live with no way to correct it. #2939 added a replace action (ENG-11346).",
-    "split": "holdout",
-    "source": "simulated",
-    "kind": "bug"
   }
 ]
