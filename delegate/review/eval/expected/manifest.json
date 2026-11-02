@@ -188,5 +188,41 @@
     "split": "tune",
     "source": "simulated",
     "kind": "bug"
+  },
+  {
+    "id": "omni-3187-race-reread-join-key",
+    "bundle": "omni-3187-race-reread-join-key.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/electionDb/places/places.service.ts",
+        "packages/gp-api/src/electionDb/races/races.service.ts"
+      ],
+      "categories": [
+        "bugs"
+      ]
+    },
+    "tests": "Simulated from omni#3187 (ENG-11449), focused to its non-test source. attachMergedRaces re-reads head races with the caller's raceColumns select and joins them to the heads by row.id; when raceColumns omits id every join misses and is dropped by a silent continue, so places return Races: []. Production approved it; #3285 fixed it (ENG-11491).",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2747-sms-cutoff-null-kickoff",
+    "bundle": "omni-2747-sms-cutoff-null-kickoff.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/campaigns/util/eligibility.util.ts",
+        "packages/gp-api/src/campaigns/tcrCompliance/services/campaignTcrCompliance.service.ts"
+      ],
+      "categories": [
+        "bugs"
+      ]
+    },
+    "tests": "Simulated from omni#2747, focused to its gp-api non-test source. smsComplianceWindow exempts only a record with kickoffSentAt or internalTestingAt, but kickoffSentAt shipped in May 2026, so approved legacy records have it null and are treated as past the 19-day cutoff, disabling SMS for compliant candidates. Fixed by #2888 (ENG-11326, ENG-11328).",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "bug"
   }
 ]
