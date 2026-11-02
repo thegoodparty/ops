@@ -570,6 +570,25 @@ nothing. Any pull request in those repositories can already assume its role
 by editing the workflow, so the build job holding it exposes nothing new.
 Main builds log in with `github-actions-pulumi-deploy`.
 
+## What step 8 found
+
+**"Narrow to main" is one ref and one environment.** A job that declares a
+GitHub environment presents `environment:<name>` as its subject instead of
+the ref. gp-terraform-dataplatform's `tf-apply.yaml` runs in `production`,
+so its subject is `repo:thegoodparty/gp-terraform-dataplatform:environment:production`,
+and a ref-only pin would have refused every apply. That environment admits
+`main` and `v*` tags and requires a reviewer. The plan job every apply waits
+on declares no environment, so it presents the ref, and a run from anything
+but `main` stops there. No omni job on this role declares an environment.
+
+**Checked against CloudTrail, not only the workflows.** The role's
+`AssumeRoleWithWebIdentity` events show five subjects, in every event from
+2026-10-28 to 2026-11-02 and as far back before that as a 20,000-event
+lookup reached: omni's `main` ref and `pull_request`, ops' `main` ref, and
+dataplatform's `main` ref and `production` environment. After the 10-29 role
+moves, omni's `pull_request` assumes are the gp-api infrastructure diff alone,
+which step 5b moves to its own role.
+
 ## Ordering
 
 The rule from `workbench-account.md` applies, with one addition. Cross-repo

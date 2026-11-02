@@ -10,7 +10,9 @@
 //
 // The trust document is no longer byte-identical to what was captured: step 7
 // of `docs/pr-previews.md` pins the ops subject to `main` and to `deploy.yml`
-// (the first statement below). The policy document is still as adopted.
+// (the first statement below), and `docs/deploy-role-trust.md` replaced the
+// other repositories' wildcards with exact subjects. The policy document is
+// still as adopted.
 
 import type { PolicyDocument, PolicyStatement } from "../identity-center/policies";
 import {
@@ -33,42 +35,35 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
-// Four repositories in three statements. Ops is pinned to `main` and to one
-// workflow file; gpvpn is pinned to `main`; gp-terraform-dataplatform and omni
-// keep the captured `:*` pattern, which includes pull_request refs.
-//
-// Why the exact pins are not in the wildcard list. `sub` under both
-// `StringEquals` and `StringLike` in the same statement is not "either": IAM
-// ANDs the condition operators for one key, so the subject would have to be
-// both the exact main ref and one of the wildcard patterns at once, and no
-// request would match. Each exact pin therefore needs its own statement.
+// Four repositories in two statements, and every subject is exact. Ops is
+// pinned to `main` and to one workflow file. omni, gp-terraform-dataplatform
+// and gpvpn share the second statement, pinned to `main`, with
+// gp-terraform-dataplatform's `production` environment beside its ref.
 //
 // Why the ops statement pins `job_workflow_ref` too. `sub` is per-ref, not
 // per-workflow: every workflow on main presents the same subject, so a
 // `main`-only pin still lets any workflow file added to the repo assume this
 // role. That is the same gap `opsWorkflowTrust()` below closes for the scoped
 // roles, and this role is broader, so it needs the pin at least as much. Only
-// `deploy.yml` should hold it.
+// `deploy.yml` should hold it, and that pin is why ops has a statement of its
+// own: in the shared one it would apply to every subject.
 //
 // The ops pin is only safe now. It depends on `deploy.yml` no longer requesting
 // credentials on `pull_request` (docs/pr-previews.md step 6, merged as PR #90);
 // before that, a PR run still assumed this role and would now fail.
 //
-// Five archived repositories were removed from the wildcard list in step 2 of
+// Five archived repositories were removed from the trust list in step 2 of
 // docs/deploy-role-trust.md: gp-api, people-api, election-api, runbooks and
 // campaign-plan-service. An archived repository cannot run a workflow, so
 // their entries granted nothing and only made the list look load bearing.
 //
-// The three left after step 2 are live and do assume this role. Correcting an
-// earlier version of this comment, which said the other eight stay wildcarded
-// because omni's `publish-experiments.yml` assumes the role on
-// `pull_request`: it does not, and has not since that workflow's publish job
-// was gated to push and workflow_dispatch. What does need `pull_request`
-// today is five other omni workflows and one in gp-terraform-dataplatform.
-// gpvpn is pinned to main in its own statement (step 9): its only workflow
-// runs on push to main, so nothing needed the wildcard. See
-// docs/deploy-role-trust.md for what each one does and the order to narrow
-// the other two in.
+// No repository assumes this role on a pull request any more, which is what
+// step 8 of that plan waited for. omni's pull request jobs use
+// `github-actions-gp-api-plan` (the gp-api infrastructure diff),
+// `github-actions-preview-deploy` and `github-actions-pulumi-plan`, and
+// dataplatform's plan uses the last. Every omni job left on this role runs on
+// `main`, by push, schedule or a dispatch from main, and declares no
+// environment, so it presents the main ref.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -104,29 +99,21 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
       Condition: {
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        },
-        StringLike: {
+          // Several values for one key under one operator are ORed, so one
+          // statement holds them all.
           "token.actions.githubusercontent.com:sub": [
-            "repo:thegoodparty/gp-terraform-dataplatform:*",
-            "repo:thegoodparty/omni:*",
-          ],
-        },
-      },
-    },
-    {
-      Effect: "Allow",
-      Principal: {
-        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
-      },
-      Action: "sts:AssumeRoleWithWebIdentity",
-      Condition: {
-        StringEquals: {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          // Its own statement, because `sub` under StringEquals and StringLike
-          // in one statement is ANDed, not ORed. gpvpn's one workflow,
-          // `main.yml`, runs only on push to main.
-          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/omni:ref:refs/heads/main",
+            "repo:thegoodparty/gp-terraform-dataplatform:ref:refs/heads/main",
+            // dataplatform's `tf-apply.yaml` runs in its `production`
+            // environment, and a job in an environment presents the
+            // environment in `sub` instead of the ref. That environment admits
+            // `main` and `v*` tags and requires a reviewer, and the plan job
+            // every apply waits on declares no environment, so it has to
+            // match the main ref above.
+            "repo:thegoodparty/gp-terraform-dataplatform:environment:production",
+            // gpvpn's one workflow, `main.yml`, runs only on push to main.
             "repo:thegoodparty/gpvpn:ref:refs/heads/main",
+          ],
         },
       },
     },
