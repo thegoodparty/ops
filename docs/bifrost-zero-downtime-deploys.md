@@ -500,7 +500,7 @@ recovery from the overlap window" makes that unnecessary, because the session
 notices the rejection itself.
 
 That document is a frozen plan and is not edited here. The amendment lands in
-step 6, the housekeeping round, which is where the rest of the stale prose this
+step 7, the housekeeping round, which is where the rest of the stale prose this
 design creates is corrected — a separate `ops` PR from the `gp-pi` extension in
 step 5, because it is a `docs/` change in this repository and that tree is
 human-owned.
@@ -585,6 +585,128 @@ step has to carry:
   restores. A half-restored database left by a failed deploy is the case it
   must handle, because the retry is the next deploy rather than a human
   cleaning up by hand.
+
+### 20. The database password is resolved per connection, not injected once
+
+On 2026-11-02 the gateway's single task was replaced because its database
+credential had gone stale. RDS rotates the master password in the secret it owns;
+`PG_PASSWORD` is injected from that secret when the task starts
+(`deploy-workbench/ecs.ts`, the Bifrost container's `secrets` block, and
+`RDS_PASSWORD_JSON_KEY` above it); Bifrost reads it once and never again, so the
+running process kept the password from the previous version. `SQLSTATE 28P01`
+followed on every new physical connection, `/health` pings the config and log
+stores, the container went unhealthy, and ECS replaced the task: 2 min 50 s of
+outage, and before it about 7 h 20 min in which inference worked while request
+logging and usage accounting failed silently.
+
+The fix is a mechanism the pinned tag already has rather than a new one. At
+`transports/v2.3.2` — the git tag, whose `transports/` prefix the image tag
+`v2.3.2` does not carry — `transports/config.schema.json` gives both
+`config_store` and `logs_store` a `password_command`: `{ command, args,
+timeout (10s), cache_ttl (60s) }`, "executed without a shell to produce the
+database password on stdout for each new physical connection". It is a mutually
+exclusive `oneOf` with `password`, so a store has exactly one of the two and
+never both, and the block itself is `additionalProperties: false`.
+`framework/postgresconn/postgresconn.go` implements it as a pgx
+`OptionBeforeConnect` that replaces the DSN's password on each new physical
+connection, behind a `singleflight` group and a TTL cache
+(`defaultPasswordCommandCacheTTL = 60s`), with failures never cached so a
+transient error does not persist for the whole TTL.
+
+The property the design needs is what that TTL buys: a rotation heals within the
+cache TTL instead of persisting until the next task start. Its own comment states
+the trade rather than hiding it — "a rotation shorter than the TTL will fail
+connections until the cached value expires" — so the rule the step carries is
+that `cache_ttl` stays well below the rotation interval.
+
+The secret the command reads is the part that looks like it needs plumbing and
+does not. It is RDS's, not Pulumi's: `rds.ts` sets `manageMasterUserPassword:
+true` and hands out `masterUserSecrets[0].secretArn` (the comment at
+`rds.ts:160-180`, the return at 220-235), and the task definition already
+references it with the `AWSCURRENT` default and the `password` JSON key. The
+`AWSCURRENT` stage is the only version needed, because RDS writes the new
+password as the current version of the same secret: a command that reads
+`AWSCURRENT` and pulls `password` out of it converges on its own, and nothing has
+to look at `AWSPENDING` or the version list. A `cache_ttl` shorter than the
+rotation interval is what makes it converge rather than chase.
+
+A consequence worth having: with both tasks resolving the credential themselves,
+two colours in an overlap cannot disagree about the password, which is one of the
+credential hazards of the window gone rather than managed.
+
+What it costs is an image that can run the command, and that is the step's real
+work. The gateway image is Alpine with the Go binary and little else: the
+derived `bootstrap.Dockerfile` installs `curl` and `jq` because "the Alpine
+runtime has neither", and nothing in the tree has an AWS CLI, which signing a
+Secrets Manager `GetSecretValue` needs. The precedent for that is in this
+deployment twice over:
+a derived image with a committed Dockerfile, a pin held in one module, a
+content-addressed tag, an immutable ECR repository, a drift test and a build slot
+in `deploy-workbench.yml` before the apply — `bootstrap-image.ts` +
+`bifrost/bootstrap.Dockerfile`, and `oauth2-proxy-image.ts` +
+`bifrost/Dockerfile`. This design adds a third of that shape rather than
+inventing one.
+
+Stated plainly, because the alternative is a reader who assumes more than this:
+**this decision does not claim zero downtime for a credential event by itself,
+and least of all before the colour flip.** The rotation still breaks
+already-open connections' successors until the TTL expires, `/health` still pings
+the stores, and a health-triggered replacement is still stop-before-start until
+step 4 lands — the same 2 min 50 s, unless a pool that still holds live
+connections bridges the 60 seconds. What it removes is the seven hours: the
+failure stops being silent and self-perpetuating and becomes a window bounded by
+the TTL.
+
+Rejected: **keeping rotation and refreshing the service on a rotation event**
+(an EventBridge rule on `RotationSucceeded` → `ecs:UpdateService`). It is
+unsafe here, for a reason that belongs to ECS rather than to this design: a
+health-triggered replacement reuses "the same service revision they belong to"
+(AWS's ECS rolling-update documentation), so every replacement lands on the same
+task definition and therefore the same config store. A refresh rolled against
+that is an unmanaged two-writer overlap on one config store — the `DumpBudgets`
+hazard this whole document exists to keep out — and a refresh that avoids
+overlap is a scheduled outage. It becomes a safe option only after the colour
+flip, and then only as a colour-moving deploy that seeds the inactive colour; a
+bare `--force-new-deployment` would still reuse the revision. That is a future
+decision, not this one.
+
+Rejected: **turning rotation off.**
+`aws.secretsmanager.SecretRotation { rotationEnabled: false }` on
+`masterUserSecrets[0].secretArn` is the smallest change in the file, and it does
+close the mid-overlap credential hazard: two tasks cannot disagree about a
+password that never changes. It was rejected on reasoning already recorded rather
+than on a new objection. It reverses the decision at `rds.ts:160-180` ("RDS
+generates the master password, stores it in a Secrets Manager secret it owns, and
+rotates it"), which makes that comment false, and it fixes nothing structurally:
+the task still reads its password once at boot, so the next change to the
+credential — a hand rotation, a restore, an incident — is urgent instead of
+scheduled, and arrives with no mechanism to deliver it. A schedule the
+deployment cannot follow is the problem; removing the schedule is not the same as
+fixing it.
+
+Rejected: **`client.disable_db_pings_in_health: true`.** It exists at the pinned
+tag (`transports/config.schema.json`, default `false`), it is handled rather than
+accepted and ignored (`transports/bifrost-http/handlers/health.go` returns `ok`
+with `"db_pings": "disabled"` without pinging), and `bifrost/config.json` does
+not set it. It decouples `/health` from the stores and so stops a rotation from
+*replacing the task*: the container stays up and the ALB keeps it. It does not
+stop the failure. The seven-hour silent window becomes a permanent silent one —
+logging and accounting broken, inference fine, nothing watching — until the
+next restart. It is recorded because it is a real trade and a cheap one, not
+because it is the fix, and if it is ever adopted it needs the alarm and the
+runbook beside it (`SQLSTATE 28P01` metric filter, `RunningTaskCount`, ELB
+`5xx`), which this document does not specify.
+
+Rejected: **forking Bifrost** to re-read the credential when a connect fails.
+`password_command` is upstream's own answer to exactly this, recommended in the
+Helm chart's storage documentation for dynamic credentials, so a fork would
+maintain a patch that reproduces a feature the pinned tag already ships.
+
+One prose consequence, recorded here rather than rediscovered: the sentence in
+[`bifrost-gateway.md`](./bifrost-gateway.md) under "Persistence, backup and
+upgrade" that says the master credential "reaches the task as an `env.`
+reference" stops being true with this step, so the housekeeping round (step 7)
+corrects it alongside the other stale prose this design creates.
 
 ## Client-side recovery from the overlap window
 
@@ -775,6 +897,10 @@ Notes that belong with the table rather than in it:
   document changes where the store they write to lives, and adds a client-side
   recovery for the one write it can lose.
 - **Not a solution for harnesses other than `gp-pi`.** See the scope note above.
+- **Not a claim that a credential event is zero-downtime.** The deploy path is
+  this document's subject. A database credential rotation is a different event
+  with its own failure mode: decision 20 is the separate implementation that
+  bounds it, and until that step a rotation can still cost a task replacement.
 
 ## Open items
 
@@ -822,8 +948,10 @@ The order is the point of the order. The two knobs land first because they are
 what makes a later failure survivable; the seed lands before anything can point
 at a second database; the colour plumbing lands before the flip; the flip is the
 step that changes behaviour; the client-side recovery lands once there is a
-window to recover from; and the document corrections land last, when the design
-is no longer going to move under them.
+window to recover from; the credential resolution follows it, because it depends
+on none of the colour work and is safe to land at any point after the image
+pipeline it needs; and the document corrections land last, when the design is no
+longer going to move under them.
 
 1. **The two missing knobs.** `stopTimeout: 120` on the Bifrost container and
    `deploymentCircuitBreaker { enable: true, rollback: true }` on the service,
@@ -888,14 +1016,79 @@ is no longer going to move under them.
    deleted from the active store out of band, a session's next turn recovers
    with no user action; with a model outside the allowlist, the turn fails once
    and surfaces the error with no second attempt.
-6. **Housekeeping.** The doc corrections this design makes stale, in this
+6. **The database password is resolved per connection.** Bifrost's pinned tag can
+   re-resolve the credential for every new physical connection, so `PG_PASSWORD`
+   stops being a value only a task start can refresh: a derived gateway image
+   that can run the fetch, `bifrost/config.json`'s two Postgres blocks moved from
+   `password` to `password_command` (the schema's `oneOf` makes that both stores
+   in one change, never one), the task role's read grant, and the `rds.ts`
+   comment that says a rotated password "reaches the task on its next start"
+   rewritten, because this step is what makes it false. The details it has to
+   settle rather than assume:
+
+   - **The image and the CLI.** `aws-cli` and `jq` from the base image's own
+     Alpine repositories (`apk add --no-cache aws-cli jq`; `aws-cli` is 2.32.x
+     on Alpine 3.23's community branch, about 116 MiB installed and a `python3`
+     dependency), because it is the cheapest thing that already implements the
+     ECS container-credential chain and SigV4. Signing a `GetSecretValue` by hand
+     against the `curl` that `bootstrap.Dockerfile` adds means fetching and
+     refreshing `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, computing the signature
+     and parsing the response with `jq` — a reimplementation of the CLI, not a
+     cheaper one. One committed script in the image, named as the `command` and
+     running `aws secretsmanager get-secret-value` piped to `jq -r .password`,
+     is the shape `bootstrap.sh` already has; the derived image reproduces the
+     upstream contract the task definition relies on (`/app/docker-entrypoint.sh
+     /app/main`, `USER 1000:0`, `APP_DIR`), and its drift test pins the
+     Dockerfile's `FROM` to the digest the gateway mirror already uses.
+   - **How the ARN reaches the command.** The schema's `command` and `args` are
+     literal strings (`args` is a list of `string` under
+     `additionalProperties: false`), and nothing expands an `env.` reference in
+     them: `schemas.SecretVar` resolution covers `*SecretVar` fields, and
+     `PasswordCommandConfig.Args` is a plain `[]string` filled by
+     `json.Unmarshal`. So the ARN cannot be written as `env.PG_SECRET_ARN` in
+     `config.json`. The script reads it from the container's own environment
+     instead, set in the task definition from `database.secretArn` — which is
+     also how the region and the task role's credentials reach the CLI. This is
+     the step's first thing to confirm against the pinned tag.
+   - **The IAM is the task role's, not the execution role's.** The execution
+     role's `secretsmanager:GetSecretValue` on the RDS ARN is what the ECS agent
+     uses to inject `PG_PASSWORD`; it is a different principal and does nothing
+     for a call made inside the container. `ecs.test.ts` currently asserts the
+     opposite of what this needs — "the task role must not read secrets: the
+     agent does that, not Bifrost" — so that assertion is replaced by the one
+     statement this becomes: `secretsmanager:GetSecretValue` on
+     `database.secretArn`, and nothing wider.
+   - **The cost per connection attempt.** Without the cache the command is a
+     process per physical connection; with it, at most one per `cache_ttl` (60s)
+     per pool, collapsed by `singleflight`, and the two stores open separate
+     pools with separate caches — so a burst is one CLI invocation, not fifty.
+     A miss pays the CLI's own startup inside `OptionBeforeConnect`, which is
+     what the 10s `timeout` bounds.
+
+   Touches `deploy-workbench/` (a derived image module beside
+   `bootstrap-image.ts`, with its Dockerfile and script, an ECR repository, the
+   task definition's image reference and the task role statement) and
+   `deploy-workbench/bifrost/config.json`, with its tests in the same PR: the
+   drift test the other two derived images have, `ecs.test.ts`'s role and image
+   assertions, and `bifrost/config.test.ts`'s two-store assertions, which today
+   require `env.PG_PASSWORD` in both blocks. Dropping the now-unused
+   `PG_PASSWORD` injection and its execution-role grant belongs to the same PR,
+   so the secret is read one way rather than two. Proves: after a rotation
+   against the live secret, new physical connections succeed within
+   `cache_ttl` — no `28P01` past that window in the logs — with no task
+   replacement and no deploy; and a deliberately broken command fails the dial
+   with its stderr surfaced rather than silently falling back to a password,
+   since failures are not cached.
+7. **Housekeeping.** The doc corrections this design makes stale, in this
    repository: the gateway plan's "Persistence, backup and upgrade" upgrade
    procedure and its rollback rule (it says the snapshot is the schema
    rollback), its "Availability" paragraph under the same heading (a task
    replacement "is still a short outage"), its "Migration from direct provider
    access, and rollback" section, item 8's entry in its phased task list where
    it explains the stop-before-start value, any other step entry that describes
-   a deploy as an outage, and the `--refresh` supersession in
+   a deploy as an outage, the master credential's "reaches the task as an `env.`
+   reference" sentence under the same heading (false once step 6 lands), and the
+   `--refresh` supersession in
    [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) (decision 15 above).
    `docs/` is human-owned, so this is a review round of its own rather than a
    rider on an implementation PR, and the gateway plan's edits are deliberate
@@ -923,6 +1116,10 @@ In this repository:
 | `--refresh` is the current 401 workaround | `docs/bifrost-virtual-keys.md`, decision 7; `thegoodparty/gp-pi`, `etc/gp-bifrost-key` |
 | Budgets are deferred; the account budget is the only cap | `docs/bifrost-gateway.md`, "Budgets and alerts" |
 | The snapshot is the current rollback rule | `docs/bifrost-gateway.md`, "Persistence, backup and upgrade" |
+| The RDS-managed password is injected once at task start, as `PG_PASSWORD` | `deploy-workbench/ecs.ts`, the Bifrost container's `secrets` block, `RDS_PASSWORD_JSON_KEY`, `PG_PASSWORD_ENV_NAME`; `deploy-workbench/rds.ts`, `manageMasterUserPassword` |
+| The task role holds no secrets read, and a test says so | `deploy-workbench/ecs.ts`, `taskRolePolicyDocument`; `deploy-workbench/ecs.test.ts`, "the task role must not read secrets" |
+| The Alpine runtime has neither curl nor jq | `deploy-workbench/bifrost/bootstrap.Dockerfile`, the header comment above `RUN apk add` |
+| A rotation costs a task replacement, and the timeline | `bifrost-restart-investigation.md` (branch `bifrost-restart`, not on `main`), 2 m 50 s outage and the 7 h 20 m silent window |
 
 In Bifrost, at the pinned tag `transports/v2.3.2`:
 
@@ -936,6 +1133,10 @@ In Bifrost, at the pinned tag `transports/v2.3.2`:
 | Log-store migrations are advisory-locked on a different key from the config store's, and background writers pause for them | `framework/logstore/migrations.go` (`1000011`), `framework/configstore/migrations.go` (`1000001`), `framework/logstore/maintenancegate.go` |
 | The two stores share one `migrations` table and their step IDs are disjoint | `framework/migrator/migrator.go`, `DefaultOptions.TableName`; the two `migrationStepIDs` lists |
 | `/health` pings the stores and does not flip on shutdown | `transports/bifrost-http/handlers/health.go`; `transports/bifrost-http/server/server.go`, `Start` |
+| `password_command` exists on both Postgres store blocks, is an exclusive `oneOf` with `password`, and takes literal `command`/`args` | `transports/config.schema.json`, the two `password_command` blocks |
+| It runs per new physical connection, through `singleflight` and a 60s TTL cache, and fails nothing but caches nothing on error | `framework/postgresconn/postgresconn.go`, `OptionBeforeConnect`, `passwordCache`, `defaultPasswordCommandCacheTTL`, `RunPasswordCommand` |
+| The CLI is upstream's own answer to dynamic credentials | `docs/deployment-guides/helm/storage.mdx`, the `passwordCommand` examples (`aws rds generate-db-auth-token`) |
+| `disable_db_pings_in_health` exists, is honoured, and is not set here | `transports/config.schema.json`; `transports/bifrost-http/handlers/health.go`, `getHealth`; `deploy-workbench/bifrost/config.json` |
 | Shutdown drains HTTP first, then waits up to 30 seconds for cleanup, whose last act is the final budget dump | `transports/bifrost-http/server/server.go`, `Start` (`s.Server.Shutdown()`, then the `shutdownCtx`); `core/bifrost.go` → `plugins/governance/main.go` → `tracker.go`, `Cleanup` |
 | A missing key is `401`; inactive, model-blocked and provider-blocked are `403`; budget is `402`; rate limit is `429` | `plugins/governance/main.go`, `decide` |
 | Migrations run at startup under an advisory lock | `framework/configstore/migrations.go`, `triggerMigrationsWithOptions` |
