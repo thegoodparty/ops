@@ -4,7 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
-import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema } from "./schema";
+import { decide } from "./gates";
+import { priorFindingsFrom } from "./bundle";
+import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema, lockKey, recordKey } from "./schema";
 import type { ReviewRecord } from "./schema";
 
 test("gatingFor defaults to off and cannot be loosened by a bad value", () => {
@@ -564,3 +566,172 @@ test("no callsite after the repair pass reads result.costUsd", () => {
   assert.equal(after.includes("result.costUsd"), false);
 });
 
+
+// Case 11 of `docs/plan-gated-merges.md`'s corpus, "a commit pushed after
+// approval". It cannot be an eval replay: `replay.ts` scores one bundle at one
+// sha through `decide()`, and `decide` is handed the findings, the two blocker
+// counts and the gating result -- never an approval. A bundle for sha B has no
+// sha-A approval to inherit, so a replay case would pass whatever the harness
+// did, which tests nothing.
+//
+// The property is deterministic and lives in the harness, so it is pinned here.
+// It is *not* that A's record is invisible at B: `listRecords` lists under
+// `reviews/<repo>/<pr>/`, which spans shas, so `latestCompletedRecord` does
+// select A's approval while running at B. What stops A's approval counting at
+// B is narrower, and is these two things: B's verdict is recomputed from B's
+// own inputs, and the only thing carried across a sha is a prior *finding*,
+// which an approval does not have.
+const approvedAtA: ReviewRecord = {
+  action: "approved",
+  runId: "a0000000-0000-4000-8000-00000000000a",
+  repo: "thegoodparty/ops",
+  prNumber: 42,
+  baseSha: "aaaaaa",
+  headSha: "a".repeat(40),
+  trigger: "webhook",
+  agentVersion: "1.0.0",
+  model: "claude-opus-4-5",
+  startedAt: "2024-01-01T00:00:00.000Z",
+  finishedAt: "2024-01-01T00:01:00.000Z",
+  wallTimeMs: 60000,
+  costUsd: null,
+  bundle: {
+    repo: "thegoodparty/ops",
+    prNumber: 42,
+    baseRef: "main",
+    baseSha: "aaaaaa",
+    headSha: "a".repeat(40),
+    author: "swain",
+    title: "t",
+    body: "Plan: docs/x.md",
+    diff: "",
+    changedFiles: [],
+    priorFindings: [],
+  },
+  output: { status: "complete", findings: [], summary: "clean" },
+  verdict: "approve",
+  gates: [],
+  findings: [],
+  droppedFindings: [],
+  reviewId: 7,
+};
+
+// A's approval *is* reachable from B, because records are listed per PR rather
+// than per sha. Pinning that explicitly keeps the next reader from assuming the
+// key scoping is what protects the verdict, and from "fixing" the listing so it
+// also hides prior findings.
+test("a later sha can see an earlier approval, and that is not what protects the verdict", () => {
+  const approvedWhileAtB = latestCompletedRecord([approvedAtA]);
+  assert.equal(approvedWhileAtB?.action, "approved");
+  assert.equal(approvedWhileAtB?.headSha, "a".repeat(40));
+
+  // A finding recorded at A is likewise carried, which is the whole point of
+  // listing per PR: a re-review has to know what the last pass flagged.
+  const commentedAtA = {
+    ...approvedAtA,
+    action: "commented" as const,
+    verdict: "comment" as const,
+    findings: [
+      {
+        id: "00000000-0000-0000-0000-000000000001",
+        path: "src/foo.ts",
+        line: 10,
+        body: "A bug",
+        category: "bugs" as const,
+        confidence: "high" as const,
+        demoted: false,
+      },
+    ],
+  } as unknown as ReviewRecord;
+  const carried = priorFindingsFrom(commentedAtA);
+  assert.equal(carried.length, 1);
+  assert.equal(carried[0].headSha, "a".repeat(40));
+});
+
+// The record and the lock are still keyed by sha, so B's run is a separate run
+// on a separate object: it does not queue behind A's lock, and it cannot
+// overwrite A's record. That is what makes each sha get its own verdict.
+test("each sha gets its own record and its own lock", () => {
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  assert.equal(
+    recordKey("thegoodparty/ops", 42, shaA, approvedAtA.runId),
+    `reviews/thegoodparty/ops/42/${shaA}/${approvedAtA.runId}.json`,
+  );
+  assert.notEqual(
+    recordKey("thegoodparty/ops", 42, shaB, approvedAtA.runId),
+    recordKey("thegoodparty/ops", 42, shaA, approvedAtA.runId),
+  );
+  assert.notEqual(lockKey("thegoodparty/ops", 42, shaB), lockKey("thegoodparty/ops", 42, shaA));
+});
+
+// The load-bearing half: whatever A recorded, B's action is recomputed from B's
+// own findings and consistency answer. A clean, consistent PR at B approves on
+// its own judgement even though A is approved, and a flagged one comments. The
+// assertion that matters is the negative one -- there is no parameter through
+// which A's verdict could arrive, which is why this is a unit test and not a
+// replay.
+//
+// The absence is asserted directly rather than left to follow from the
+// behaviour: `decide` takes the model's output and three optional blocker
+// counts, and nothing else. A parameter added here is how "a commit pushed
+// after approval" would come back, so a signature change trips this test rather
+// than silently widening the gate.
+test("decide takes no approval, so there is no channel for A's verdict", () => {
+  const source = readFileSync(join(__dirname, "gates.ts"), "utf-8");
+  const opts = source.match(/opts: \{([^}]*)\}/);
+  assert.ok(opts, "expected `decide`'s options argument");
+  const fields = opts[1].match(/[A-Za-z]+\??:/g) ?? [];
+  assert.deepEqual(
+    fields.map((f) => f.replace(/\??:$/, "")).sort(),
+    ["gating", "unparseableCount", "unplaceableCount"],
+    "an approval-shaped input here would let a new sha inherit the old verdict",
+  );
+});
+
+test("the verdict at B is recomputed from B's inputs, never taken from A", () => {
+  const gatingAtB = {
+    mode: "enforce" as const,
+    binding: { path: "docs/x.md" },
+    baseRef: "main",
+    plan: { path: "docs/x.md", blobSha: "c".repeat(40) },
+    authority: { checked: true, ownedPaths: [], reason: "" },
+    flags: [],
+  };
+  const flaggedAtB = decide(
+    {
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: {
+        verdict: "inconsistent",
+        reasoning: "the step names the log group",
+        departure: { plan: "the delegate log group", diff: "the playwright bucket" },
+      },
+    },
+    { gating: gatingAtB },
+  );
+  assert.equal(flaggedAtB.action, "comment", "B comments even though A was approved");
+  assert.deepEqual(flaggedAtB.gates, ["inconsistent"]);
+
+  // And no approval can be fed in: `decide` is a function of the output and the
+  // blocker counts alone. A clean, consistent B approves, so an approval is not
+  // being withheld here either -- the answer is B's own.
+  const cleanAtB = decide(
+    {
+      status: "complete",
+      findings: [],
+      summary: "clean",
+      planConsistency: { verdict: "consistent", reasoning: "step 1's own words" },
+    },
+    { gating: gatingAtB },
+  );
+  assert.equal(cleanAtB.action, "approve");
+});
+
+// An approval carries no findings, so the only channel that crosses a sha --
+// `priorFindings` -- hands nothing forward from it. This is the one way A's
+// approval could have leaked into B's bundle, and it does not.
+test("an approval puts nothing in the prior-findings channel", () => {
+  assert.deepEqual(priorFindingsFrom(approvedAtA), []);
+});
