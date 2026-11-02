@@ -1,6 +1,5 @@
 # Bifrost model gateway in the Workbench account
 
-> **Status: proposal, decisions settled in review. Nothing has been deployed.**
 > This document is the plan for putting GoodParty's coding harnesses behind a
 > single self-hosted model gateway,
 > [`maximhq/bifrost`](https://github.com/maximhq/bifrost), running in the
@@ -296,7 +295,7 @@ the shared admin Basic credential, on the claim that a human would then meet
 only Google SSO. That claim was wrong in an important way: the dashboard's
 gate is a **session cookie**, not a per-request credential, so the injected
 Basic header authenticated the proxy's requests rather than a person, and
-every allowlisted address still acted as the same admin. The decision now is
+every allowlisted address still acted as the same admin. The decision is
 `is_enabled: false`: oauth2-proxy plus the committed email allowlist is the
 only gate on the admin surface, and the edge invariant — no route reaches
 Bifrost directly except the enumerated inference prefixes and `/health` — is
@@ -509,7 +508,7 @@ worse than a task that visibly will not stabilize.
 
 **Risk, and the rollback.** `injectRequestHeaders` is alpha configuration: its
 structure may change between minor releases (upstream's own warning, and the
-flag's help text), and the wrapper is gone so the injected value is now a
+flag's help text), and the wrapper is gone so the injected value is a
 single `fromEnv` reference. The pin is what contains that — the digest in
 `deploy-workbench/bifrost/Dockerfile` and `oauth2-proxy-image.ts` — and the
 image tag is content-addressed over the allowlist, the Dockerfile and the alpha
@@ -803,13 +802,13 @@ on Bedrock Claude sessions across thousands of turns and roughly 38M input
 tokens. Every turn was billed as fresh input, which is the whole cost of an
 agent loop paid repeatedly.
 
-Two causes, both now fixed:
+Two causes, both fixed:
 
 - **No markers.** Bifrost never injects a cache breakpoint on its own: a
   provider with no `prompt_cache` block is one whose operator expressed no
   opinion (`PromptCacheInjectionEnabled`, `core/providers/utils/promptcache.go`).
   A harness that sends no `cache_control` therefore got no Bedrock `cachePoint`
-  at all. `config.json` now sets, on `providers.bedrock`:
+  at all. `config.json` sets, on `providers.bedrock`:
 
   ```json
   "prompt_cache": {
@@ -832,7 +831,7 @@ Two causes, both now fixed:
   discarded a top-level `cache_control` and nested a `cachePoint` inside
   `toolResult.content` instead, which Bedrock accepts while caching nothing
   (maximhq/bifrost#8541, fixed by #8595 in `v2.3.1`). The image is pinned at
-  `v2.3.2`, so the marker that reaches the converter now becomes a `cachePoint`
+  `v2.3.2`, so the marker that reaches the converter becomes a `cachePoint`
   after the last cacheable block. A config-only fix on `v2.3.0` would have
   looked applied and cached nothing.
 
@@ -920,7 +919,7 @@ Virtual keys are Bifrost's primary governance entity
   against an AZ failure, but it does not make the gateway highly available:
   the OSS app is a single Fargate task, and a task replacement is still a
   short outage. Multi-AZ is therefore a cost/benefit decision rather than an
-  HA claim. **Settled in item 7: single-AZ**, which is defensible for the
+  HA claim. **Item 7 chooses single-AZ**, which is defensible for the
   inner loop; the DB subnet group already spans both private subnets, so
   `multiAz: true` in `deploy-workbench/rds.ts` is the whole of that change if
   the budget ever justifies it.
@@ -1102,7 +1101,7 @@ OSS over Enterprise clustering.
 
 ### Open questions a human has to answer
 
-Review settled most of the earlier questions. What genuinely remains:
+What genuinely remains open:
 
 - **The Bifrost admin allowlist versus `Admins`.** The allowlist under
   `deploy-workbench/` is maintained by hand (jagoda for now) and is a
@@ -1111,19 +1110,18 @@ Review settled most of the earlier questions. What genuinely remains:
   from `Admins` (which needs an Identity Store reader oauth2-proxy does not
   have, so a small job would have to write the file), or move to Verified
   Access, which reads `Admins` natively at roughly $200/month.
-- ~~**RDS size and Multi-AZ.**~~ Settled in item 7, implemented in
-  `deploy-workbench/rds.ts`: **single-AZ**, `db.t4g.micro`, 20 GiB gp3 (RDS's
-  minimum), no storage autoscaling, 7-day automated backup retention, and a
-  master password RDS manages and rotates in Secrets Manager rather than one
-  a human types. PostgreSQL 16, which is the version upstream's installation
-  guide states as the minimum and the version its own guides run
-  (`postgres:16-alpine`); 17 is documented as supported but never exercised
-  upstream. What remains is not a decision but a test: item 23 rehearses the
-  restore.
-- ~~**Model allowlist.**~~ **Settled** in "US-only inference" under "Provider
-  configuration": the lists are US-only, eight classes, and the Fireworks
+- **RDS size and Multi-AZ: answered by item 7.** Single-AZ, `db.t4g.micro`,
+  20 GiB gp3 (RDS's minimum), no storage autoscaling, 7-day automated backup
+  retention, and a master password RDS manages and rotates in Secrets Manager
+  rather than one a human types. PostgreSQL 16, which is the version
+  upstream's installation guide states as the minimum and the version its own
+  guides run (`postgres:16-alpine`); 17 is documented as supported but never
+  exercised upstream. What remains is not a decision but a test: item 23
+  rehearses the restore.
+- **Model allowlist: answered under "US-only inference" in "Provider
+  configuration".** The lists are US-only, eight classes, and the Fireworks
   endpoint is the US-only host. What is left of this question is the pricing
-  half, and it is now sharper rather than smaller: US-only Serverless is 1.5x
+  half, and it is sharper rather than smaller: US-only Serverless is 1.5x
   the base price from 2026-09-01, so a catalog entry that prices the base model
   is wrong by that factor and every per-key cost number inherits the error.
   Wrong pricing makes a future budget wrong. Item 16.
@@ -1195,20 +1193,20 @@ network or a permission can land before the item that creates it.
    DB subnet group and the security groups.
 6. Add the ALB, its target groups and listeners, the ACM certificate and
    validation, and the Route 53 alias, all taking the explicit provider.
-7. ~~Add the RDS Postgres instance, private and encrypted, with automated
-   backups and deletion protection, and its credentials in Secrets Manager.~~
-   **Done** in `deploy-workbench/rds.ts`. PostgreSQL 16, single-AZ
+7. Add the RDS Postgres instance, private and encrypted, with automated
+   backups and deletion protection, and its credentials in Secrets Manager, in
+   `deploy-workbench/rds.ts`. PostgreSQL 16, single-AZ
    `db.t4g.micro`, 20 GiB gp3 with autoscaling off, 7-day automated backups,
    deletion protection, no public access, and the RDS-managed master password
    whose secret ARN is exported as `bifrostDatabaseSecretArn`. It consumes the
    DB subnet group and the task-only security group from item 5, which is not
    touched; the ECS task definition and the read grant on that secret arrive in
    item 8, so the database is created and consumed by nothing until then.
-8. ~~Add the ECS cluster, task definition and service, copying the
+8. Add the ECS cluster, task definition and service, copying the
    task-definition idiom in `deploy/components/worker.ts` (execution role with
    the managed ECS policy plus secrets read, a separate task role scoped to the
    Bedrock model list, `secrets` from Secrets Manager, `awslogs`,
-   `initProcessEnabled`), and the CloudWatch log group.~~ **Done** in
+   `initProcessEnabled`), and the CloudWatch log group, in
    `deploy-workbench/ecs.ts`. One cluster with container insights; one Fargate
    task definition at 0.5 vCPU / 1 GB, `awsvpc`, x86_64 because the mirror pulls
    `linux/amd64`; one task, `desiredCount: 1`, with
@@ -1248,29 +1246,28 @@ network or a permission can land before the item that creates it.
    configuration are item 10, so **the container cannot answer `/health` until
    then**; the plan's staging, not a defect.
 
-   The one place this item could not be implemented as written is the
-   service's load-balancer registration, and it is a defect in the sequencing
-   rather than in either item. ECS's `CreateService` rejects a target group
+   The service's load-balancer registration is constrained by the sequencing
+   rather than by either item. ECS's `CreateService` rejects a target group
    that no listener or listener rule references — `InvalidParameterException:
    The target group with targetGroupArn ... does not have an associated load
    balancer` — and item 6 attaches neither group to a routing rule: the HTTPS
    listener's default action points at oauth2-proxy, deliberately fail-closed.
    So item 8 cannot register against either group, and the plan's "registered
    against both ALB target groups" cannot hold until the rules exist. The
-   association and the attachment therefore arrive together in item 9, with
-   the rules; meanwhile the task runs with no target registered, which is the
-   safe direction — the ALB's default action answers 503, and a container
-   cannot fail a health check nobody is asking for. `ingress.ts`'s note that
-   item 8 registers a target into the Bifrost group predated this constraint;
-   item 9 corrected it along with the registration.
-9. ~~Add the oauth2-proxy sidecar to the task definition and the
+   association and the attachment therefore belong to item 9, with the rules;
+   until then the task runs with no target registered, which is the safe
+   direction — the ALB's default action answers 503, and a container cannot
+   fail a health check nobody is asking for. `ingress.ts` records item 8 as the
+   one that could not register and item 9 as the one that supplies the rules
+   and the registration together.
+9. Add the oauth2-proxy sidecar to the task definition and the
    admin/inference ALB routing: the `/oauth2/*` and admin-path rules to the
    oauth2-proxy target group on 4180, the inference-prefix rule to the Bifrost
    target group on 8080, the derived oauth2-proxy image with the allowlist
-   baked in, and the three `OAUTH2_PROXY_*` secret containers.~~ **Done** in
+   baked in, and the three `OAUTH2_PROXY_*` secret containers, in
    `deploy-workbench/ecs.ts` and `deploy-workbench/ingress.ts`.
 
-   The task definition now runs two containers: Bifrost on 8080 unchanged, and
+   The task definition runs two containers: Bifrost on 8080 unchanged, and
    the derived oauth2-proxy image (`oauth2-proxy-image.ts`) on 4180 with the
    three `OAUTH2_PROXY_*` keys from `bifrost/oauth2-proxy`, the
    Google/cookie/upstream settings from "Protecting the admin surface"
@@ -1292,16 +1289,16 @@ network or a permission can land before the item that creates it.
    separate rule because an ALB `path-pattern` condition accepts at most five
    values.
 
-   **Superseded by the proxy-only auth change.** Dashboard auth is now off, and
+   **Superseded by the proxy-only auth change.** Dashboard auth is off, and
    the direct rules are the inference prefixes plus `/health`; `/metrics` is no
    longer routed directly. See "Routing, and the edge invariant" and "Bifrost's
-   own login is off" above. The rest of this entry is the state item 9 landed
-   in.
+   own login is off" above; this entry describes the routing as item 9 first
+   shipped it.
 
-   The service now registers the task as a target in both groups, with the
+   The service registers the single task as a target in both groups, with the
    listener rules as an explicit `dependsOn` so the groups are associated
    before `CreateService` runs. That is the registration item 8 could not make,
-   and the reason moves with it; `ingress.ts` no longer claims item 8 registers
+   and the reason moves with it; `ingress.ts` does not claim item 8 registers
    a target.
 
    One consequence to know before item 12: the sidecar names all three
@@ -1309,8 +1306,7 @@ network or a permission can land before the item that creates it.
    has written them to `bifrost/oauth2-proxy`. That is the plan's sequence —
    nothing can serve traffic before item 10 supplies `BIFROST_CONFIG` anyway —
    and it fails closed rather than starting a proxy without its credentials.
-   This item changes no secret value, no `config.json` and no image pin, and
-   nothing was deployed.
+   This item changes no secret value, no `config.json` and no image pin.
 
 **Phase 2 — the gateway itself**
 
@@ -1388,7 +1384,7 @@ network or a permission can land before the item that creates it.
 The plan is based on the upstream repository at tag **`transports/v2.3.0`**
 (2026-10-13) and the matching container image
 **`docker.io/maximhq/bifrost:v2.3.0`** (published 2026-10-13). The image the
-gateway runs is now pinned at **`v2.3.2`**: the same release plus the v2.3.1
+gateway runs is pinned at **`v2.3.2`**: the same release plus the v2.3.1
 Bedrock cache-point fix and a Go `crypto/x509` security release, with no
 database migrations of its own. The facts this plan states were read at
 `v2.3.0` and re-checked at `v2.3.2` where a bump could have changed them; see
