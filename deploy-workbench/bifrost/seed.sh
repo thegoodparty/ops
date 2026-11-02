@@ -31,29 +31,49 @@
 #
 # `CREATE DATABASE` cannot run in a transaction, and it needs `CREATEDB`, which
 # the RDS master user has -- so it is its own statement, before the restore, and
-# the restore is the transaction. The three cases:
+# the restore is the transaction (`psql --single-transaction`; see the note above
+# the restore). The three cases:
 #
 #   - target missing          -> create it, restore into it;
-#   - target present, empty   -> restore into it. This is the half-restored
-#                                database a failed deploy leaves, and the retry
-#                                is the next deploy rather than a human with a
-#                                `DROP DATABASE`;
+#   - target present, with no rows -> restore into it. This is the half-restored
+#                                database a failed deploy leaves, because the
+#                                restore is one transaction and therefore rolls
+#                                back to this shape; the retry is the next
+#                                deploy rather than a human with a `DROP
+#                                DATABASE`;
 #   - target present, with rows -> refuse. A colour with content is either one
 #                                something is serving from or one a human seeded
 #                                on purpose, and neither is ours to overwrite.
 #
 # A target with a schema and no rows is a failed restore, so it is dropped and
-# recreated; a target with a schema *and* rows is refused.
+# recreated; a target with a schema *and* rows is refused. The refusal is only
+# reachable for rows this script did not write, because its own restore cannot
+# leave any: that is the property `--single-transaction` gives it.
 #
-# It connects with the same credentials the gateway's task uses: `PGHOST`,
-# `PGPORT`, `PGUSER` and `PGPASSWORD`, which libpq reads from the environment,
-# with `PGPASSWORD` injected from the RDS-managed secret in `ecs.ts`. There is no
-# second connection mechanism and no connection string here, because a URL would
-# put the password in the process's arguments where `ps` can read it.
+# It connects with the same credentials the gateway's task uses, and the names do
+# not line up by themselves: the task definition injects `PG_HOST`, `PG_PORT`,
+# `PG_USER` and `PG_PASSWORD` (Bifrost's `config.json` reads those), while libpq --
+# which `psql` and `pg_dump` use -- reads `PGHOST`, `PGPORT`, `PGUSER` and
+# `PGPASSWORD`. So the mapping below is load-bearing: without it libpq ignores
+# every one of them and falls back to a local Unix socket that does not exist in
+# the container, and `set -e` stops the run on its first statement. It is
+# exported once, here, rather than the task definition being changed to a second
+# set of names: the gateway's names are the ones `config.json` documents, and a
+# seed that spoke a different dialect would be the third connection mechanism
+# this avoids.
 #
-# It never prints `PGPASSWORD`. Only statuses, timings and the server's own error
+# There is no connection string and no URL, because either would put the password
+# in the process's arguments where `ps` can read it.
+#
+# It never prints the password. Only statuses, timings and the server's own error
 # text reach the log.
 set -eu
+
+# The task definition's names are not libpq's. See above.
+if [ -n "${PG_HOST:-}" ]; then export PGHOST="$PG_HOST"; fi
+if [ -n "${PG_PORT:-}" ]; then export PGPORT="$PG_PORT"; fi
+if [ -n "${PG_USER:-}" ]; then export PGUSER="$PG_USER"; fi
+if [ -n "${PG_PASSWORD:-}" ]; then export PGPASSWORD="$PG_PASSWORD"; fi
 
 log() { printf 'bifrost-seed: %s\n' "$*"; }
 fail() { printf 'bifrost-seed: error: %s\n' "$*" >&2; exit 1; }
@@ -195,27 +215,28 @@ if [ "$target_exists" = "1" ]; then
     # At least one table. It is a failed restore only if every one of them is
     # empty; anything else is refused.
     #
-    # One query over every table, unioned by the server and stopping at the
-    # first row each: `format('%I')` quotes the identifiers so a name cannot
-    # break the query the server builds for itself, and the whole aggregate is
-    # wrapped in one `EXISTS` so the per-table `LIMIT` is legal -- a bare
-    # `UNION ALL` of `LIMIT`ed selects is a syntax error. That error was the
-    # first version of this and it was worse than a bug: an empty result from a
-    # *failed* query reads exactly like an empty database, so the script
-    # dropped and re-seeded a target that had all of its rows.
+    # One query of `EXISTS (SELECT 1 FROM t)` arms joined with `OR`, built by the
+    # server so `format('%I')` quotes the identifiers. Each arm is a sub-select
+    # rather than a `LIMIT`ed `SELECT` joined with `UNION ALL`: PostgreSQL rejects
+    # `LIMIT` in the middle of a `UNION` without per-arm parentheses, and the
+    # first version of this did exactly that -- so it worked on a target with one
+    # table and was a syntax error on a target with two, which is every real
+    # one. `OR` short-circuits, so the cost is one row from the first non-empty
+    # table.
     probe_sql="$(psql --no-psqlrc --quiet --no-align --tuples-only -d "$TARGET" -c "
       SELECT coalesce(
-        string_agg(format('SELECT 1 FROM %I.%I LIMIT 1', schemaname, tablename), ' UNION ALL '),
-        'SELECT 1 WHERE false'
+        string_agg(format('EXISTS (SELECT 1 FROM %I.%I)', schemaname, tablename), ' OR '),
+        'false'
       )
       FROM pg_tables WHERE schemaname = 'public'
     ")"
     if [ -z "$probe_sql" ]; then
       fail "could not build the emptiness probe for '$TARGET'; refusing to guess whether it has content"
     fi
-    # `ON_ERROR_STOP` and the explicit failure branch: a probe that cannot run
-    # has to stop the seed. Reading a failed query as "empty" is the bug above.
-    populated="$(psql --no-psqlrc --quiet --no-align --tuples-only -v ON_ERROR_STOP=1 -d "$TARGET" -c "SELECT EXISTS (${probe_sql})")" \
+    # No `ON_ERROR_STOP` excuse here: a probe that cannot run has to stop the
+    # seed, because reading a failed query as "empty" is how a target with rows
+    # gets dropped.
+    populated="$(psql --no-psqlrc --quiet --no-align --tuples-only -v ON_ERROR_STOP=1 -d "$TARGET" -c "SELECT ${probe_sql}")" \
       || fail "the emptiness probe for '$TARGET' did not run; refusing to guess whether it has content"
     case "$populated" in
       t | f ) : ;;
@@ -272,12 +293,20 @@ dump_seconds="$(elapsed_seconds "$dump_start" "$dump_end")"
 log "dump took ${dump_seconds}s ($(wc -c < "$dump_file" | tr -d ' ') bytes)"
 
 restore_start="$(now_ms)"
-# `ON_ERROR_STOP` so a restore that fails half way exits non-zero rather than
-# printing errors and returning 0, which is what leaves the half-restored target
-# the next run resets. Output is discarded because the dump's leading
-# `set_config` calls return rows, and their output in the log is noise rather
-# than evidence.
-psql --no-psqlrc --quiet -v ON_ERROR_STOP=1 -o /dev/null -d "$TARGET" -f "$dump_file"
+# `--single-transaction` is what makes "the restore is the transaction" true.
+# Plain `pg_dump` output carries no `BEGIN`/`COMMIT` (measured: zero of either in
+# a dump of two tables), so without this every statement commits as it runs --
+# and because data is loaded before the post-data section (constraints, indexes,
+# foreign keys), a failure after the first `COPY` leaves rows behind. The next
+# run's emptiness probe would then correctly see content and refuse, so the retry
+# decision 19 promises would need a human with `DROP DATABASE`. With this flag a
+# failed restore rolls back to the schema-less or row-less shapes the script
+# already resets, which is the convergent behaviour.
+#
+# `ON_ERROR_STOP` so a statement that fails stops rather than being skipped and
+# reported as success; `-o /dev/null` because the dump's leading `set_config`
+# calls return rows and their output is noise rather than evidence.
+psql --no-psqlrc --quiet -v ON_ERROR_STOP=1 --single-transaction -o /dev/null -d "$TARGET" -f "$dump_file"
 restore_end="$(now_ms)"
 restore_seconds="$(elapsed_seconds "$restore_start" "$restore_end")"
 log "restore took ${restore_seconds}s"

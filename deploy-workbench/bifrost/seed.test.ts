@@ -445,44 +445,145 @@ describe("seed.sh", () => {
       psql(pg, "postgres", `DROP DATABASE ${target}`);
     });
 
-    it("refuses a target that is already seeded rather than restoring twice", () => {
-      const target = "bifrost_seed_again";
-      const first = runSeed(pg, { target });
-      assert.equal(first.status, 0, first.stderr);
-      const before = rowCount(pg, target, "governance_budgets");
+    it("refuses a target with content across several tables", () => {
+      // The case the single-table fixture above cannot see, and it is the one
+      // that ships. The emptiness probe is built per table and joined by the
+      // server; the first version joined the arms with `UNION ALL` around a
+      // `LIMIT`, which PostgreSQL rejects -- so it worked on one table and was a
+      // syntax error on two. Every real colour has dozens.
+      //
+      // Worse, the failure was silent in the direction that matters: a failed
+      // probe returned nothing, which reads exactly like an empty database, and
+      // an *empty* target takes the reset path and is dropped. So the bug's real
+      // shape was "a target with rows in one of several tables gets dropped and
+      // re-seeded". This test puts the rows in the table that is NOT first, so a
+      // probe that only inspected one table fails it too.
+      const target = "bifrost_seed_refuse_multi";
+      psql(pg, "postgres", `CREATE DATABASE ${target}`);
+      // `aaa_empty` sorts before `zzz_populated`, so the probe sees an empty
+      // table first.
+      psql(pg, target, "CREATE TABLE aaa_empty (id varchar(255) PRIMARY KEY)");
+      psql(pg, target, "CREATE TABLE zzz_populated (id varchar(255) PRIMARY KEY)");
+      psql(pg, target, "INSERT INTO zzz_populated VALUES ('a-row') ");
 
-      const second = runSeed(pg, { target });
-      assert.notEqual(second.status, 0, "a second seed restored over the first");
-      assert.equal(rowCount(pg, target, "governance_budgets"), before);
-      // The retry that matters is the one after a *failure*, and it takes the
-      // reset path below. A completed seed is a refusal, because the target is
-      // the colour that would be serving.
+      const result = runSeed(pg, { target });
+      assert.notEqual(
+        result.status,
+        0,
+        "the seed dropped a target that had rows in one of several tables",
+      );
+      // The *right* refusal, not just any failure. A probe that does not run
+      // also exits non-zero, and that is the state the first version of this
+      // probe produced: the script's `|| fail` caught the syntax error, so the
+      // run failed for the wrong reason and the test above could not tell. The
+      // message is the difference between "this colour has content" and "I could
+      // not tell whether it has content".
+      assert.match(
+        result.stderr,
+        /already has content/,
+        `expected the content refusal, got: ${result.stderr}`,
+      );
+      assert.doesNotMatch(
+        result.stderr,
+        /did not run|could not build/,
+        `the emptiness probe failed rather than answering: ${result.stderr}`,
+      );
+      // The rows survived, which is the property: refused, not truncated.
+      assert.equal(rowCount(pg, target, "zzz_populated"), 1);
       psql(pg, "postgres", `DROP DATABASE ${target}`);
     });
 
-    it("resets a half-restored target instead of refusing it", () => {
-      const target = "bifrost_seed_half";
-      psql(pg, "postgres", `CREATE DATABASE ${target}`);
-      // What a `pg_restore` killed mid-copy leaves: the schema, and no rows.
-      // Decision 19's convergent case, and the reason the retry is the next
-      // deploy rather than a human with a `DROP DATABASE`.
-      psql(
-        pg,
-        target,
-        "CREATE TABLE governance_budgets (id varchar(255) PRIMARY KEY, current_usage float8 DEFAULT 0, last_reset timestamptz)",
+    it("restores inside one transaction, so a failure leaves nothing", () => {
+      // Decision 19's promise, in two halves, because the end-to-end failure
+      // cannot be contrived from a valid dump: the reset drops the target, so
+      // the restore always starts from zero tables and a `pg_dump` of a healthy
+      // store produces SQL that loads. Every failure that matters in practice --
+      // a dropped connection, a disk full, a statement the target rejects -- is
+      // one nothing in the dump predicts.
+      //
+      // So: the semantics, measured on this server; and the flag, pinned where
+      // the script uses it. Together they cover the property, and neither is a
+      // simulation of the other.
+      //
+      // This matters because plain `pg_dump` output carries no BEGIN/COMMIT
+      // (measured: none in a dump of two tables), and data is loaded before the
+      // post-data section. Without the flag a failure after the first `COPY`
+      // commits those rows, the next run's probe correctly sees content, and the
+      // retry decision 19 promises needs a human with `DROP DATABASE`.
+      const statement = [
+        "CREATE TABLE landed (id int);",
+        "INSERT INTO landed VALUES (1);",
+        "SELECT 1 / 0;",
+      ].join("\n");
+      const file = path.join(
+        fs.mkdtempSync(path.join(os.tmpdir(), "seed-rollback-")),
+        "fail.sql",
+      );
+      fs.writeFileSync(file, statement);
+
+      const restore = (target: string, flags: string[]): void => {
+        psql(pg, "postgres", `CREATE DATABASE ${target}`);
+        const result = spawnSync(
+          pgBin("psql"),
+          [
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-o",
+            "/dev/null",
+            ...flags,
+            "-d",
+            target,
+            "-f",
+            file,
+          ],
+          { env: pgEnv(pg), encoding: "utf8" },
+        );
+        assert.notEqual(result.status, 0, "the failing statement did not fail");
+      };
+
+      // Without the flag: the rows the earlier statements wrote are still there.
+      // This is the state that makes the next run refuse.
+      restore("bifrost_seed_no_txn", []);
+      assert.equal(
+        psql(
+          pg,
+          "bifrost_seed_no_txn",
+          "SELECT to_regclass('public.landed') IS NOT NULL",
+        ),
+        "t",
+        "expected the unwrapped statements to commit; if they did not, this test proves nothing",
       );
 
-      const result = runSeed(pg, { target });
+      // With it: nothing the failed run did survives.
+      restore("bifrost_seed_one_txn", ["--single-transaction"]);
       assert.equal(
-        result.status,
-        0,
-        `a half-restored target was refused rather than reset: ${result.stderr}`,
+        psql(
+          pg,
+          "bifrost_seed_one_txn",
+          "SELECT to_regclass('public.landed') IS NOT NULL",
+        ),
+        "f",
+        "--single-transaction did not roll the failed restore back, so the convergent retry is broken",
       );
-      assert.equal(
-        rowCount(pg, target, "governance_budgets"),
-        rowCount(pg, SOURCE_DB, "governance_budgets"),
+
+      // And the script's own restore carries the flag, which is what puts the
+      // measured semantics in the task rather than in this test.
+      const restoreLine = fs
+        .readFileSync(SCRIPT, "utf8")
+        .split("\n")
+        .find((line) => /^\s*psql\b.*-f "\$dump_file"/.test(line));
+      assert.ok(restoreLine, "the seed has no restore invocation");
+      assert.match(
+        restoreLine,
+        /--single-transaction/,
+        "the restore does not run in one transaction, so a failed deploy leaves rows behind and the next seed refuses instead of resetting",
       );
-      psql(pg, "postgres", `DROP DATABASE ${target}`);
+      assert.match(restoreLine, /ON_ERROR_STOP/);
+
+      psql(pg, "postgres", "DROP DATABASE bifrost_seed_no_txn");
+      psql(pg, "postgres", "DROP DATABASE bifrost_seed_one_txn");
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
     });
 
     it("refuses a target that is the source, so a colour cannot seed itself", () => {
@@ -670,9 +771,19 @@ describe("seed.sh", () => {
         !/--serializable-deferrable/.test(code),
         "the seed enables serializable-deferrable, which is a stronger lock than the seed needs",
       );
-      assert.ok(
-        !/--single-transaction/.test(code),
-        "pg_dump already wraps a dump in one transaction; --single-transaction has a different meaning and is not what makes this a snapshot",
+      // `--single-transaction` is the *restore's* flag and must be there: it is
+      // what makes a failed restore roll back to a shape the next run resets
+      // (see the rollback test). It is not the dump's: `pg_dump` already wraps
+      // its own dump in one transaction, and the flag on that side would be a
+      // different guarantee wearing the same name.
+      const dumpLine = code
+        .split("\n")
+        .find((line) => /^\s*pg_dump\b/.test(line));
+      assert.ok(dumpLine, "the seed has no pg_dump call");
+      assert.doesNotMatch(
+        dumpLine,
+        /--single-transaction|(^|\s)-1(\s|$)/,
+        "the dump passes --single-transaction; pg_dump's own dump is already one transaction, and the flag belongs on the restore",
       );
       assert.ok(
         !/--exclude-table-data/.test(code),
@@ -711,31 +822,102 @@ describe("seed.sh", () => {
     });
   });
 
-  describe("credentials", LIVE, () => {
-    it("connects with the env names the task definition injects", () => {
-      // The task reuses `PG_*` and the RDS-managed password rather than a
-      // third mechanism, so the script must read those names and no other.
-      // libpq reads PGHOST/PGPORT/PGUSER/PGPASSWORD from the environment, so
-      // the script names them only in its documentation -- which is exactly
-      // what keeps it from inventing a connection string.
+  describe("the credentials the task definition injects", LIVE, () => {
+    // The bug this suite missed on its first pass, and the one an ECS run would
+    // have hit immediately: the task injects `PG_HOST`/`PG_PORT`/`PG_USER`/
+    // `PG_PASSWORD` (Bifrost's names, from `config.json`), while libpq reads
+    // `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`. The tests set the libpq names
+    // directly and the task-definition test checked the `PG_*` names, so neither
+    // saw that nothing converted one to the other. Only the union fails.
+    const TASK_NAMES: Array<[string, string]> = [
+      ["PG_HOST", "PGHOST"],
+      ["PG_PORT", "PGPORT"],
+      ["PG_USER", "PGUSER"],
+      ["PG_PASSWORD", "PGPASSWORD"],
+    ];
+
+    it("maps every task-definition name onto the libpq name it stands for", () => {
       const source = fs.readFileSync(SCRIPT, "utf8");
-      for (const name of ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD"]) {
-        assert.ok(
-          source.includes(name),
-          `seed.sh does not name ${name}, so it is not documented as reading the credentials the task injects`,
+      for (const [taskName, libpqName] of TASK_NAMES) {
+        // The mapping has to be an assignment from the task's name, not a
+        // mention in a comment: a `grep` for `PGHOST` passes on a script that
+        // mentions it and never sets it, which is what the first version did.
+        assert.match(
+          source,
+          new RegExp(`export ${libpqName}="\\$${taskName}"`),
+          `seed.sh does not map ${taskName} onto ${libpqName}, so libpq falls back to a local socket the container does not have`,
         );
       }
-      // `PGPASSWORD` comes from the same secret key the gateway uses, and
-      // libpq reads it from the environment. A URL or a `password=` here would
-      // be the password in an argument list, visible in `ps`.
+    });
+
+    it("connects when given only the task definition's names", () => {
+      // The behavioural half, which is what makes the textual check above more
+      // than a spelling test: the environment has the task's names and none of
+      // libpq's, exactly as ECS would build it.
+      const result = spawnSync("/bin/sh", [SCRIPT], {
+        env: {
+          PATH: PG_BIN
+            ? `${PG_BIN}${path.delimiter}${process.env.PATH ?? ""}`
+            : process.env.PATH,
+          PG_HOST: pg.host,
+          PG_PORT: pg.port,
+          PG_USER: pg.user,
+          ...(pg.password ? { PG_PASSWORD: pg.password } : {}),
+          [ENV.SOURCE]: SOURCE_DB,
+          [ENV.TARGET]: "bifrost_seed_tasknames",
+          // The full list, so the source-coverage check does not answer first:
+          // this test is about the connection, not the table set.
+          [ENV.TABLES]: scriptTables().join(" "),
+        },
+        encoding: "utf8",
+      });
+      assert.equal(
+        result.status,
+        0,
+        `the seed could not connect when given only the task definition's PG_* names: ${result.stderr}`,
+      );
+      assert.equal(
+        rowCount(pg, "bifrost_seed_tasknames", "governance_budgets"),
+        2,
+      );
+      psql(pg, "postgres", "DROP DATABASE bifrost_seed_tasknames");
+    });
+
+    it("does not overwrite libpq's own variables with an empty string", () => {
+      // The mapping is conditional, which is what lets the script run from a
+      // shell that already has libpq's variables exported.
+      const source = fs.readFileSync(SCRIPT, "utf8");
+      for (const taskName of ["PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD"]) {
+        assert.ok(
+          source.includes(`if [ -n "\${${taskName}:-}" ]`),
+          `the mapping for ${taskName} is unconditional, so an unset value would clobber a real libpq variable`,
+        );
+      }
+    });
+  });
+
+  describe("credentials", LIVE, () => {
+    it("names no password on any command line", () => {
+      // The connection mechanism itself is pinned by the `the credentials the task
+      // definition injects` suite above. This is the separate property that the
+      // password never reaches an argument list -- `ps` on a task is not
+      // private -- so there is no URL and no `password=...` flag, only libpq's
+      // own environment variable.
+      const code = fs
+        .readFileSync(SCRIPT, "utf8")
+        .split("\n")
+        .filter((line) => !/^\s*#/.test(line))
+        .join("\n");
       assert.ok(
-        !/password=/i.test(source),
-        "seed.sh builds a connection string with a password in it",
+        !/password=['\"]/.test(code),
+        "seed.sh puts a password on a command line, where `ps` can read it",
       );
       assert.ok(
-        !/postgres:\/\//.test(source),
+        !/postgres:\/\//.test(code),
         "seed.sh builds a connection URL, which would put the password in its arguments",
       );
+      // It is read from the environment and exported, never echoed.
+      assert.ok(!/echo[^\n]*\$PGPASSWORD|printf[^\n]*\$PGPASSWORD/.test(code));
     });
 
     it("never prints the password", () => {
