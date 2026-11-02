@@ -532,6 +532,50 @@ Three choices the design left open:
 
 The teardown question is answered under "Open questions".
 
+## What step 5b found
+
+Step 4b landed as thegoodparty/omni#3507, so gp-api's diff reads no secret
+value, and `github-actions-gp-api-plan` takes the Terraform plan role's
+shape: `ReadOnlyAccess` plus denies. It adds three things a Pulumi preview
+needs: gp-api's dev and prod checkpoints, the state passphrase, and the two
+Grafana tokens its Grafana provider is configured with.
+
+**The passphrase decrypts whatever gp-api stores in state.** That is the
+standing cost of a pull request running a Pulumi preview. Checked on
+2026-11-02 by listing every encrypted value in both checkpoints, by
+ciphertext length, without decrypting any:
+
+- Live: the Grafana provider's `auth` and `smAccessToken`, the same two
+  tokens the role reads from SSM.
+- Empty or null: `masterPassword` on gp-api's three Aurora clusters and the
+  election cluster, the SES identity's `domainSigningPrivateKey`, the
+  synthetic checks' `bearerToken`, and the prod CloudWatch datasource's
+  `secureJsonDataEncoded` and `httpHeaders`.
+- Public: the three DKIM CNAME records' names and values.
+
+A component that later stores a real secret in gp-api's state makes it
+readable from a pull request, so that is worth catching in review.
+
+**Older copies of state hold the old passwords.** Each stack's `.json.bak`
+beside the checkpoint, `backups/`, `history/` and the bucket's object
+versions all keep earlier checkpoints, and the ones written before 4b carry
+the Aurora master passwords. So the state grant is the two checkpoints by
+exact name, not `stacks/gp-api/*`, and `GetObjectVersion` is denied
+everywhere. Changing the passwords once would make those copies worthless as
+well. That is optional, and a manual change to each cluster and its secret,
+since Pulumi no longer manages them.
+
+**A preview writes nothing.** The DIY backend takes the state lock for
+update, import, refresh and destroy, not preview, and `stack select
+--create` writes nothing for a stack that exists (settled under "What step 4
+found"). The role holds no write.
+
+**One lookup still asks for a secret.** `components/grafana.ts` reads the
+alert filter's webhook password from `AI_SECRETS_<ENV>`. The role denies it,
+and the code catches that, warns, and skips the contact point, which neither
+stack has created. If one is created later, pull request diffs will show it
+as a delete; the fix then belongs in omni.
+
 ## Design: the workflows that should not hold credentials at all
 
 Three cases, all of them the pattern PR #90 applied to this repo's
@@ -588,11 +632,12 @@ consumer to sequence against.
 
 ## Open questions
 
-- How does the gp-api program stop needing `DB_PASSWORD` at program time?
-  The key-name half is `pr-previews.md` step 3's declared list, but
-  `masterPassword` on the Aurora cluster is a real value, so that half needs
-  its own answer (AWS-managed master password, or keeping the cluster out of
-  the previewed program). (step 4b)
+- ~~How does the gp-api program stop needing `DB_PASSWORD` at program
+  time?~~ Settled at step 4b (thegoodparty/omni#3507): neither option. The
+  clusters take no `masterPassword` input, as the election cluster already
+  did, so each keeps the password it has and tasks read `DB_PASSWORD` from
+  the secret. The key names are a declared list in
+  `deploy/gp-api-secret-keys.ts`, checked against the live secret on deploy.
 - ~~Can teardown drop the preview database without running a task on the dev
   cluster's task definition?~~ Settled at step 6: yes. The preview's own task
   definition already carries everything the drop needs (`GP_API_DEV`'s

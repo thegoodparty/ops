@@ -6,6 +6,8 @@ import {
   githubActionsPulumiDeployTrust,
   githubActionsPulumiPlan,
   githubActionsPulumiPlanTrust,
+  githubActionsGpApiPlan,
+  githubActionsGpApiPlanTrust,
   githubActionsPulumiPreview,
   githubActionsPulumiPreviewTrust,
   githubActionsWorkbenchDeploy,
@@ -230,6 +232,34 @@ export const createCiRoles = () => {
     policyArn: READ_ONLY_ACCESS_ARN,
   });
 
+  // The gp-api plan role, step 5b of docs/deploy-role-trust.md. Trusted by
+  // `pull_request` in omni alone, for `gp-api-infrastructure-diffs.yml`'s
+  // `pulumi preview` of gp-api's dev and prod stacks. The Terraform plan
+  // role's shape, ReadOnlyAccess plus an inline document whose denies bound
+  // it, with gp-api's current state, the passphrase and the two Grafana tokens
+  // added.
+  //
+  // No protect. Nothing depends on it until omni points the diff workflow at
+  // it.
+  const gpApiPlanRole = new aws.iam.Role("githubActionsGpApiPlan", {
+    name: "github-actions-gp-api-plan",
+    description:
+      "Read-only Pulumi previews of gp-api's dev and prod stacks from pull_request runs in thegoodparty/omni.",
+    assumeRolePolicy: JSON.stringify(githubActionsGpApiPlanTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsGpApiPlanPolicy", {
+    name: "GpApiPlan",
+    role: gpApiPlanRole.id,
+    policy: JSON.stringify(githubActionsGpApiPlan),
+  });
+
+  new aws.iam.RolePolicyAttachment("githubActionsGpApiPlanReadOnlyAttachment", {
+    role: gpApiPlanRole.name,
+    policyArn: READ_ONLY_ACCESS_ARN,
+  });
+
   const delegateEvalRole = new aws.iam.Role("githubActionsDelegateEval", {
     name: "github-actions-delegate-eval",
     description:
@@ -324,6 +354,7 @@ export const createCiRoles = () => {
     infrastructureDeployRole,
     previewRole,
     planRole,
+    gpApiPlanRole,
     delegateEvalRole,
     delegateEvalCachePushRole,
     delegateEvalLedgerRole,

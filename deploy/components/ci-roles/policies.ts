@@ -1281,6 +1281,168 @@ export const githubActionsPulumiPlan: PolicyDocument = {
 };
 
 // ---------------------------------------------------------------------------
+// The gp-api plan role (step 5b of docs/deploy-role-trust.md)
+//
+// omni's `gp-api-infrastructure-diffs.yml` runs `pulumi preview` of gp-api's
+// dev and prod stacks on pull requests that touch its deploy code, and today
+// assumes the shared admin deploy role to do it. Step 4b
+// (thegoodparty/omni#3507) stopped the program reading GP_API_DEV and
+// GP_API_PROD, which is what lets a read-only role run it.
+//
+// The Terraform plan role's shape, ReadOnlyAccess plus denies, for its reason:
+// a preview reads whatever the program looks up, and enumerating that breaks
+// every time a component adds a lookup. omni pull requests can already assume
+// the Terraform plan role, so ReadOnlyAccess's reach is not new to them. What
+// this role adds is what a Pulumi preview needs and a Terraform plan does not:
+// gp-api's current state, the passphrase that decrypts it, and the two Grafana
+// tokens its Grafana provider is configured with.
+//
+// The standing cost: anything gp-api's program stores in state as a secret, a
+// pull request can decrypt. On 2026-11-02 the only live ones were the Grafana
+// provider's two tokens, which this role reads from SSM anyway; the rest were
+// empty or public. docs/deploy-role-trust.md, "What step 5b found", lists them.
+//
+// Its own role rather than more statements on the Terraform one, because that
+// role's other subject, gp-terraform-dataplatform, should not read gp-api's
+// state.
+
+const STATE_PASSPHRASE_PARAMETER =
+  "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase";
+
+const GRAFANA_TOKEN_PARAMETERS = [
+  "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+  "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+];
+
+// The two stacks the diff previews, by exact name, and the backend's format
+// file. Exact rather than `stacks/gp-api/*`, which is what
+// `pulumiBackendReadStatements` would grant: that prefix also holds each
+// stack's `.json.bak`, the previous checkpoint, and the preview stacks. Older
+// copies of this state are also kept under `backups/` and `history/` and as S3
+// versions, and the ones written before step 4b hold the Aurora master
+// passwords. A preview reads only the current checkpoint.
+const GP_API_PLAN_READABLE = [
+  `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
+  `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+  `${BUCKET}/.pulumi/meta.yaml`,
+];
+
+export const githubActionsGpApiPlanTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // No `job_workflow_ref` pin, for the reason given on the Terraform
+          // plan role: on a pull request the workflow file comes from the
+          // branch too, so the pin constrains nothing.
+          "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:pull_request",
+        },
+      },
+    },
+  ],
+};
+
+/**
+ * Inline half of the gp-api plan role. The other half is the AWS-managed
+ * `ReadOnlyAccess`, attached in ci-roles.ts, so the allows here document what
+ * a preview uses and the denies are what bound it.
+ *
+ * No write of any kind. A DIY-backend `pulumi preview` takes no state lock
+ * (only update, refresh, destroy and import do), and `stack select --create`
+ * writes nothing for a stack that already exists ("What step 4 found").
+ */
+export const githubActionsGpApiPlan: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "PulumiStateBucket",
+      Effect: "Allow",
+      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+      Resource: BUCKET,
+    },
+    {
+      Sid: "PulumiStateObjects",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: GP_API_PLAN_READABLE,
+    },
+    {
+      Sid: "PulumiStatePassphrase",
+      Effect: "Allow",
+      Action: ["ssm:GetParameter"],
+      Resource: STATE_PASSPHRASE_PARAMETER,
+    },
+    {
+      Sid: "GrafanaTokens",
+      Effect: "Allow",
+      // `infra-cli.ts` reads both on every dev and prod run and hands them to
+      // the Grafana provider, which a preview needs to compare the alert
+      // rules, dashboards and synthetic checks gp-api manages. A preview with
+      // the provider configured differently would report every one of them
+      // as changed.
+      Action: ["ssm:GetParameter"],
+      Resource: GRAFANA_TOKEN_PARAMETERS,
+    },
+    {
+      // ReadOnlyAccess grants `s3:GetObject` on `*`, so this deny, not the
+      // allow above, is what limits the role to gp-api's current state. Its
+      // NotResource must stay identical to that allow.
+      Sid: "DenyOtherS3Objects",
+      Effect: "Deny",
+      Action: ["s3:GetObject"],
+      NotResource: GP_API_PLAN_READABLE,
+    },
+    {
+      // Blanket, gp-api's own state included. The state bucket is versioned,
+      // and the versions written before step 4b hold the Aurora master
+      // passwords Pulumi no longer manages. The backend never passes a
+      // `versionId`, so nothing a preview does needs this.
+      Sid: "DenyObjectVersions",
+      Effect: "Deny",
+      Action: ["s3:GetObjectVersion"],
+      Resource: "*",
+    },
+    {
+      // Blanket. The program reads no secret value since step 4b. Its one
+      // remaining lookup, the alert filter's webhook password in
+      // AI_SECRETS_<ENV> (`components/grafana.ts`), catches the AccessDenied,
+      // warns and skips that contact point, which neither stack has created.
+      Sid: "DenySecretValues",
+      Effect: "Deny",
+      Action: ["secretsmanager:GetSecretValue"],
+      Resource: "*",
+    },
+    {
+      // Every parameter but the three this role reads. ReadOnlyAccess grants
+      // `ssm:GetParameter*` on `*`.
+      Sid: "DenyOtherParameters",
+      Effect: "Deny",
+      Action: [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+      ],
+      NotResource: [STATE_PASSPHRASE_PARAMETER, ...GRAFANA_TOKEN_PARAMETERS],
+    },
+    {
+      // Including the three above: history returns earlier values in
+      // plaintext, and a preview needs only the current ones.
+      Sid: "DenyParameterHistory",
+      Effect: "Deny",
+      Action: ["ssm:GetParameterHistory"],
+      Resource: "*",
+    },
+  ],
+};
+
+// ---------------------------------------------------------------------------
 // The gp-api preview role boundary (step 6a of docs/deploy-role-trust.md)
 //
 // A permissions boundary, not a grant. omni's gp-api preview stack creates two
