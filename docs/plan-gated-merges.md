@@ -81,7 +81,17 @@ Stated as invariants, not features:
   `CODEOWNERS` on `main` leaves unowned, and (c) is consistent with that plan,
   can merge on a `delegate` approval with no human code-owner behind it.
 - **`delegate` can never approve a change to itself.** Not its code, not its
-  prompts, not its inputs, not its own authority.
+  prompts, not its inputs, not its own authority. This holds by carve-out
+  rather than by `deploy/` staying owned: seven paths inside it are named back
+  into the owned set in `.github/CODEOWNERS` -- `deploy/components/worker.ts`
+  (the image binding, the gating mode, the record bucket and the agent
+  version), `deploy/components/webhooks.ts` (the dispatcher: `ecs:RunTask`,
+  `iam:PassRole`, read of `DELEGATES`), `deploy/index.ts` (the wiring),
+  `deploy/deploy.sh` (the only place `workerImageUri` is set),
+  `deploy/delegate-secret.ts` (`DELEGATE_SECRET_KEYS`), and
+  `deploy/components/ci-roles.ts` with `ci-roles/policies.ts` (the delegate-path
+  IAM). Everything else under `deploy/` is infrastructure, and step 6 accepts
+  bot approval of it. See "The carve-out" below.
 - **No single human can change the organization's security posture.** A posture
   change still requires a human other than the author, either directly or as the
   review of a plan that the bot is then bound to.
@@ -570,18 +580,53 @@ that the rates are recorded where the next reader can see them.
 
 That bar was not met for the first path de-owned, and the bar is not lowered
 because of it. What happened instead is recorded once, with its evidence and its
-tripwire, in "The first path, and the bar it did not wait for" below; the bar
-still governs the three trees that remain owned.
+tripwire, in "The first path, and the bar it did not wait for" below. It was not
+met for the other three either, and that is recorded in "The batch of three, and
+the bar it did not wait for". Neither departure lowers the bar. Any Pulumi path
+still owned after both is still governed by it.
 
 ## De-owning the Pulumi trees, one path at a time
 
 Each of `deploy/`, `deploy-org/`, `deploy-workbench/` and `deploy-infrastructure/`
-is its own PR, and each PR changes only its own line plus the places that
-describe it:
+is de-owned by its own PR, as the rule below says, and each PR changes only its
+own line plus the places that describe it. **Amended 2026-10-30:** three of the
+four went in one PR, `deploy/`, `deploy-org/` and `deploy-infrastructure/`,
+which is the departure recorded in "The batch of three, and the bar it did not
+wait for". The sentence above describes the rule that was set, not every PR
+that has followed it.
 
-- `.github/CODEOWNERS`: one line removed from the opt-out list, and the
+**The carve-out.** `deploy/` is de-owned except for the reviewer's own logic and
+authority, which stay human-owned. Seven paths are named back into the owned set
+in `.github/CODEOWNERS`, after the owner-less `/deploy/` line so that the last
+match wins:
+
+| Path | Why it is not de-owned |
+|---|---|
+| `deploy/components/worker.ts` | The reviewer's task definition. `image: config.imageUri` is what commit of `delegate/` runs, `DELEGATE_GATING_MODE` is its authority, `REVIEW_BUCKET` and `AGENT_VERSION` are what it decided and what ran. |
+| `deploy/components/webhooks.ts` | The only path that starts a review: the dispatcher role holds `ecs:RunTask` on the task definition, `iam:PassRole` on `*`, read of `DELEGATES`, and carries the task definition ARN. |
+| `deploy/index.ts` | Wires `createWorker` and the webhook Lambda: the image URI, the secret key list and the task definition ARN pass through it. |
+| `deploy/deploy.sh` | The only place `workerImageUri` is set. A change here can pin an arbitrary image, so it changes what logic runs. |
+| `deploy/delegate-secret.ts` | `DELEGATE_SECRET_KEYS`, the source of truth for keys injected into the agent container: its inputs and its capability. |
+| `deploy/components/ci-roles.ts`, `ci-roles/policies.ts` | The IAM the delegate eval path assumes. IAM is what the reviewer is allowed to do, which is authority, not plumbing. |
+
+Everything else under `deploy/` is de-owned on purpose, not by oversight:
+`Pulumi.yaml`, `check-secret-keys.ts`, the rest of `deploy/components/`
+(`identity-center`, the bifrost readers) and the non-delegate components. The
+line is the engineer's, stated in their words: bot approval of delegate
+*infrastructure* is accepted; only delegate *logic* and *authority* are carved
+out. Widening the carve-out is a change to a path the default owns, so it needs
+a human, like every other entry in this list.
+
+`delegate/review/codeowners.test.ts` pins the shipped file against the gate's own
+resolver: each de-owned tree resolves to unowned, each carved-out path to owned,
+and the paths the decision deliberately leaves de-owned stay that way. The order
+is part of what it pins, because a carve-out block moved above `/deploy/` is
+overridden silently rather than rejected.
+
+- `.github/CODEOWNERS`: one owner-less line added to the opt-out list, and the
   commentary updated to say which path was de-owned, on what evidence, and when.
-  This is the record; there is no other.
+  This is the record; there is no other. The line grants authority, so reading
+  "one line removed" literally would re-own the path (see "The first path").
 - `CLAUDE.md`: the "Review and approval" section, whose list of paths that need
   a human is now wrong. `docs/` is human-owned after step 2, which is why this
   edit rides in the same PR as the de-owning rather than needing its own: both
@@ -645,9 +690,14 @@ to `CODEOWNERS`.
    ahead of step 5's bar rather than after it, deliberately and once, on the
    engineer's call. What that decision rests on, what it does not, and the
    tripwire that reverses it are in "The first path, and the bar it did not
-   wait for". The rule itself is unchanged: the other three trees are still
-   candidates under the bar, each on its own evidence, and a false approve on
-   any of them still blocks de-owning it.
+   wait for".
+   **Amended 2026-10-30:** the other three, `deploy/`, `deploy-org/` and
+   `deploy-infrastructure/`, were de-owned in one batch, also ahead of the bar,
+   on the engineer's call. The rule that a path is de-owned only on its own
+   shadow evidence is not met for them, and this decision does not pretend it
+   is; what it records is in "The batch of three, and the bar it did not wait
+   for". The rule for any path not yet de-owned is unchanged, and a false
+   approve on any de-owned path still blocks de-owning further paths.
 7. **The bot derives authority from `CODEOWNERS` on `main`, per PR.** Not from a
    cached copy, not from configuration, not from the plan. Read at run time from
    the PR's base ref, and the base ref has to be `main`.
@@ -692,7 +742,11 @@ to `CODEOWNERS`.
 12. **Gating is per repo, by explicit adoption, and `ops` first.** See "Which
     repos this covers".
 13. **`off` is the default for the mode, in code.** A deployed `enforce` is a
-    human-owned `deploy/` change. Nothing about a missing env var or a failed
+    human-owned change: the reviewer's image binding, gating mode, secret key
+    list, dispatcher authority and delegate-path IAM are carved out of the
+    de-owned `deploy/` tree and stay owned. **Amended 2026-10-30:** this
+    decision used to say "a human-owned `deploy/` change", which is no longer
+    true of the tree as a whole; other `deploy/` infrastructure is de-owned. Nothing about a missing env var or a failed
     deploy can make the bot more able to merge, and the mode is flipped to
     `enforce` in the same PR that de-owns the first path (step 6), so the switch
     and the first thing it enables are reviewed together.
@@ -848,7 +902,7 @@ The Progress list is the checklist; this is the detail behind each step.
    against what humans did. The rates are recorded in the de-owning PRs' bodies
    and on a plan's ClickUp task when one exists. Step 5 ends with the numbers in
    hand and a recommendation per Pulumi tree, not with a date.
-6. **De-own, one path at a time.** Four PRs, each removing one line in
+6. **De-own, one path at a time.** Four PRs, each adding one owner-less line to
    `.github/CODEOWNERS` and updating the commentary and `CLAUDE.md` as above,
    each citing the shadow evidence for that path in its body. The first of the
    four also sets `DELEGATE_GATING_MODE=enforce` in
@@ -862,6 +916,22 @@ The Progress list is the checklist; this is the detail behind each step.
    evidence, not by size; `deploy-infrastructure/` is the one I would expect to
    go last, because it holds the runtime that acts on the identity store and the
    break-glass tool's own Lambda.
+   **Amended 2026-10-30:** the engineer chose to batch the remaining three trees
+   into one PR rather than run them one at a time, which is the departure
+   recorded in "The batch of three, and the bar it did not wait for". The mode
+   was already `enforce` from the first increment, so the batch changed no
+   `deploy/` file for the switch.
+   **Also amended 2026-10-30, and the part a reader needs:** `deploy/` is not
+   de-owned wholesale. Seven paths inside it are named back into the owned set in
+   the same file, each listed *after* the owner-less `/deploy/` line because the
+   last matching pattern wins: `deploy/components/worker.ts`,
+   `deploy/components/webhooks.ts`, `deploy/index.ts`, `deploy/deploy.sh`,
+   `deploy/delegate-secret.ts`, `deploy/components/ci-roles.ts` and
+   `deploy/components/ci-roles/policies.ts`. Together they are the reviewer's
+   image binding, gating mode, record bucket, agent version, secret key list,
+   dispatcher authority and delegate-path IAM — its logic and its authority. A
+   reader who believes "deploy/ is de-owned" believes something false about the
+   reviewer's own runtime. See "The carve-out" below.
 
 ## The first path, and the bar it did not wait for
 
@@ -940,17 +1010,23 @@ same repair.
 So that this decision has a trigger and an owner rather than an assumption that
 someone will notice.
 
-- **A false approve** is a PR in `deploy-workbench/` that `delegate` approved,
+- **A false approve** is a PR in any of `deploy/`, `deploy-org/`,
+  `deploy-workbench/` or `deploy-infrastructure/` that `delegate` approved,
   that merged on that approval, and that a human then had to fix or revert, or
-  that caused an incident. A finding it flagged is not a false approve, and a
+  that caused an incident. (Amended 2026-10-30: the definition named only
+  `deploy-workbench/` before the batch; it now covers all four de-owned trees.) A finding it flagged is not a false approve, and a
   comment a human merged over is not one either.
 - **One is enough.** The response is to remove the `deploy-workbench/` line from
   `.github/CODEOWNERS` immediately, in its own human-reviewed PR, and only then
   decide whether to try again, with the false approve described in that PR's
   body. The mode stays `enforce` through it: with no de-owned path it can only
-  comment, so it is not the thing that needs changing.
+  comment, so it is not the thing that needs changing. **Amended 2026-10-30:**
+  this response is written for the workbench tree alone and no longer covers the
+  batch. For a false approve in any of the four de-owned trees the response is
+  to re-own the batch, not the one path. See "The batch of three" below for what
+  that means and what it costs.
 - **Who reads them.** Jeff, who drives this plan and owns the workbench account,
-  reads the bot's approvals in `deploy-workbench/`. This document names the
+  reads the bot's approvals in all four de-owned trees. This document names the
   reader so the job is a responsibility rather than a hope, and naming someone
   else is how the job moves.
 - **Reading them needs no new tooling.** An approval is an `APPROVE` review from
@@ -958,6 +1034,76 @@ someone will notice.
   label and nothing new to add: every merged PR in the tree, and
   `gh pr view <n> --json reviews` for whether `delegate-reviewer` approved it.
   There is nothing to build before this can be read.
+
+## The batch of three, and the bar it did not wait for
+
+**2026-10-30.** `deploy/`, `deploy-org/` and `deploy-infrastructure/` are
+de-owned together, in one PR, on the engineer's call. Step 6 says each Pulumi
+tree is its own PR, de-owned only on its own shadow evidence, and that
+`deploy-infrastructure/` should go last. This section records why that rule is
+set aside for these three, and what it costs.
+
+**The bar was not met for them either.** The evidence is the same as for the
+workbench tree, and no more: over the last 100 merged PRs the reviewer's findings
+held up 31 of 32 times (median 4 minutes to the fix commit), its recall is
+unmeasured, and the shadow window produced no would-approves, so there is no
+false-approve denominator for any of the three. The gate would have approved none
+of those 100 PRs. The per-path rule has nothing to cite here, and this document
+does not pretend otherwise.
+
+**Per-path shadow evidence cannot be cited for them.** A single PR cannot cite
+three separate shadow windows. The shadow window also measured nothing that
+distinguishes the trees: every shadow review was a would-comment, so there is no
+per-path rate to put in the body of any of the three. The batch's PR body says
+the same, so the reviewer and the record do not read as if each tree had its own
+evidence.
+
+**Why the batch, and why the order the plan set is given up.** The engineer
+chose to batch the remaining three rather than run them one at a time. That
+gives up the plan's ordering by evidence, and it means `deploy-infrastructure/`
+goes at the same time as the other two, not last. The plan expected it to go
+last because it holds the runtime that acts on the identity store and the
+break-glass tool's own Lambda. Batching accepts that a false approve in that
+tree lands with the other two in the same record.
+
+**What the tripwire becomes.** Under the per-path design a false approve on one
+path was a one-line revert of that path, and the other paths stayed as they were.
+That is no longer true. Removing one of the three lines does not undo the
+decision, because the record covers the batch as one, and a false approve in any
+of the four leaves the decision in force for the other three unless the whole
+batch is re-owned. So:
+
+- **A false approve in any of the four** (as defined in "The tripwire") is
+  answered by re-owning all four trees in one human-reviewed PR, with the false
+  approve described in its body and this section updated in the same PR. A PR
+  that re-owns only the tree where the false approve happened needs its own
+  justification, because it leaves the record covering trees it no longer
+  describes.
+- **The mode stays `enforce`** through any re-owning. With no de-owned path it
+  can only comment, as above.
+- **What is not yet known.** Whether one false approve in the batch is enough to
+  reopen the other three trees, or whether a re-owning of only the failing tree
+  is acceptable, is a decision for the engineer when it arises. This PR does not
+  settle it, and the default above (re-own all four) is the conservative reading,
+  not a decision that has been made about the other case.
+
+**What this does not change.** Nothing about the bar's content, or the fact that
+`deploy-infrastructure/` is the riskiest of the four. Each of the four keeps its
+own name in the record, so a later reader can see which path was approved on
+which PR.
+
+**The carve-out, added the same day (#433 review).** Batching `deploy/` with the
+other two de-owned the reviewer's own task definition, dispatcher and image
+binding along with it, which the Goal invariant forbids and decision 13 said
+could not happen. The engineer's decision was to carve out delegate logic and
+authority, not the whole tree: seven paths in `deploy/` are named back into the
+owned set, listed in "The carve-out" above. The residual is deliberate and
+accepted -- `deploy.sh`'s image pinning is carved out, but `Pulumi.yaml`, the
+identity center, the bifrost readers and the wiring `deploy.sh` calls into are
+not, so a bot-approved `deploy/` change still reaches infrastructure. What the
+carve-out buys is that it cannot reach the reviewer's logic or authority through
+the paths named; what it does not buy is a guarantee that no indirect route
+exists, which is the same trust the rest of the de-owned trees already run on.
 
 ## What was verified
 
