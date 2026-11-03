@@ -1,14 +1,30 @@
 # Zero-downtime Bifrost deploys: a config store per colour
 
+> **Archived 2026-11-03. Superseded by
+> [`../bifrost-reconciler.md`](../bifrost-reconciler.md).** This plan proposed a
+> config store per colour, a seed of the inactive database on every deploy, and a
+> 100/200 rollout that briefly ran two tasks. It is rejected: the seed's committed
+> 66-table list is a permanent maintenance obligation against a dependency Bifrost
+> bumps weekly, and the residual 503 gap the overlap removed was never measured.
+> The replacement does not try to remove the restart window. It removes most of
+> the *reasons* for a restart, by converging the running single node to a
+> committed desired state. **Step 1 landed and is retained**: `stopTimeout: 120` and
+> `deploymentCircuitBreaker { enable: true, rollback: true }` merged in #437, and
+> they are still worth what they cost. **Steps 2 and onward are abandoned**, plus
+> the open PR for step 2, #438. The text below is otherwise unedited, because it
+> is the evidence for what was considered and rejected; the only changes are this
+> header and the relative links, which now point one directory up. Read it as a
+> record, not as a plan.
+
 > This is the plan for taking the gateway out of a deploy, which is a different
 > problem from making it highly available: it is one serving task before and
 > after, with a brief second task while the replacement is promoted. It extends
-> [`bifrost-gateway.md`](./bifrost-gateway.md), the gateway's plan, and assumes
+> [`bifrost-gateway.md`](../bifrost-gateway.md), the gateway's plan, and assumes
 > the task definition, service and database that plan describes. It changes no
 > code and no infrastructure. A PR that implements a step of it names this
 > document and the step in its body; progress is derived from those PRs and is
 > not written here (decision 11 of
-> [`plan-gated-merges.md`](./plan-gated-merges.md)).
+> [`plan-gated-merges.md`](../plan-gated-merges.md)).
 
 Every deploy of the gateway is an outage measured in minutes. The one measured
 end to end in `deploy-workbench/ingress.ts` took seven and a half minutes, and
@@ -464,7 +480,7 @@ A re-mint is safe to attempt blindly because the mint is the authorisation
 decision: the Lambda re-checks `Engineers` membership live on every call and
 refuses a non-member with `403`
 (`deploy-workbench/bifrost/vk-mint-core.ts`, and decision 1 of
-[`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md)). A mis-triggered re-mint
+[`bifrost-virtual-keys.md`](../bifrost-virtual-keys.md)). A mis-triggered re-mint
 therefore cannot escalate — at worst it is refused, which is the same error the
 caller already had.
 
@@ -491,7 +507,7 @@ between "a key was minted and lost" and "a key was minted into the new colour".
 It is cheap to add to the next step's verification and it is not worth a step.
 
 ### 15. `--refresh` documentation is replaced by the extension
-Decision 7 of [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) records the
+Decision 7 of [`bifrost-virtual-keys.md`](../bifrost-virtual-keys.md) records the
 current workaround, in its step 6: "A `401` from the gateway cannot be seen by
 the command — Pi calls the command before the request — so the gateway's
 rejection is answered by documentation: the `401` handling note says to run
@@ -703,7 +719,7 @@ Helm chart's storage documentation for dynamic credentials, so a fork would
 maintain a patch that reproduces a feature the pinned tag already ships.
 
 One prose consequence, recorded here rather than rediscovered: the sentence in
-[`bifrost-gateway.md`](./bifrost-gateway.md) under "Persistence, backup and
+[`bifrost-gateway.md`](../bifrost-gateway.md) under "Persistence, backup and
 upgrade" that says the master credential "reaches the task as an `env.`
 reference" stops being true with this step, so the housekeeping round (step 7)
 corrects it alongside the other stale prose this design creates.
@@ -771,7 +787,7 @@ across a deploy.
 The helper's name is not this document's to fix. `models.json`'s `apiKey` names
 whichever command the image actually ships — `gp-bifrost-key` today, because
 the image has no `gp-pi` dispatcher (open item 5 of
-[`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), settled in that plan's
+[`bifrost-virtual-keys.md`](../bifrost-virtual-keys.md), settled in that plan's
 `gp-pi` step). The extension runs the same command, not a string of its own, and
 that is the one detail the implementing step must not spell twice.
 
@@ -893,7 +909,7 @@ Notes that belong with the table rather than in it:
   colours being migrated by the same bad image is the snapshot restore, and the
   restore rehearsal stays.
 - **Not a change to how keys are issued.** The mint, the janitor and the key
-  template are [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md). This
+  template are [`bifrost-virtual-keys.md`](../bifrost-virtual-keys.md). This
   document changes where the store they write to lives, and adds a client-side
   recovery for the one write it can lose.
 - **Not a solution for harnesses other than `gp-pi`.** See the scope note above.
@@ -1089,7 +1105,7 @@ longer going to move under them.
    a deploy as an outage, the master credential's "reaches the task as an `env.`
    reference" sentence under the same heading (false once step 6 lands), and the
    `--refresh` supersession in
-   [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) (decision 15 above).
+   [`bifrost-virtual-keys.md`](../bifrost-virtual-keys.md) (decision 15 above).
    `docs/` is human-owned, so this is a review round of its own rather than a
    rider on an implementation PR, and the gateway plan's edits are deliberate
    amendments to a frozen spec, which is what that review is for. Proves: no

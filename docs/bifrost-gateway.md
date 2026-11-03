@@ -917,12 +917,21 @@ Virtual keys are Bifrost's primary governance entity
   populated by hand, and reaches the task as an `env.` reference.
 - **Availability.** Multi-AZ is the robust choice and protects the database
   against an AZ failure, but it does not make the gateway highly available:
-  the OSS app is a single Fargate task, and a task replacement is still a
-  short outage. Multi-AZ is therefore a cost/benefit decision rather than an
+  the OSS app is a single Fargate task, and a task replacement is still an
+  outage. Multi-AZ is therefore a cost/benefit decision rather than an
   HA claim. **Item 7 chooses single-AZ**, which is defensible for the
   inner loop; the DB subnet group already spans both private subnets, so
   `multiAz: true` in `deploy-workbench/rds.ts` is the whole of that change if
   the budget ever justifies it.
+
+  **Amended 2026-11-03:** "a task replacement is still an outage" stays true,
+  but it is no longer the whole story. A task replacement happens for an image
+  upgrade, for a boot-only configuration change, and for a credential or health
+  event, and most configuration and governance changes no longer need one at
+  all: they converge on the running task. The restarts that remain, what still
+  needs one, and why are
+  [`bifrost-reconciler.md`](./bifrost-reconciler.md), decisions 1 and 2. This
+  entry's HA claim is unchanged.
 - **Content.** `client.disable_content_logging: true` on the client, and audit
   every virtual key for `disable_content_logging: false`. Keep
   `client.allow_per_request_content_storage_override` at its default (`false`)
@@ -958,6 +967,18 @@ Virtual keys are Bifrost's primary governance entity
   Rollback is previous digest plus snapshot if the schema moved; previous
   digest alone if it did not. RDS engine upgrades are separate and follow
   RDS's own version windows.
+
+  **Amended 2026-11-03:** the procedure above is the image-upgrade path, and it
+  is unchanged for a schema-breaking bump. What is narrower now is how often it
+  is reached, and what a rollback means for a change that is not an image. A
+  configuration or governance change is reverted, not restored: revert the
+  committed file and the reconciler converges the running task back within one
+  tick (5 minutes for governance) or one deploy run (for config), with the task
+  definition and the task untouched. The snapshot remains the rollback of last
+  resort, which is what a migration that touched the data needs. The old
+  alternative, repointing a per-colour database, is gone with the archived
+  plan. See [`bifrost-reconciler.md`](./bifrost-reconciler.md), decision 14 and
+  "Failure, rollback, observability". The restore rehearsal above still stands.
 
 ## Observability, usage and cost
 
