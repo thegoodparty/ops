@@ -298,12 +298,16 @@ export const createCiRoles = () => {
   // and preview roles above, so its policy is scoped to preview names and
   // tags, and the roles it creates must carry the boundary above.
   //
+  // It runs omni's gp-api infrastructure diff as well (step 5b), with reads
+  // only. Any omni pull request can assume every role trusted on its
+  // subject, so a second role for the diff would separate nothing.
+  //
   // No protect. Nothing depends on it until step 7 points omni's preview and
   // teardown workflows at it.
   const previewDeployRole = new aws.iam.Role("githubActionsPreviewDeploy", {
     name: "github-actions-preview-deploy",
     description:
-      "gp-api preview deploys and teardowns from pull_request runs in thegoodparty/omni.",
+      "gp-api preview deploys, teardowns and infrastructure diffs from pull_request runs in thegoodparty/omni.",
     assumeRolePolicy: JSON.stringify(githubActionsPreviewDeployTrust),
     maxSessionDuration: 3600,
   });

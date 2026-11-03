@@ -532,6 +532,79 @@ Three choices the design left open:
 
 The teardown question is answered under "Open questions".
 
+## What step 5b found
+
+**No new role.** Step 5b names a gp-api plan role, but the diff runs on
+`github-actions-preview-deploy` instead (review of #440, 2026-11-03). Both
+would be trusted on `repo:thegoodparty/omni:pull_request`, and a pull request
+can assume every role trusted on its subject by editing its workflow, so a
+second role would separate nothing. One role keeps what an omni pull request
+can reach in one document.
+
+**What the diff adds is reads, each named.** Step 4b landed as
+thegoodparty/omni#3507, so the diff reads no secret value. Sized from
+CloudTrail for the 21 diff runs on 2026-11-02 and 11-03 under the shared
+role:
+
+- gp-api's current dev and prod checkpoints, by exact name. `.pulumi/meta.yaml`,
+  the bucket listing and the passphrase, previews already hold.
+- The two Grafana tokens `infra-cli.ts` configures the Grafana provider with.
+- `DescribeSecret` and `GetResourcePolicy` on GP_API_PROD, for the ARN in the
+  task definition. GP_API_DEV's, previews already hold.
+- `ecs:DescribeServices` on the dev and prod gp-api services, for the image
+  the diff compares against. `DescribeTaskDefinition` and the network
+  interface lookup, previews already hold.
+
+The rest of what those runs called is a secret value. `GP_API_DEV` and
+`GP_API_PROD` values came from branches that predate #3507. `AI_SECRETS_PROD`
+is the alert filter's webhook password in `components/grafana.ts`; the role
+does not grant it, and the code catches that, warns, and skips the contact
+point, which neither stack has created. If one is created later, pull request
+diffs will show it as a delete, and the fix belongs in omni.
+
+**The prod tag deny needed an exception.** The prod service and GP_API_PROD
+are tagged `Environment=prod`, and AWS checks the tag on all three of those
+reads, so `DenyProductionTagged` would have refused them. It now leaves those
+two resources out, and `DiffProdReadsOnly` denies everything on them except
+the three reads, with no tag condition. Not one deny with `NotAction`: Access
+Analyzer flags a `NotAction` deny on a tag key, because actions that do not
+support the key slip past it.
+
+**The passphrase decrypts whatever gp-api stores in state.** That is the
+standing cost of a pull request running a Pulumi preview. Checked on
+2026-11-02 by listing every encrypted value in both checkpoints, by
+ciphertext length, without decrypting any:
+
+- Live: the Grafana provider's `auth` and `smAccessToken`, the same two
+  tokens the role reads from SSM.
+- Empty or null: `masterPassword` on gp-api's three Aurora clusters and the
+  election cluster, the SES identity's `domainSigningPrivateKey`, the
+  synthetic checks' `bearerToken`, and the prod CloudWatch datasource's
+  `secureJsonDataEncoded` and `httpHeaders`.
+- Public: the three DKIM CNAME records' names and values.
+
+A component that later stores a real secret in gp-api's state makes it
+readable from a pull request, so that is worth catching in review.
+
+**Older copies of state hold the old passwords.** Each stack's `.json.bak`
+beside the checkpoint, `backups/`, `history/` and the bucket's object
+versions all keep earlier checkpoints, and the ones written before 4b carry
+the Aurora master passwords. So the grant is the two checkpoints by exact
+name, not `stacks/gp-api/*`, and the role holds no `s3:GetObjectVersion`.
+Changing the passwords once would make those copies worthless as well. That
+is optional, and a manual change to each cluster and its secret, since
+Pulumi no longer manages them.
+
+**A preview writes nothing outside its own stacks.** The DIY backend takes
+the state lock for update, import, refresh and destroy, not preview, and
+`stack select --create` writes nothing for a stack that exists (settled
+under "What step 4 found"). The role's state writes stop at `gp-api-pr-*`.
+
+**The inline policy is close to its quota.** The role's document is now
+9,685 of the 10,240 characters a role's inline policies share. A widening
+that does not fit moves the diff's statements into a managed policy of
+their own.
+
 ## Design: the workflows that should not hold credentials at all
 
 Three cases, all of them the pattern PR #90 applied to this repo's
@@ -588,11 +661,12 @@ consumer to sequence against.
 
 ## Open questions
 
-- How does the gp-api program stop needing `DB_PASSWORD` at program time?
-  The key-name half is `pr-previews.md` step 3's declared list, but
-  `masterPassword` on the Aurora cluster is a real value, so that half needs
-  its own answer (AWS-managed master password, or keeping the cluster out of
-  the previewed program). (step 4b)
+- ~~How does the gp-api program stop needing `DB_PASSWORD` at program
+  time?~~ Settled at step 4b (thegoodparty/omni#3507): neither option. The
+  clusters take no `masterPassword` input, as the election cluster already
+  did, so each keeps the password it has and tasks read `DB_PASSWORD` from
+  the secret. The key names are a declared list in
+  `deploy/gp-api-secret-keys.ts`, checked against the live secret on deploy.
 - ~~Can teardown drop the preview database without running a task on the dev
   cluster's task definition?~~ Settled at step 6: yes. The preview's own task
   definition already carries everything the drop needs (`GP_API_DEV`'s

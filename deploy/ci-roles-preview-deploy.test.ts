@@ -26,6 +26,22 @@ const allowedActions = () =>
 const allowsWith = (action: string) =>
   allows().filter((s) => "Action" in s && asList(s.Action).includes(action));
 
+const CHECKPOINTS = [
+  "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-dev.json",
+  "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-prod.json",
+];
+
+const DIFF_PROD_RESOURCES = [
+  "arn:aws:ecs:us-west-2:333022194791:service/gp-master-fargateCluster/gp-api-master",
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_PROD-??????",
+];
+
+const DIFF_PROD_READS = [
+  "ecs:DescribeServices",
+  "secretsmanager:DescribeSecret",
+  "secretsmanager:GetResourcePolicy",
+];
+
 describe("githubActionsPreviewDeployTrust", () => {
   it("is assumed by omni pull_request runs alone, under StringEquals", () => {
     assert.equal(githubActionsPreviewDeployTrust.Statement.length, 1);
@@ -120,26 +136,57 @@ describe("githubActionsPreviewDeploy", () => {
     ]);
   });
 
-  it("reads one SSM parameter, the state passphrase", () => {
+  it("reads three SSM parameters: the passphrase and the diff's Grafana tokens", () => {
     const ssm = allowedActions().filter((a) => a.startsWith("ssm:"));
-    assert.deepEqual(ssm, ["ssm:GetParameter"]);
-    assert.deepEqual(asList(statement("PulumiStatePassphrase").Resource), [
-      "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
-    ]);
+    assert.deepEqual([...new Set(ssm)], ["ssm:GetParameter"]);
+    assert.deepEqual(
+      allowsWith("ssm:GetParameter").flatMap((s) => asList(s.Resource)),
+      [
+        "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      ],
+    );
   });
 
-  // gp-api's dev and prod stacks share the project prefix, and their state
-  // holds the Aurora master passwords under the shared passphrase. Every
-  // object grant on the state bucket has to stop at the preview stack prefix.
-  it("reaches gp-api's preview stacks in the state bucket, and no other", () => {
+  // gp-api's dev and prod stacks share the project prefix, and their older
+  // copies hold the Aurora master passwords under the shared passphrase.
+  // Every write on the state bucket has to stop at the preview stack prefix,
+  // and the diff reads the two current checkpoints by exact name.
+  it("reaches gp-api's preview stacks in the state bucket, and reads two checkpoints", () => {
     const objects = allows()
       .flatMap((s) => asList(s.Resource))
       .filter((r) => r.startsWith("arn:aws:s3:::goodparty-iac-state/"));
     for (const r of objects) {
-      if (r.endsWith("/.pulumi/meta.yaml")) continue;
+      if (r.endsWith("/.pulumi/meta.yaml") || CHECKPOINTS.includes(r)) continue;
       assert.match(r, /\/gp-api\/gp-api-pr-\*$/, `outside the preview stacks: ${r}`);
     }
     assert.deepEqual(asList(statement("PulumiStateMeta").Action), ["s3:GetObject"]);
+    assert.deepEqual(asList(statement("DiffCheckpoints").Action), ["s3:GetObject"]);
+    assert.deepEqual(asList(statement("DiffCheckpoints").Resource), CHECKPOINTS);
+    for (const s of allows()) {
+      if (s.Sid === "DiffCheckpoints") continue;
+      for (const c of CHECKPOINTS) {
+        assert.equal(asList(s.Resource).includes(c), false, `${s.Sid} names ${c}`);
+      }
+    }
+  });
+
+  // The bucket is versioned, and every earlier checkpoint is one versionId
+  // away from the current one.
+  it("reads no object version", () => {
+    assert.equal(allowsWith("s3:GetObjectVersion").length, 0);
+  });
+
+  it("only reads in the diff's statements, and reads no secret value", () => {
+    const diff = allows().filter((s) => s.Sid?.startsWith("Diff"));
+    assert.equal(diff.length, 4);
+    for (const s of diff) {
+      for (const action of asList(s.Action)) {
+        assert.match(action, /^[a-z0-9-]+:(Get|Describe)[A-Za-z]*$/, `${s.Sid}: ${action}`);
+        assert.notEqual(action, "secretsmanager:GetSecretValue", s.Sid);
+      }
+    }
   });
 
   // RDS deserves its own decision in the plan. Previews create no RDS
@@ -165,8 +212,10 @@ describe("githubActionsPreviewDeploy", () => {
     assert.deepEqual(s.Condition, {
       ArnLike: { "ecs:cluster": "arn:aws:ecs:us-west-2:333022194791:cluster/gp-pr-*" },
     });
-    for (const r of allows().flatMap((x) => asList(x.Resource))) {
-      assert.equal(/gp-develop|gp-master/.test(r), false, `dev or prod resource: ${r}`);
+    for (const x of allows()) {
+      if (!asList(x.Resource).some((r) => /gp-develop|gp-master/.test(r))) continue;
+      assert.equal(x.Sid, "DiffDeployedServices", `dev or prod resource in ${x.Sid}`);
+      assert.deepEqual(asList(x.Action), ["ecs:DescribeServices"]);
     }
   });
 
@@ -224,15 +273,32 @@ describe("githubActionsPreviewDeploy", () => {
     });
   });
 
-  it("denies everything on a resource tagged Environment=prod", () => {
+  it("denies everything on a resource tagged Environment=prod, but the diff's two", () => {
     const deny = statement("DenyProductionTagged");
     assert.equal(deny.Effect, "Deny");
     assert.ok("Action" in deny);
     assert.equal(deny.Action, "*");
-    assert.equal(deny.Resource, "*");
+    assert.equal(deny.Resource, undefined);
+    assert.deepEqual(deny.NotResource, DIFF_PROD_RESOURCES);
     assert.deepEqual(deny.Condition, {
       StringEquals: { "aws:ResourceTag/Environment": "prod" },
     });
+  });
+
+  // The tag deny leaves those two out, so this is what holds them to reads.
+  it("denies everything but three reads on the diff's two prod resources", () => {
+    const deny = statement("DiffProdReadsOnly");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("NotAction" in deny);
+    assert.deepEqual(deny.NotAction, DIFF_PROD_READS);
+    assert.deepEqual(deny.Resource, DIFF_PROD_RESOURCES);
+    assert.equal(deny.Condition, undefined);
+    for (const s of allows()) {
+      if (!asList(s.Resource).some((r) => DIFF_PROD_RESOURCES.includes(r))) continue;
+      for (const action of asList(s.Action)) {
+        assert.ok(DIFF_PROD_READS.includes(action), `${s.Sid}: ${action}`);
+      }
+    }
   });
 
   // "*" is for the actions AWS defines no resource for. Anything that takes
@@ -257,15 +323,19 @@ describe("githubActionsPreviewDeploy", () => {
     }
   });
 
-  it("names no prod or master resource", () => {
-    for (const r of allows().flatMap((s) => asList(s.Resource))) {
-      assert.equal(/prod|master/i.test(r), false, `not preview: ${r}`);
+  it("names a prod or master resource only in the diff's statements", () => {
+    for (const s of allows()) {
+      const named = asList(s.Resource).filter((r) => /prod|master/i.test(r));
+      if (named.length === 0) continue;
+      assert.match(s.Sid ?? "", /^Diff/, `not preview: ${named.join(", ")}`);
     }
   });
 
   // Role inline policies share a 10,240 character quota, counted without
-  // whitespace. JSON.stringify emits none.
+  // whitespace. JSON.stringify emits none. The diff's statements (step 5b)
+  // took most of the room; a widening that does not fit moves them into a
+  // managed policy of their own, which does not count against it.
   it("fits the inline policy quota with room to widen", () => {
-    assert.ok(JSON.stringify(githubActionsPreviewDeploy).length < 9000);
+    assert.ok(JSON.stringify(githubActionsPreviewDeploy).length < 9800);
   });
 });

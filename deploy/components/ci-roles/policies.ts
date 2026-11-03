@@ -1484,6 +1484,13 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // it creates are capped by `gpApiPreviewRoleBoundary`, and it reads one
 // secret.
 //
+// It also runs omni's `gp-api-infrastructure-diffs.yml`, the `pulumi preview`
+// of gp-api's dev and prod stacks (step 5b). A pull request can assume every
+// role trusted on its subject, so a separate role for the diff would separate
+// nothing, and one role keeps what an omni pull request can reach in one
+// document. The diff adds reads only, each named, in the `Diff` statements
+// before `DenyProductionTagged`.
+//
 // Sized from the code on omni's main and from CloudTrail for one create, one
 // update and one teardown of a live preview under the shared role
 // (2026-10-28), not by enumerating services. Widened only by observed
@@ -1516,10 +1523,12 @@ export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
  * Backend access for one project's preview stacks, and none of its others.
  *
  * Not `pulumiBackendStatements("gp-api")`, which covers every gp-api stack.
- * gp-api's dev and prod stacks share the project prefix with its previews,
- * and their state holds the Aurora master passwords as Pulumi secrets, which
- * the shared passphrase below decrypts. The stack-name prefix is what keeps a
- * pull request to its own kind of stack.
+ * gp-api's dev and prod stacks share the project prefix with its previews.
+ * Their current state no longer holds the Aurora master passwords (step 4b),
+ * but their `.json.bak`, `backups/` and `history/` copies from before it do,
+ * and the shared passphrase below decrypts them. The stack-name prefix is
+ * what keeps a pull request's writes to its own kind of stack. The diff's
+ * read of the two current checkpoints is a separate grant, by exact name.
  *
  * Read and write, unlike `pulumiBackendReadStatements`: a new pull request's
  * stack does not exist yet, so `stack select --create` writes it, and
@@ -1584,6 +1593,12 @@ const SHARED_PREVIEW_LISTENER =
   "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener/app/gp-api-previews/*";
 const SHARED_PREVIEW_LISTENER_RULES =
   "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener-rule/app/gp-api-previews/*";
+
+// The two prod resources the infrastructure diff reads (step 5b).
+const PROD_SERVICE =
+  "arn:aws:ecs:us-west-2:333022194791:service/gp-master-fargateCluster/gp-api-master";
+const PROD_APP_SECRET =
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_PROD-??????";
 
 export const githubActionsPreviewDeploy: PolicyDocument = {
   Version: "2012-10-17",
@@ -1965,14 +1980,80 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       ],
     },
     {
+      // The infrastructure diff, step 5b, from here to `DenyProductionTagged`:
+      // `pulumi preview` of gp-api's dev and prod stacks. Sized from
+      // CloudTrail for the 21 diff runs on 2026-11-02 and 11-03 under the
+      // shared role. The rest of what they called is granted above for
+      // previews, or is a secret value the diff no longer needs
+      // (docs/deploy-role-trust.md, "What step 5b found").
+      //
+      // The two current checkpoints by exact name, and read only. Not
+      // `stacks/gp-api/*`, whose `.json.bak` files still hold the Aurora
+      // master passwords, and this role has no `s3:GetObjectVersion`
+      // anywhere. A preview takes no state lock and writes no state.
+      Sid: "DiffCheckpoints",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [
+        `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
+        `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+      ],
+    },
+    {
+      // `infra-cli.ts` configures the Grafana provider with these on dev and
+      // prod runs, and the diff cannot compare gp-api's Grafana resources
+      // without them. SecureStrings under alias/aws/ssm, like the passphrase.
+      Sid: "DiffGrafanaTokens",
+      Effect: "Allow",
+      Action: ["ssm:GetParameter"],
+      Resource: [
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      ],
+    },
+    {
+      // `index.ts` looks up the prod app secret's ARN for the task
+      // definition's `valueFrom`. Metadata only, as for GP_API_DEV above.
+      Sid: "DiffProdSecretMetadata",
+      Effect: "Allow",
+      Action: ["secretsmanager:DescribeSecret", "secretsmanager:GetResourcePolicy"],
+      Resource: PROD_APP_SECRET,
+    },
+    {
+      // The workflow diffs against the image dev and prod run now, so a
+      // code-only change shows no diff. `ecs:DescribeTaskDefinition` is
+      // already granted above, on `*`.
+      Sid: "DiffDeployedServices",
+      Effect: "Allow",
+      Action: ["ecs:DescribeServices"],
+      Resource: [
+        "arn:aws:ecs:us-west-2:333022194791:service/gp-develop-fargateCluster/gp-api-develop",
+        PROD_SERVICE,
+      ],
+    },
+    {
+      // The two prod resources the diff reads are tagged `Environment=prod`,
+      // so the deny below leaves them out, and this one holds them to the
+      // diff's three reads instead, tag or no tag. None returns a secret
+      // value.
+      Sid: "DiffProdReadsOnly",
+      Effect: "Deny",
+      NotAction: [
+        "ecs:DescribeServices",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+      ],
+      Resource: [PROD_SERVICE, PROD_APP_SECRET],
+    },
+    {
       // The plan's "no write to any resource carrying the production tags",
       // as a deny so it holds whatever is later added above. Nothing this role
-      // legitimately touches is tagged `Environment=prod`. The shared VPC is,
-      // and this role acts on nothing in it directly: ECS places the tasks.
+      // writes is tagged `Environment=prod`. The shared VPC is, and this role
+      // acts on nothing in it directly: ECS places the tasks.
       Sid: "DenyProductionTagged",
       Effect: "Deny",
       Action: "*",
-      Resource: "*",
+      NotResource: [PROD_SERVICE, PROD_APP_SECRET],
       Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
     },
   ],
