@@ -13,6 +13,7 @@ import {
 import { createWorkbenchNetwork, REGION } from "./network";
 import { createOauth2ProxyRepository } from "./oauth2-proxy-image";
 import { createBifrostBootstrapRepository } from "./bootstrap-image";
+import { createBifrostGatewayRepository } from "./pg-password-image";
 import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
 import { createBifrostEcs } from "./ecs";
@@ -436,6 +437,28 @@ export const bifrostBootstrapRepositoryUrl =
   bifrostBootstrapRepository.repositoryUrl;
 
 // ---------------------------------------------------------------------------
+// The ECR repository the derived gateway image is built into.
+//
+// Step 6 of `docs/bifrost-zero-downtime-deploys.md` (decision 20): the task's
+// image is now a derivative of the pinned Bifrost release that carries `aws-cli`
+// and `jq`, because Bifrost resolves its database password with a
+// `password_command` on every new physical connection rather than reading an
+// injected `PG_PASSWORD` once. The command and its Dockerfile live in
+// `bifrost/`; the build and push live in `.github/workflows/deploy-workbench.yml`,
+// and the pin and the content-addressed tag are documented in
+// `pg-password-image.ts`. A fourth repository, for the same reason as the other
+// two derived images: ours and rebuilt when the command changes, not an upstream
+// release pulled by digest. The mirror in `bifrost` stays, because the derived
+// Dockerfile is built `FROM` the digest it pins.
+const bifrostGatewayRepository = createBifrostGatewayRepository({
+  provider,
+});
+
+/** The push target, for a human reading `pulumi stack output`. */
+export const bifrostGatewayRepositoryUrl =
+  bifrostGatewayRepository.repositoryUrl;
+
+// ---------------------------------------------------------------------------
 // The network the gateway runs in.
 //
 // Phase 1 item 5 of docs/bifrost-gateway.md: the VPC, its public and private
@@ -545,7 +568,7 @@ const ecs = createBifrostEcs({
   network,
   database,
   ingress,
-  repositoryUrl: bifrostRepository.repositoryUrl,
+  gatewayRepositoryUrl: bifrostGatewayRepository.repositoryUrl,
   oauth2ProxyRepositoryUrl: oauth2ProxyRepository.repositoryUrl,
   bootstrapRepositoryUrl: bifrostBootstrapRepository.repositoryUrl,
   // The task's own name in the VPC, registered by the service below.

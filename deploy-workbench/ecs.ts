@@ -5,8 +5,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
-import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
 import { BIFROST_BOOTSTRAP_TAG } from "./bootstrap-image";
+import { BIFROST_GATEWAY_TAG } from "./pg-password-image";
 import {
   BIFROST_PORT,
   createWorkbenchNetwork,
@@ -41,9 +41,15 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   (Bifrost on 8080 and the oauth2-proxy sidecar on 4180), one ECS service
  *   with `desiredCount: 1` registered as a target in both ingress target
  *   groups, the `/aws/ecs/bifrost` log group, the execution role (managed ECS
- *   task-execution policy plus read on the task's secrets) and the separate
- *   task role (the Bedrock model list, the catalog listing that renders it, and
- *   nothing else).
+ *   task-execution policy plus read on the two script-owned secrets) and the
+ *   separate task role (the Bedrock model list, the catalog listing that renders
+ *   it, and read on the one RDS-managed secret its `password_command` resolves).
+ * - Owns since step 6 of `docs/bifrost-zero-downtime-deploys.md`: the task role's
+ *   `secretsmanager:GetSecretValue` grant on the RDS-managed secret, the
+ *   `PG_SECRET_ARN` environment entry the container's password command reads it
+ *   from, and the task's image, which is now the derived gateway image rather
+ *   than the mirror (`pg-password-image.ts`). The `PG_PASSWORD` `secrets` entry
+ *   is gone: a value injected once at task start cannot follow a rotation.
  * - Owns since item 9: the oauth2-proxy sidecar, its three `OAUTH2_PROXY_*`
  *   secret references plus the one `bifrost/gateway` key the injected header is
  *   read from, the `--alpha-config` flag that loads the alpha file, and the
@@ -86,6 +92,12 @@ import { BifrostDatabase, DATABASE_NAME, DATABASE_USERNAME } from "./rds";
  *   needs no Secrets Manager permission at all. See `deploy/delegate-secret.ts`
  *   and `docs/pr-previews.md` step 3 for why the key list is declared in the
  *   repo instead of looked up.
+ * - Does not read the RDS-managed secret either, now that the container does:
+ *   the ARN comes from `rds.ts` as a resource output, and the value is read
+ *   inside the task, at connection time, by `bifrost/pg-password.sh`. Nothing
+ *   in this program calls `GetSecretValue`, so `preview` still needs no
+ *   Secrets Manager permission. The one grant this file adds is IAM, not a
+ *   read.
  *
  * The task-definition idiom is `deploy/components/worker.ts` (documented in
  * `docs/bifrost-gateway.md` as the working example to copy): `secrets` from
@@ -508,21 +520,40 @@ export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
   TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS * TARGET_GROUP_HEALTHY_THRESHOLD;
 
 /**
- * The RDS-managed master password, injected as the task's `PG_PASSWORD`.
+ * The RDS-managed master password's location, resolved by the container per
+ * physical connection rather than injected at task start.
  *
- * Item 7's module returns `secretArn` for exactly this ("The secret's ARN is
- * returned below for item 8 to inject as the task's `PG_PASSWORD`"), so the
- * injection lands here rather than waiting for item 10. Only the password:
- * host, port, database name and user are non-secret configuration and belong
- * to `config.json`'s `env.` references in item 10, and inventing them here
- * would be the runtime configuration the plan puts in that item.
+ * Step 6 of `docs/bifrost-zero-downtime-deploys.md` (decision 20). This used to
+ * be an ECS `secrets` entry: `PG_PASSWORD`, `valueFrom`
+ * `${databaseSecretArn}:password::`. Bifrost reads that once, when the process
+ * starts, so a rotation left the running gateway on the previous password until
+ * the next task replacement — the 2026-11-02 event: `SQLSTATE 28P01` on every
+ * new physical connection, `/health` pings the stores, the container went
+ * unhealthy and ECS replaced it. Now `bifrost/config.json` declares a
+ * `password_command` for both stores and the gateway image ships the script
+ * that runs it (`pg-password-image.ts`), so a rotation heals within the
+ * command's `cache_ttl` without a restart.
  *
- * `password` is the key RDS uses in the JSON it writes for a managed master
- * user (`username`, `password`, `engine`, `host`, `port`,
- * `dbInstanceIdentifier`).
+ * Three names carry it:
+ *
+ * - `PG_SECRET_ARN` is the ARN, in the container's environment. It cannot be an
+ *   argument of the command: the schema's `args` are literal strings and
+ *   nothing expands an `env.` reference in them (`PasswordCommandConfig.Args`
+ *   is a plain `[]string` filled by `json.Unmarshal`).
+ * - `RDS_PASSWORD_JSON_KEY` is the key RDS writes in the JSON it owns for a
+ *   managed master user (`username`, `password`, `engine`, `host`, `port`,
+ *   `dbInstanceIdentifier`), and the script reads it from the `AWSCURRENT`
+ *   version — RDS writes a rotation there, so nothing has to look at
+ *   `AWSPENDING`.
+ * - `PG_PASSWORD_ENV_NAME` is what the execution role used to inject and what
+ *   `config.json` used to reference. It is no longer injected and no longer
+ *   referenced; it is kept here as the single statement of the name that step
+ *   removed, so a test can assert its absence rather than a reader having to
+ *   grep for a string that appears nowhere.
  */
 export const RDS_PASSWORD_JSON_KEY = "password";
 export const PG_PASSWORD_ENV_NAME = "PG_PASSWORD";
+export const PG_SECRET_ARN_ENV_NAME = "PG_SECRET_ARN";
 
 /**
  * The plain environment variables, and what each is for.
@@ -535,8 +566,9 @@ export const PG_PASSWORD_ENV_NAME = "PG_PASSWORD";
  * that `config.json`'s `config_store` and `logs_store` resolve by name. They
  * are Pulumi outputs of `rds.ts` (host, port) or constants that module owns
  * (user, database name), so the connection string has one source rather than a
- * copy in a JSON file. The password is not here: it is `PG_PASSWORD`, already
- * injected from the RDS-managed secret.
+ * copy in a JSON file. The password is not here and is not a `secrets` entry
+ * either: `PG_SECRET_ARN` below names the RDS-managed secret and the container
+ * resolves the password from it per connection (`PG_SECRET_ARN_ENV_NAME`).
  *
  * Bifrost resolves `host`, `port`, `user`, `password` and `db_name` as
  * `schemas.SecretVar`, which accepts a literal, `env.NAME` or a `vault.path`
@@ -551,10 +583,19 @@ export const PG_USER_ENV_NAME = "PG_USER";
 export const PG_DATABASE_ENV_NAME = "PG_DATABASE";
 
 /**
- * Every env name `config.json` may resolve that is *not* one of the gateway's
- * Secrets Manager keys. The two together are the complete set an `env.`
- * reference in that file can name, which is what makes a reference that
- * resolves to nothing a test failure rather than a runtime surprise.
+ * Every env name the gateway container receives that is *not* one of its
+ * Secrets Manager keys. Together with `GATEWAY_SECRET_KEYS` that is the
+ * complete set an `env.` reference in `config.json` can name, which is what
+ * makes a reference that resolves to nothing a test failure rather than a
+ * runtime surprise. The password is deliberately not in either list: it is not
+ * an `env.` reference any more, it is what the gateway's `password_command`
+ * prints (`PG_SECRET_ARN_ENV_NAME`).
+ *
+ * `PG_SECRET_ARN` is deliberately *not* in this list even though the container
+ * carries it. This list is "names `config.json` may resolve", and an ARN is not
+ * a password: a `"password": "env.PG_SECRET_ARN"` would authenticate with the
+ * ARN. It is asserted as its own container environment entry instead, in
+ * `GATEWAY_PASSWORD_ENV_NAMES` below.
  */
 export const GATEWAY_PLAIN_ENV_NAMES = [
   AWS_REGION_ENV_NAME,
@@ -563,6 +604,21 @@ export const GATEWAY_PLAIN_ENV_NAMES = [
   PG_USER_ENV_NAME,
   PG_DATABASE_ENV_NAME,
 ] as const;
+
+/**
+ * The gateway container's remaining environment entries: what the password
+ * command reads, rather than what `config.json` resolves.
+ *
+ * `PG_SECRET_ARN` is an identifier, not a credential: the read is authorised by
+ * the task role, and the ARN is the Pulumi output that `pulumi stack output
+ * bifrostDatabaseSecretArn` already shows. It is an `environment` entry rather
+ * than a `secrets` entry on purpose — resolving it through the execution role
+ * is the identity this step takes the read away from.
+ *
+ * It has to be an environment entry at all because `password_command.args` are
+ * literal strings: nothing expands an `env.` reference inside them.
+ */
+export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
 
 /**
  * The gateway's runtime configuration (phase 2 item 10): the non-secret
@@ -750,14 +806,34 @@ export const OAUTH2_PROXY_ENVIRONMENT: Readonly<Record<string, string>> = {
  * that neither contains a wildcard, and so "what may this identity do" is one
  * list to read rather than a policy document to parse.
  *
- * The execution role reads secrets and nothing else beyond its managed policy;
- * the task role invokes the enumerated models and reads the one account-wide
- * catalog listing that draws the dashboard's model list, and does nothing
- * else. No `secretsmanager:*`, no `bedrock:*`, and one wildcard resource in the
- * whole file: the catalog read, which Bedrock gives no resource type to scope
- * (see `TASK_BEDROCK_READ_RESOURCES`).
+ * The execution role reads the two script-owned secrets and nothing else beyond
+ * its managed policy; the task role invokes the enumerated models, reads the
+ * one account-wide catalog listing that draws the dashboard's model list, and
+ * reads the RDS-managed master secret, and does nothing else. No
+ * `secretsmanager:*`, no `bedrock:*`, and one wildcard resource in the whole
+ * file: the catalog read, which Bedrock gives no resource type to scope (see
+ * `TASK_BEDROCK_READ_RESOURCES`).
+ *
+ * The database password used to be the execution role's, because ECS resolved it
+ * into `PG_PASSWORD`. It is the task role's now: `password_command` runs inside
+ * the container, so the call to `GetSecretValue` is made by the process that
+ * assumes the task role, and a grant on the execution role would authorise an
+ * identity that no longer makes the call (`docs/bifrost-zero-downtime-deploys.md`,
+ * decision 20).
  */
 export const EXECUTION_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
+
+/**
+ * The task role's one Secrets Manager action, and the reason it is not wider.
+ *
+ * The ECS agent is not in this path: the gateway's own `password_command`
+ * (`bifrost/pg-password.sh` in the derived image) calls `GetSecretValue` on
+ * the RDS-managed secret with the task role's container credentials. The
+ * resource is that secret's exact ARN — no `-??????` pattern, because Pulumi
+ * owns the describe that produced it (`database.secretArn`) and the ARN does
+ * not change when RDS rotates the value in place.
+ */
+export const TASK_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
 
 /**
  * The one action the config parameter needs, and no wider.
@@ -886,11 +962,13 @@ export type PolicyDocument = {
 };
 
 /**
- * The execution role's inline policy: read the three secrets the task
- * resolves. `bifrost/gateway` and `bifrost/oauth2-proxy` are the plan's two,
- * and the RDS-managed master password is the third because item 7 handed it to
- * this item. Nothing else: the ECR pull and the log writes come from the
- * managed policy attached alongside it.
+ * The execution role's inline policy: read the two script-owned secrets the ECS
+ * agent resolves into the containers. `bifrost/gateway` and
+ * `bifrost/oauth2-proxy` are the plan's two. The RDS-managed master password is
+ * deliberately not here any more: it is no longer a `secrets` entry, so the
+ * agent never resolves it, and the container reads it with the task role
+ * (`docs/bifrost-zero-downtime-deploys.md`, decision 20). Nothing else: the ECR
+ * pull and the log writes come from the managed policy attached alongside it.
  */
 export const executionRoleSecretsPolicyDocument = (
   secretArns: string[],
@@ -939,9 +1017,16 @@ export const executionRoleConfigParameterPolicyDocument = (
  * statements fixes. The read is kept to the one action the provider calls, on
  * the one resource shape IAM permits for it — see
  * `TASK_BEDROCK_READ_ACTIONS` and `TASK_BEDROCK_READ_RESOURCES`.
+ *
+ * Plus the database password, which is the one secret this process reads itself:
+ * `secretsmanager:GetSecretValue` on the RDS-managed secret's exact ARN, and
+ * nothing wider. It is a third statement rather than part of either Bedrock one
+ * because it is a different service and a different principal than the agent
+ * that used to read it.
  */
 export const taskRolePolicyDocument = (
   bedrockResources: string[],
+  databaseSecretArns: string[],
 ): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
@@ -956,6 +1041,12 @@ export const taskRolePolicyDocument = (
       Effect: "Allow",
       Action: [...TASK_BEDROCK_READ_ACTIONS],
       Resource: [...TASK_BEDROCK_READ_RESOURCES],
+    },
+    {
+      Sid: "ReadDatabasePassword",
+      Effect: "Allow",
+      Action: [...TASK_SECRET_ACTIONS],
+      Resource: databaseSecretArns,
     },
   ],
 });
@@ -972,15 +1063,19 @@ export const createBifrostEcs = (args: {
    */
   ingress: BifrostIngress;
   /**
-   * The mirrored repository's URL, from `bifrost-image.ts`. The tag is
-   * appended here from `BIFROST_UPSTREAM_TAG` so the pin lives in one module;
-   * the repository is immutable, so the tag cannot be repointed and the
-   * reference is as reproducible as a digest. The ECR digest the mirror
-   * produces is not a Pulumi value (the push happens in the workflow, after
-   * the apply), which is the reason the tag carries the pin rather than a
-   * digest literal that the first mirror run would have to supply.
+   * The derived gateway image's repository, from `pg-password-image.ts`. It
+   * replaces the mirror as the task's image, so it can run the
+   * `password_command` the stores resolve (`docs/bifrost-zero-downtime-deploys.md`,
+   * decision 20). Its tag is content-addressed on the command script and the
+   * Dockerfile, so it comes from that module rather than from a literal; a
+   * changed command is a new tag and a new task definition revision.
+   *
+   * `bifrost-image.ts` is still the module that owns the upstream pin, and the
+   * mirror's repository is still created by `index.ts`; the derived image's
+   * Dockerfile `FROM`s that pinned digest, and the drift tests hold the two
+   * together.
    */
-  repositoryUrl: pulumi.Input<string>;
+  gatewayRepositoryUrl: pulumi.Input<string>;
   /**
    * The derived oauth2-proxy image's repository, from `oauth2-proxy-image.ts`.
    * Its tag is content-addressed on the admin allowlist, so it comes from that
@@ -1009,13 +1104,13 @@ export const createBifrostEcs = (args: {
     network,
     database,
     ingress,
-    repositoryUrl,
+    gatewayRepositoryUrl,
     oauth2ProxyRepositoryUrl,
     bootstrapRepositoryUrl,
     discovery,
   } = args;
 
-  const imageUri = pulumi.interpolate`${repositoryUrl}:${BIFROST_UPSTREAM_TAG}`;
+  const imageUri = pulumi.interpolate`${gatewayRepositoryUrl}:${BIFROST_GATEWAY_TAG}`;
   const oauth2ProxyImageUri = pulumi.interpolate`${oauth2ProxyRepositoryUrl}:${OAUTH2_PROXY_TAG}`;
   const bootstrapImageUri = pulumi.interpolate`${bootstrapRepositoryUrl}:${BIFROST_BOOTSTRAP_TAG}`;
 
@@ -1091,8 +1186,12 @@ export const createBifrostEcs = (args: {
    *
    * DIFFERS from `deploy/components/worker.ts`: that role grants read on one
    * secret by its exact Pulumi ARN, because Pulumi owns that container. These
-   * third is the ARN item 7 returned — which is also why the policy is built
-   * with `apply` rather than inline.
+   * two script-owned secrets have to be granted by a name pattern, since the
+   * six random characters Secrets Manager appends are unknowable without a
+   * describe this project's preview role may not make. The RDS-managed secret is
+   * no longer here at all: the container reads it with the task role, so the
+   * agent has nothing to resolve (`docs/bifrost-zero-downtime-deploys.md`,
+   * decision 20).
    */
   const executionRole = new aws.iam.Role(
     "bifrostExecutionRole",
@@ -1114,14 +1213,11 @@ export const createBifrostEcs = (args: {
       inlinePolicies: [
         {
           name: "secrets",
-          policy: database.secretArn.apply((databaseSecretArn) =>
-            JSON.stringify(
-              executionRoleSecretsPolicyDocument([
-                secretArnPattern(GATEWAY_SECRET_NAME),
-                secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
-                databaseSecretArn,
-              ]),
-            ),
+          policy: JSON.stringify(
+            executionRoleSecretsPolicyDocument([
+              secretArnPattern(GATEWAY_SECRET_NAME),
+              secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
+            ]),
           ),
         },
         {
@@ -1147,17 +1243,18 @@ export const createBifrostEcs = (args: {
    * whose task role carries five AWS-managed read policies because the
    * delegate is a general-purpose agent that is expected to explore the
    * account. The gateway is a proxy: it may invoke its models, read the one
-   * account-wide catalog listing that draws its model list, and nothing else.
-   * The invoke statement's `Resource` list is the model list rather than `*`;
-   * the catalog statement's is `*` because Bedrock offers nothing to scope it
-   * to.
+   * account-wide catalog listing that draws its model list, read the one
+   * database secret its own `password_command` resolves, and nothing else. The
+   * invoke statement's `Resource` list is the model list rather than `*`; the
+   * catalog statement's is `*` because Bedrock offers nothing to scope it to;
+   * the secret statement is the RDS ARN and no wildcard.
    */
   const taskRole = new aws.iam.Role(
     "bifrostTaskRole",
     {
       name: TASK_ROLE_NAME,
       description:
-        "Bifrost gateway task: invoke the models in utils/bedrock-models.ts, list the Bedrock catalog, and nothing else.",
+        "Bifrost gateway task: invoke the models in utils/bedrock-models.ts, list the Bedrock catalog, read the RDS-managed database password, and nothing else.",
       assumeRolePolicy: pulumi.jsonStringify({
         Version: "2012-10-17",
         Statement: [
@@ -1171,8 +1268,14 @@ export const createBifrostEcs = (args: {
       inlinePolicies: [
         {
           name: "bedrock",
-          policy: pulumi.jsonStringify(
-            taskRolePolicyDocument(bedrockInvokeResources()),
+          // Built with `apply` because the secret statement's resource is the
+          // RDS-managed secret's ARN, which is a Pulumi output (item 7's).
+          policy: database.secretArn.apply((databaseSecretArn) =>
+            JSON.stringify(
+              taskRolePolicyDocument(bedrockInvokeResources(), [
+                databaseSecretArn,
+              ]),
+            ),
           ),
         },
       ],
@@ -1196,10 +1299,9 @@ export const createBifrostEcs = (args: {
    *   sizing, and the containers' own reservations split that total rather
    *   than each repeating it; see the constants above.
    * - The `secrets` block is not a list of keys read from a secret. It is the
-   *   declared lists above, plus `PG_PASSWORD` from the RDS-managed ARN and
-   *   `BIFROST_CONFIG` from the SSM parameter; see the module header for why
-   *   nothing here reads Secrets Manager. Bifrost gets `bifrost/gateway`'s five,
-   *   `PG_PASSWORD` and `BIFROST_CONFIG`; the sidecar gets
+   *   declared lists above, plus `BIFROST_CONFIG` from the SSM parameter; see
+   *   the module header for why nothing here reads Secrets Manager. Bifrost gets
+   *   `bifrost/gateway`'s five and `BIFROST_CONFIG`; the sidecar gets
    *   `bifrost/oauth2-proxy`'s three plus `bifrost/gateway`'s setup token,
    *   which the alpha configuration injects upstream. It gets no provider key,
    *   no encryption key and no admin username or password. The ECS agent
@@ -1207,11 +1309,16 @@ export const createBifrostEcs = (args: {
    *   absent from the secret is a task that never starts: `fill-secrets.sh` has
    *   to write `BIFROST_SETUP_TOKEN` before a task definition naming it deploys,
    *   exactly as it already has to write the sidecar's three and the gateway's
-   *   five.
+   *   five. The database password is not one of them any more: it is not a value
+   *   the agent can resolve once and forget, so `config.json` resolves it per
+   *   physical connection and the gateway image's `password_command` prints it
+   *   (`PG_SECRET_ARN_ENV_NAME`, `docs/bifrost-zero-downtime-deploys.md`
+   *   decision 20).
    * - The environment carries `AWS_REGION`, because the Bedrock provider needs
    *   a region (the delegate sets `AWS_DEFAULT_REGION` for the same reason),
-   *   and the four non-secret Postgres values `config.json` resolves by name.
-   *   The sidecar has no AWS configuration at all: it is a Google OAuth proxy.
+   *   the four non-secret Postgres values `config.json` resolves by name, and
+   *   `PG_SECRET_ARN` for the password command. The sidecar has no AWS
+   *   configuration at all: it is a Google OAuth proxy.
    * - The entry point is overridden, which the delegate's container does not
    *   do. Upstream's own ECS guide is the reason: the gateway has to write the
    *   injected config to `/app/data/config.json` before Bifrost starts, and
@@ -1282,6 +1389,13 @@ export const createBifrostEcs = (args: {
             { name: PG_PORT_ENV_NAME, value: databasePort },
             { name: PG_USER_ENV_NAME, value: DATABASE_USERNAME },
             { name: PG_DATABASE_ENV_NAME, value: DATABASE_NAME },
+            // Where the password comes from, for the `password_command` both
+            // stores now declare. The ARN is an identifier, not a credential:
+            // the read is the task role's, and the value never reaches this
+            // container's environment. It cannot be an argument of the command
+            // instead -- `password_command.args` are literal strings and
+            // nothing expands an `env.` reference in them.
+            { name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn },
             // A config change has to roll the task; see the constant. This is
             // a digest computed from the file in this program, deliberately
             // not the parameter's preview-unknown version output: an unknown
@@ -1298,10 +1412,6 @@ export const createBifrostEcs = (args: {
               name: key,
               valueFrom: secretReference(GATEWAY_SECRET_NAME, key),
             })),
-            {
-              name: PG_PASSWORD_ENV_NAME,
-              valueFrom: `${databaseSecretArn}:${RDS_PASSWORD_JSON_KEY}::`,
-            },
             // The one `secrets` entry that is not a secret: an SSM parameter
             // ARN. ECS resolves it through the execution role's
             // `ssm:GetParameters` grant and hands the value to the entry point

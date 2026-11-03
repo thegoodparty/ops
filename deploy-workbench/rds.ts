@@ -166,13 +166,22 @@ export const createBifrostDatabase = (args: {
    *   independently of the account, this is the property to change.
    * - `manageMasterUserPassword: true` and no `password`. RDS generates the
    *   master password, stores it in a Secrets Manager secret it owns, and
-   *   rotates it; nothing in this repo, and no human, ever knows the value.
-   *   That is the decision review settled — the alternative, a secret a person
-   *   populates, is a credential that has to be typed somewhere. The secret's
-   *   ARN is returned below for item 8 to inject as the task's `PG_PASSWORD`;
-   *   because the rotation replaces the value in place, a rotated password
-   *   reaches the task on its next start, which is also when Bifrost reads its
-   *   environment.
+   *   rotates it every seven days by default (RDS's own schedule; the interval
+   *   is a setting on the secret, not something this repo chooses). Nothing in
+   *   this repo, and no human, ever knows the value. That is the decision
+   *   review settled — the alternative, a secret a person populates, is a
+   *   credential that has to be typed somewhere.
+   *
+   *   The rotation replaces the value as the `AWSCURRENT` version of the same
+   *   secret, in place, and the task follows it without a restart: the secret's
+   *   ARN is returned below, the container gets it as `PG_SECRET_ARN`, and
+   *   Bifrost's `password_command` re-reads `AWSCURRENT` for every new physical
+   *   connection, behind a cache whose TTL is 60 seconds (step 6 of
+   *   `docs/bifrost-zero-downtime-deploys.md`, decision 20). This comment used
+   *   to say a rotated password reached the task when the task next started,
+   *   because the password was injected as `PG_PASSWORD` and Bifrost read it
+   *   once; that is no longer how it works, and the sentence is corrected here
+   *   rather than left to mislead the next reader of a rotation.
    * - `publiclyAccessible: false`, explicitly, because it is the property a
    *   reviewer is looking for. The subnet group has no route to the internet
    *   gateway and the security group admits 5432 only from the task group, so
@@ -221,10 +230,12 @@ export const createBifrostDatabase = (args: {
    * The secret RDS created and owns.
    *
    * `masterUserSecrets` is a list because the API models it as one; there is
-   * exactly one entry for a single instance, and it is the secret an ECS task
-   * definition injects as `PG_PASSWORD` in item 8. Handed out resolved rather
-   * than as the raw list, so a consumer does not have to know the shape or
-   * index into it.
+   * exactly one entry for a single instance. Injected into the task as
+   * `PG_SECRET_ARN`, not as the password itself: the container resolves the
+   * password from it per physical connection (step 6 of
+   * `docs/bifrost-zero-downtime-deploys.md`). Handed out resolved rather than as
+   * the raw list, so a consumer does not have to know the shape or index into
+   * it.
    */
   const secretArn = database.masterUserSecrets.apply(
     (secrets) => secrets[0].secretArn,
@@ -233,7 +244,8 @@ export const createBifrostDatabase = (args: {
   return {
     database,
     /**
-     * For item 8's `secrets` block and its read grant. Nothing reads it yet.
+     * For the task's `PG_SECRET_ARN` environment entry and the task role's read
+     * grant.
      */
     secretArn,
     /** Host and port for `config_store`/`logs_store` and the task's env. */

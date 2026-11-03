@@ -80,6 +80,16 @@ env:
   # build step derives it from the committed claim script and Dockerfile, the
   # same two files the module hashes in that order.
   BIFROST_BOOTSTRAP_REPOSITORY: bifrost-bootstrap
+  # The derived gateway image the task now runs (step 6 of
+  # docs/bifrost-zero-downtime-deploys.md, decision 20): the pinned Bifrost
+  # release plus `aws-cli` and `jq`, so the container can resolve its database
+  # password per connection with a `password_command`. The repository name is
+  # duplicated from `deploy-workbench/pg-password-image.ts` because Actions
+  # cannot import a TypeScript module, and `pg-password-image.test.ts` fails if
+  # they drift. The tag is not a literal: the build step derives it from the
+  # committed command script and Dockerfile, the same two files the module
+  # hashes in that order.
+  BIFROST_GATEWAY_REPOSITORY: bifrost-gateway
 
 jobs:
   deploy:
@@ -317,6 +327,40 @@ jobs:
           fi
           docker build --platform linux/amd64 \
             -f deploy-workbench/bifrost/bootstrap.Dockerfile \
+            -t "$image_uri" deploy-workbench/bifrost
+          docker push "$image_uri"
+
+      # Build and push the derived gateway image the task now runs (step 6 of
+      # docs/bifrost-zero-downtime-deploys.md, decision 20). It is the pinned
+      # Bifrost release plus `aws-cli` and `jq`, so `password_command` has an
+      # executable that can sign a Secrets Manager read; `bifrost/pg-password.sh`
+      # is that executable and `bifrost/gateway.Dockerfile` installs it.
+      #
+      # The tag is content-addressed over both committed inputs, in the order
+      # `BIFROST_GATEWAY_CONTENT_INPUTS` in `pg-password-image.ts` lists them, so
+      # the immutable repository accepts a push whenever the command's content
+      # changes and this step skips when the same content is already built.
+      #
+      # Before the apply like the other three, and for the same reason: the
+      # service is stop-before-start, so an apply that names a tag ECR does not
+      # have yet drains the only healthy task and has nothing to replace it
+      # with.
+      - name: Build and push the derived gateway image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          gateway_digest="$(cat deploy-workbench/bifrost/pg-password.sh deploy-workbench/bifrost/gateway.Dockerfile | sha256sum | cut -c1-12)"
+          image_tag="${BIFROST_TAG}-${gateway_digest}"
+          image_uri="${ECR_REGISTRY}/${BIFROST_GATEWAY_REPOSITORY}:${image_tag}"
+          if aws ecr describe-images \
+              --repository-name "$BIFROST_GATEWAY_REPOSITORY" \
+              --image-ids imageTag="$image_tag" >/dev/null 2>&1; then
+            echo "bifrost-gateway:$image_tag is already built; nothing to do."
+            exit 0
+          fi
+          docker build --platform linux/amd64 \
+            -f deploy-workbench/bifrost/gateway.Dockerfile \
             -t "$image_uri" deploy-workbench/bifrost
           docker push "$image_uri"
 

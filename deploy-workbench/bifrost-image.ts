@@ -13,8 +13,10 @@ import * as aws from "@pulumi/aws";
  * Why mirror at all, rather than pull from Docker Hub at task start: the
  * gateway is a component every harness depends on, so its image should not be
  * fetched from a public registry on every Fargate task start, and a public
- * tag can be repointed. The mirror is reproducible (pinned by digest) and the
- * task definition in phase 1 references the account's own copy.
+ * tag can be repointed. The mirror is reproducible (pinned by digest) and is
+ * what the derived gateway image is built `FROM` (`pg-password-image.ts`); the
+ * task itself runs that derivative, not the mirror directly, because it needs
+ * `aws-cli` to resolve its database password.
  *
  * These constants are the single source of truth for the pin. The workflow
  * duplicates the upstream reference because GitHub Actions cannot import a

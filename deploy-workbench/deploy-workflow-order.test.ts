@@ -45,11 +45,12 @@ const SOURCE = fs.readFileSync(WORKFLOW, "utf8");
 const FIRST_HOP_ROLE_ARN =
   "arn:aws:iam::333022194791:role/github-actions-workbench-deploy";
 
-/** The three images the task definition resolves, and their push steps. */
+/** The four images the task definition resolves, and their push steps. */
 const IMAGE_STEPS = [
   "Mirror the pinned Bifrost image",
   "Build and push the derived oauth2-proxy image",
   "Build and push the derived bootstrap image",
+  "Build and push the derived gateway image",
 ];
 
 type Step = { name: string; body: string };
@@ -248,13 +249,14 @@ describe("deploy-workbench.yml step order", () => {
       "bifrost-image.ts",
       "oauth2-proxy-image.ts",
       "bootstrap-image.ts",
+      "pg-password-image.ts",
     ].flatMap((file) => {
       const source = fs.readFileSync(path.resolve(__dirname, file), "utf8");
       return [...source.matchAll(/new aws\.ecr\.Repository\(\s*"([^"]+)"/g)].map(
         (match) => match[1],
       );
     });
-    assert.equal(logicalNames.length, 3, `expected three ECR repositories: ${logicalNames}`);
+    assert.equal(logicalNames.length, 4, `expected four ECR repositories: ${logicalNames}`);
     for (const name of logicalNames) {
       assert.match(
         `urn:pulumi:main::workbench::aws:ecr/repository:Repository::${name}`,

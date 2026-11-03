@@ -176,6 +176,32 @@ describe("bifrost database", () => {
     );
   });
 
+  it("describes a rotation as something the running task follows, not the next start", () => {
+    // The comment used to say "a rotated password reaches the task on its next
+    // start, which is also when Bifrost reads its environment". That was true
+    // when the password was injected as `PG_PASSWORD` and is false now: the
+    // stores declare a `password_command`, so the task re-reads `AWSCURRENT`
+    // for every new physical connection (step 6 of
+    // `docs/bifrost-zero-downtime-deploys.md`, decision 20). Pinned as source
+    // text because the claim is prose and prose is what goes stale.
+    const note = RDS_SOURCE.replace(/\s*\*\s*/g, " ");
+    assert.ok(
+      !note.includes("reaches the task on its next start"),
+      "rds.ts still says a rotated password reaches the task on its next start; the password is resolved per connection now",
+    );
+    assert.ok(
+      note.includes("password_command"),
+      "the rotation note must say how the task follows a rotation",
+    );
+    // The rotation interval is RDS's own default, and the comment should not
+    // invent one: seven days by default is what AWS documents for a
+    // `manageMasterUserPassword` secret.
+    assert.ok(
+      note.includes("seven days"),
+      "the rotation note must name the interval rather than leaving it to be assumed",
+    );
+  });
+
   it("is private: the subnet group and the task-only security group are item 5's", () => {
     const block = instanceBlock();
     assert.ok(

@@ -99,7 +99,7 @@ describe("extractRequiredSecretReferences", () => {
           valueFrom: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/bifrost/config`,
         },
         {
-          name: "PG_PASSWORD",
+          name: "DATABASE_PASSWORD",
           valueFrom: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf:password::`,
         },
       ]),
@@ -114,15 +114,16 @@ describe("extractRequiredSecretReferences", () => {
     ]);
   });
   it("derives every key from the task definition Pulumi will deploy", () => {
+    // The database password is deliberately NOT in this list any more (step 6 of
+    // docs/bifrost-zero-downtime-deploys.md): it is no longer an ECS `secrets`
+    // entry, so there is no key for the agent to resolve and nothing for this
+    // preflight to check. The container reads it at connection time with the
+    // task role.
     const preview = previewWith(
       containerDefinitions([
         {
           name: "BIFROST_SETUP_TOKEN",
           valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
-        },
-        {
-          name: "PG_PASSWORD",
-          valueFrom: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf:password::`,
         },
         {
           name: "OAUTH2_PROXY_CLIENT_ID",
@@ -136,11 +137,6 @@ describe("extractRequiredSecretReferences", () => {
         secretId: "bifrost/gateway",
         secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost/gateway`,
         key: "BIFROST_SETUP_TOKEN",
-      },
-      {
-        secretId: "bifrost-db-AbCdEf",
-        secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf`,
-        key: "password",
       },
       {
         secretId: "bifrost/oauth2-proxy",
