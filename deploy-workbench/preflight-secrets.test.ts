@@ -1,12 +1,21 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DATABASE_PASSWORD_JSON_KEY,
   PULUMI_UNKNOWN_SENTINEL,
+  PG_SECRET_ARN_ENV_NAME,
+  databasePasswordProblem,
+  extractDatabaseSecretArn,
   extractRequiredSecretReferences,
   formatMissingSecretKeys,
+  formatDatabasePasswordProblem,
   missingSecretKeys,
   parseSecretReference,
 } from "./scripts/preflight-secrets";
+import {
+  PG_SECRET_ARN_ENV_NAME as ECS_PG_SECRET_ARN_ENV_NAME,
+  RDS_PASSWORD_JSON_KEY as ECS_RDS_PASSWORD_JSON_KEY,
+} from "./ecs";
 
 /**
  * The pre-apply secret check, tested as functions rather than by shelling out
@@ -99,7 +108,7 @@ describe("extractRequiredSecretReferences", () => {
           valueFrom: `arn:aws:ssm:${REGION}:${ACCOUNT}:parameter/bifrost/config`,
         },
         {
-          name: "PG_PASSWORD",
+          name: "DATABASE_PASSWORD",
           valueFrom: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf:password::`,
         },
       ]),
@@ -114,15 +123,16 @@ describe("extractRequiredSecretReferences", () => {
     ]);
   });
   it("derives every key from the task definition Pulumi will deploy", () => {
+    // The database password is deliberately NOT in this list any more (step 6 of
+    // docs/bifrost-zero-downtime-deploys.md): it is no longer an ECS `secrets`
+    // entry, so there is no key for the agent to resolve and nothing for this
+    // preflight to check. The container reads it at connection time with the
+    // task role.
     const preview = previewWith(
       containerDefinitions([
         {
           name: "BIFROST_SETUP_TOKEN",
           valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
-        },
-        {
-          name: "PG_PASSWORD",
-          valueFrom: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf:password::`,
         },
         {
           name: "OAUTH2_PROXY_CLIENT_ID",
@@ -136,11 +146,6 @@ describe("extractRequiredSecretReferences", () => {
         secretId: "bifrost/gateway",
         secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost/gateway`,
         key: "BIFROST_SETUP_TOKEN",
-      },
-      {
-        secretId: "bifrost-db-AbCdEf",
-        secretArn: `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:bifrost-db-AbCdEf`,
-        key: "password",
       },
       {
         secretId: "bifrost/oauth2-proxy",
@@ -417,5 +422,172 @@ describe("formatMissingSecretKeys", () => {
     assert.match(message, /BIFROST_SETUP_TOKEN/);
     assert.match(message, /did not contain json key BIFROST_SETUP_TOKEN/);
     assert.match(message, /fill-secrets\.sh/);
+  });
+});
+
+describe("extractDatabaseSecretArn", () => {
+  const gatewayWithArn = (arn: string) =>
+    JSON.stringify([
+      {
+        name: "bifrost",
+        environment: [
+          { name: "AWS_REGION", value: REGION },
+          { name: "PG_SECRET_ARN", value: arn },
+        ],
+        secrets: [
+          {
+            name: "BIFROST_SETUP_TOKEN",
+            valueFrom: secretArn("bifrost/gateway", "BIFROST_SETUP_TOKEN"),
+          },
+        ],
+      },
+    ]);
+
+  it("reads the ARN the gateway's password command resolves the password from", () => {
+    // The RDS-managed secret is not a Pulumi resource and no longer a `secrets`
+    // entry, so nothing else in this check would look at it. Its ARN reaches
+    // the container as plain environment (`PG_SECRET_ARN`), which is the only
+    // in-band statement of which secret the command reads.
+    const arn = `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
+    const preview = {
+      steps: [
+        {
+          op: "update",
+          urn: "urn:pulumi:main::workbench::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+          newState: {
+            type: "aws:ecs/taskDefinition:TaskDefinition",
+            inputs: { containerDefinitions: gatewayWithArn(arn) },
+          },
+        },
+      ],
+    };
+
+    assert.equal(extractDatabaseSecretArn(preview), arn);
+  });
+
+  it("fails closed when the gateway carries no PG_SECRET_ARN", () => {
+    // A definition without it is a gateway whose `password_command` has no
+    // secret to read: every store init fails and Bifrost exits, after the
+    // apply has drained the running task. That must fail the run, not be
+    // reported as "nothing to check".
+    const preview = {
+      steps: [
+        {
+          op: "update",
+          urn: "urn:pulumi:main::workbench::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+          newState: {
+            type: "aws:ecs/taskDefinition:TaskDefinition",
+            inputs: {
+              containerDefinitions: JSON.stringify([
+                {
+                  name: "bifrost",
+                  environment: [{ name: "AWS_REGION", value: REGION }],
+                },
+              ]),
+            },
+          },
+        },
+      ],
+    };
+
+    assert.throws(
+      () => extractDatabaseSecretArn(preview),
+      /PG_SECRET_ARN/,
+    );
+  });
+
+  it("refuses a preview-unknown ARN instead of skipping the check", () => {
+    const preview = {
+      steps: [
+        {
+          op: "update",
+          urn: "urn:pulumi:main::workbench::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+          newState: {
+            type: "aws:ecs/taskDefinition:TaskDefinition",
+            inputs: {
+              containerDefinitions: gatewayWithArn(PULUMI_UNKNOWN_SENTINEL),
+            },
+          },
+        },
+      ],
+    };
+
+    assert.throws(
+      () => extractDatabaseSecretArn(preview),
+      /could not be validated at preview time/,
+    );
+  });
+});
+
+describe("databasePasswordProblem", () => {
+  // The half ECS used to cover. `PG_PASSWORD`'s `valueFrom` made the agent
+  // resolve `<secret>:password::` at task launch, so an ARN that did not
+  // resolve, or a secret without that key, failed the task rather than the
+  // deploy. With the password read by the container instead, nothing checked
+  // either fact before the drain, and a failure there is a gateway that cannot
+  // open its stores.
+  it("accepts the JSON RDS writes for a managed master user", () => {
+    assert.equal(
+      databasePasswordProblem(
+        JSON.stringify({
+          username: "bifrost",
+          password: "not-printed-anywhere",
+          engine: "postgres",
+          host: "bifrost-db.example",
+          port: 5432,
+          dbInstanceIdentifier: "bifrost-db",
+        }),
+      ),
+      null,
+    );
+  });
+
+  it("reports a missing password key", () => {
+    assert.match(
+      String(databasePasswordProblem(JSON.stringify({ username: "bifrost" }))),
+      /no "password" key/,
+    );
+  });
+
+  it("reports an empty or non-string password, which the command refuses", () => {
+    // `pg-password.sh` requires a non-empty string, so a `password` that is
+    // present but unusable is the same outage as a missing one.
+    for (const value of ["", 42, null, { nested: true }]) {
+      assert.match(
+        String(
+          databasePasswordProblem(JSON.stringify({ password: value }) ?? ""),
+        ),
+        /password/,
+        `a password of ${JSON.stringify(value)} must be reported`,
+      );
+    }
+  });
+
+  it("reports a secret that is not a JSON object", () => {
+    assert.match(String(databasePasswordProblem("not json")), /JSON/);
+    assert.match(String(databasePasswordProblem("[1,2,3]")), /JSON object/);
+  });
+
+  it("never includes the password in its message", () => {
+    const message = String(
+      databasePasswordProblem(
+        JSON.stringify({ password: "" }),
+      ),
+    );
+    assert.ok(
+      !message.includes("not-printed-anywhere"),
+      "the check may name key names only, never a value",
+    );
+  });
+});
+
+describe("the database secret's names match the deployment's", () => {
+  it("pins the environment variable and JSON key to ecs.ts's own", () => {
+    // The check reads the ARN out of the synthesized task definition and the
+    // key out of the secret. Both names are `ecs.ts`'s, and a rename there
+    // that did not reach this script would make the check look at nothing
+    // (or fail in a way that reads like a preflight defect).
+    assert.equal(PG_SECRET_ARN_ENV_NAME, ECS_PG_SECRET_ARN_ENV_NAME);
+    assert.equal(DATABASE_PASSWORD_JSON_KEY, ECS_RDS_PASSWORD_JSON_KEY);
   });
 });

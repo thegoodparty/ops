@@ -10,7 +10,11 @@
       "host": "env.PG_HOST",
       "port": "env.PG_PORT",
       "user": "env.PG_USER",
-      "password": "env.PG_PASSWORD",
+      "password_command": {
+        "command": "/usr/local/bin/bifrost-pg-password",
+        "timeout": "30s",
+        "cache_ttl": "60s"
+      },
       "db_name": "env.PG_DATABASE",
       "ssl_mode": "require",
       "max_idle_conns": 5,
@@ -24,7 +28,11 @@
       "host": "env.PG_HOST",
       "port": "env.PG_PORT",
       "user": "env.PG_USER",
-      "password": "env.PG_PASSWORD",
+      "password_command": {
+        "command": "/usr/local/bin/bifrost-pg-password",
+        "timeout": "30s",
+        "cache_ttl": "60s"
+      },
       "db_name": "env.PG_DATABASE",
       "ssl_mode": "require",
       "max_idle_conns": 10,

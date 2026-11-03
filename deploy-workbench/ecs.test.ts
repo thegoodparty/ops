@@ -36,6 +36,7 @@ import {
   EXECUTION_PARAMETER_ACTIONS,
   EXECUTION_ROLE_NAME,
   EXECUTION_SECRET_ACTIONS,
+  GATEWAY_PASSWORD_ENV_NAMES,
   GATEWAY_PLAIN_ENV_NAMES,
   GATEWAY_SECRET_KEYS,
   GATEWAY_SECRET_NAME,
@@ -48,14 +49,17 @@ import {
   OAUTH2_PROXY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_NAME,
   PG_DATABASE_ENV_NAME,
+  BIFROST_PG_PASSWORD_TIMEOUT_SECONDS,
   PG_HOST_ENV_NAME,
   PG_PASSWORD_ENV_NAME,
   PG_PORT_ENV_NAME,
+  PG_SECRET_ARN_ENV_NAME,
   PG_USER_ENV_NAME,
   RDS_PASSWORD_JSON_KEY,
   TASK_BEDROCK_ACTIONS,
   TASK_BEDROCK_READ_ACTIONS,
   TASK_BEDROCK_READ_RESOURCES,
+  TASK_SECRET_ACTIONS,
   TASK_CPU,
   TASK_MEMORY,
   TASK_ROLE_NAME,
@@ -71,6 +75,10 @@ import { BIFROST_PORT, OAUTH2_PROXY_PORT, REGION } from "./network";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_UPSTREAM_TAG } from "./bifrost-image";
+import {
+  BIFROST_GATEWAY_TAG,
+  BIFROST_PG_PASSWORD_CONTAINER_PATH,
+} from "./pg-password-image";
 import {
   BIFROST_HOSTNAME,
   TARGET_GROUP_DEREGISTRATION_DELAY_SECONDS,
@@ -256,11 +264,14 @@ describe("bifrost ecs", () => {
     }
   });
 
-  it("gives the execution role secrets read and the task role nothing but Bedrock", () => {
+  it("gives the execution role the script-owned secrets and the task role Bedrock plus the database password", () => {
+    // The split the step-6 change moved the database password across:
+    // `password_command` runs inside the container, so the call to
+    // `secretsmanager:GetSecretValue` is made with the task role. The execution
+    // role still resolves the two script-owned secrets into the containers.
     const executionPolicy = executionRoleSecretsPolicyDocument([
       secretArnPattern(GATEWAY_SECRET_NAME),
       secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
-      "arn:aws:secretsmanager:us-west-2:024901689212:secret:rds!db-abc123",
     ]);
     const executionActions = executionPolicy.Statement.flatMap((s) => s.Action);
     assert.deepEqual([...EXECUTION_SECRET_ACTIONS], [
@@ -272,7 +283,10 @@ describe("bifrost ecs", () => {
       "the execution role must not hold Bedrock actions",
     );
 
-    const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources());
+    const rdsSecretArn = `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
+    const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
     const taskActions = taskPolicy.Statement.flatMap((s) => s.Action);
     assert.deepEqual([...TASK_BEDROCK_ACTIONS], [
       "bedrock:Converse",
@@ -286,12 +300,27 @@ describe("bifrost ecs", () => {
     assert.deepEqual(taskActions, [
       ...TASK_BEDROCK_ACTIONS,
       ...TASK_BEDROCK_READ_ACTIONS,
+      ...TASK_SECRET_ACTIONS,
     ]);
-    assert.ok(taskActions.every((a) => a.startsWith("bedrock:")));
-    assert.ok(
-      taskActions.every((a) => !a.includes("secretsmanager")),
-      "the task role must not read secrets: the agent does that, not Bifrost",
+
+    // The one secret action the task role holds, and the one resource it names.
+    const secretStatement = taskPolicy.Statement.filter((s) =>
+      s.Action.some((a) => a.startsWith("secretsmanager:")),
     );
+    assert.equal(secretStatement.length, 1);
+    assert.equal(secretStatement[0].Sid, "ReadDatabasePassword");
+    assert.deepEqual(secretStatement[0].Action, ["secretsmanager:GetSecretValue"]);
+    assert.deepEqual(secretStatement[0].Resource, [rdsSecretArn]);
+
+    // The rest is still Bedrock, so an edit that folds a second service into an
+    // existing statement fails here rather than in an AccessDenied.
+    for (const statement of taskPolicy.Statement) {
+      const actions = statement.Action.filter((a) => !a.startsWith("secretsmanager:"));
+      assert.ok(
+        actions.every((a) => a.startsWith("bedrock:")),
+        `unexpected action in ${statement.Sid}`,
+      );
+    }
   });
 
   it("lets the task role list the catalog so the model list renders", () => {
@@ -300,7 +329,9 @@ describe("bifrost ecs", () => {
     // renders that page from a signed `GET /foundation-models`
     // (`core/providers/bedrock/bedrock.go`, `listModelsByKey` at `v2.3.0`),
     // i.e. `bedrock:ListFoundationModels`, and the role had no read at all.
-    const policy = taskRolePolicyDocument(bedrockInvokeResources());
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-x`,
+    ]);
     const catalog = policy.Statement.filter((s) =>
       s.Action.includes("bedrock:ListFoundationModels"),
     );
@@ -324,6 +355,10 @@ describe("bifrost ecs", () => {
     assert.deepEqual(invoke.Action, [...TASK_BEDROCK_ACTIONS]);
     assert.deepEqual(invoke.Resource, bedrockInvokeResources());
     for (const action of policy.Statement.flatMap((s) => s.Action)) {
+      // `secretsmanager:GetSecretValue` contains "Get", and the database
+      // password's read is exactly that one action on one ARN. Everything else
+      // is the Bedrock set, where no `bedrock:Get*` is granted.
+      if (action.startsWith("secretsmanager:")) continue;
       assert.ok(!action.includes("Get"), action);
       assert.ok(!/^bedrock:List(InferenceProfiles|CustomModels)/.test(action), action);
     }
@@ -333,7 +368,9 @@ describe("bifrost ecs", () => {
     // The plan: "The role is scoped to the model list in
     // utils/bedrock-models.ts". Composed here from the same function
     // WorkbenchAccess uses, so adding a model there reaches the gateway too.
-    const policy = taskRolePolicyDocument(bedrockInvokeResources());
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-x`,
+    ]);
     const invoke = policy.Statement.find(
       (s) => s.Sid === "InvokeSelectedBedrockModels",
     );
@@ -357,18 +394,20 @@ describe("bifrost ecs", () => {
     // grant the plan rules out.
     //
     // Built with the same three ARN shapes `ecs.ts` grants — the two script-owned
-    // secret name patterns and the exact ARN item 7 returns for the RDS-managed
-    // master password — so the no-wildcard property is exercised over the RDS
-    // ARN too, not only over the two secret references.
+    // secret name patterns on the execution role and the exact ARN item 7
+    // returns for the RDS-managed master password on the task role — so the
+    // no-wildcard property is exercised over the RDS ARN too, not only over the
+    // two secret references.
     const rdsSecretArn = `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
     const executionSecretArns = [
       secretArnPattern(GATEWAY_SECRET_NAME),
       secretArnPattern(OAUTH2_PROXY_SECRET_NAME),
-      rdsSecretArn,
     ];
     const executionPolicy =
       executionRoleSecretsPolicyDocument(executionSecretArns);
-    const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources());
+    const taskPolicy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
 
     for (const document of [executionPolicy, taskPolicy]) {
       assert.equal(document.Version, "2012-10-17");
@@ -391,11 +430,10 @@ describe("bifrost ecs", () => {
       }
     }
 
-    // The execution role's resources are the three secret ARNs it grants, in
-    // the shapes the module uses: the two script-owned names carry the six
-    // random characters Secrets Manager appends, wildcarded; the RDS-managed
-    // secret is granted by its exact ARN, which carries no wildcard at all.
-    // Neither shape may acquire a `*`, which is the property being pinned.
+    // The execution role's resources are the two script-owned secret ARNs it
+    // grants, in the shapes the module uses: both carry the six random
+    // characters Secrets Manager appends, wildcarded with `?`. Neither may
+    // acquire a `*`, which is the property being pinned.
     const executionResources = executionPolicy.Statement.flatMap(
       (statement) => statement.Resource,
     );
@@ -415,10 +453,16 @@ describe("bifrost ecs", () => {
     // The only wildcard anywhere in these ARNs is the six `?` characters of
     // the script-owned name patterns; `?` is a single-character glob, not a
     // rest-of-ARN wildcard, and it is not `*`.
-    for (const resource of executionResources.slice(0, 2)) {
+    for (const resource of executionResources) {
       assert.match(resource, /-\?\?\?\?\?\?$/, resource);
     }
-    assert.equal(executionResources[2], rdsSecretArn);
+
+    // The task role's one secret is the RDS-managed ARN, exactly as item 7
+    // returns it: no `?` pattern, because nothing here describes the secret.
+    const taskSecretResources = taskPolicy.Statement.filter((statement) =>
+      statement.Action.some((action) => action.startsWith("secretsmanager:")),
+    ).flatMap((statement) => statement.Resource);
+    assert.deepEqual(taskSecretResources, [rdsSecretArn]);
 
     // The task role's invoke resources are model ARNs. They carry exactly one
     // wildcard, the region, and that is deliberate: the destination set differs
@@ -531,7 +575,6 @@ describe("bifrost ecs", () => {
     const injected = new Set<string>([
       ...GATEWAY_SECRET_KEYS,
       ...GATEWAY_PLAIN_ENV_NAMES,
-      PG_PASSWORD_ENV_NAME,
     ]);
     const block = containerBlock();
     for (const name of referenced) {
@@ -552,35 +595,39 @@ describe("bifrost ecs", () => {
       "config.json no longer resolves env.BIFROST_SETUP_TOKEN",
     );
     // The Postgres half is what makes the config store survive a task
-    // replacement, so a dropped reference is the SQLite regression again.
-    for (const name of [
-      "PG_HOST",
-      "PG_PORT",
-      "PG_USER",
-      "PG_PASSWORD",
-      "PG_DATABASE",
-    ]) {
+    // replacement, so a dropped reference is the SQLite regression again. The
+    // password is deliberately absent: it is not an `env.` reference any more
+    // (`PG_SECRET_ARN` names where it comes from, and the stores resolve it with
+    // a `password_command`), and asserting it here would pin the shape step 6
+    // removed.
+    for (const name of ["PG_HOST", "PG_PORT", "PG_USER", "PG_DATABASE"]) {
       assert.ok(
         referenced.includes(name),
         `config.json no longer resolves env.${name}, so the stores would fall back to SQLite`,
       );
     }
+    assert.ok(
+      !referenced.includes("PG_PASSWORD"),
+      "config.json must not reference env.PG_PASSWORD: the password is resolved per connection, not injected",
+    );
   });
 
   it("injects the four non-secret Postgres values from the database module", () => {
     // host and port are item 7's outputs; user and database name are that
     // module's constants. Nothing here spells a connection string a second
-    // time, and the password stays the RDS-managed secret.
+    // time, and the password is resolved by the container rather than injected.
     assert.equal(PG_HOST_ENV_NAME, "PG_HOST");
     assert.equal(PG_PORT_ENV_NAME, "PG_PORT");
     assert.equal(PG_USER_ENV_NAME, "PG_USER");
     assert.equal(PG_DATABASE_ENV_NAME, "PG_DATABASE");
+    assert.equal(PG_SECRET_ARN_ENV_NAME, "PG_SECRET_ARN");
     const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     for (const fragment of [
       "{ name: PG_HOST_ENV_NAME, value: databaseAddress }",
       "{ name: PG_PORT_ENV_NAME, value: databasePort }",
       "{ name: PG_USER_ENV_NAME, value: DATABASE_USERNAME }",
       "{ name: PG_DATABASE_ENV_NAME, value: DATABASE_NAME }",
+      "{ name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn }",
     ]) {
       assert.ok(block.includes(fragment), `${fragment} is missing\n${block}`);
     }
@@ -612,21 +659,49 @@ describe("bifrost ecs", () => {
     assert.equal(REGION, "us-west-2");
   });
 
-  it("injects the RDS-managed master password item 7 handed over", () => {
-    // rds.ts: "The secret's ARN is returned below for item 8 to inject as the
-    // task's `PG_PASSWORD`". Only the password; host, port, user and database
-    // belong to config.json in item 10.
+  it("resolves the database password per connection instead of injecting it", () => {
+    // Step 6 of docs/bifrost-zero-downtime-deploys.md (decision 20). The body
+    // used to be a `secrets` entry, `PG_PASSWORD`, `valueFrom`
+    // `${databaseSecretArn}:password::`; Bifrost read it once at process start,
+    // so an RDS rotation left the running gateway on the previous password and
+    // every new physical connection failed with SQLSTATE 28P01.
     assert.equal(RDS_PASSWORD_JSON_KEY, "password");
     assert.equal(PG_PASSWORD_ENV_NAME, "PG_PASSWORD");
-    const block = containerBlock();
+    assert.equal(PG_SECRET_ARN_ENV_NAME, "PG_SECRET_ARN");
+
+    const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    // The name is gone from the gateway's secrets: no `PG_PASSWORD` entry, and
+    // nothing in the container reads the secret's `password` key through the
+    // ECS agent.
     assert.ok(
-      block.includes("valueFrom: `${databaseSecretArn}:${RDS_PASSWORD_JSON_KEY}::`"),
+      !block.includes("valueFrom: `${databaseSecretArn}:${RDS_PASSWORD_JSON_KEY}::`"),
       block,
     );
-    // And the read grant names the same ARN.
+    assert.ok(!block.includes("PG_PASSWORD_ENV_NAME"), block);
+    // What replaced it: the ARN in the plain environment, for the
+    // `password_command` the stores declare.
     assert.ok(
-      resourceBlock("bifrostExecutionRole").includes("database.secretArn.apply"),
-      "the execution role must be granted read on the RDS secret",
+      block.includes("{ name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn }"),
+      block,
+    );
+    // The ARN is an identifier, not a credential, so it is deliberately not a
+    // `secrets` entry: resolving it there would route the read through the
+    // execution role, which is the identity this step takes it away from.
+    const secretsBlock = block.slice(block.indexOf("secrets: ["));
+    assert.ok(
+      !secretsBlock.includes("PG_SECRET_ARN_ENV_NAME"),
+      "the secret ARN must be plain environment, not a `secrets` entry",
+    );
+
+    // The read grant moved to the task role, which is the principal that makes
+    // the call now, and it names the RDS ARN exactly.
+    assert.ok(
+      resourceBlock("bifrostTaskRole").includes("database.secretArn.apply"),
+      "the task role must be granted read on the RDS secret",
+    );
+    assert.ok(
+      !resourceBlock("bifrostExecutionRole").includes("database.secretArn.apply"),
+      "the execution role no longer resolves the database secret; the container does",
     );
   });
 
@@ -635,11 +710,14 @@ describe("bifrost ecs", () => {
     // Pulumi-declared `Secret` or `SecretVersion` here could replace one and
     // delete them. Nothing in this module reads a value either, which is what
     // keeps `preview` free of `secretsmanager:GetSecretValue`.
+    //
+    // The one `GetSecretValue` in the deployment is a string in a policy
+    // document's `Action` (`TASK_SECRET_ACTIONS`), never a call: the CLI call
+    // is in `bifrost/pg-password.sh`, which runs inside the container.
     for (const forbidden of [
       "new aws.secretsmanager.Secret(",
       "aws.secretsmanager.SecretVersion",
       "aws.secretsmanager.getSecret",
-      "getSecretValue",
     ]) {
       assert.ok(
         !ECS_SOURCE.includes(forbidden),
@@ -1228,9 +1306,18 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("names the pinned images from the mirror stores, not floating tags", () => {
-    assert.ok(ECS_SOURCE.includes("${repositoryUrl}:${BIFROST_UPSTREAM_TAG}"));
-    // The Bifrost pin itself lives in bifrost-image.ts and is asserted there.
+  it("names the pinned images from the derived-image modules, not floating tags", () => {
+    // The task's image is the derived gateway image (step 6, decision 20), and
+    // its tag is content-addressed on the `password_command` script and its
+    // Dockerfile, so it comes from `pg-password-image.ts` rather than a literal
+    // in the task definition.
+    assert.ok(
+      ECS_SOURCE.includes("${gatewayRepositoryUrl}:${BIFROST_GATEWAY_TAG}"),
+      ECS_SOURCE,
+    );
+    assert.match(BIFROST_GATEWAY_TAG, /^v2\.3\.2-[0-9a-f]{12}$/);
+    // That tag starts from the upstream release the mirror pins, so a bump still
+    // moves one version and not two.
     assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.2");
     assert.ok(ECS_SOURCE.includes('cpuArchitecture: "X86_64"'));
     // The sidecar's tag is content-addressed on the allowlist, so it comes
@@ -1378,6 +1465,13 @@ describe("bifrost ecs", () => {
       command.includes("exit 1"),
       `the command must fail closed when the config is missing: ${command}`,
     );
+    // The warm is between the write and the exec; see the memory test below for
+    // why it exists and what bounds it.
+    assert.ok(
+      command.indexOf(BIFROST_PG_PASSWORD_CONTAINER_PATH) <
+        command.indexOf("exec /app/docker-entrypoint.sh /app/main"),
+      `the warm must run before the process starts: ${command}`,
+    );
     const bifrostBlock = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(
       bifrostBlock.includes("entryPoint: [...BIFROST_CONTAINER_ENTRY_POINT]") &&
@@ -1415,6 +1509,19 @@ describe("bifrost ecs", () => {
         PG_DATABASE_ENV_NAME,
       ],
     );
+    // The password command's inputs are their own list: they are what the
+    // container carries for the command, not names config.json may resolve.
+    // Putting `PG_SECRET_ARN` in the list above would let a
+    // `"password": "env.PG_SECRET_ARN"` pass the reference test and try to
+    // authenticate with an ARN.
+    assert.deepEqual([...GATEWAY_PASSWORD_ENV_NAMES], [PG_SECRET_ARN_ENV_NAME]);
+    for (const name of GATEWAY_PASSWORD_ENV_NAMES) {
+      assert.ok(
+       !(GATEWAY_PLAIN_ENV_NAMES as readonly string[]).includes(name),
+        `${name} must not be a name config.json may resolve`,
+      );
+    }
+    assert.ok(block.includes("{ name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn }"));
   });
 
   it("is wired into index.ts with the network and the database", () => {
@@ -1429,8 +1536,10 @@ describe("bifrost ecs", () => {
       );
     }
     assert.ok(
-      INDEX_SOURCE.includes("repositoryUrl: bifrostRepository.repositoryUrl"),
-      "index.ts does not pass the mirrored repository to the task definition",
+      INDEX_SOURCE.includes(
+        "gatewayRepositoryUrl: bifrostGatewayRepository.repositoryUrl",
+      ),
+      "index.ts does not pass the derived gateway repository; the task would run an image with no password command",
     );
     assert.ok(
       INDEX_SOURCE.includes(
@@ -1448,5 +1557,254 @@ describe("bifrost ecs", () => {
       INDEX_SOURCE.includes("export const bifrostLogGroupName"),
       "index.ts must export the log group name for item 12",
     );
+    assert.ok(
+      INDEX_SOURCE.includes(
+        "export const bifrostGatewayRepositoryUrl",
+      ),
+      "index.ts must export the derived gateway image's repository, like the other derived images",
+    );
+  });
+
+  it("names the password command path the derived image installs", () => {
+    // The path is stated twice on purpose and the two have to agree: the
+    // Dockerfile's `COPY` destination decides where the executable is, and
+    // `config.json`'s `password_command.command` names it. Bifrost's
+    // `validatePasswordCommand` only rejects a whitespace-split path and a
+    // shell, so a wrong path is not a config error — it is a dial that fails
+    // with "no such file or directory" on the first connection.
+    assert.equal(
+      BIFROST_PG_PASSWORD_CONTAINER_PATH,
+      "/usr/local/bin/bifrost-pg-password",
+    );
+    assert.ok(
+      !BIFROST_PG_PASSWORD_CONTAINER_PATH.includes(" "),
+      "the schema's `command` pattern is ^\\S+$",
+    );
+    assert.ok(/^\/(usr|opt|app)\//.test(BIFROST_PG_PASSWORD_CONTAINER_PATH));
+  });
+});
+
+describe("the password command's memory at boot", () => {
+  /**
+   * The gateway container's own limit (`BIFROST_CONTAINER_MEMORY`) was sized
+   * for Bifrost alone, before the container forked anything. A cache miss now
+   * forks a Python `aws-cli`, and the two stores have separate caches
+   * (`postgresconn.go`: "One cache per pool"), so `singleflight` collapses a
+   * burst within a pool but not across them: the first connection after boot
+   * and the first after each `cache_ttl` expiry can be two forks at once.
+   *
+   * The numbers here are measured, not assumed:
+   *
+   * - One `aws secretsmanager get-secret-value` peaks at 71 MiB RSS (five runs
+   *   in the build container, aarch64, warm page cache).
+   * - Two concurrent invocations peak at 142 MiB summed `VmHWM` and 121 MiB
+   *   summed `Pss`, so half of the second one's footprint is shared pages
+   *   rather than new ones.
+   * - The gateway's own high-water mark, from the service's
+   *   `MemoryUtilization` (a percentage of the task's 1024 MiB), is 65.97% on
+   *   2026-10-25, i.e. about 676 MiB.
+   *
+   * The fix is the entry point's warm below rather than a bigger task: the
+   * measured concurrent figure fits inside the existing reservation, and the
+   * warm keeps the expensive cold part (the interpreter and botocore import
+   * faulting in from the image layer) to one serial pass before Bifrost starts
+   * instead of two racing for 0.44 vCPU.
+   *
+   * 676 + 142 = 818 MiB of the 896 MiB limit, so the margin is 78 MiB. That is
+   * the tripwire: if the gateway's peak passes ~750 MiB the reservation is what
+   * needs to change, and the container will be killed before a deploy notices.
+   */
+  const GATEWAY_PEAK_MIB = 676;
+  const PASSWORD_COMMAND_PEAK_MIB = 71;
+  const CONCURRENT_PEAK_MIB = 142;
+
+  it("fits the gateway and two concurrent password commands in its reservation", () => {
+    assert.equal(CONCURRENT_PEAK_MIB, PASSWORD_COMMAND_PEAK_MIB * 2);
+    assert.ok(
+      GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB <= BIFROST_CONTAINER_MEMORY,
+      `the gateway's ${GATEWAY_PEAK_MIB} MiB peak plus two ${PASSWORD_COMMAND_PEAK_MIB} MiB password commands is ${
+        GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB
+      } MiB, over the ${BIFROST_CONTAINER_MEMORY} MiB reservation; raise BIFROST_CONTAINER_MEMORY and TASK_MEMORY together rather than lowering this`,
+    );
+    // The reservation is still inside the task, which the sizing test above
+    // already asserts; this only says the arithmetic above is not satisfied by
+    // a value that is under what was measured.
+    assert.ok(BIFROST_CONTAINER_MEMORY > GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB);
+    assert.equal(BIFROST_CONTAINER_MEMORY, 896);
+  });
+
+  it("is not relying on singleflight across the two pools", () => {
+    // The reason the concurrency above is real and the warm is worth doing: the
+    // cache is per pool, because `postgresconn.Open` constructs one
+    // `passwordCache` per call and the two stores call it separately. Pinned as
+    // a statement of what the group in the source says, so a future reader who
+    // assumes "singleflight covers the two stores" finds the assumption
+    // already answered here.
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "bifrost/pg-password.sh"),
+      "utf8",
+    );
+    assert.ok(
+      source.includes("singleflight"),
+      "the script's header must still explain what singleflight does and does not collapse",
+    );
+    // And the entry point is the only place the two-pool gap is closed, so a
+    // removed warm fails here rather than only in the string assertions above.
+    assert.ok(
+      BIFROST_CONTAINER_COMMAND.join(" ").includes(
+        BIFROST_PG_PASSWORD_CONTAINER_PATH,
+      ),
+      "the warm is the mitigation for the per-pool cache; without it the first connection in each pool is a concurrent fork",
+    );
+  });
+
+  it("warms the command once, in the entry point, before Bifrost starts", () => {
+    // The cheapest fix of the two the review named, and the reason it is the
+    // cheapest: it changes no task size, so it changes no bill, and the work it
+    // removes is the cold interpreter import. Done in the entry point because
+    // that is the last place before Bifrost's own pools open, and ECS has no
+    // init container to put it in.
+    //
+    // What it does not do, because the comment should not overclaim it: it
+    // cannot populate Bifrost's own cache, which lives inside the process this
+    // runs before. The userland is what warms, so the residual risk is a later
+    // `cache_ttl` expiry producing two concurrent forks into a warm page cache.
+    // The reservation arithmetic in the test above is what bounds that; the warm
+    // only removes the expensive case.
+    const command = BIFROST_CONTAINER_COMMAND.join(" ");
+    const warmAt = command.indexOf(BIFROST_PG_PASSWORD_CONTAINER_PATH);
+    assert.notEqual(
+      warmAt,
+      -1,
+      `the entry point must run the password command once before Bifrost starts: ${command}`,
+    );
+    assert.ok(
+      warmAt < command.indexOf("exec /app/docker-entrypoint.sh /app/main"),
+      `the warm must run before the process starts, or it races the pools it is warming for: ${command}`,
+    );
+    // The warm's output is discarded and its failure is swallowed. It is an
+    // optimisation, so it must not become a way for a transient
+    // GetSecretValue failure at boot to stop the task: `password_command`
+    // failures are per connection and retried on the next dial, and a boot
+    // that dies instead is the outage this whole change is against.
+    assert.match(
+      command,
+      /bifrost-pg-password[^;]*>\/dev\/null/,
+      `the warm must not print the password anywhere: ${command}`,
+    );
+    assert.match(
+      command,
+      /\|\|\s*true|;\s*timeout/,
+      `a failed warm must not fail the boot: ${command}`,
+    );
+    assert.ok(
+      !command.includes("PGPASSWORD"),
+      "the warm runs the same command, not a second credential path",
+    );
+  });
+
+  it("bounds the warm so a hung CLI cannot hold the boot open", () => {
+    // The container's health check is what eventually replaces a task that
+    // never becomes healthy, and that is 90 s of start period away. The warm is
+    // given the same budget the `password_command` itself gets in
+    // `bifrost/config.json`, so the worst case is the same as a slow dial
+    // rather than an unbounded one.
+    const command = BIFROST_CONTAINER_COMMAND.join(" ");
+    assert.match(
+      command,
+      new RegExp(`timeout ${BIFROST_PG_PASSWORD_TIMEOUT_SECONDS} `),
+      `the warm must be bounded by the password_command timeout: ${command}`,
+    );
+    const config = JSON.parse(fs.readFileSync(BIFROST_CONFIG_SOURCE_PATH, "utf8"));
+    for (const store of ["config_store", "logs_store"] as const) {
+      assert.equal(
+        config[store].config.password_command.timeout,
+        `${BIFROST_PG_PASSWORD_TIMEOUT_SECONDS}s`,
+        "the warm's bound and config.json's timeout are the same number, so a change to one is a change to the other",
+      );
+    }
+  });
+});
+
+describe("the task role's secret read, which replaces the old prohibition", () => {
+  /**
+   * This replaces the assertion that used to read
+   *
+   *     the task role must not read secrets: the agent does that, not Bifrost
+   *
+   * It was true while `PG_PASSWORD` was an ECS `secrets` entry: the agent
+   * resolved the value with the execution role, and the gateway process never
+   * made a Secrets Manager call. Step 6 of
+   * `docs/bifrost-zero-downtime-deploys.md` moves that call into the container
+   * (`password_command`), so the task role is now the principal that makes it.
+   * The prohibition is replaced, not deleted, by the narrower statement it
+   * becomes: exactly one secret, named by its exact ARN, one action, and
+   * nothing else in the role.
+   */
+  const rdsSecretArn = `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
+
+  it("reads exactly one secret: the RDS-managed ARN, with no pattern and no second entry", () => {
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
+    const statements = policy.Statement.filter((statement) =>
+      statement.Action.some((action) => action.startsWith("secretsmanager:")),
+    );
+    assert.equal(
+      statements.length,
+      1,
+      "the task role must hold exactly one secretsmanager statement",
+    );
+    assert.deepEqual(statements[0].Action, ["secretsmanager:GetSecretValue"]);
+    assert.deepEqual(
+      statements[0].Resource,
+      [rdsSecretArn],
+      "the resource must be the exact ARN Pulumi returns, not a name pattern",
+    );
+    // No second secret sneaks in through the same statement, and the exact ARN
+    // is the whole list: `secretArnPattern`'s `-??????` would authorise every
+    // secret with that name, including a future one this deployment does not
+    // create.
+    assert.equal(statements[0].Resource.length, 1);
+    assert.ok(!statements[0].Resource[0].includes("?"));
+    assert.ok(!statements[0].Resource[0].includes("*"));
+  });
+
+  it("gets that one ARN from the database module, not a second description of it", () => {
+    // The grant and the container's `PG_SECRET_ARN` must be the same secret.
+    // Two independent descriptions of it could drift, and the drift would be an
+    // AccessDenied on the first dial rather than a preview failure.
+    const taskRole = resourceBlock("bifrostTaskRole");
+    assert.ok(
+      taskRole.includes("database.secretArn.apply"),
+      "the task role's policy must be built from database.secretArn",
+    );
+    assert.ok(
+      taskRole.includes("taskRolePolicyDocument(bedrockInvokeResources(), [") &&
+        taskRole.includes("databaseSecretArn,"),
+      `the task role must pass the one ARN to taskRolePolicyDocument\n${taskRole}`,
+    );
+    const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(
+      block.includes("{ name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn }"),
+      "the command reads the same ARN the role is granted",
+    );
+  });
+
+  it("still holds nothing but Bedrock beyond that one statement", () => {
+    // The narrower half of the replaced assertion: the exception is a secret
+    // read for the password command, and it did not become a door for anything
+    // else.
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
+    const nonBedrock = policy.Statement.filter((statement) =>
+      statement.Action.some((action) => !action.startsWith("bedrock:")),
+    );
+    assert.equal(nonBedrock.length, 1, "one statement may name a non-Bedrock service");
+    assert.equal(nonBedrock[0].Sid, "ReadDatabasePassword");
+    for (const action of nonBedrock[0].Action) {
+      assert.ok(action.startsWith("secretsmanager:"), action);
+    }
   });
 });

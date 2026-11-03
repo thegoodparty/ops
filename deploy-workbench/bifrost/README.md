@@ -44,6 +44,14 @@ files that belong in review:
   inside the task, and the derivative of the pinned Bifrost image that gives it
   `curl` and `jq`. Its pin and content-addressed tag live in
   `deploy-workbench/bootstrap-image.ts`.
+- `pg-password.sh` and `gateway.Dockerfile` — the derivative the gateway itself
+  now runs: `aws-cli` and `jq` added to the pinned release, plus the committed
+  command that prints the RDS-managed password for every new physical
+  connection (step 6 of
+  [`docs/bifrost-zero-downtime-deploys.md`](../../docs/bifrost-zero-downtime-deploys.md),
+  decision 20). Its pin, its content-addressed tag and the path the command is
+  installed to live in `deploy-workbench/pg-password-image.ts`. See
+  "The database password" below.
 
 The ECS task definition, the sidecar container and the ALB routing rules are
 the other half of phase 1 item 9 and live in `deploy-workbench/ecs.ts` and
@@ -72,7 +80,13 @@ a later tag. It holds:
   deploy takes it with it. The connection fields are `env.` references to the
   task definition's `PG_*` values rather than a connection string spelled in
   this file, and `logs_store.retention_days` is explicit (90) because the
-  upstream default prunes nothing.
+  upstream default prunes nothing. The password is the one field that is not a
+  plain `env.` reference: both stores declare a `password_command`
+  (`/usr/local/bin/bifrost-pg-password`, from the derived gateway image) that
+  prints the RDS-managed password for every new physical connection, because a
+  `password` reference is read once at process start and an RDS rotation left
+  the running gateway holding the previous value (`SQLSTATE 28P01`). See
+  "The database password" below.
 - **Providers.** `fireworks`, pinned to Fireworks' US-only Serverless endpoint
   (`network_config.base_url: https://us.api.fireworks.ai/inference`, the only
   `base_url` in the schema at the pinned tag) with its key read from
@@ -151,11 +165,95 @@ a later tag. It holds:
 `bifrost/gateway` that `fill-secrets.sh` writes
 (`BIFROST_ENCRYPTION_KEY`, `BIFROST_ADMIN_USERNAME`, `BIFROST_ADMIN_PASSWORD`,
 `BIFROST_SETUP_TOKEN`, `FIREWORKS_API_KEY`), and the task definition's own
-environment and RDS-managed password entry for the Postgres connection
-(`PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE`, `PG_PASSWORD`). Bedrock has no
-entry because its credential is the role. `config.test.ts` fails on a
-reference to a name neither provides, and `deploy-workbench/ecs.test.ts` fails
-on a name the task definition does not inject.
+environment for the Postgres connection (`PG_HOST`, `PG_PORT`, `PG_USER`,
+`PG_DATABASE`). Bedrock has no entry because its credential is the role.
+`config.test.ts` fails on a reference to a name neither provides, and
+`deploy-workbench/ecs.test.ts` fails on a name the task definition does not
+inject.
+
+## The database password
+
+The password is deliberately **not** an `env.` reference and not an ECS
+`secrets` entry any more (step 6 of
+[`docs/bifrost-zero-downtime-deploys.md`](../../docs/bifrost-zero-downtime-deploys.md),
+decision 20). It was `PG_PASSWORD`, injected from the RDS-managed secret when
+the task started; Bifrost reads that once and never again, so a rotation left
+the running process on the previous password. On 2026-11-02 that produced
+`SQLSTATE 28P01` on every new physical connection, `/health` pings the stores,
+the container went unhealthy and ECS replaced the task: 2 min 50 s of outage
+after about 7 h 20 min in which inference worked while request logging and
+usage accounting failed silently.
+
+Both stores now declare a `password_command` instead:
+
+```json
+"password_command": { "command": "/usr/local/bin/bifrost-pg-password",
+                      "timeout": "30s", "cache_ttl": "60s" }
+```
+
+At the pinned tag `framework/postgresconn/postgresconn.go` runs it from an
+`OptionBeforeConnect`, so it is executed for every new physical connection,
+behind a `singleflight` group and a TTL cache that never caches a failure. The
+schema makes `password` and `password_command` a mutually exclusive `oneOf`, so
+a store has exactly one of them and both stores have to move in one change.
+
+The `timeout` is 30s rather than the pinned tag's 10s default. A timeout here
+fails store init and Bifrost exits, and the call it bounds is a cold Python
+`aws-cli` start on a task with 0.44 vCPU, not a warm one on a build machine;
+the worst case is two of them at once at boot. 30s is still inside the container
+health check's 90s `startPeriod` even with the slowest measured boot (23.1s of
+store migrations) added to it, which is the constraint that makes it safe
+rather than merely generous: a timeout at or above the start period would turn
+the slow CLI it was bounding into a failed task.
+
+The command is in the image, not in the file: `bifrost/pg-password.sh` is
+installed by `bifrost/gateway.Dockerfile` at the path above, and
+`deploy-workbench/pg-password-image.ts` pins both. It reads the secret's ARN
+from `PG_SECRET_ARN` — the schema's `args` are literal strings and nothing
+expands an `env.` reference in them — calls
+`aws secretsmanager get-secret-value --version-stage AWSCURRENT` with the
+container's own task-role credentials, and prints the `password` key. RDS owns
+that secret and writes a rotation as the current version of the same secret, so
+`AWSCURRENT` converges on its own and nothing looks at `AWSPENDING`. The image
+is the pinned Bifrost release plus `aws-cli` and `jq`, which Alpine ships
+neither of.
+
+The read is the **task role's**, not the execution role's: the ECS agent is no
+longer in this path, so `ecs.ts` grants `secretsmanager:GetSecretValue` on
+`database.secretArn` to the task role and nothing wider, and the execution role
+no longer holds it. `cache_ttl` is what heals a rotation: the 60 s default is
+well under RDS's own seven-day rotation interval, so a rotated-away password
+fails new connections for at most a minute instead of until the next task
+start. A consequence worth having: during a two-colour overlap both tasks
+resolve the credential themselves and cannot disagree about it.
+
+**What replaced the `PG_PASSWORD` preflight, and the memory it costs.**
+Dropping the `secrets` entry also dropped the ECS-side check that the secret
+exists and holds a `password` key: the agent resolved `<secret>:password::` at
+task launch, so a bad ARN failed the task. Nothing did that afterwards, and a
+failure there now surfaces after the apply has drained the running task.
+`scripts/preflight-secrets.ts` therefore reads the ARN out of the synthesized
+task definition's `PG_SECRET_ARN` environment entry and checks the secret the
+same way: it must resolve, its `SecretString` must be a JSON object, and the
+`password` key must be a non-empty string, which is exactly what
+`pg-password.sh`'s own `jq` requires. It fails the deploy run, before the
+drain, on an unreadable preview or a bad secret.
+
+The command forks a Python `aws-cli` on a cache miss (71 MiB RSS measured), and
+`postgresconn.go` builds one cache per pool, so `singleflight` collapses a burst
+inside a pool and not across the two stores: at boot both can miss at once. The
+gateway container's limit was sized before the container forked anything. The
+container entry point therefore runs the command once, serially, before Bifrost
+starts, bounded by the same timeout and with a failure swallowed (the first
+dial then reports it, where Bifrost retries instead of exiting). That warm does
+not fill Bifrost's cache, which is inside the process it runs before; it fills
+the page cache, so the interpreter and botocore fault in once and alone instead
+of twice at once on a 0.44 vCPU task. The measured worst case, the gateway's
+676 MiB peak plus two concurrent 71 MiB forks, is 818 MiB of the 896 MiB
+reservation, so no task-size change was needed. Past about 750 MiB of gateway
+usage the reservation is what has to move, and a `cache_ttl` expiry after boot
+can still produce two concurrent forks, so that arithmetic rather than the warm
+is what bounds the risk.
 
 **How it reaches the container (item 10's second half).**
 `deploy-workbench/ecs.ts` reads this file at deploy time, stores it in the SSM

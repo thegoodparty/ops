@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-models";
-import { PG_PASSWORD_ENV_NAME, GATEWAY_PLAIN_ENV_NAMES } from "../ecs";
+import {
+  BIFROST_HEALTH_CHECK,
+  BIFROST_MEASURED_BOOT_SECONDS,
+  BIFROST_MEASURED_CLI_SECONDS,
+  GATEWAY_PLAIN_ENV_NAMES,
+  PG_PASSWORD_ENV_NAME,
+} from "../ecs";
+import { BIFROST_PG_PASSWORD_CONTAINER_PATH } from "../pg-password-image";
 import { BIFROST_HOSTNAME } from "../ingress";
 import { REGION } from "../network";
 import { BIFROST_UPSTREAM_TAG } from "../bifrost-image";
@@ -299,10 +306,11 @@ describe("bifrost config.json", () => {
     const filled = new Set([
       ...fillSecretsArray("HUMAN_KEYS"),
       ...fillSecretsArray("REQUIRED_KEYS"),
-      // The task definition's own environment and its RDS-managed password
-      // entry, which are provided by `ecs.ts` rather than by the filler.
+      // The task definition's own environment and the RDS-managed secret's ARN,
+      // which are provided by `ecs.ts` rather than by the filler. The password
+      // itself is not an `env.` reference any more: it is what the stores'
+      // `password_command` prints.
       ...GATEWAY_PLAIN_ENV_NAMES,
-      PG_PASSWORD_ENV_NAME,
     ]);
     const referenced = envReferences(config);
     assert.ok(referenced.length > 0, "config.json references no env vars");
@@ -329,6 +337,16 @@ describe("bifrost config.json", () => {
 
     // The encryption key must be a reference, never a passphrase in git.
     assert.equal(config.encryption_key, "env.BIFROST_ENCRYPTION_KEY");
+
+    // And the password is not a reference at all any more. Both stores resolve
+    // it with a `password_command` (step 6 of
+    // `docs/bifrost-zero-downtime-deploys.md`), because an injected
+    // `PG_PASSWORD` is read once at process start and an RDS rotation left the
+    // running gateway on the previous value.
+    assert.ok(
+      !referenced.includes(PG_PASSWORD_ENV_NAME),
+      "config.json must not resolve env.PG_PASSWORD; the stores resolve the password per connection",
+    );
   });
 
   it("contains no literal that looks like a key or a token", () => {
@@ -641,26 +659,90 @@ describe("bifrost config.json", () => {
       assert.ok(connection, `${name} has no config`);
       // Every connection field is a reference: the values live in the task
       // definition, sourced from rds.ts, so a connection string cannot drift
-      // in a JSON file nobody diffs against the database.
+      // in a JSON file nobody diffs against the database. The password is the
+      // exception in shape, not in spirit: it is a `password_command`, not a
+      // `password`, because the value has to be resolved per physical
+      // connection.
       assert.equal(connection.host, "env.PG_HOST");
       assert.equal(connection.port, "env.PG_PORT");
       assert.equal(connection.user, "env.PG_USER");
-      assert.equal(connection.password, "env.PG_PASSWORD");
       assert.equal(connection.db_name, "env.PG_DATABASE");
+      assert.ok(
+        !("password" in connection),
+        `${name}.config.password must be absent: the schema's oneOf makes password and password_command exclusive`,
+      );
       // The instance is private and in the same VPC, but RDS still requires
       // TLS for the master credential; `require` is the plan's value.
       assert.equal(connection.ssl_mode, "require");
       // A connection string must not be spelled as a literal.
-      for (const field of ["host", "user", "password", "db_name"]) {
+      for (const field of ["host", "user", "db_name"]) {
         assert.ok(
           String(connection[field]).startsWith("env."),
           `${name}.config.${field} is a literal; it belongs in the task definition`,
         );
       }
+      // And the command is the executable the derived image installs, with the
+      // TTL that bounds how long a rotated-away password can be reused and the
+      // timeout that bounds one resolution. The timeout is 30s, not the pinned
+      // tag's 10s default: a cold `aws-cli` start on a 0.44 vCPU task is not
+      // the same measurement as a warm one on a build machine, and a timeout
+      // here fails store init and exits Bifrost. The budget is in the timeout
+      // test below, held against the health check's start period.
+      const command = connection.password_command as Record<string, unknown>;
+      assert.ok(command, `${name} has no password_command`);
+      assert.deepEqual(Object.keys(command).sort(), [
+        "cache_ttl",
+        "command",
+        "timeout",
+      ]);
+      assert.equal(command.command, BIFROST_PG_PASSWORD_CONTAINER_PATH);
+      assert.equal(command.timeout, "30s");
+      assert.equal(command.cache_ttl, "60s");
+      // The two must be a Go duration: the schema's pattern is
+      // `^[1-9][0-9]*(ns|us|µs|ms|s|m|h)$`, and Bifrost parses it with
+      // `time.ParseDuration`.
+      for (const field of ["timeout", "cache_ttl"]) {
+        assert.match(String(command[field]), /^[1-9][0-9]*(ns|us|µs|ms|s|m|h)$/);
+      }
+      // The TTL is what heals a rotation without a restart, so it has to stay
+      // well under the rotation interval. RDS's default rotation is every seven
+      // days; a minute is three orders of magnitude shorter and is the pinned
+      // tag's own default.
+      assert.ok(
+        Number(String(command.cache_ttl).replace("s", "")) <= 300,
+        "cache_ttl must stay well below the rotation interval, or a rotated password fails connections until it expires",
+      );
     }
     // Retention is explicit rather than defaulted, per "Persistence, backup and
     // upgrade": a log store that never prunes is the one value certainly wrong.
     assert.equal(config.logs_store?.retention_days, 90);
+  });
+
+  it("moves both stores to the password command in one change, never one", () => {
+    // The schema makes `password` and `password_command` a mutually exclusive
+    // `oneOf` per store (`transports/config.schema.json` at
+    // `transports/v2.3.2`: `config_store.config.anyOf[1].then` and
+    // `logs_store.config.oneOf[1].then`, each with
+    // `additionalProperties: false`), so a half-migrated config is a validation
+    // error rather than two stores disagreeing about the password. Moving one
+    // and not the other would also leave one store on a credential that a
+    // rotation can strand.
+    const config = loadConfig();
+    const stores = [config.config_store, config.logs_store] as PostgresStore[];
+    for (const store of stores) {
+      assert.ok(store, "config.json is missing a store");
+      const connection = store.config as Record<string, unknown>;
+      assert.ok("password_command" in connection, "a store is still on `password`");
+      assert.ok(
+        !("password" in connection),
+        "`password` and `password_command` are exclusive in the schema; both must be absent or exactly one present",
+      );
+    }
+    assert.deepEqual(
+      config.config_store?.config?.password_command,
+      config.logs_store?.config?.password_command,
+      "the two stores must resolve the credential the same way; two pools resolving it differently is the disagreement this removes",
+    );
   });
 
   it("turns on the client controls the plan calls data-boundary controls", () => {
@@ -883,4 +965,79 @@ describe("bifrost config.json", () => {
     }
   });
 
+});
+
+describe("the password command's timeout budget", () => {
+  /**
+   * The timeout is not a taste: it fails store init, and a failed store init
+   * is Bifrost exiting, so it has to be measured against two things at once.
+   *
+   * - **Long enough for a cold start.** Two `aws-cli` processes can start on
+   *   the same boot (the two stores have separate caches, so a miss in each is
+   *   two forks), and the task has 0.44 vCPU. Measured in the build container,
+   *   one `aws secretsmanager get-secret-value` costs 0.62-0.88 s wall and 71
+   *   MiB peak RSS with a warm page cache on four cores; a cold container also
+   *   faults in the ~116 MiB of `aws-cli` plus `python3` from the image layer,
+   *   and two of them contend for less than half a core. 30 s is over 30x the
+   *   measured warm path, which covers that cold and contended case with an
+   *   order of magnitude to spare.
+   * - **Short enough to stay inside the health check's start period.** The
+   *   check ignores failures for `BIFROST_HEALTH_CHECK.startPeriod` (90 s),
+   *   and a boot that is slow because it is migrating is not a boot to
+   *   restart. The slowest boot this deployment has measured is 23.1 s of
+   *   store migrations, so a timeout of 30 s leaves the whole boot at 53.1 s,
+   *   inside 90 s with 37 s spare. A timeout at or above the start period would
+   *   turn "the CLI was slow" into a failed task, which is strictly worse than
+   *   the slow dial it was trying to bound.
+   *
+   * 10 s was the pinned tag's own default and is not enough for the cold case:
+   * it gives the second of two contended cold forks about 5 s of headroom over
+   * a warm measurement on a machine nine times the task's CPU share.
+   */
+  const PASSWORD_COMMAND_TIMEOUT_SECONDS = 30;
+
+  it("is 30s, and a Go duration the schema accepts", () => {
+    const config = loadConfig();
+    for (const name of ["config_store", "logs_store"] as const) {
+      const command = config[name]?.config?.password_command as Record<
+        string,
+        unknown
+      >;
+      assert.ok(command, `${name} has no password_command`);
+      assert.equal(
+        command.timeout,
+        `${PASSWORD_COMMAND_TIMEOUT_SECONDS}s`,
+        `${name}.config.password_command.timeout must be ${PASSWORD_COMMAND_TIMEOUT_SECONDS}s: see the budget in this test`,
+      );
+      assert.match(
+        String(command.timeout),
+        /^[1-9][0-9]*(ns|us|µs|ms|s|m|h)$/,
+      );
+    }
+  });
+
+  it("stays comfortably inside the health check's start period", () => {
+    // The arithmetic, as an assertion rather than a comment: a working-but-slow
+    // boot must not be a failed task. `startPeriod` is the window in which ECS
+    // ignores failing container health checks, so the CLI's timeout plus the
+    // rest of a measured boot has to fit inside it.
+    const startPeriod = BIFROST_HEALTH_CHECK.startPeriod;
+    const measuredBootSeconds = BIFROST_MEASURED_BOOT_SECONDS;
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS < startPeriod,
+      `a ${PASSWORD_COMMAND_TIMEOUT_SECONDS}s timeout at or above the ${startPeriod}s start period turns a slow CLI into a failed task`,
+    );
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS + measuredBootSeconds < startPeriod,
+      `a full slow boot is ${PASSWORD_COMMAND_TIMEOUT_SECONDS} + ${measuredBootSeconds} = ${
+        PASSWORD_COMMAND_TIMEOUT_SECONDS + measuredBootSeconds
+      }s, which must stay inside the ${startPeriod}s start period`,
+    );
+    // And the timeout is generous against the measured cold path rather than
+    // sized to it: 30 s is over 30x the 0.88 s warm measurement.
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS >= 10 * BIFROST_MEASURED_CLI_SECONDS,
+      "the timeout must leave a wide margin over a single warm CLI start",
+    );
+  });
 });
