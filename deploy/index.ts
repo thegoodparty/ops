@@ -7,6 +7,7 @@ import { createIdentityCenter } from "./components/identity-center";
 import { createCiRoles } from "./components/ci-roles";
 import { createDelegateSwarmProdRead } from "./components/delegate-swarm-prod-read";
 import { createSheriffGrant } from "./components/sheriff-grant";
+import { createGrafanaCloudwatchRead } from "./components/grafana-cloudwatch-read";
 import { createIdentityGroupSyncGrant } from "./components/identity-group-sync-grant";
 import { createBifrostVkReader } from "./components/bifrost-vk-reader";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
@@ -53,6 +54,7 @@ export = async () => {
 
   createDelegateSwarmProdRead();
   createSheriffGrant();
+  createGrafanaCloudwatchRead();
   createIdentityGroupSyncGrant();
   createBifrostVkReader();
   createInfraZoneDelegation();
