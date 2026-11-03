@@ -80,7 +80,7 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
   assert.deepEqual(byId.get("ops-plan-addition-unnamed")?.expect, {
     verdict: "block",
     paths: ["deploy-workbench/bifrost/vk-mint-handler.ts"],
-    categories: ["security"],
+    categories: ["bugs", "security"],
     consistency: "consistent",
   });
   assert.deepEqual(byId.get("ops-plan-amends-itself")?.expect, {
