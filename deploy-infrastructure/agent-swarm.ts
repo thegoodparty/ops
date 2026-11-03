@@ -24,9 +24,10 @@ const PROD_READ_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/delegate-
 const DATA_VOLUME_NAME = "delegate-swarm-data";
 const DATA_VOLUME_PLACEHOLDER = "__DATA_VOLUME_ID__";
 
-// `Environment` comes from the provider's default tags; `Project` overrides them.
 // The audience of the token the host's agents present to gp-api. The
 // condition key is multi-valued, so it takes ForAllValues.
+// Workers mint it with `--profile host`: the default AWS profile assumes the
+// prod-read role, which has no such grant.
 export const OIDC_AUDIENCE = "gp-api";
 export const identityTokenStatement = {
   Sid: "GetGpApiIdentityToken",
@@ -40,6 +41,7 @@ export const identityTokenStatement = {
   },
 };
 
+// `Environment` comes from the provider's default tags; `Project` overrides them.
 const TAGS = { Name: NAME, Project: NAME };
 
 const ROOT = path.resolve(__dirname, "../agent-swarm");

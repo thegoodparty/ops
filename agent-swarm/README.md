@@ -341,7 +341,10 @@ The agents read production AWS (account 333022194791) through the role
 is mounted read-only into the lead and both workers, and
 `AWS_CONFIG_FILE` points at it: the default profile assumes that role with
 the instance's own credentials from IMDS (the instance's hop limit is 2 so
-containers can reach IMDS). The api container has no AWS access.
+containers can reach IMDS). The `host` profile in the same file uses the
+instance's credentials without assuming the role; it is how a worker mints the
+gp-api token (`aws sts get-web-identity-token --audience gp-api
+--signing-algorithm ES384 --profile host`). The api container has no AWS access.
 `host/global-setup-script.sh` installs the AWS CLI into the workers.
 
 ## Bringing it up

@@ -3,3 +3,9 @@ role_arn = arn:aws:iam::333022194791:role/delegate-swarm-prod-read
 credential_source = Ec2InstanceMetadata
 role_session_name = delegate-swarm
 region = us-west-2
+
+# No role to assume: the CLI falls back to the instance's own credentials.
+# For `aws sts get-web-identity-token --profile host`, the token the swarm
+# presents to gp-api; the default profile cannot mint it.
+[profile host]
+region = us-west-2
