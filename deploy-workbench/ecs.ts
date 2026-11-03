@@ -6,7 +6,10 @@ import * as path from "node:path";
 import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { bedrockInvokeResources } from "../utils/bedrock-models";
 import { BIFROST_BOOTSTRAP_TAG } from "./bootstrap-image";
-import { BIFROST_GATEWAY_TAG } from "./pg-password-image";
+import {
+  BIFROST_GATEWAY_TAG,
+  BIFROST_PG_PASSWORD_CONTAINER_PATH,
+} from "./pg-password-image";
 import {
   BIFROST_PORT,
   createWorkbenchNetwork,
@@ -520,6 +523,32 @@ export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
   TARGET_GROUP_HEALTH_CHECK_INTERVAL_SECONDS * TARGET_GROUP_HEALTHY_THRESHOLD;
 
 /**
+ * The slowest gateway boot this deployment has measured, in seconds: the
+ * 2026-10-26 apply's "Time spent in Bifrost server bootstrap" against an empty
+ * RDS, which is what `BIFROST_HEALTH_CHECK.startPeriod` was raised to 90 for.
+ *
+ * Recorded as a constant rather than only in prose because `config.json`'s
+ * `password_command.timeout` has to fit around it: the CLI's timeout is spent
+ * once per pool during store init, so a timeout that is generous in isolation
+ * can still push a migrating boot past the start period and turn it into a
+ * failed task. `bifrost/config.test.ts` holds the sum to the start period.
+ */
+export const BIFROST_MEASURED_BOOT_SECONDS = 23.1;
+
+/**
+ * A single warm `aws secretsmanager get-secret-value`, in seconds: the slower
+ * end of five measured runs in the build container (0.62-0.88 s wall, 71 MiB
+ * peak RSS, four cores, aarch64).
+ *
+ * It is a floor, not a prediction of the task. The task has 0.44 vCPU and a
+ * cold page cache, so the real cold start is several times this, which is why
+ * `config.json`'s timeout is many multiples of it rather than a small margin.
+ * The number is here so the test can assert that multiple instead of restating
+ * the timeout as a taste.
+ */
+export const BIFROST_MEASURED_CLI_SECONDS = 0.88;
+
+/**
  * The RDS-managed master password's location, resolved by the container per
  * physical connection rather than injected at task start.
  *
@@ -554,6 +583,23 @@ export const BIFROST_HEALTH_CHECK_GRACE_PERIOD_SECONDS =
 export const RDS_PASSWORD_JSON_KEY = "password";
 export const PG_PASSWORD_ENV_NAME = "PG_PASSWORD";
 export const PG_SECRET_ARN_ENV_NAME = "PG_SECRET_ARN";
+
+/**
+ * How long the entry point's warm gives the password command, in seconds.
+ *
+ * The same number as `bifrost/config.json`'s `password_command.timeout`, and
+ * spelled here because the warm is shell in the task definition rather than a
+ * field in that file. The two are asserted equal in `ecs.test.ts`: a warm with
+ * a longer budget than the command could hang the boot for longer than the
+ * thing it is warming for, and a shorter one would abandon a resolution the
+ * first dial is about to need anyway.
+ *
+ * 30 rather than the pinned tag's 10s default, for the reason
+ * `bifrost/config.test.ts`'s timeout budget records: two cold `aws-cli` starts
+ * on a 0.44 vCPU task are not the warm measurement, and 30s still leaves the
+ * whole slow boot inside the health check's 90s start period.
+ */
+export const BIFROST_PG_PASSWORD_TIMEOUT_SECONDS = 30;
 
 /**
  * The plain environment variables, and what each is for.
@@ -740,12 +786,46 @@ export const readBifrostConfig = (): string =>
  * file differ from the reviewed one. `umask 077` keeps the file private to the
  * container user. A missing variable exits rather than starting a gateway on
  * defaults: a task with no configuration is exactly the state this closes.
+ *
+ * The warm in the middle is the memory fix for `password_command`. Bifrost's
+ * two stores open separate pools with separate password caches
+ * (`postgresconn.go`, "One cache per pool"), so `singleflight` collapses a
+ * burst inside one pool and not across the two: the connections each store
+ * makes while `initStores` runs can be two concurrent forks of a Python
+ * `aws-cli` (71 MiB RSS each, measured) on a task with 0.44 vCPU.
+ *
+ * What the warm does and does not do, stated precisely because the difference
+ * matters: it does not populate Bifrost's cache, which lives inside the process
+ * the warm runs before and which nothing outside that process can reach. What
+ * it warms is the page cache. On a cold task every `aws-cli` invocation faults
+ * in the interpreter and botocore from the image layer, and running the command
+ * once here, serially, does that faulting once and alone instead of twice at
+ * the same moment while also contending for less than half a core. The first
+ * connection in each pool then forks into an already-warm userland, so the
+ * peak RSS overlap is short rather than the whole of two cold starts, and it
+ * also puts the slow case before the process starts rather than inside its
+ * store init, where a `password_command` timeout is fatal.
+ *
+ * The residual risk is honest: `cache_ttl` expiry can still produce two
+ * concurrent forks later in the task's life. Those are cheap ones, with the
+ * userland already resident, which is why the arithmetic in `ecs.test.ts` is
+ * what decides whether the reservation is big enough rather than the warm
+ * being treated as a guarantee.
+ *
+ * Deliberately tolerant of failure, and that is not sloppiness: the warm is an
+ * optimisation, so a transient `GetSecretValue` error here must not be the
+ * thing that kills a task. A real failure still surfaces on the first dial,
+ * where `password_command`'s own timeout and error reporting apply and where
+ * Bifrost retries rather than exits. Its output goes to `/dev/null`, so the
+ * password never reaches a log, and it is bounded by the same 30 s
+ * `config.json` gives the command itself so a hung CLI cannot hold the boot.
  */
 export const BIFROST_CONTAINER_ENTRY_POINT = ["/bin/sh", "-c"] as const;
 export const BIFROST_CONTAINER_COMMAND = [
   `if [ -z "$${BIFROST_CONFIG_ENV_NAME}" ]; then echo "${BIFROST_CONFIG_ENV_NAME} is not set" >&2; exit 1; fi; ` +
     `umask 077; ` +
     `printf '%s' "$${BIFROST_CONFIG_ENV_NAME}" > ${BIFROST_CONFIG_FILE_PATH} || exit 1; ` +
+    `timeout ${BIFROST_PG_PASSWORD_TIMEOUT_SECONDS} ${BIFROST_PG_PASSWORD_CONTAINER_PATH} >/dev/null 2>&1 || true; ` +
     `exec /app/docker-entrypoint.sh /app/main`,
 ] as const;
 
@@ -1323,8 +1403,10 @@ export const createBifrostEcs = (args: {
    *   do. Upstream's own ECS guide is the reason: the gateway has to write the
    *   injected config to `/app/data/config.json` before Bifrost starts, and
    *   ECS has no init-container equivalent here. `BIFROST_CONTAINER_COMMAND`
-   *   writes it and then `exec`s the image's own entry point, so PID 1, signal
-   *   handling and the app-dir checks stay upstream's.
+   *   writes it, warms the password command once and then `exec`s the image's
+   *   own entry point, so PID 1, signal handling and the app-dir checks stay
+   *   upstream's. The warm is there because the two stores open separate
+   *   password caches; see the constant's own comment.
    *
    * Every value that comes from another resource is put through one `pulumi.all`
    * *before* the object is built, including `logGroup.name`, `database.address`,

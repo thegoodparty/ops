@@ -30,6 +30,19 @@
 # (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`) handed in by the platform, which is
 # the task role's identity — not the execution role's.
 #
+# That inheritance is a dependency on upstream, not an accident, so it is named
+# here where a change to it would be read. At the pinned tag
+# (`transports/v2.3.2`) `RunPasswordCommand` in
+# `framework/postgresconn/postgresconn.go` builds the command at line 563 with
+# `cmd := exec.Command(config.Command, config.Args...)` and never assigns
+# `cmd.Env`. In Go a nil `cmd.Env` means the child inherits the parent's
+# environment (`os.Environ()` is implied); a version that built its own list
+# there would drop both `PG_SECRET_ARN` and the container credentials, and
+# every dial would fail with this script's own "PG_SECRET_ARN is not set" or
+# the CLI's credential-chain error. Re-read those three lines on a tag bump.
+# Deliberately no fallback to `PGPASSWORD` or a second credential source: the
+# only thing one would buy is a slower, less obvious failure.
+#
 # stdout is the password and nothing else; Bifrost trims the trailing newline.
 # Errors go to stderr, which Bifrost includes in the dial error rather than
 # swallowing. The value is never echoed, logged or traced.

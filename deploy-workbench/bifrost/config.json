@@ -12,7 +12,7 @@
       "user": "env.PG_USER",
       "password_command": {
         "command": "/usr/local/bin/bifrost-pg-password",
-        "timeout": "10s",
+        "timeout": "30s",
         "cache_ttl": "60s"
       },
       "db_name": "env.PG_DATABASE",
@@ -30,7 +30,7 @@
       "user": "env.PG_USER",
       "password_command": {
         "command": "/usr/local/bin/bifrost-pg-password",
-        "timeout": "10s",
+        "timeout": "30s",
         "cache_ttl": "60s"
       },
       "db_name": "env.PG_DATABASE",

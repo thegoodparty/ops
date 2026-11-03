@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { WORKBENCH_MODELS, bedrockInvokeResources } from "../../utils/bedrock-models";
-import { PG_PASSWORD_ENV_NAME, GATEWAY_PLAIN_ENV_NAMES } from "../ecs";
+import {
+  BIFROST_HEALTH_CHECK,
+  BIFROST_MEASURED_BOOT_SECONDS,
+  BIFROST_MEASURED_CLI_SECONDS,
+  GATEWAY_PLAIN_ENV_NAMES,
+  PG_PASSWORD_ENV_NAME,
+} from "../ecs";
 import { BIFROST_PG_PASSWORD_CONTAINER_PATH } from "../pg-password-image";
 import { BIFROST_HOSTNAME } from "../ingress";
 import { REGION } from "../network";
@@ -676,7 +682,12 @@ describe("bifrost config.json", () => {
         );
       }
       // And the command is the executable the derived image installs, with the
-      // TTL that bounds how long a rotated-away password can be reused.
+      // TTL that bounds how long a rotated-away password can be reused and the
+      // timeout that bounds one resolution. The timeout is 30s, not the pinned
+      // tag's 10s default: a cold `aws-cli` start on a 0.44 vCPU task is not
+      // the same measurement as a warm one on a build machine, and a timeout
+      // here fails store init and exits Bifrost. The budget is in the timeout
+      // test below, held against the health check's start period.
       const command = connection.password_command as Record<string, unknown>;
       assert.ok(command, `${name} has no password_command`);
       assert.deepEqual(Object.keys(command).sort(), [
@@ -685,7 +696,7 @@ describe("bifrost config.json", () => {
         "timeout",
       ]);
       assert.equal(command.command, BIFROST_PG_PASSWORD_CONTAINER_PATH);
-      assert.equal(command.timeout, "10s");
+      assert.equal(command.timeout, "30s");
       assert.equal(command.cache_ttl, "60s");
       // The two must be a Go duration: the schema's pattern is
       // `^[1-9][0-9]*(ns|us|µs|ms|s|m|h)$`, and Bifrost parses it with
@@ -954,4 +965,79 @@ describe("bifrost config.json", () => {
     }
   });
 
+});
+
+describe("the password command's timeout budget", () => {
+  /**
+   * The timeout is not a taste: it fails store init, and a failed store init
+   * is Bifrost exiting, so it has to be measured against two things at once.
+   *
+   * - **Long enough for a cold start.** Two `aws-cli` processes can start on
+   *   the same boot (the two stores have separate caches, so a miss in each is
+   *   two forks), and the task has 0.44 vCPU. Measured in the build container,
+   *   one `aws secretsmanager get-secret-value` costs 0.62-0.88 s wall and 71
+   *   MiB peak RSS with a warm page cache on four cores; a cold container also
+   *   faults in the ~116 MiB of `aws-cli` plus `python3` from the image layer,
+   *   and two of them contend for less than half a core. 30 s is over 30x the
+   *   measured warm path, which covers that cold and contended case with an
+   *   order of magnitude to spare.
+   * - **Short enough to stay inside the health check's start period.** The
+   *   check ignores failures for `BIFROST_HEALTH_CHECK.startPeriod` (90 s),
+   *   and a boot that is slow because it is migrating is not a boot to
+   *   restart. The slowest boot this deployment has measured is 23.1 s of
+   *   store migrations, so a timeout of 30 s leaves the whole boot at 53.1 s,
+   *   inside 90 s with 37 s spare. A timeout at or above the start period would
+   *   turn "the CLI was slow" into a failed task, which is strictly worse than
+   *   the slow dial it was trying to bound.
+   *
+   * 10 s was the pinned tag's own default and is not enough for the cold case:
+   * it gives the second of two contended cold forks about 5 s of headroom over
+   * a warm measurement on a machine nine times the task's CPU share.
+   */
+  const PASSWORD_COMMAND_TIMEOUT_SECONDS = 30;
+
+  it("is 30s, and a Go duration the schema accepts", () => {
+    const config = loadConfig();
+    for (const name of ["config_store", "logs_store"] as const) {
+      const command = config[name]?.config?.password_command as Record<
+        string,
+        unknown
+      >;
+      assert.ok(command, `${name} has no password_command`);
+      assert.equal(
+        command.timeout,
+        `${PASSWORD_COMMAND_TIMEOUT_SECONDS}s`,
+        `${name}.config.password_command.timeout must be ${PASSWORD_COMMAND_TIMEOUT_SECONDS}s: see the budget in this test`,
+      );
+      assert.match(
+        String(command.timeout),
+        /^[1-9][0-9]*(ns|us|µs|ms|s|m|h)$/,
+      );
+    }
+  });
+
+  it("stays comfortably inside the health check's start period", () => {
+    // The arithmetic, as an assertion rather than a comment: a working-but-slow
+    // boot must not be a failed task. `startPeriod` is the window in which ECS
+    // ignores failing container health checks, so the CLI's timeout plus the
+    // rest of a measured boot has to fit inside it.
+    const startPeriod = BIFROST_HEALTH_CHECK.startPeriod;
+    const measuredBootSeconds = BIFROST_MEASURED_BOOT_SECONDS;
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS < startPeriod,
+      `a ${PASSWORD_COMMAND_TIMEOUT_SECONDS}s timeout at or above the ${startPeriod}s start period turns a slow CLI into a failed task`,
+    );
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS + measuredBootSeconds < startPeriod,
+      `a full slow boot is ${PASSWORD_COMMAND_TIMEOUT_SECONDS} + ${measuredBootSeconds} = ${
+        PASSWORD_COMMAND_TIMEOUT_SECONDS + measuredBootSeconds
+      }s, which must stay inside the ${startPeriod}s start period`,
+    );
+    // And the timeout is generous against the measured cold path rather than
+    // sized to it: 30 s is over 30x the 0.88 s warm measurement.
+    assert.ok(
+      PASSWORD_COMMAND_TIMEOUT_SECONDS >= 10 * BIFROST_MEASURED_CLI_SECONDS,
+      "the timeout must leave a wide margin over a single warm CLI start",
+    );
+  });
 });

@@ -49,6 +49,7 @@ import {
   OAUTH2_PROXY_SECRET_KEYS,
   OAUTH2_PROXY_SECRET_NAME,
   PG_DATABASE_ENV_NAME,
+  BIFROST_PG_PASSWORD_TIMEOUT_SECONDS,
   PG_HOST_ENV_NAME,
   PG_PASSWORD_ENV_NAME,
   PG_PORT_ENV_NAME,
@@ -1464,6 +1465,13 @@ describe("bifrost ecs", () => {
       command.includes("exit 1"),
       `the command must fail closed when the config is missing: ${command}`,
     );
+    // The warm is between the write and the exec; see the memory test below for
+    // why it exists and what bounds it.
+    assert.ok(
+      command.indexOf(BIFROST_PG_PASSWORD_CONTAINER_PATH) <
+        command.indexOf("exec /app/docker-entrypoint.sh /app/main"),
+      `the warm must run before the process starts: ${command}`,
+    );
     const bifrostBlock = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
     assert.ok(
       bifrostBlock.includes("entryPoint: [...BIFROST_CONTAINER_ENTRY_POINT]") &&
@@ -1573,5 +1581,230 @@ describe("bifrost ecs", () => {
       "the schema's `command` pattern is ^\\S+$",
     );
     assert.ok(/^\/(usr|opt|app)\//.test(BIFROST_PG_PASSWORD_CONTAINER_PATH));
+  });
+});
+
+describe("the password command's memory at boot", () => {
+  /**
+   * The gateway container's own limit (`BIFROST_CONTAINER_MEMORY`) was sized
+   * for Bifrost alone, before the container forked anything. A cache miss now
+   * forks a Python `aws-cli`, and the two stores have separate caches
+   * (`postgresconn.go`: "One cache per pool"), so `singleflight` collapses a
+   * burst within a pool but not across them: the first connection after boot
+   * and the first after each `cache_ttl` expiry can be two forks at once.
+   *
+   * The numbers here are measured, not assumed:
+   *
+   * - One `aws secretsmanager get-secret-value` peaks at 71 MiB RSS (five runs
+   *   in the build container, aarch64, warm page cache).
+   * - Two concurrent invocations peak at 142 MiB summed `VmHWM` and 121 MiB
+   *   summed `Pss`, so half of the second one's footprint is shared pages
+   *   rather than new ones.
+   * - The gateway's own high-water mark, from the service's
+   *   `MemoryUtilization` (a percentage of the task's 1024 MiB), is 65.97% on
+   *   2026-10-25, i.e. about 676 MiB.
+   *
+   * The fix is the entry point's warm below rather than a bigger task: the
+   * measured concurrent figure fits inside the existing reservation, and the
+   * warm keeps the expensive cold part (the interpreter and botocore import
+   * faulting in from the image layer) to one serial pass before Bifrost starts
+   * instead of two racing for 0.44 vCPU.
+   *
+   * 676 + 142 = 818 MiB of the 896 MiB limit, so the margin is 78 MiB. That is
+   * the tripwire: if the gateway's peak passes ~750 MiB the reservation is what
+   * needs to change, and the container will be killed before a deploy notices.
+   */
+  const GATEWAY_PEAK_MIB = 676;
+  const PASSWORD_COMMAND_PEAK_MIB = 71;
+  const CONCURRENT_PEAK_MIB = 142;
+
+  it("fits the gateway and two concurrent password commands in its reservation", () => {
+    assert.equal(CONCURRENT_PEAK_MIB, PASSWORD_COMMAND_PEAK_MIB * 2);
+    assert.ok(
+      GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB <= BIFROST_CONTAINER_MEMORY,
+      `the gateway's ${GATEWAY_PEAK_MIB} MiB peak plus two ${PASSWORD_COMMAND_PEAK_MIB} MiB password commands is ${
+        GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB
+      } MiB, over the ${BIFROST_CONTAINER_MEMORY} MiB reservation; raise BIFROST_CONTAINER_MEMORY and TASK_MEMORY together rather than lowering this`,
+    );
+    // The reservation is still inside the task, which the sizing test above
+    // already asserts; this only says the arithmetic above is not satisfied by
+    // a value that is under what was measured.
+    assert.ok(BIFROST_CONTAINER_MEMORY > GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB);
+    assert.equal(BIFROST_CONTAINER_MEMORY, 896);
+  });
+
+  it("is not relying on singleflight across the two pools", () => {
+    // The reason the concurrency above is real and the warm is worth doing: the
+    // cache is per pool, because `postgresconn.Open` constructs one
+    // `passwordCache` per call and the two stores call it separately. Pinned as
+    // a statement of what the group in the source says, so a future reader who
+    // assumes "singleflight covers the two stores" finds the assumption
+    // already answered here.
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "bifrost/pg-password.sh"),
+      "utf8",
+    );
+    assert.ok(
+      source.includes("singleflight"),
+      "the script's header must still explain what singleflight does and does not collapse",
+    );
+    // And the entry point is the only place the two-pool gap is closed, so a
+    // removed warm fails here rather than only in the string assertions above.
+    assert.ok(
+      BIFROST_CONTAINER_COMMAND.join(" ").includes(
+        BIFROST_PG_PASSWORD_CONTAINER_PATH,
+      ),
+      "the warm is the mitigation for the per-pool cache; without it the first connection in each pool is a concurrent fork",
+    );
+  });
+
+  it("warms the command once, in the entry point, before Bifrost starts", () => {
+    // The cheapest fix of the two the review named, and the reason it is the
+    // cheapest: it changes no task size, so it changes no bill, and the work it
+    // removes is the cold interpreter import. Done in the entry point because
+    // that is the last place before Bifrost's own pools open, and ECS has no
+    // init container to put it in.
+    //
+    // What it does not do, because the comment should not overclaim it: it
+    // cannot populate Bifrost's own cache, which lives inside the process this
+    // runs before. The userland is what warms, so the residual risk is a later
+    // `cache_ttl` expiry producing two concurrent forks into a warm page cache.
+    // The reservation arithmetic in the test above is what bounds that; the warm
+    // only removes the expensive case.
+    const command = BIFROST_CONTAINER_COMMAND.join(" ");
+    const warmAt = command.indexOf(BIFROST_PG_PASSWORD_CONTAINER_PATH);
+    assert.notEqual(
+      warmAt,
+      -1,
+      `the entry point must run the password command once before Bifrost starts: ${command}`,
+    );
+    assert.ok(
+      warmAt < command.indexOf("exec /app/docker-entrypoint.sh /app/main"),
+      `the warm must run before the process starts, or it races the pools it is warming for: ${command}`,
+    );
+    // The warm's output is discarded and its failure is swallowed. It is an
+    // optimisation, so it must not become a way for a transient
+    // GetSecretValue failure at boot to stop the task: `password_command`
+    // failures are per connection and retried on the next dial, and a boot
+    // that dies instead is the outage this whole change is against.
+    assert.match(
+      command,
+      /bifrost-pg-password[^;]*>\/dev\/null/,
+      `the warm must not print the password anywhere: ${command}`,
+    );
+    assert.match(
+      command,
+      /\|\|\s*true|;\s*timeout/,
+      `a failed warm must not fail the boot: ${command}`,
+    );
+    assert.ok(
+      !command.includes("PGPASSWORD"),
+      "the warm runs the same command, not a second credential path",
+    );
+  });
+
+  it("bounds the warm so a hung CLI cannot hold the boot open", () => {
+    // The container's health check is what eventually replaces a task that
+    // never becomes healthy, and that is 90 s of start period away. The warm is
+    // given the same budget the `password_command` itself gets in
+    // `bifrost/config.json`, so the worst case is the same as a slow dial
+    // rather than an unbounded one.
+    const command = BIFROST_CONTAINER_COMMAND.join(" ");
+    assert.match(
+      command,
+      new RegExp(`timeout ${BIFROST_PG_PASSWORD_TIMEOUT_SECONDS} `),
+      `the warm must be bounded by the password_command timeout: ${command}`,
+    );
+    const config = JSON.parse(fs.readFileSync(BIFROST_CONFIG_SOURCE_PATH, "utf8"));
+    for (const store of ["config_store", "logs_store"] as const) {
+      assert.equal(
+        config[store].config.password_command.timeout,
+        `${BIFROST_PG_PASSWORD_TIMEOUT_SECONDS}s`,
+        "the warm's bound and config.json's timeout are the same number, so a change to one is a change to the other",
+      );
+    }
+  });
+});
+
+describe("the task role's secret read, which replaces the old prohibition", () => {
+  /**
+   * This replaces the assertion that used to read
+   *
+   *     the task role must not read secrets: the agent does that, not Bifrost
+   *
+   * It was true while `PG_PASSWORD` was an ECS `secrets` entry: the agent
+   * resolved the value with the execution role, and the gateway process never
+   * made a Secrets Manager call. Step 6 of
+   * `docs/bifrost-zero-downtime-deploys.md` moves that call into the container
+   * (`password_command`), so the task role is now the principal that makes it.
+   * The prohibition is replaced, not deleted, by the narrower statement it
+   * becomes: exactly one secret, named by its exact ARN, one action, and
+   * nothing else in the role.
+   */
+  const rdsSecretArn = `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-1a2b3c4d-5e6f-7890-abcd-ef1234567890`;
+
+  it("reads exactly one secret: the RDS-managed ARN, with no pattern and no second entry", () => {
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
+    const statements = policy.Statement.filter((statement) =>
+      statement.Action.some((action) => action.startsWith("secretsmanager:")),
+    );
+    assert.equal(
+      statements.length,
+      1,
+      "the task role must hold exactly one secretsmanager statement",
+    );
+    assert.deepEqual(statements[0].Action, ["secretsmanager:GetSecretValue"]);
+    assert.deepEqual(
+      statements[0].Resource,
+      [rdsSecretArn],
+      "the resource must be the exact ARN Pulumi returns, not a name pattern",
+    );
+    // No second secret sneaks in through the same statement, and the exact ARN
+    // is the whole list: `secretArnPattern`'s `-??????` would authorise every
+    // secret with that name, including a future one this deployment does not
+    // create.
+    assert.equal(statements[0].Resource.length, 1);
+    assert.ok(!statements[0].Resource[0].includes("?"));
+    assert.ok(!statements[0].Resource[0].includes("*"));
+  });
+
+  it("gets that one ARN from the database module, not a second description of it", () => {
+    // The grant and the container's `PG_SECRET_ARN` must be the same secret.
+    // Two independent descriptions of it could drift, and the drift would be an
+    // AccessDenied on the first dial rather than a preview failure.
+    const taskRole = resourceBlock("bifrostTaskRole");
+    assert.ok(
+      taskRole.includes("database.secretArn.apply"),
+      "the task role's policy must be built from database.secretArn",
+    );
+    assert.ok(
+      taskRole.includes("taskRolePolicyDocument(bedrockInvokeResources(), [") &&
+        taskRole.includes("databaseSecretArn,"),
+      `the task role must pass the one ARN to taskRolePolicyDocument\n${taskRole}`,
+    );
+    const block = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
+    assert.ok(
+      block.includes("{ name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn }"),
+      "the command reads the same ARN the role is granted",
+    );
+  });
+
+  it("still holds nothing but Bedrock beyond that one statement", () => {
+    // The narrower half of the replaced assertion: the exception is a secret
+    // read for the password command, and it did not become a door for anything
+    // else.
+    const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
+      rdsSecretArn,
+    ]);
+    const nonBedrock = policy.Statement.filter((statement) =>
+      statement.Action.some((action) => !action.startsWith("bedrock:")),
+    );
+    assert.equal(nonBedrock.length, 1, "one statement may name a non-Bedrock service");
+    assert.equal(nonBedrock[0].Sid, "ReadDatabasePassword");
+    for (const action of nonBedrock[0].Action) {
+      assert.ok(action.startsWith("secretsmanager:"), action);
+    }
   });
 });

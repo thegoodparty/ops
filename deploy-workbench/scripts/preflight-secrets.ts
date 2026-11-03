@@ -61,7 +61,37 @@ import { assumeRoleEnvironment, runAws } from "./aws-role";
  * messages below name the container and field when the sentinel is somewhere
  * the message can see, which is what makes the next occurrence a one-read
  * diagnosis.
+ *
+ * There is a second check, for the one secret ECS no longer resolves. Step 6
+ * of `docs/bifrost-zero-downtime-deploys.md` replaced the `PG_PASSWORD`
+ * `secrets` entry with a `password_command` the container runs per physical
+ * connection, which took the RDS-managed secret out of `container.secrets` and
+ * with it the agent's launch-time check that the secret exists and holds a
+ * `password` key. `extractDatabaseSecretArn` + `databasePasswordProblem` put
+ * an equivalent in front of the drain, reading the ARN out of the same
+ * synthesized definition (`PG_SECRET_ARN`, a plain environment entry) and the
+ * rest through `secretsmanager:GetSecretValue`. That is an AWS API read, not a
+ * Pulumi output inspection: RDS owns the secret, so nothing in the stack can
+ * say whether it resolves.
  */
+
+/**
+ * The plain environment variable the task definition carries the RDS-managed
+ * secret's ARN in, and the JSON key RDS writes the password at.
+ *
+ * Both are `ecs.ts`'s own names (`PG_SECRET_ARN_ENV_NAME`,
+ * `RDS_PASSWORD_JSON_KEY`) and a test pins the two files to each other. They
+ * are spelled out here rather than imported because this script is the pre-apply
+ * half of the deploy, run with `tsx` against the workflow's checkout: importing
+ * `ecs.ts` would load `@pulumi/pulumi` into a process that has no business
+ * synthesizing a stack, and a preview that failed to import would fail closed
+ * for the wrong reason.
+ */
+export const PG_SECRET_ARN_ENV_NAME = "PG_SECRET_ARN";
+export const DATABASE_PASSWORD_JSON_KEY = "password";
+
+/** The container `config.json`'s `password_command` runs in. */
+const GATEWAY_CONTAINER_NAME = "bifrost";
 
 export type SecretReference = {
   /** The secret's name, used for grouping and for the failure message. */
@@ -250,9 +280,7 @@ const findPreviewUnknowns = (definitions: unknown[]): string[] => {
   return found;
 };
 
-const parseContainerDefinitions = (
-  raw: unknown,
-): Array<{ secrets?: unknown }> => {
+const parseContainerDefinitions = (raw: unknown): JsonRecord[] => {
   let definitions = raw;
 
   if (typeof raw === "string") {
@@ -322,8 +350,158 @@ const parseContainerDefinitions = (
     );
   }
 
-  return definitions as Array<{ secrets?: unknown }>;
+  return definitions as JsonRecord[];
 };
+
+/**
+ * The ARN the gateway's `password_command` reads the database password from.
+ *
+ * The RDS-managed secret is the one secret this deployment reads that nothing
+ * in the old preflight could see. It is not a Pulumi resource (`rds.ts` sets
+ * `manageMasterUserPassword: true` and consumes `masterUserSecrets[0]`), and
+ * since step 6 of `docs/bifrost-zero-downtime-deploys.md` it is not an ECS
+ * `secrets` entry either: the container resolves it per physical connection
+ * with the task role. So the only in-band statement of which secret that is is
+ * the container's own `PG_SECRET_ARN` environment entry, which is what this
+ * reads out of the same synthesized task definition the key check uses.
+ *
+ * The check it feeds is the one dropping `PG_PASSWORD` lost. That entry's
+ * `valueFrom` made the ECS agent resolve `<secret>:password::` at task launch,
+ * so a bad ARN or a secret without the key failed the task start rather than
+ * the deploy. Nothing did that afterwards: the container would have started,
+ * failed its store init and exited, after `minimumHealthyPercent: 0` had
+ * already drained the running task.
+ *
+ * Same documents and same first-match rule as
+ * `extractRequiredSecretReferences`, and it fails closed on every unknown: a
+ * preview-unknown `containerDefinitions`, a definition with no gateway
+ * container, a gateway with no `PG_SECRET_ARN`, and a value that is still
+ * Pulumi's unknown sentinel. Each of those is a real misconfiguration or an
+ * unreadable preview, and neither is something to report as a pass.
+ */
+export const extractDatabaseSecretArn = (...documents: unknown[]): string => {
+  let sawTaskDefinition = false;
+
+  for (const document of documents) {
+    const definitions = containerDefinitionsFrom(document);
+    if (definitions.length === 0) continue;
+    sawTaskDefinition = true;
+
+    for (const raw of definitions) {
+      for (const container of parseContainerDefinitions(raw)) {
+        if (!isRecord(container)) continue;
+        if (container.name !== GATEWAY_CONTAINER_NAME) continue;
+
+        const environment = container.environment;
+        if (!Array.isArray(environment)) {
+          throw new Error(
+            `the ${GATEWAY_CONTAINER_NAME} container has no environment block, so ${PG_SECRET_ARN_ENV_NAME} cannot be read`,
+          );
+        }
+
+        const entry = environment.find(
+          (candidate) =>
+            isRecord(candidate) && candidate.name === PG_SECRET_ARN_ENV_NAME,
+        );
+        if (!isRecord(entry) || typeof entry.value !== "string") {
+          throw new Error(
+            [
+              `the ${GATEWAY_CONTAINER_NAME} container has no ${PG_SECRET_ARN_ENV_NAME} environment entry.`,
+              "Both Postgres stores resolve their password with a `password_command` that reads it, so a",
+              "task without it starts and then fails store initialization; with the service stop-before-start",
+              "that is an empty gateway until a human notices.",
+            ].join("\n"),
+          );
+        }
+
+        if (entry.value.includes(PULUMI_UNKNOWN_SENTINEL)) {
+          throw new Error(
+            [
+              "the task definition could not be validated at preview time: the gateway's",
+              `${PG_SECRET_ARN_ENV_NAME} is Pulumi's preview unknown value (${PULUMI_UNKNOWN_SENTINEL}),`,
+              "so the database secret it names cannot be read and its password cannot be checked.",
+              "This check will not approve a definition it could not read. Find the preview-unknown",
+              "Output feeding that environment entry and make it known at preview time.",
+            ].join("\n"),
+          );
+        }
+
+        return entry.value;
+      }
+    }
+
+    // The preview described the task definition, so there is nothing the
+    // exported state can add.
+    break;
+  }
+
+  if (!sawTaskDefinition) {
+    throw new Error(
+      "could not find an ECS task definition in the preview or exported stack state; refusing to report success without comparing anything",
+    );
+  }
+
+  throw new Error(
+    `the task definition has no ${GATEWAY_CONTAINER_NAME} container, so the database password's secret cannot be checked`,
+  );
+};
+
+/**
+ * Why a secret's `SecretString` would leave the stores without a password, or
+ * `null` when it is usable.
+ *
+ * The rules are `bifrost/pg-password.sh`'s, not new ones: it prints
+ * `jq -er '.password | select(type == "string" and length > 0)'`, so a missing
+ * key, an empty string and a non-string all produce a non-zero exit and a dial
+ * that fails with the command's stderr. Checking the same three here is what
+ * turns that into a red deploy run instead of a task that starts and dies.
+ *
+ * Key names and shapes only. The value is never returned, logged or put in a
+ * message, which is the same rule the key-presence check follows.
+ */
+export const databasePasswordProblem = (secretString: string): string | null => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(secretString);
+  } catch {
+    return "the database secret does not contain a JSON SecretString, so its password cannot be read";
+  }
+
+  if (!isRecord(parsed)) {
+    return "the database secret does not contain a JSON object, so its password cannot be read";
+  }
+
+  if (!(DATABASE_PASSWORD_JSON_KEY in parsed)) {
+    return `the database secret has no "${DATABASE_PASSWORD_JSON_KEY}" key`;
+  }
+
+  const value = parsed[DATABASE_PASSWORD_JSON_KEY];
+  if (typeof value !== "string" || value.length === 0) {
+    return `the database secret's "${DATABASE_PASSWORD_JSON_KEY}" is not a non-empty string, which pg-password.sh refuses`;
+  }
+
+  return null;
+};
+
+/** What a failure of the check above prints, in the shape of its sibling. */
+export const formatDatabasePasswordProblem = (
+  secretArn: string,
+  problem: string,
+): string =>
+  [
+    "Secret preflight failed: the database password the gateway resolves per connection is unusable.",
+    `  ${secretArn}`,
+    `  ${problem}`,
+    "",
+    "The gateway's `password_command` runs with the task role on every new physical connection, so ECS",
+    "cannot catch this at task launch the way it caught an unresolved `secrets` entry. What it would",
+    "have produced is a task that starts, fails its store init, and exits after the apply drained the",
+    "running task: `SQLSTATE 28P01` on every dial, or `postgres password_command failed`.",
+    "",
+    "Check that the ARN names the RDS-managed master secret (`rds.ts`, `manageMasterUserPassword: true`)",
+    "and that the task role's `secretsmanager:GetSecretValue` grant has propagated; a freshly created",
+    "secret can lag its IAM grant by seconds.",
+  ].join("\n");
 
 /**
  * Every secret key the task definition will ask the ECS agent to resolve.
@@ -440,13 +618,20 @@ const readJson = (file: string, description: string): unknown => {
   }
 };
 
-/** Read only the key names. The value is parsed and discarded. */
-const listSecretKeys = (
+/**
+ * The secret's `SecretString`, as the CLI prints it with `--output text`.
+ *
+ * Only ever compared or parsed, never printed: the key-presence check reads
+ * key names out of it and the database check reads the password's shape. Both
+ * discard the value, which is the rule this script has held since the
+ * 2026-10-26 outage put secret values one log line away from CloudWatch.
+ */
+const readSecretString = (
   secretId: string,
   region: string,
   env: NodeJS.ProcessEnv,
-): Set<string> => {
-  const raw = runAws(
+): string =>
+  runAws(
     [
       "secretsmanager",
       "get-secret-value",
@@ -461,6 +646,14 @@ const listSecretKeys = (
     ],
     env,
   );
+
+/** Read only the key names. The value is parsed and discarded. */
+const listSecretKeys = (
+  secretId: string,
+  region: string,
+  env: NodeJS.ProcessEnv,
+): Set<string> => {
+  const raw = readSecretString(secretId, region, env);
 
   let parsed: unknown;
   try {
@@ -500,6 +693,12 @@ export const main = (argv: string[] = process.argv.slice(2)): number => {
       );
     }
 
+    // The one secret ECS no longer resolves for us. Read from the same
+    // synthesized definition, so a bad ARN or a secret without the password
+    // key fails this run rather than the gateway after the drain; see
+    // `extractDatabaseSecretArn`.
+    const databaseSecretArn = extractDatabaseSecretArn(...documents);
+
     const roleArn =
       argument(argv, "--role-arn") ??
       process.env.WORKBENCH_DEPLOY_ROLE_ARN ??
@@ -532,8 +731,34 @@ export const main = (argv: string[] = process.argv.slice(2)): number => {
       return 1;
     }
 
+    let databaseSecret: string;
+    try {
+      databaseSecret = readSecretString(databaseSecretArn, region, env);
+    } catch (error) {
+      // A bad ARN, a secret that does not exist yet and an IAM grant that has
+      // not propagated all land here, which is the class of failure the old
+      // `PG_PASSWORD` `valueFrom` caught at task launch.
+      console.error(
+        formatDatabasePasswordProblem(
+          databaseSecretArn,
+          `could not be read in ${region}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+      return 1;
+    }
+
+    const passwordProblem = databasePasswordProblem(databaseSecret);
+    if (passwordProblem) {
+      console.error(
+        formatDatabasePasswordProblem(databaseSecretArn, passwordProblem),
+      );
+      return 1;
+    }
+
     console.log(
-      `Secret preflight passed: ${required.length} referenced key(s) across ${secretIds.length} secret(s) are present.`,
+      `Secret preflight passed: ${required.length} referenced key(s) across ${secretIds.length} secret(s) are present, and the database password resolves.`,
     );
     return 0;
   } catch (error) {

@@ -187,3 +187,70 @@ describe("the database password command", () => {
     assert.match(result.stderr, /disabled=true/);
   });
 });
+
+describe("the command's dependence on Bifrost's environment inheritance", () => {
+  /**
+   * The command reads `PG_SECRET_ARN` and the task role's container
+   * credentials from its own environment. That only works because Bifrost runs
+   * it with `cmd.Env` left nil, and in Go a nil `Env` means the child inherits
+   * the parent's environment (`os.Environ()` is implied by `exec.Cmd`'s own
+   * `environ()`). Setting it to a built list would drop both, and every
+   * connection would fail with the CLI's credential-chain error.
+   *
+   * Pinned from the script's side rather than by fetching upstream's Go source
+   * (which this repo cannot do in a test): the script asserts the dependency
+   * at the point that would break. The two details that make it hold are that
+   * `RunPasswordCommand` builds the command as
+   * `exec.Command(config.Command, config.Args...)` at
+   * `framework/postgresconn/postgresconn.go:563` (tag `transports/v2.3.2`) and
+   * never assigns `cmd.Env` anywhere in the file, and that the command is not
+   * run through a shell, which would be a second environment to lose them at.
+   */
+  const SCRIPT = fs.readFileSync(BIFROST_PG_PASSWORD_SCRIPT_PATH, "utf8");
+
+  it("names the upstream line it depends on, so a reader can check it", () => {
+    assert.match(
+      SCRIPT,
+      /postgresconn\.go:?563|RunPasswordCommand/,
+      "the script must name the upstream function and line its environment inheritance rests on",
+    );
+    assert.match(
+      SCRIPT,
+      /cmd\.Env/,
+      "the script must name the nil `cmd.Env` that makes inheritance work",
+    );
+  });
+
+  it("is an executable the caller execs, not a shell it pipes through", () => {
+    // Bifrost refuses `sh`/`bash` as `password_command.command`
+    // (`validatePasswordCommand`), and this is why the shebang matters only for
+    // a human running the file: the kernel gets the path and this `#!` line,
+    // and the environment it was started with is the one it keeps.
+    assert.ok(
+      fs.statSync(BIFROST_PG_PASSWORD_SCRIPT_PATH).mode & 0o111,
+      "the command must be executable: Bifrost execs the path, it does not source it",
+    );
+    assert.match(SCRIPT.split("\n")[0], /^#!\/bin\/sh$/);
+  });
+
+  it("needs PG_SECRET_ARN and the container credentials from that inherited environment", () => {
+    // The positive statement of what the inheritance is for. A `PGPASSWORD`
+    // fallback or a defensive re-derivation would hide a change to upstream's
+    // environment handling instead of failing on it, so there is none.
+    assert.ok(SCRIPT.includes("PG_SECRET_ARN"));
+    // The prohibition is on shell code, not on the prose above it: the header
+    // explains at length why there is no fallback, and reading that as a
+    // fallback would make the explanation its own failure.
+    const code = SCRIPT.split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+    assert.ok(
+      !code.includes("PGPASSWORD"),
+      "no fallback: the only source is the secret the task definition's ARN names",
+    );
+    assert.ok(
+      !/AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY/.test(code),
+      "the credential chain is the container's; the command must not spell a key",
+    );
+  });
+});

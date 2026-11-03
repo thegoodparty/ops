@@ -131,6 +131,15 @@ if [ "$CI" = "true" ]; then
     # service empty. That is the 2026-10-26 outage, when `bifrost:3` named
     # `BIFROST_SETUP_TOKEN` and `bifrost/gateway` did not have it.
     #
+    # The database password is checked here for the same reason, and because
+    # nothing else does since it stopped being a `secrets` entry: the
+    # container resolves it per connection with the task role, so a bad ARN or
+    # a secret without a `password` key is a store init failure after the
+    # drain rather than a task that never starts. The ARN comes from the
+    # gateway's `PG_SECRET_ARN` environment entry in the same synthesized
+    # definition, and the check is an AWS API read (the secret is RDS's, not a
+    # Pulumi resource).
+    #
     # The required keys are derived from the task definition Pulumi is about
     # to deploy, not from a list in the repo. The preview JSON is the
     # synthesized state; the stack export is the fallback for an unchanged
