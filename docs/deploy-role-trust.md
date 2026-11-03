@@ -587,7 +587,7 @@ but `main` stops there. No omni job on this role declares an environment.
 lookup reached: omni's `main` ref and `pull_request`, ops' `main` ref, and
 dataplatform's `main` ref and `production` environment. After the 10-29 role
 moves, omni's `pull_request` assumes are the gp-api infrastructure diff alone,
-which step 5b moves to its own role.
+which step 5b moves to the preview deploy role.
 
 ## Ordering
 

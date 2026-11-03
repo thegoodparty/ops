@@ -58,9 +58,9 @@ export type TrustPolicyDocument = {
 // their entries granted nothing and only made the list look load bearing.
 //
 // No repository assumes this role on a pull request any more, which is what
-// step 8 of that plan waited for. omni's pull request jobs use
-// `github-actions-gp-api-plan` (the gp-api infrastructure diff),
-// `github-actions-preview-deploy` and `github-actions-pulumi-plan`, and
+// step 8 of that plan waited for. omni's pull request deploy and plan jobs
+// use `github-actions-preview-deploy` (gp-api previews, their teardown and
+// the infrastructure diff) and `github-actions-pulumi-plan`, and
 // dataplatform's plan uses the last. Every omni job left on this role runs on
 // `main`, by push, schedule or a dispatch from main, and declares no
 // environment, so it presents the main ref.
