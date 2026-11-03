@@ -18,6 +18,7 @@ import { BIFROST_HOSTNAME, createBifrostIngress } from "./ingress";
 import { createBifrostDatabase } from "./rds";
 import { createBifrostEcs } from "./ecs";
 import { createBifrostDiscovery } from "./discovery";
+import { createBifrostGovernanceParameters } from "./governance-parameters";
 import { createBifrostVkMint } from "./bifrost-vk-mint";
 import { createBifrostVkJanitor } from "./bifrost-vk-janitor";
 
@@ -582,20 +583,52 @@ export const bifrostTaskDefinitionFamily = ecs.taskDefinition.family;
 export const bifrostLogGroupName = ecs.logGroup.name;
 
 // ---------------------------------------------------------------------------
+// The governance desired state.
+//
+// Step 2 of `docs/bifrost-reconciler.md`: the key template and the per-person
+// overrides, published as two SSM `String` parameters from two committed files.
+// The reconciler (step 3) converges the running node to the merge of them, and
+// the minter (step 5) creates from the same desired state, so neither may hold
+// its own copy of the documents.
+//
+// It is created before the mint because the mint's read grant names the
+// template parameter's ARN rather than declaring the parameter itself. That
+// moved the resource out of `bifrost-vk-mint.ts` in this step; the parameter's
+// name, tier and value are unchanged, so the apply is an update in place for
+// anyone reading the diff.
+const governance = createBifrostGovernanceParameters({
+  provider,
+  tags: { Project: "bifrost-virtual-keys" },
+});
+
+/** The template parameter's name, for a human reading the console. */
+export const vkBifrostMintTemplateParameterName =
+  governance.template.name;
+
+/** The overrides parameter's name, beside the template's. */
+export const bifrostGovernanceOverridesParameterName =
+  governance.overrides.name;
+
+// ---------------------------------------------------------------------------
 // The virtual-key mint.
 //
 // Step 3 of `docs/bifrost-virtual-keys.md`: the Lambda a `WorkbenchAccess`
 // session calls to get its own Bifrost key. IAM-gated Function URL, attached to
 // the gateway's private subnets, one new 8080 ingress rule on the task group,
 // the template in SSM, and read on the dedicated setup-token secret. It consumes
-// the network, the discovery record above and the template file in `bifrost/`
-// rather than declaring a second copy of any of them.
+// the network, the discovery record above and the template parameter step 2
+// publishes rather than declaring a second copy of either.
 //
 // The invoke grant for people is step 4's, in `deploy/`, and is deliberately not
 // here: decision 2 shapes it as `lambda:InvokeFunctionUrl` plus a
 // `InvokedViaFunctionUrl`-conditioned `lambda:InvokeFunction`, and this stack
 // must never carry a bare `InvokeFunction` on the function.
-const vkMint = createBifrostVkMint({ provider, network, discovery });
+const vkMint = createBifrostVkMint({
+  provider,
+  network,
+  discovery,
+  templateParameter: governance.template,
+});
 
 /** The IAM-gated endpoint step 4 grants people permission to call. */
 export const vkBifrostMintUrl = vkMint.functionUrl;
@@ -608,10 +641,6 @@ export const vkBifrostMintFunctionArn = vkMint.function.arn;
 
 /** The task's private DNS name, so a human can resolve it from inside the VPC. */
 export const bifrostPrivateHostname = vkMint.bifrostHostname;
-
-/** The SSM parameter holding the key template, for a human reading the console. */
-export const vkBifrostMintTemplateParameterName =
-  vkMint.templateParameter.name;
 
 // ---------------------------------------------------------------------------
 // The virtual-key janitor.

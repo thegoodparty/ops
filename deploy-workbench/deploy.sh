@@ -219,6 +219,27 @@ if [ "$CI" = "true" ]; then
       --preview "$PREFLIGHT_DIR/preview.json" \
       --stack-export "$PREFLIGHT_DIR/stack.json"
 
+    # Step 2 of docs/bifrost-reconciler.md: the per-person governance overrides
+    # are validated twice, and this is the half a Pulumi program cannot do.
+    # `governance-parameters.ts` checks the document's shape, its durations and
+    # its field names as the program is evaluated, so a malformed file fails a
+    # preview. Membership in `Engineers` is a directory read, and the deploy
+    # role is deliberately not the reader, so this script assumes
+    # `bifrost-vk-reader` -- the same role both Lambdas assume -- and runs the
+    # same validation with the member set it read.
+    #
+    # Before the apply, because the apply is what writes the parameter: an email
+    # that is not an Engineer is an override no key can ever match, and the
+    # parameter would still be published with it. Before the drain for the same
+    # reason the secrets check is: nothing is rolled until the inputs are known
+    # to be usable.
+    #
+    # It reads the committed file rather than the preview, since the file is
+    # what the program publishes and a bad file fails here with its own paths in
+    # the message. A directory read that fails is a non-zero exit, not a pass:
+    # "I could not tell" is never "this person is not a member".
+    npx --no-install tsx "$SCRIPT_DIR/scripts/preflight-governance.ts"
+
     pulumi up --diff --yes
   fi
 else

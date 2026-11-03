@@ -18,12 +18,14 @@ import {
   VK_MINT_ROLE_NAME,
   SETUP_TOKEN_SECRET_JSON_KEY,
   SETUP_TOKEN_SECRET_NAME,
-  VK_MINT_TEMPLATE_PARAMETER_NAME,
   VK_READER_ROLE_ARN,
-  readVkMintTemplate,
   vkMintEnvironment,
   vkMintExecutionPolicy,
 } from "./bifrost-vk-mint";
+import {
+  VK_MINT_TEMPLATE_PARAMETER_NAME,
+  readVkMintTemplate,
+} from "./governance-parameters";
 import { VK_DESCRIPTION_MARKER } from "./bifrost/vk-marker";
 
 /**
@@ -158,17 +160,41 @@ describe("the function, its URL and its network", () => {
   });
 
   it("is wired into the stack, and the ECS service registers itself for discovery", () => {
-    assert.match(INDEX_SOURCE, /createBifrostVkMint\(\{\s*provider,\s*network,\s*discovery\s*\}\)/);
+    // The mint receives the published template rather than creating it: step 2
+    // of `docs/bifrost-reconciler.md` moved the parameter into
+    // `governance-parameters.ts`, beside the per-person overrides, because the
+    // two documents are one desired state. The four arguments are the whole
+    // wiring, and the template's presence here is what keeps the grant's ARN
+    // bound to the parameter the apply actually creates.
+    assert.match(
+      INDEX_SOURCE,
+      /createBifrostVkMint\(\{\s*provider,\s*network,\s*discovery,\s*templateParameter:\s*governance\.template,?\s*\}\)/,
+    );
     assert.match(INDEX_SOURCE, /createBifrostDiscovery\(\{\s*provider,\s*vpcId:\s*network\.vpc\.id\s*\}\)/);
     assert.match(ECS_SOURCE, /serviceRegistries:\s*\{\s*registryArn:\s*discovery\.service\.arn\s*\}/);
   });
 });
 
 describe("the template, the secret and the logs", () => {
-  it("stores the committed template as an SSM String parameter", () => {
+  it("reads the committed template as an SSM String parameter, created beside the overrides", () => {
     assert.equal(VK_MINT_TEMPLATE_PARAMETER_NAME, "/bifrost/vk-mint-template");
     assert.equal(vkMintEnvironment().TEMPLATE_PARAMETER_NAME, VK_MINT_TEMPLATE_PARAMETER_NAME);
-    assert.match(SOURCE, /name:\s*VK_MINT_TEMPLATE_PARAMETER_NAME,\s*type:\s*"String",\s*value:\s*readVkMintTemplate\(\)/);
+
+    // The resource moved to `governance-parameters.ts` in step 2; the shape it
+    // must have did not. Asserted against the file that now owns it, so the
+    // parameter cannot quietly lose its tier or start carrying a secret.
+    const GOVERNANCE_SOURCE = fs.readFileSync(
+      path.resolve(__dirname, "governance-parameters.ts"),
+      "utf8",
+    );
+    assert.match(
+      GOVERNANCE_SOURCE,
+      /name:\s*VK_MINT_TEMPLATE_PARAMETER_NAME,\s*type:\s*"String",\s*value:\s*parameterValue\(templateText\)/,
+    );
+    assert.match(GOVERNANCE_SOURCE, /name:\s*GOVERNANCE_OVERRIDES_PARAMETER_NAME,\s*type:\s*"String"/);
+    // And the mint must not have gone back to creating its own.
+    assert.doesNotMatch(SOURCE, /new aws\.ssm\.Parameter\(/);
+
     // The stored bytes are the reviewed file, marker included, so a mint
     // creates exactly the shape step 1 pinned.
     assert.equal(

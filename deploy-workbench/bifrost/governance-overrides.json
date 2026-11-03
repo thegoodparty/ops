@@ -1,0 +1,24 @@
+{
+  "$comment": [
+    "Per-person overrides for the governance of a Lambda-managed Bifrost virtual key. Step 2 of docs/bifrost-reconciler.md.",
+    "",
+    "The default shape every key gets is vk-mint-template.json. This document changes it for the people it names, and nobody else. It is stored as /bifrost/governance-overrides by Pulumi on every apply, so a console edit to the parameter is overwritten by the next one: this file is the source, and a change here is a review.",
+    "",
+    "The keys are lowercase emails, which is the key's name and what the mint lowercases before it compares. An email that is not in the Engineers group fails the check that runs before the parameter is written, so a typo here is a red run rather than an override nobody ever gets.",
+    "",
+    "The merge is field by field. A field you leave out keeps the template's value, and \"provider_configs\": \"inherit\" says that out loud for the one field where a reader would otherwise have to know the default. On every other field the sentinel is refused, because absent already means the same thing and a second spelling for it would invite you to think the two differ. Naming provider_configs replaces the whole list rather than merging into the template's entries: the field is a replacement set on Bifrost's wire, so restating the providers you mean is the only reading that cannot narrow a list by accident.",
+    "",
+    "Durations are Bifrost's own: 1d, 1w, 1M (30 days), 1Q, 1Y, or Go's forms (30s, 5m, 1h30m). A lowercase 1q is not a quarter and is refused here as it is there. Two budgets on one reset duration are refused, because that is the field the reconciler matches an existing budget by.",
+    "",
+    "calendar_aligned: true snaps a monthly budget to the calendar month rather than to the day the key was created, so a limit resets with the billing period rather than on everybody's own mint date.",
+    "",
+    "There is no default rate limit anywhere, deliberately: an omitted rate_limit means \"leave the key's alone\" on Bifrost's update path, so a limit is something you add here for the people it should apply to. A rate limit needs a maximum and its duration together.",
+    "",
+    "Three shapes, as they are written:",
+    "  \"someone@goodparty.org\": { \"budgets\": [{ \"max_limit\": 250, \"reset_duration\": \"1M\" }] }",
+    "  \"someone@goodparty.org\": { \"rate_limit\": { \"request_max_limit\": 600, \"request_reset_duration\": \"5m\" } }",
+    "  \"someone@goodparty.org\": { \"provider_configs\": [ { \"provider\": \"bedrock\", \"allowed_models\": [\"us.anthropic.claude-sonnet-5-5\"], \"key_ids\": [\"*\"] } ], \"calendar_aligned\": true }",
+    "",
+    "Empty is the correct state until there is usage data to choose a number from: every key gets the template, and the reconciler has nothing to do."
+  ]
+}

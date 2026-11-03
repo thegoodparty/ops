@@ -1,13 +1,13 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as esbuild from "esbuild";
-import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { MANAGEMENT_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
 import { BIFROST_DISCOVERY_DNS_NAME, type BifrostDiscovery } from "./discovery";
 import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
+import { VK_MINT_TEMPLATE_PARAMETER_NAME } from "./governance-parameters";
 import {
   BIFROST_PORT,
   REGION,
@@ -96,8 +96,15 @@ export const VK_MINT_ROLE_NAME = VK_MINT_NAME;
 export const VK_MINT_LOG_GROUP_NAME = `/aws/lambda/${VK_MINT_FUNCTION_NAME}`;
 export const VK_MINT_LOG_RETENTION_DAYS = 30;
 
-/** The SSM parameter the template is stored in, in the gateway's own namespace. */
-export const VK_MINT_TEMPLATE_PARAMETER_NAME = "/bifrost/vk-mint-template";
+/**
+ * The SSM parameter the template is stored in, in the gateway's own namespace.
+ *
+ * Imported from `governance-parameters.ts` and re-exported rather than declared
+ * here: step 2 of `docs/bifrost-reconciler.md` publishes the template beside the
+ * per-person overrides, so one module owns both parameters and the mint names
+ * the one it reads. The name, the tier and the mint's read grant are unchanged.
+ */
+export { VK_MINT_TEMPLATE_PARAMETER_NAME };
 
 /**
  * The gateway's own container, read for `BIFROST_SETUP_TOKEN` (decision 3).
@@ -131,13 +138,11 @@ export const LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN =
 export const VK_MINT_TIMEOUT_SECONDS = 30;
 export const VK_MINT_MEMORY_MB = 256;
 
-/** The repo file the parameter is built from, read at deploy time. */
-export const VK_MINT_TEMPLATE_PATH = path.resolve(
-  __dirname,
-  "bifrost/vk-mint-template.json",
-);
-export const readVkMintTemplate = (): string =>
-  fs.readFileSync(VK_MINT_TEMPLATE_PATH, "utf8");
+/**
+ * The repo file the template is read from lives beside
+ * `bifrost/governance-overrides.json` and is read by `governance-parameters.ts`
+ * at deploy time. This module owns the read grant, not the read.
+ */
 
 /**
  * The non-secret configuration, as data so a test can pin it without standing
@@ -276,8 +281,16 @@ export const createBifrostVkMint = (args: {
   provider: aws.Provider;
   network: ReturnType<typeof createWorkbenchNetwork>;
   discovery: BifrostDiscovery;
+  /**
+   * The published template, from `governance-parameters.ts`.
+   *
+   * Passed in rather than created here: the function's read grant names this
+   * parameter's ARN, and step 2 publishes it in the same apply as the per-person
+   * overrides, so the two documents are one dependency edge and one owner.
+   */
+  templateParameter: aws.ssm.Parameter;
 }) => {
-  const { provider, network, discovery } = args;
+  const { provider, network, discovery, templateParameter } = args;
   const tags = { Name: VK_MINT_NAME, Project: "bifrost-virtual-keys" };
 
   // The function's own group, created bare with each rule as its own resource
@@ -376,22 +389,13 @@ export const createBifrostVkMint = (args: {
     { provider },
   );
 
-  // The template, stored as a `String` and not a `SecureString`: it is a
-  // reviewed file in git with no secret in it (decision 5), and a SecureString
-  // would need `kms:Decrypt` for no confidentiality. Reading it at deploy time
-  // is what keeps the live value from drifting from the reviewed one.
-  const templateParameter = new aws.ssm.Parameter(
-    "bifrostVkMintTemplate",
-    {
-      name: VK_MINT_TEMPLATE_PARAMETER_NAME,
-      type: "String",
-      value: readVkMintTemplate(),
-      description:
-        "Default provider_configs for a minted Bifrost virtual key (step 1 of docs/bifrost-virtual-keys.md); edit deploy-workbench/bifrost/vk-mint-template.json.",
-      tags,
-    },
-    { provider },
-  );
+  // The template parameter itself is created by `governance-parameters.ts` and
+  // arrives as `args.templateParameter`. It stays a `String` and not a
+  // `SecureString` for the reason it always was: a reviewed file in git with no
+  // secret in it (decision 5), and a SecureString would need `kms:Decrypt` for
+  // no confidentiality. Reading the committed file at deploy time is what keeps
+  // the live value from drifting from the reviewed one, and that read now lives
+  // beside the overrides document's.
 
   const role = new aws.iam.Role(
     "bifrostVkMintRole",

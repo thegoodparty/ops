@@ -20,11 +20,22 @@ files that belong in review:
   alongside the `bedrock:ListFoundationModels` grant that renders it).
 - `vk-mint-template.json` — the default per-person virtual key shape, as data
   ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md),
-  step 1). See "Virtual-key template" below.
+  step 1). See "Virtual-key template" and "Governance overrides" below.
 - `vk-mint-template.test.ts` — pins the template's provider and model lists to
   `config.json`, its Lambda-managed marker, decision 5's absences, and the same
   US-only rule from the key's side, since a key may not name a model the
   gateway would refuse.
+- `governance-overrides.json` — the per-person overrides of that shape, keyed by
+  lowercase email, with its own `$comment` stating the merge rules
+  ([`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md), step 2). See
+  "Governance overrides" below. Empty until there is usage data to pick a
+  number from, which is the correct state and not an unfinished one.
+- `governance-desired-state.ts` — the merge and the validation for both
+  documents, with no AWS SDK and no `fetch` in it, so a bad override is a failed
+  test or a failed apply rather than a `400` retried every five minutes behind
+  an alarm. `governance-parameters.ts` is the Pulumi side: it publishes both
+  documents as SSM `String` parameters and runs the shape half of the
+  validation as the program is evaluated.
 - `allowed-emails.txt` — the admin allowlist, one `goodparty.org` address per
   line, the same shape as `agent-swarm/host/allowed-emails.txt`. Granting or
   revoking access is a PR to this file. The list is deliberately **separate**
@@ -364,6 +375,45 @@ What it carries, and why each is a decision (decision 5):
   template: one name in a shared template is one name for everyone, and
   Bifrost's unique index on the key name would hand the first caller's key to
   the second.
+
+## Governance overrides
+
+`governance-overrides.json` is step 2 of
+[`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md): per-person
+changes to the template's governance, keyed by **lowercase email** — the key's
+name, and what the mint lowercases before it compares. It is published as its
+own SSM `String`, `/bifrost/governance-overrides`, on every apply, exactly as the
+template is; a console edit is overwritten by the next one.
+
+The merge is field by field, with `"provider_configs": "inherit"` as the one
+explicit sentinel. Everything else keeps the template's value by being absent,
+and the sentinel is refused anywhere else, because a second spelling for "keep
+the template's" would invite a reader to think the two differ. Naming
+`provider_configs` replaces the whole list: it is a replacement set on Bifrost's
+wire, so an override that narrows one provider states the whole list it means.
+
+The reason it is a second parameter and not more of the first is the tier
+ceiling: `config.json` is already 3,794 bytes against the standard tier's 4 KiB,
+and the two governance documents have separate lifetimes anyway. Both are
+checked against the ceiling by `governance-parameters.test.ts`, which fails the
+build rather than the apply.
+
+Validation has two halves, and the split is the point:
+
+- the **shape** — an unknown field, a malformed budget, a duplicate
+  `reset_duration`, an `inherit` where it cannot be honoured, an email that is
+  not lowercase — runs in the Pulumi program, so a malformed file fails a
+  preview and a test, in the credential-free job;
+- **membership** in the `Engineers` group is a directory read, so it runs in
+  `scripts/preflight-governance.ts` from `deploy.sh`, before the apply that would
+  write the parameter. It assumes `bifrost-vk-reader` — the role both Lambdas
+  assume — and a directory read that fails is a non-zero exit, never a pass.
+
+Durations are Bifrost's own (`1d`, `1w`, `1M` = 30 days, `1Q`, `1Y`, or Go's
+`30s`, `5m`, `1h30m`); a lowercase `1q` is not a quarter there and is refused
+here. `rate_limit` has no default anywhere: an omitted one means "leave the
+key's alone", so a limit is added here for the people it should apply to, never
+in the template, where it would reach every key on the next tick.
 
 ## The image
 
