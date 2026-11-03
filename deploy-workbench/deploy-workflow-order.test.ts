@@ -29,8 +29,9 @@ import * as path from "node:path";
  * carry on: a skipped push is an apply onto an image that does not exist, which
  * is the outage. The one thing that cannot be pushed before an apply is a
  * repository the apply has never created, so the run creates those first with a
- * targeted apply that touches nothing else -- and if the probe cannot tell
- * whether a repository exists, it stops.
+ * constrained apply that holds the service and the task definition back, and
+ * touches the image path otherwise -- and if the probe cannot tell whether a
+ * repository exists, it stops.
  *
  * The workflow is read as text rather than parsed: the repo has no YAML
  * dependency, and the assertions here are about the order and the shape of the
@@ -57,8 +58,8 @@ type Step = { name: string; body: string };
 
 /**
  * A block with its comment lines removed. Every assertion below is about what
- * the workflow *does*, and a comment that mentions `describe-repositories` or
- * `--target` (explaining why the step exists) is not the step doing it.
+ * the workflow *does*, and a comment that mentions `--exclude` (explaining why
+ * the step exists) is not the step doing it.
  */
 const codeOnly = (text: string): string =>
   text
@@ -108,11 +109,14 @@ describe("deploy-workbench.yml step order", () => {
     }
   });
 
-  it("creates a missing repository with a targeted apply, before anything pushes", () => {
-    // The only write allowed before the images exist, and it must be limited to
-    // the ECR repositories: a full apply here would create the repository and
-    // roll the service out onto the image in the same breath, which is the
-    // outage. `--target` updates what it matches and leaves the stack alone.
+  it("creates a missing repository with an exclude-shaped apply, before anything pushes", () => {
+    // The only write allowed before the images exist. It must keep the service
+    // and the task definition out of it: a full apply here would create the
+    // repository and roll the service out onto the image in the same breath,
+    // which is the outage. It is `--exclude` rather than `--target` for a Pulumi
+    // engine reason, not a preference -- see the block above
+    // `DEPLOY_EXCLUDE_SERVICE` in deploy.sh, and the assertions below that pin
+    // which flags are passed.
     //
     // Unconditional on purpose. A conditional pass has to decide that a
     // repository is missing from a failed API call, and an expired session or a
@@ -124,7 +128,7 @@ describe("deploy-workbench.yml step order", () => {
     );
     assert.ok(
       create < stepIndex(IMAGE_STEPS[0]),
-      "the targeted apply must run before the first push, or the push has nowhere to go",
+      "the constrained apply must run before the first push, or the push has nowhere to go",
     );
     assert.ok(
       create < stepIndex("Configure AWS Credentials (workbench)"),
@@ -136,13 +140,11 @@ describe("deploy-workbench.yml step order", () => {
     ).body;
     assert.ok(
       !/\n\s+if:/.test(createBody),
-      "the targeted apply must not be conditional: its point is that no check decides whether a push can happen",
+      "the constrained apply must not be conditional: its point is that no check decides whether a push can happen",
     );
     assert.ok(
-      createBody.includes(
-        'DEPLOY_TARGET: "urn:pulumi:*::*::aws:ecr/repository:Repository::*"',
-      ),
-      "the create step must target the stack's ECR repositories and nothing else",
+      !createBody.includes("DEPLOY_TARGET"),
+      "the pass must not constrain by target: a --targeted update hits the Pulumi engine race in pulumi/pulumi#24359, which took deploy run 41678173008 down 5 of 5 attempts",
     );
     assert.ok(
       createBody.includes("run: ./deploy.sh"),
@@ -150,10 +152,63 @@ describe("deploy-workbench.yml step order", () => {
     );
   });
 
+  it("holds the service and the task definition out of the repositories pass", () => {
+    // The two resources whose update drains the only Fargate task. Both, not
+    // one: `ecs.ts` builds the service's container definitions from the task
+    // definition, so the service's diff reads it and excluding only the task
+    // definition still yields a create-replacement of the service. Measured on
+    // the local repro, which rolled the service with only the task definition
+    // excluded.
+    //
+    // Matched against the logical names `ecs.ts` declares, by name and type, so
+    // that a rename fails here rather than silently letting the service into the
+    // pass.
+    const createBody = stepNamed(
+      "Create the image repositories if the stack does not have them yet",
+    ).body;
+    const env = (key: string): string => {
+      const match = createBody.match(
+        new RegExp(`^\\s+${key}: "([^"]+)"$`, "m"),
+      );
+      assert.ok(match, `the create step has no ${key}`);
+      return match[1];
+    };
+
+    const ecs = fs.readFileSync(path.resolve(__dirname, "ecs.ts"), "utf8");
+    const declared = (type: string): string[] => [
+      ...ecs.matchAll(new RegExp(`new aws\\.ecs\\.${type}\\(\\s*"([^"]+)"`, "g")),
+    ].map((match) => match[1]);
+
+    assert.deepEqual(
+      declared("Service"),
+      ["bifrostService"],
+      "ecs.ts declares more than one ECS service; this test pins one",
+    );
+    assert.deepEqual(
+      declared("TaskDefinition"),
+      ["bifrostTaskDefinition"],
+      "ecs.ts declares more than one task definition; this test pins one",
+    );
+
+    for (const [key, urn] of [
+      ["DEPLOY_EXCLUDE_SERVICE", "aws:ecs/service:Service::bifrostService"],
+      [
+        "DEPLOY_EXCLUDE_TASK_DEFINITION",
+        "aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition",
+      ],
+    ] as const) {
+      assert.equal(
+        env(key),
+        `urn:pulumi:*::*::${urn}`,
+        `${key} must name the resource by type and logical name, globbing the stack and project so a stack rename keeps it matching`,
+      );
+    }
+  });
+
   it("cannot skip a push", () => {
     // Nothing here may decide that an image does not have to be pushed: no
     // repository probe to read a failure as an absence, and no
-    // warning-and-yield path. The targeted apply above is what makes the
+    // warning-and-yield path. The constrained apply above is what makes the
     // repositories exist, so every push either succeeds or stops the run before
     // the apply. The `describe-images` checks that remain are a different
     // thing: they skip a push only when the tag is already in ECR.
@@ -193,13 +248,15 @@ describe("deploy-workbench.yml step order", () => {
   it("applies the whole stack exactly once, and only after every push", () => {
     // A second full apply is a second drain of the running task, and the
     // ordering above only guarantees the images exist for the first. The one
-    // other `deploy.sh` invocation is the targeted repositories pass.
+    // other `deploy.sh` invocation is the constrained repositories pass.
     const running = steps().filter((step) => step.body.includes("run: ./deploy.sh"));
-    assert.equal(running.length, 2, "expected one targeted and one full apply");
-    const full = running.filter((step) => !step.body.includes("DEPLOY_TARGET"));
-    const targeted = running.filter((step) => step.body.includes("DEPLOY_TARGET"));
-    assert.equal(full.length, 1, "exactly one untargeted apply");
-    assert.equal(targeted.length, 1, "exactly one targeted apply");
+    assert.equal(running.length, 2, "expected one constrained and one full apply");
+    const constrained = running.filter((step) =>
+      step.body.includes("DEPLOY_EXCLUDE_SERVICE"),
+    );
+    const full = running.filter((step) => !step.body.includes("DEPLOY_EXCLUDE_SERVICE"));
+    assert.equal(full.length, 1, "exactly one unconstrained apply");
+    assert.equal(constrained.length, 1, "exactly one constrained apply");
     assert.ok(
       stepIndex(full[0].name) > stepIndex(IMAGE_STEPS[IMAGE_STEPS.length - 1]),
       "the full apply must run after the last push",
@@ -214,36 +271,53 @@ describe("deploy-workbench.yml step order", () => {
     assert.ok(stepIndex("Enable Bedrock models") > stepIndex("Deploy"));
   });
 
-  it("supports the targeted apply in deploy.sh, and only on the write path", () => {
+  it("supports the constrained apply in deploy.sh, and only on the write path", () => {
+    // `--exclude`, not `--target`: see the block above `DEPLOY_EXCLUDE_SERVICE`
+    // in deploy.sh for why, and the test above for which resources it excludes.
     assert.ok(
-      DEPLOY_SH.includes('pulumi up --diff --yes --target "$DEPLOY_TARGET"'),
-      "deploy.sh must pass the target through to pulumi up",
+      DEPLOY_SH.includes(
+        'pulumi up --diff --yes \\\n      --exclude "$DEPLOY_EXCLUDE_SERVICE" \\\n      --exclude "$DEPLOY_EXCLUDE_TASK_DEFINITION"',
+      ),
+      "deploy.sh must pass both excludes through to pulumi up",
     );
     assert.equal(
-      [...DEPLOY_SH.matchAll(/--target/g)].length,
-      1,
-      "one target, one flag: the glob is passed whole rather than split",
+      [...DEPLOY_SH.matchAll(/--exclude /g)].length,
+      2,
+      "two excludes, both passed whole and quoted",
+    );
+    assert.ok(
+      !DEPLOY_SH.includes("--target"),
+      "deploy.sh must not constrain by target: a --targeted update hits the Pulumi engine race in pulumi/pulumi#24359",
+    );
+    // Half a pair is the silent drain this exists to prevent, so it is an error
+    // rather than a pass that touches only one of the two.
+    assert.ok(
+      DEPLOY_SH.includes("set both DEPLOY_EXCLUDE_SERVICE and DEPLOY_EXCLUDE_TASK_DEFINITION"),
+      "deploy.sh must refuse a half-configured exclude pair rather than apply with it",
     );
     // Preview mode returns before the apply, so a preview never becomes a
-    // targeted write: the target is read only by the `pulumi up` below.
+    // constrained write: the excludes are read only by the `pulumi up` below.
     const previewAt = DEPLOY_SH.indexOf('if [ "$PREVIEW" = "true" ]');
-    const targetUsage = DEPLOY_SH.indexOf("--target");
-    assert.ok(previewAt !== -1 && targetUsage > previewAt, "the target is used outside the preview path");
+    const excludeUsage = DEPLOY_SH.indexOf('--exclude "$DEPLOY_EXCLUDE_SERVICE"');
+    assert.ok(
+      previewAt !== -1 && excludeUsage > previewAt,
+      "the excludes are used outside the preview path",
+    );
   });
 
-  it("targets every ECR repository this stack declares, by type", () => {
-    // The glob is written by type rather than by name so that renaming a
-    // repository resource does not silently stop matching it -- and this
-    // checks the type it names is the one the modules declare, and that the
-    // URNs those modules produce are what a `urn:pulumi:<stack>::<project>` glob
-    // matches.
-    const pattern = stepNamed(
+  it("excludes no ECR repository this stack declares", () => {
+    // The pass has to create every repository the stack has not made yet, so no
+    // exclude may match one. Checked against the logical names the four image
+    // modules declare, and against the URNs a `urn:pulumi:<stack>::<project>`
+    // glob produces, so a future edit that swaps an exclude for the old
+    // repository-type pattern fails here rather than at push time.
+    const createBody = stepNamed(
       "Create the image repositories if the stack does not have them yet",
-    ).body.match(/DEPLOY_TARGET: "([^"]+)"/)?.[1];
-    assert.ok(pattern, "the create step has no DEPLOY_TARGET");
-    const asRegExp = new RegExp(
-      `^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^:]*")}$`,
-    );
+    ).body;
+    const patterns = [
+      ...createBody.matchAll(/DEPLOY_EXCLUDE_[A-Z_]+: "([^"]+)"/g),
+    ].map((match) => match[1]);
+    assert.equal(patterns.length, 2, "expected two exclude patterns");
 
     const logicalNames = [
       "bifrost-image.ts",
@@ -257,12 +331,28 @@ describe("deploy-workbench.yml step order", () => {
       );
     });
     assert.equal(logicalNames.length, 4, `expected four ECR repositories: ${logicalNames}`);
-    for (const name of logicalNames) {
-      assert.match(
-        `urn:pulumi:main::workbench::aws:ecr/repository:Repository::${name}`,
-        asRegExp,
-        `the target glob does not match the ${name} repository this stack declares`,
+
+    const matches = (pattern: string, urn: string): boolean =>
+      new RegExp(
+        `^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^:]*")}$`,
+      ).test(urn);
+
+    for (const pattern of patterns) {
+      // A type glob over every ECR repository, as the pass used to be targeted
+      // by, would match here and must not come back.
+      assert.ok(
+        !matches(pattern, "urn:pulumi:main::workbench::aws:ecr/repository:Repository::any"),
+        `${pattern} excludes an ECR repository, which the pass exists to create`,
       );
+      for (const name of logicalNames) {
+        assert.ok(
+          !matches(
+            pattern,
+            `urn:pulumi:main::workbench::aws:ecr/repository:Repository::${name}`,
+          ),
+          `${pattern} excludes the ${name} repository this stack declares`,
+        );
+      }
     }
   });
 });
@@ -289,12 +379,12 @@ describe("deploy-workbench.yml deploy health checks", () => {
       "deploy.sh must run the pre-apply secret check",
     );
 
-    const targetedAt = DEPLOY_SH.indexOf("--target");
+    const constrainedAt = DEPLOY_SH.indexOf('--exclude "$DEPLOY_EXCLUDE_SERVICE"');
     const fullApplyAt = DEPLOY_SH.lastIndexOf("pulumi up --diff --yes");
-    assert.notEqual(targetedAt, -1, "the targeted repositories apply is gone");
+    assert.notEqual(constrainedAt, -1, "the constrained repositories apply is gone");
     assert.notEqual(fullApplyAt, -1, "the full apply is gone");
     assert.ok(
-      preflightAt > targetedAt,
+      preflightAt > constrainedAt,
       "the secret check belongs on the full-apply path, not the repositories pass",
     );
     assert.ok(

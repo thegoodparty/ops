@@ -125,7 +125,7 @@ jobs:
 
       - run: npm ci
 
-      # The targeted repositories pass. It runs on the first-hop credentials the
+      # The excluded repositories pass. It runs on the first-hop credentials the
       # step above configured, because `deploy.sh` reads the Pulumi state
       # passphrase from SSM in the management account and then assumes
       # `pulumi-deploy` through the provider (`index.ts`), exactly as the full
@@ -133,15 +133,31 @@ jobs:
       # pushes on purpose: those two steps replace this session in the job
       # environment for every step after them.
       #
-      # `--target` updates the resources it matches and leaves the rest of the
-      # stack alone; the value is a glob over the resource *type* rather than a
-      # list of names, so renaming a repository resource does not silently stop
-      # matching it. `deploy-workflow-order.test.ts` checks the glob against the
-      # URNs the three image modules declare.
+      # `--exclude` holds the service and the task definition back and leaves
+      # everything else to update, which includes the ECR repositories, so a
+      # repository this stack does not have yet is created here. Both patterns
+      # name a resource *type* and logical name, with a glob over the stack and
+      # project, so renaming a resource does not silently stop matching it.
+      # `deploy-workflow-order.test.ts` checks them against the logical names
+      # `ecs.ts` declares, checks that no ECR repository is excluded, and fails
+      # if the pair is incomplete.
+      #
+      # This was `--target` over the repository type, and cannot be again. A
+      # `--target`ed update hits a Pulumi engine race that fails with
+      # "Duplicate resource URN" naming a resource declared exactly once and not
+      # targeted (pulumi/pulumi#24359): it took this step down on 5 of 5 attempts
+      # of deploy run 41678173008, each naming a different bystander. The full
+      # argument, the upstream issue and PRs, and the measured failure rates are
+      # in the block above `DEPLOY_EXCLUDE_SERVICE` in `deploy.sh`.
       - name: Create the image repositories if the stack does not have them yet
         working-directory: deploy-workbench
         env:
-          DEPLOY_TARGET: "urn:pulumi:*::*::aws:ecr/repository:Repository::*"
+          # Held back because updating either one drains the only healthy task
+          # (`minimumHealthyPercent: 0`). Both are needed: the service's diff
+          # reads the task definition, so excluding only the latter still
+          # produces a create-replacement of the former.
+          DEPLOY_EXCLUDE_SERVICE: "urn:pulumi:*::*::aws:ecs/service:Service::bifrostService"
+          DEPLOY_EXCLUDE_TASK_DEFINITION: "urn:pulumi:*::*::aws:ecs/taskDefinition:TaskDefinition::bifrostTaskDefinition"
         run: ./deploy.sh
 
       # Everything the task definition can resolve is pushed BEFORE the apply
@@ -167,9 +183,15 @@ jobs:
       # probed for: a stack whose ECR repositories do not exist yet, because the
       # apply creates them. Nothing can be pushed before the first apply, and
       # pushing after it is the wrong order again -- so the run creates them
-      # itself, with a `--target`ed apply limited to this stack's ECR
-      # repositories. That apply matches no service, so there is nothing to
-      # drain, and the pushes below have somewhere to push to.
+      # itself, with an `--exclude`d apply that holds back the service and the
+      # task definition. That apply has no service in it, so there is nothing to
+      # drain, and the pushes below have somewhere to push to. It does apply
+      # whatever else has changed -- on the #444 merge that is two IAM role
+      # policies -- and that is safe for a reason worth stating rather than
+      # assuming: draining the task requires an update to the ECS *service*, and
+      # the service is out of this pass. Nothing else here restarts a task. The
+      # cost is one extra update per run (usually "no changes"), which is the
+      # same cost the targeted pass had.
       #
       # Unconditional, and that is the point. A conditional version (probe, then
       # create only if something is missing) has to read "the repository is not
