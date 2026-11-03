@@ -182,6 +182,9 @@ const agentSwarm = createAgentSwarm({ provider, zone: infraZone });
 
 export const delegateSwarmInstanceId = agentSwarm.instance.id;
 export const delegateSwarmPublicIp = agentSwarm.eip.publicIp;
+// gp-api's AWS_OIDC_ISSUER: `pulumi stack output delegateSwarmOidcIssuer`.
+export const delegateSwarmOidcIssuer =
+  agentSwarm.outboundFederation.issuerIdentifier;
 
 // The break-glass Lambda, step 3 (dry) of docs/sheriff.md. The function
 // URL is the endpoint the separate break-glass Slack app points its slash

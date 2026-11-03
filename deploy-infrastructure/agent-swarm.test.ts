@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   hostFiles,
+  identityTokenStatement,
+  OIDC_AUDIENCE,
   hostFilesHash,
   SWARM_HOSTNAME,
   syncCommand,
@@ -85,5 +87,18 @@ describe("delegate swarm user data", () => {
     const script = userData("vol-0123456789abcdef0");
     assert.ok(script.includes("vol-0123456789abcdef0"));
     assert.ok(!script.includes("__DATA_VOLUME_ID__"));
+  });
+});
+
+describe("delegate swarm host identity token", () => {
+  // Any agent on the host can mint this token, so the audience is the only
+  // thing keeping it from being presented to another service.
+  it("allows GetWebIdentityToken for the gp-api audience only", () => {
+    assert.equal(OIDC_AUDIENCE, "gp-api");
+    assert.equal(identityTokenStatement.Effect, "Allow");
+    assert.equal(identityTokenStatement.Action, "sts:GetWebIdentityToken");
+    assert.deepEqual(identityTokenStatement.Condition, {
+      "ForAllValues:StringEquals": { "sts:IdentityTokenAudience": "gp-api" },
+    });
   });
 });

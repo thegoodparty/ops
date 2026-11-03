@@ -25,6 +25,21 @@ const DATA_VOLUME_NAME = "delegate-swarm-data";
 const DATA_VOLUME_PLACEHOLDER = "__DATA_VOLUME_ID__";
 
 // `Environment` comes from the provider's default tags; `Project` overrides them.
+// The audience of the token the host's agents present to gp-api. The
+// condition key is multi-valued, so it takes ForAllValues.
+export const OIDC_AUDIENCE = "gp-api";
+export const identityTokenStatement = {
+  Sid: "GetGpApiIdentityToken",
+  Effect: "Allow",
+  Action: "sts:GetWebIdentityToken",
+  Resource: "*",
+  Condition: {
+    "ForAllValues:StringEquals": {
+      "sts:IdentityTokenAudience": OIDC_AUDIENCE,
+    },
+  },
+};
+
 const TAGS = { Name: NAME, Project: NAME };
 
 const ROOT = path.resolve(__dirname, "../agent-swarm");
@@ -84,6 +99,14 @@ export const createAgentSwarm = (args: {
   zone: aws.route53.Zone;
 }) => {
   const { provider, zone } = args;
+
+  // Account-wide switch; the issuer URL it exposes is gp-api's
+  // AWS_OIDC_ISSUER.
+  const outboundFederation = new aws.iam.OutboundWebIdentityFederation(
+    "outboundWebIdentityFederation",
+    {},
+    { provider },
+  );
 
   const securityGroup = new aws.ec2.SecurityGroup(
     "delegateSwarmSecurityGroup",
@@ -264,6 +287,7 @@ export const createAgentSwarm = (args: {
                 Action: "sts:AssumeRole",
                 Resource: PROD_READ_ROLE_ARN,
               },
+              identityTokenStatement,
             ],
           }),
         ),
@@ -464,5 +488,5 @@ export const createAgentSwarm = (args: {
     { provider },
   );
 
-  return { instance, eip };
+  return { instance, eip, outboundFederation };
 };
