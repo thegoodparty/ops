@@ -502,7 +502,7 @@ describe("the committed documents and their parameters", () => {
     }
   });
 
-  it("publishes both documents as valid JSON with no secret in them", () => {
+  it("publishes both documents as valid JSON with no secret in them, and no metadata", () => {
     for (const text of [readVkMintTemplate(), readGovernanceOverrides()]) {
       assert.doesNotThrow(() => JSON.parse(text));
       assert.doesNotThrow(() => parameterValue(text));
@@ -512,9 +512,23 @@ describe("the committed documents and their parameters", () => {
       assert.doesNotMatch(text, /sk-[A-Za-z0-9]{8,}/);
       assert.doesNotMatch(text, /AKIA[0-9A-Z]{16}/);
     }
+
+    // `$comment` is the document's own documentation, not desired state: it is
+    // stripped before publication, so the published value carries no metadata
+    // key at all and the byte check measures what is actually written.
+    const published = JSON.parse(
+      parameterValue(readGovernanceOverrides()),
+    ) as Record<string, unknown>;
+    for (const field of ["$comment", "$schema"]) {
+      assert.ok(!(field in published), `${field} reached the published parameter`);
+    }
+    assert.ok(
+      !parameterValue(readGovernanceOverrides()).includes("$comment"),
+      "the published overrides value still carries the $comment block",
+    );
   });
 
-  it("keeps each document under the standard tier's 4 KiB", () => {
+  it("keeps each document under the standard tier's 4 KiB, measured as published", () => {
     assert.equal(GOVERNANCE_PARAMETER_STANDARD_TIER_BYTES, 4096);
     // The same ceiling `ecs.ts` records for `config.json`, and the reason the
     // two governance documents are two parameters and not one.
@@ -533,6 +547,15 @@ describe("the committed documents and their parameters", () => {
         `${name} is ${bytes} bytes and the standard tier holds ${GOVERNANCE_PARAMETER_STANDARD_TIER_BYTES}; past that the parameter needs tier: "Advanced"`,
       );
     }
+
+    // And the room the plan budgets for: the committed document is a few bytes
+    // of `{}` published, so an empty document is not eating the room a
+    // per-person override needs. 3 KiB is the plan's working figure.
+    const empty = Buffer.byteLength(parameterValue(readGovernanceOverrides()), "utf8");
+    assert.ok(
+      empty < 512,
+      `the empty overrides document is ${empty} bytes published; the $comment block is not being stripped`,
+    );
   });
 
   it("keeps the template's own shape tests true after the repository move", () => {

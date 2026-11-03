@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import { MANAGEMENT_ACCOUNT_ID } from "../utils/accounts";
 import { ENGINEERS_GROUP_ID as CORE_ENGINEERS_GROUP_ID } from "./bifrost/vk-mint-core";
+import { checkGovernanceOverrides } from "./bifrost/governance-desired-state";
 import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
 import {
   GOVERNANCE_OVERRIDES_FILE,
@@ -205,7 +206,65 @@ describe("the role, the session and the group are the ones the Lambdas use", () 
   });
 });
 
-describe("it runs before the apply that writes the parameter", () => {
+describe("the deploy job can actually run it", () => {
+  it("does not assume a role this job's session cannot assume", () => {
+    // The reviewer's finding, pinned. `bifrost-vk-reader`'s trust admits two
+    // principals, the two Lambdas' execution roles; the deploy job holds the
+    // first-hop `github-actions-workbench-deploy`, whose policy allows
+    // `sts:AssumeRole` only on the workbench `pulumi-deploy`. So an
+    // unconditional assume of the reader from this script is an `AccessDenied`
+    // on every deploy, under `set -e`, before `pulumi up` -- and it is a role
+    // neither file admits, so no test of the ARN or the session name would
+    // catch it.
+    const readerSource = fs.readFileSync(
+      path.resolve(__dirname, "../deploy/components/bifrost-vk-reader.ts"),
+      "utf8",
+    );
+    const ciRoleSource = fs.readFileSync(
+      path.resolve(__dirname, "../deploy/components/ci-roles/policies.ts"),
+      "utf8",
+    );
+
+    // The reader's trust names the Lambdas' roles and no CI role.
+    const granteeBlock = /const GRANTEE_ROLE_ARNS = \[([\s\S]*?)\];/.exec(
+      readerSource,
+    );
+    assert.ok(granteeBlock, "the reader's grantee list moved");
+    assert.ok(!/github-actions/.test(granteeBlock[1]));
+
+    // The CI role's assume grant names one workbench role, not the reader.
+    // Matched up to the closing `},` of the statement rather than the first
+    // `}`, because the statement's own braces are nested inside it.
+    const assumeAt = ciRoleSource.indexOf('Sid: "AssumeWorkbenchDeployRole"');
+    assert.ok(assumeAt !== -1, "the CI role's workbench assume moved");
+    const assumeBlock = ciRoleSource.slice(assumeAt, assumeAt + 400);
+    assert.match(assumeBlock, /pulumi-deploy/);
+    assert.ok(!/bifrost-vk-reader/.test(assumeBlock));
+
+    // And the script reads the grant it needs before doing the read, so a
+    // caller without it takes the shape-only path instead of throwing.
+    const scriptSource = fs.readFileSync(
+      path.resolve(__dirname, "scripts/preflight-governance.ts"),
+      "utf8",
+    );
+    assert.match(scriptSource, /GOVERNANCE_CHECK_MEMBERSHIP/);
+    assert.match(scriptSource, /--members/);
+  });
+
+  it("takes an explicit member set, which is the form a caller without the grant uses", () => {
+    // The logic the flag feeds: a set, and an email outside it fails.
+    const members = new Set(["someone@goodparty.org"]);
+    const problems = checkGovernanceOverrides(
+      documentText({
+        "someone@goodparty.org": { calendar_aligned: true },
+        "departed@goodparty.org": { calendar_aligned: true },
+      }),
+      { isMember: (email: string) => members.has(email.toLowerCase()) },
+    );
+    assert.equal(problems.length, 1);
+    assert.equal(problems[0].path, "departed@goodparty.org");
+  });
+
   it("is invoked by deploy.sh in the write path, after the secrets check and before the apply", () => {
     const governanceAt = DEPLOY_SH.indexOf("scripts/preflight-governance.ts");
     const secretsAt = DEPLOY_SH.indexOf("scripts/preflight-secrets.ts");

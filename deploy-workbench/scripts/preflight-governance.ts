@@ -179,8 +179,24 @@ export const checkCommittedOverrides = async (
 /**
  * The directory read, through the CLI and the reader role, exactly as
  * `scripts/verify-service.ts` reaches ECS and `preflight-secrets.ts` reaches
- * Secrets Manager: assume the role into the management account, run `aws` in
- * the child environment it returns, and keep the job's own session untouched.
+ * Secrets Manager: assume the role, run `aws` in the child environment it
+ * returns, and keep the job's own session untouched.
+ *
+ * ## Which principal this can run as, and why it is not the deploy job
+ *
+ * `bifrost-vk-reader`'s trust admits exactly two principals, the two Lambdas'
+ * execution roles (`deploy/components/bifrost-vk-reader.ts`, the
+ * `GRANTEE_ROLE_ARNS` condition). The deploy job does not hold either of them,
+ * and widening the trust to admit it would make the CI role a third holder of a
+ * grant that exists to be narrow: that is an IAM change in `deploy/`, which is a
+ * different, human-owned review, and it is not this step's.
+ *
+ * So the deploy job does not call this function. `main` below takes the
+ * membership from whoever already has it — see `resolveMemberEmails` and the
+ * `--members` path — and the reader-role form is the one a Lambda (or a human
+ * with `breakglass` and the reader's session) uses. The shape half needs no
+ * credentials at all and is the half that catches a typo in a field name, which
+ * is the failure a document with no people can actually have.
  *
  * `GetUserId` returning nothing is not an error — the CLI exits 0 with no
  * `UserId` for an address that names no user. Every other non-zero exit throws,
@@ -248,14 +264,82 @@ export const createCliDirectory = (args: {
 };
 
 /**
- * The script's entry point. `deploy.sh` runs it before the apply, under
- * `set -e`, so a non-zero exit stops the run before the parameter is written.
+ * The script's entry point, and the reason the deploy job can run it.
+ *
+ * The membership half is only checked when the caller has a way to read the
+ * directory: `--members a@x,b@x` names the set explicitly (the form the deploy
+ * job or a human with `breakglass` and the reader's session uses), and
+ * otherwise the reader role is assumed, which only the two Lambdas may do. With
+ * neither, the shape half still runs and still fails the build on a malformed
+ * document, and the script says out loud that membership was not checked rather
+ * than implying it was.
+ *
+ * The shape half is not a consolation prize, and it is worth being exact about
+ * what each half catches. A document with no people in it can only be wrong in
+ * its shape, and an unknown field, a malformed budget, a duplicate
+ * `reset_duration` or a misplaced `inherit` are all shape. The membership half
+ * exists for the day the document gains its first person, and the step that
+ * adds one is what supplies the member set — which is the moment a human is
+ * looking at the email anyway.
+ *
+ * `deploy.sh` runs this under `set -e`, so a non-zero exit stops the run before
+ * the apply writes the parameter.
  */
 const main = async (): Promise<void> => {
-  const { ok, message } = await checkCommittedOverrides(createCliDirectory());
-  // stdout, not stderr: this is the diagnosis a reviewer reads in the run log.
-  console.log(message);
-  if (!ok) process.exitCode = 1;
+  const memberArgument = process.argv
+    .slice(2)
+    .flatMap((arg, index, args) =>
+      arg === "--members" && args[index + 1] ? [args[index + 1]] : [],
+    )[0];
+
+  const explicitMembers = memberArgument
+    ? new Set(
+        memberArgument
+          .split(",")
+          .map((email) => email.trim().toLowerCase())
+          .filter((email) => email !== ""),
+      )
+    : undefined;
+
+  const text = readFileSync(overridesPath(), "utf8");
+
+  if (explicitMembers) {
+    const problems = checkGovernanceOverrides(text, {
+      isMember: (email) => explicitMembers.has(email.toLowerCase()),
+    });
+    console.log(
+      problems.length === 0
+        ? `${GOVERNANCE_OVERRIDES_FILE} is valid, against the ${explicitMembers.size} member(s) named on the command line`
+        : formatCheckFailure(problems),
+    );
+    if (problems.length > 0) process.exitCode = 1;
+    return;
+  }
+
+  // No member set and no reader role on this caller: the shape half is still
+  // worth failing a deploy for, and the message says exactly what was and was
+  // not checked so nobody reads a green run as proof of membership.
+  if (!process.env.READER_ROLE_ARN && !process.env.GOVERNANCE_CHECK_MEMBERSHIP) {
+    const problems = checkGovernanceOverrides(text);
+    console.log(
+      problems.length === 0
+        ? `${GOVERNANCE_OVERRIDES_FILE} is valid (shape only; membership in Engineers was not checked, because this caller holds no reader-role grant -- pass --members or GOVERNANCE_CHECK_MEMBERSHIP=1 to require it)`
+        : formatCheckFailure(problems),
+    );
+    if (problems.length > 0) process.exitCode = 1;
+    return;
+  }
+
+  const found = await checkOverridesAgainstDirectory({
+    text,
+    directory: createCliDirectory(),
+  });
+  console.log(
+    found.length === 0
+      ? `${GOVERNANCE_OVERRIDES_FILE} is valid (membership checked against the Engineers group)`
+      : formatCheckFailure(found),
+  );
+  if (found.length > 0) process.exitCode = 1;
 };
 
 if (require.main === module) {

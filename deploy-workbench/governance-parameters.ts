@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import {
+  GOVERNANCE_METADATA_FIELDS,
   checkGovernanceOverrides,
   formatGovernanceProblems,
 } from "./bifrost/governance-desired-state";
@@ -81,17 +82,46 @@ export const readGovernanceOverrides = (): string =>
   fs.readFileSync(GOVERNANCE_OVERRIDES_PATH, "utf8");
 
 /**
- * The published value, which is the committed text with its formatting
- * removed.
+ * A document with its `$comment` block removed.
+ *
+ * `$comment` is where a reviewable JSON document states its own rules, and it
+ * is not part of the desired state: no consumer of the parameter reads it, and
+ * `composeGovernanceDesiredState` drops it on the way to the gateway. Stripping
+ * it before publication is what makes the paragraph free, and what makes the
+ * three claims about it agree — the PR's, the test's, and the byte check's.
+ *
+ * Without this the block is the majority of the parameter: the committed
+ * overrides document is 2.7 KB published with it and about 40 bytes without,
+ * which is the difference between roughly ten overrides fitting under the 4 KiB
+ * tier and the ~3 KiB the plan budgets for.
+ *
+ * Only the top level, because that is the only place a metadata field is
+ * allowed; a `$comment` inside an override is a validation failure, so there is
+ * nothing here to strip.
+ */
+export const stripMetadata = (text: string): string => {
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  const stripped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if ((GOVERNANCE_METADATA_FIELDS as readonly string[]).includes(key)) continue;
+    stripped[key] = value;
+  }
+  return JSON.stringify(stripped);
+};
+
+/**
+ * The published value of a document: no `$comment`, no formatting.
  *
  * The parameter is read by a Lambda that parses it, so the only thing the
  * whitespace buys is bytes against a 4 KiB ceiling — and a document a reviewer
  * reads is the file, not the parameter. Re-serialising is safe for the same
  * reason `ecs.ts`'s digest parses rather than hashes: the content is what
  * matters, and a reformat of the file is not a change to the desired state.
+ *
+ * The template carries no metadata field, so stripping it is a no-op there and
+ * the two documents go through one function.
  */
-export const parameterValue = (text: string): string =>
-  JSON.stringify(JSON.parse(text));
+export const parameterValue = (text: string): string => stripMetadata(text);
 
 /**
  * The two parameters, and the validation that gates them.

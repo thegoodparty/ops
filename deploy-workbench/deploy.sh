@@ -220,25 +220,37 @@ if [ "$CI" = "true" ]; then
       --stack-export "$PREFLIGHT_DIR/stack.json"
 
     # Step 2 of docs/bifrost-reconciler.md: the per-person governance overrides
-    # are validated twice, and this is the half a Pulumi program cannot do.
-    # `governance-parameters.ts` checks the document's shape, its durations and
-    # its field names as the program is evaluated, so a malformed file fails a
-    # preview. Membership in `Engineers` is a directory read, and the deploy
-    # role is deliberately not the reader, so this script assumes
-    # `bifrost-vk-reader` -- the same role both Lambdas assume -- and runs the
-    # same validation with the member set it read.
+    # are validated twice, and the split is which caller can do which half.
     #
-    # Before the apply, because the apply is what writes the parameter: an email
-    # that is not an Engineer is an override no key can ever match, and the
-    # parameter would still be published with it. Before the drain for the same
-    # reason the secrets check is: nothing is rolled until the inputs are known
-    # to be usable.
+    # The shape half -- an unknown field, a malformed budget, a duplicate
+    # reset_duration, a misplaced inherit -- runs in the Pulumi program, so a
+    # malformed file already fails the preview above. This script is the second
+    # caller of it, with the document's paths in the message, and `npm test` is
+    # the third, in the credential-free job.
     #
-    # It reads the committed file rather than the preview, since the file is
-    # what the program publishes and a bad file fails here with its own paths in
-    # the message. A directory read that fails is a non-zero exit, not a pass:
-    # "I could not tell" is never "this person is not a member".
-    npx --no-install tsx "$SCRIPT_DIR/scripts/preflight-governance.ts"
+    # The membership half is the one a Pulumi program cannot do, and this job
+    # cannot either. `bifrost-vk-reader`'s trust admits exactly the two Lambdas'
+    # execution roles (`deploy/components/bifrost-vk-reader.ts`), and the
+    # first-hop role in this job may assume only the workbench `pulumi-deploy`
+    # (`deploy/components/ci-roles/policies.ts`). Widening either is an IAM
+    # change in `deploy/` that makes CI a third holder of a grant whose point is
+    # that it is narrow: a separate reviewed change, not a line here, so this
+    # script does not attempt that assume in the deploy.
+    #
+    # So membership runs when a member set is supplied, and the check says out
+    # loud which half it ran rather than implying both. `GOVERNANCE_OVERRIDES_MEMBERS`
+    # is the hook: a comma-separated list of the document's emails, which the
+    # person adding the first override supplies, since they are looking at that
+    # email in review anyway. Absent it, the shape half runs alone and the log
+    # says so. The deploy never fails for not holding a grant it was never given.
+    #
+    # Before the apply either way, because the apply is what writes the
+    # parameter: a document that cannot converge is one a reconciler would
+    # retry a 400 against forever, and before the drain for the same reason the
+    # secrets check is. A malformed file is a non-zero exit under `set -e`, not
+    # a pass.
+    npx --no-install tsx "$SCRIPT_DIR/scripts/preflight-governance.ts" \
+      ${GOVERNANCE_OVERRIDES_MEMBERS:+--members "$GOVERNANCE_OVERRIDES_MEMBERS"}
 
     pulumi up --diff --yes
   fi
