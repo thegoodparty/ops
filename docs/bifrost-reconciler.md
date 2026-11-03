@@ -73,11 +73,12 @@ Success, in the order it should be proven:
    `logs_store` connection block, `encryption_key`, `setup_token`, a provider
    key's value, or the image registers a new task-definition revision. The
    digest is the seam that makes that happen, so it must still happen.
-5. **The digest's allowlist cannot rot silently.** A key present in
-   `config.json` that is not on the boot-only allowlist fails a test, and so
-   does a key on the allowlist that the file no longer carries. The failure this
-   prevents is a config change that never applies, which is the exact bug commit
-   `75d30ae` was written to close.
+5. **The digest's allowlist cannot rot silently.** A path in
+   `config.json` that is boot-only and not on the allowlist fails a test, and so
+   does an allowlist entry that matches no leaf in the file or that claims a leaf
+   the reconciler converges live. The failure this prevents is a config change
+   that never applies, which is the exact bug commit `75d30ae` was written to
+   close.
 6. **Rollback is a revert plus one tick.** Reverting the committed file
    converges the running task back: within one reconciler interval for
    governance, and within one deploy run for config. The bound is stated, not
@@ -146,15 +147,26 @@ it hashes: today a model alias edit moves the digest and rolls the task, which
 is the restart this plan exists to remove.
 
 So the digest becomes a digest over **only the boot-only subset**, computed from
-parsed JSON with a committed key allowlist, and the allowlist gets a drift test:
-every key the reconciler knows how to converge live must be absent from it,
-every boot-only key present in the file must be in it, and every key in it must
-exist in the file. The failure mode of getting this wrong is asymmetric and
-worth naming. A boot-only key missed from the allowlist is a change that never
-rolls the task and never applies: silent, and the exact class of bug commit
-`75d30ae` was written to prevent. A live key wrongly included is a needless
-restart: visible, and cheap. The test therefore fails in both directions, and
-the direction that matters is the first.
+parsed JSON against a committed allowlist of **paths**, not of top-level keys.
+That distinction is load-bearing rather than pedantic: `providers` is a mixed
+section. A provider's metadata, its key's models, aliases and weight, and the
+model catalog all converge live, while `providers.*.keys[].value` is boot-only
+because it holds the `env.` reference only the task can resolve. A top-level key
+list cannot express that split. With `providers` on the list, an alias edit
+rolls the task and the plan does nothing; with `providers` off it, a key-value
+change never moves the digest and never applies, which is the silent `75d30ae`
+failure. So the allowlist names leaf paths (a prefix over `providers.*.keys[].value`
+and the whole of `config_store`, `logs_store`, `encryption_key`, `setup_token`),
+and the drift test walks the parsed file's leaves against it: every leaf whose
+path matches an entry must roll the task, every leaf whose path does not must be
+converged live, and an entry that matches no leaf fails.
+
+The failure mode of getting this wrong is asymmetric and worth naming. A
+boot-only leaf that the allowlist misses is a change that never rolls the task
+and never applies: silent, and the exact class of bug commit `75d30ae` was
+written to prevent. A live leaf wrongly included is a needless restart: visible,
+and cheap. The test therefore fails in both directions, and the direction that
+matters is the first.
 
 ## The design
 
@@ -329,6 +341,40 @@ already take (`deploy-workbench/scripts/aws-role.ts`, the pattern
 one SSM read, not `lambda:*` (`deploy/components/ci-roles/policies.ts:926-952`),
 while `pulumi-deploy` is `AdministratorAccess` (`deploy-workbench/deploy-role.ts:66-127`).
 
+**`reservedConcurrentExecutions: 1` turns a collision into a failed deploy.**
+The function is capped at one concurrent execution (`bifrost-vk-janitor.ts:120`)
+so a reconcile cannot read its own partial state, and that cap stays. But a
+capped function has no queue: an invoke that arrives while a scheduled tick is
+running is **throttled**, not delayed, and a `RequestResponse` invoke returns
+`TooManyRequestsException` (429) rather than a result. The module already knows
+this shape and says so at load, in the guard that keeps the timeout below the
+interval: "`reservedConcurrentExecutions: 1` would then start dropping
+invocations" (`:110-117`). A deploy that then fails "convergence did not run"
+would be red for a reason that has nothing to do with the change, which is the
+wrong colour in the direction that erodes trust in the signal.
+
+The fix is three parts and the plan commits to all three, because either half
+alone is wrong:
+
+- **The deliverable is idempotent and safe to overlap.** Convergence state is
+  read-then-written per key, and two runs converging the same key converge to
+  the same place. The cap is about not reading a half-written state within one
+  run, not about mutual exclusion between runs.
+- **The workflow treats a throttle as "retry", not "failed".** It retries the
+  invoke with backoff for a bounded window, sized against the timeout
+  (`VK_JANITOR_TIMEOUT_SECONDS`, 120s at `:107`), and only after that window
+  fails the run. A 429 that clears is a scheduling collision, not a
+  convergence failure, and the two must not read the same in the run log.
+- **The alarm is on convergence failures, not on throttles.** The three-in-a-row
+  alarm counts runs that ran and did not converge. A throttle is counted
+  separately and loudly enough to be seen, because a pattern of them means the
+  cadence and the deploy are fighting and the answer is a second rule, not a
+  bigger cap.
+
+A module-level constant pins the relationship the same way the timeout/interval
+check does at load (`:110-117`), so the retry window cannot drift below the
+timeout it has to outlast.
+
 **Diff before write.** At 5 minutes an unconditional full desired-set `PUT` every
 tick is 288 no-op writes per key per day, each one calling `ReloadVirtualKey`
 (`governance.go:3031`) and rebuilding that key's in-memory governance, and each
@@ -395,9 +441,19 @@ Three properties make it safe to run on a schedule:
 gains the field shape and sets nothing, and no override is required to have one.
 The asymmetry is worth recording because it is not symmetric: on a `PUT`, an
 omitted `rate_limit` means "leave unchanged", so the reconciler will never
-introduce one; adding a limit later is a template change for keys minted after
-it, plus an explicit override for the keys that already exist. There is no
-"default rate limit" that silently appears, and that is the intent.
+introduce one from an absent field. There is no "default rate limit" that
+silently appears, and that is the intent.
+
+The subtlety that follows, and that a reader will otherwise read as a
+contradiction: the reconciler converges every existing key to template plus
+override, so **a value that *is* in the template reaches every key on the next
+tick, not just the keys minted after it.** "Applies only to new keys" is a
+property of an absent field, not of a template change. So the rule is that
+`rate_limit` stays absent from the template, and any limit is added as an
+override naming the people it should apply to. Setting one in the template is
+the same act as adding it to the whole fleet, and it should be done knowing
+that. Anything else would be a second mechanism ("template but not this field;")
+that the `PUT` semantics do not have.
 
 **Per-key budgets are back, and this reverses the deferral.** `#404` and
 "Deferred" in [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md) recorded
@@ -489,10 +545,12 @@ model catalog, virtual-key governance. Boot-only: the two store connection
 blocks, `encryption_key`, `setup_token`, provider key values, the image, and
 anything task-shaped. The table above is the whole split, with a citation per row.
 
-The digest becomes a digest over the boot-only subset, from parsed JSON against a
-committed key allowlist, with a drift test in both directions. This is what makes
-the split real: without it a model alias edit still rolls the task, and the plan
-is decorative.
+The digest becomes a digest over the boot-only paths, from parsed JSON against a
+committed allowlist of paths, with a drift test in both directions. This is what
+makes the split real: without it a model alias edit still rolls the task, and the
+plan is decorative. `providers` is why the allowlist is a set of paths and not a
+set of top-level keys: that section is mixed, and a key list cannot say "roll on
+`keys[].value`, converge on `keys[].aliases`".
 
 Rejected: **keep hashing the whole file.** It is one line and it is what is there
 today, and it costs a restart for every live change, which is every change this
@@ -554,7 +612,10 @@ a schedule.
 ### 5. The deploy polls the invoke, and a fire-and-forget invoke is a bug
 
 The deploy asserts the reconciler's result and fails the run if it did not
-converge. See "The deploy must poll the invoke".
+converge. See "The deploy must poll the invoke", including the
+`reservedConcurrentExecutions: 1` collision: a throttled invoke is retried with
+backoff for a window sized against the function's own timeout, and only a run that
+ran and did not converge fails the deploy.
 
 Rejected: **`Event` invocation, or `Request` without reading the body.** Both
 return before the work does, both are green on a failed convergence, and both put
@@ -652,12 +713,16 @@ mid-sprint for everybody at a different time.
 
 ### 12. `rate_limit` is supported, and defaults to nothing
 
-The field is in the shape and no value is set. See "Budgets and rate limits" for
-the asymmetry, which is the point.
+The field is in the shape and no value is set, in the template or anywhere else.
+See "Budgets and rate limits" for the asymmetry, which is the point, and for
+the one consequence worth knowing: because the reconciler converges every
+existing key to the template, a value put in the template applies to the whole
+fleet on the next tick. That is why the template carries none.
 
 Rejected: **a default rate limit.** Any number chosen without usage data is the
-guess `#404` was right to refuse, and unlike a budget it would be introduced
-silently by a template change to every key minted after it.
+guess `#404` was right to refuse. And a template default is not a gentler
+version of the same thing here: it is a fleet-wide limit introduced by one line,
+which is exactly the silent default the design refused.
 
 Rejected: **leaving `rate_limit` out of the shape entirely** until someone needs
 one. Then adding it later is a change to three callers (template, reconciler,
@@ -720,8 +785,8 @@ Read from the code, not from memory.
 | `VK_JANITOR_INTERVAL_MINUTES` | `deploy-workbench/bifrost-vk-janitor.ts:99` | `60` | `5` |
 | EventBridge rules invoking the function | `bifrost-vk-janitor.ts:389-421` (the permission at `:414`) | one | one at 5 minutes; a second rule needs its own `Permission` and statement id |
 | Deploy workflow invoke | `.github/workflows/deploy-workbench.yml` after the apply | none | `RequestResponse`, then a poll, then a failure if not converged |
-| Digest input | `ecs.ts:645-657` | the whole file | the boot-only subset, from parsed JSON |
-| Digest allowlist | new, in `ecs.ts` or beside it | none | committed, with a two-way drift test |
+| Digest input | `ecs.ts:645-657` | the whole file | the boot-only paths, from parsed JSON |
+| Digest allowlist | new, in `ecs.ts` or beside it | none | committed paths, covering `providers.*.keys[].value` and the four whole keys, with a two-way drift test |
 | Governance template parameter | `bifrost-vk-mint.ts:100`, `:383-392` | `/bifrost/vk-mint-template`, 704 bytes | unchanged name, gains budgets/rate-limit shape |
 | Overrides parameter | new | none | `/bifrost/governance-overrides`, one String |
 | Parameter tier | `ecs.ts:590-593` records the ceiling | standard | standard until 4 KiB, then `Advanced` |
@@ -730,7 +795,7 @@ Read from the code, not from memory.
 | `deploymentMinimumHealthyPercent` / `deploymentMaximumPercent` | `ecs.ts:153-154` | `0` / `100` | unchanged, and this plan does not touch them |
 | `healthCheckGracePeriodSeconds` | `ecs.ts:504` | `160`, derived | unchanged |
 | Target-group timing | `ingress.ts:284`, `:311-314` | 30s deregistration, 10s interval, 2 healthy, 3 unhealthy | unchanged |
-| Reconciler timeout / concurrency | `bifrost-vk-janitor.ts:107`, `:120` | 120s / 1 | unchanged, and the load-time guard still holds (120 < 300) |
+| Reconciler timeout / concurrency | `bifrost-vk-janitor.ts:107`, `:110-117`, `:120` | 120s / 1 | unchanged; the deploy's retry window is pinned above the 120s timeout, because a throttle must not read as a convergence failure |
 
 Notes that belong with the table:
 
@@ -783,9 +848,13 @@ Notes that belong with the table:
 1. **Whether the boot-only allowlist is complete on day one.** The table in
    "The split" is derived from the schema and the load sequence, and the drift
    test can only enforce agreement between the file and the allowlist, not that
-   the allowlist is right. The way to settle it is a config change per live
-   class, applied, with the task ARN checked before and after: five changes, five
-   checks, and the result is a test that pins each class rather than a reading.
+   the allowlist classifies every leaf correctly. The way to settle it is a
+   config change per live class, applied, with the task ARN checked before and
+   after: five changes, five checks, and the result is a test that pins each
+   class rather than a reading. The `providers.*.keys[].value` leaf is the one
+   that makes this a path list rather than a key list, so it is the first to
+   pin: an edit to it must register a revision, and an edit to `aliases` in the
+   same array must not.
 2. **The exact tier at which the overrides document needs `Advanced`.** The
    arithmetic (roughly 25 budget-only or 5 full-model-policy overrides in 3 KiB)
    is from the byte sizes of the committed files, not from a written-and-read
@@ -814,13 +883,16 @@ then the plumbing that triggers it, then the second caller, then the documents
 that are now stale.
 
 1. **Split the digest, with its drift test.** `bifrostConfigVersion` hashes only
-   the boot-only subset, computed from parsed JSON against a committed key
-   allowlist; the allowlist gets a two-way drift test (a file key that must roll
-   the task is on it, a live key is not). Touches `deploy-workbench/ecs.ts` and
-   `deploy-workbench/ecs.test.ts`. Behaviour changes in one direction only: a
-   live-subset edit stops registering a new revision, which is the first visible
-   evidence that the design is real. Proves: a `providers` edit registers no new
-   revision and a `config_store` edit does.
+   the boot-only paths, computed from parsed JSON against a committed path
+   allowlist which covers `providers.*.keys[].value` and the whole of
+   `config_store`, `logs_store`, `encryption_key` and `setup_token`. The drift
+   test walks the file's leaves against that list in both directions. Touches
+   `deploy-workbench/ecs.ts` and `deploy-workbench/ecs.test.ts`. Behaviour
+   changes in one direction only: a live-subset edit stops registering a new
+   revision, which is the first visible evidence that the design is real.
+   Proves: a provider metadata, alias or catalog edit registers no new revision,
+   a `config_store` edit and a `providers.*.keys[].value` edit both do, and a
+   leaf neither list claims fails the test.
 2. **The governance desired state: an overrides file, its parameter, and the
    validation test.** `deploy-workbench/bifrost/governance-overrides.json` with
    the merge and `inherit` semantics spelled out in its own comment, the
@@ -845,11 +917,15 @@ that are now stale.
 4. **The two triggers and the deploy's poll.** `rate(5 minutes)` on the existing
    rule, and the `RequestResponse` invoke plus poll in `deploy-workbench.yml`
    under the `pulumi-deploy` hop the existing post-apply check already makes, so
-   no new IAM is needed; failing the run when the summary is not converged. Also
-   the config-convergence half of the loop, which is only reachable once the
-   invoke exists. Proves: an edit to `config.json`'s live subset reaches the
-   running task inside one deploy run with the same task ARN, and a deliberately
-   broken convergence fails the run.
+   no new IAM is needed. A throttled invoke (429, `TooManyRequestsException`, from
+   the `reservedConcurrentExecutions: 1` cap colliding with a scheduled tick) is
+   retried with backoff for a window pinned above the function's timeout, and
+   only a run that ran and did not converge fails the deploy. Also the
+   config-convergence half of the loop, which is only reachable once the invoke
+   exists. Proves: an edit to `config.json`'s live subset reaches the running
+   task inside one deploy run with the same task ARN, a deliberately broken
+   convergence fails the run, and a tick that is already running when the deploy
+   invokes does not fail the run.
 5. **The minter applies overrides at create.** `bifrost/vk-mint-core.ts` and its
    handler compute the same desired state for the caller's email, so a new key
    starts converged and the first reconciler tick has nothing to do. Proves: a
@@ -878,6 +954,7 @@ In this repository:
 | Fact | Where |
 |---|---|
 | The digest hashes the whole file today | `deploy-workbench/ecs.ts`, `bifrostConfigVersion` (`:645-657`); the env entry at `:1291-1294`; the comment block at `:605-636` |
+| `providers` is a mixed section: `keys[].value` is a reference, `keys[].aliases` and the rest are plain config | `deploy-workbench/bifrost/config.json`; `deploy-workbench/bifrost/config.test.ts`, "references every credential by a name the deployment actually provides" |
 | A config change rolls the task, and why that seam was added | commit `75d30ae`; `deploy-workbench/ecs.test.ts`, the `BIFROST_CONFIG_VERSION` assertions |
 | The parameter is a `String`, standard tier, 4 KiB | `deploy-workbench/ecs.ts:590-593`; `:1074-1085` |
 | `config.json` is 3,794 bytes and its `governance` block holds only `auth_config` | `deploy-workbench/bifrost/config.json` (`wc -c`) |
