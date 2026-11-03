@@ -107,9 +107,8 @@ export const createCiRoles = () => {
   // fix is always the same red-then-green policy PR.
   //
   // The boundary belongs on who may assume the role, which is the trust
-  // policy in ci-roles/policies.ts. Eight repositories are still wildcarded
-  // there on `:*`, which includes pull_request refs; narrowing that is the
-  // follow-up this change makes worth doing.
+  // policy in ci-roles/policies.ts. Every subject there is an exact `main`
+  // ref, or one deploy environment, and none is a pull request.
   new aws.iam.RolePolicyAttachment(
     "githubActionsPulumiDeployAdminAttachment",
     { role: deployRole.name, policyArn: ADMINISTRATOR_ACCESS_ARN },

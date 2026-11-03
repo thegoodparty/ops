@@ -18,28 +18,53 @@ const subjectConditions = () => {
   return found;
 };
 
-const wildcardSubjects = () =>
-  subjectConditions()
-    .filter((c) => c.operator === "StringLike")
-    .flatMap((c) => c.value as string[]);
+const allSubjects = () =>
+  subjectConditions().flatMap((c) =>
+    Array.isArray(c.value) ? c.value : [c.value]
+  );
 
 describe("githubActionsPulumiDeployTrust", () => {
-  // `sub` under both StringEquals and StringLike in one statement is not "or":
-  // IAM ANDs them, so nothing would match. The pin must be its own statement.
-  it("pins the ops and gpvpn subjects to main under StringEquals, each in its own statement", () => {
-    const exact = subjectConditions().filter(
-      (c) => c.operator === "StringEquals"
-    );
-    assert.deepEqual(exact, [
+  // Exact equality, not inclusion: this role carries AdministratorAccess, so
+  // a subject added to its trust should fail the test rather than pass
+  // silently.
+  it("trusts exactly these subjects, all under StringEquals", () => {
+    assert.deepEqual(subjectConditions(), [
       {
         operator: "StringEquals",
         value: "repo:thegoodparty/ops:ref:refs/heads/main",
       },
       {
         operator: "StringEquals",
-        value: "repo:thegoodparty/gpvpn:ref:refs/heads/main",
+        value: [
+          "repo:thegoodparty/omni:ref:refs/heads/main",
+          "repo:thegoodparty/gp-terraform-dataplatform:ref:refs/heads/main",
+          "repo:thegoodparty/gp-terraform-dataplatform:environment:production",
+          "repo:thegoodparty/gpvpn:ref:refs/heads/main",
+        ],
       },
     ]);
+  });
+
+  // Step 8 of docs/deploy-role-trust.md. A wildcard or a pull_request subject
+  // would let a branch's workflow, which nobody has reviewed, assume admin.
+  it("trusts no wildcard and no pull request", () => {
+    for (const statement of githubActionsPulumiDeployTrust.Statement) {
+      assert.equal(statement.Condition.StringLike, undefined);
+    }
+    for (const subject of allSubjects()) {
+      assert.equal(subject.includes("*"), false, subject);
+      assert.equal(subject.endsWith(":pull_request"), false, subject);
+    }
+  });
+
+  // An environment subject is only as narrow as the environment's branch
+  // policy, which lives in GitHub, not here. Keep it to the one apply that
+  // needs it.
+  it("trusts one environment subject, dataplatform's production", () => {
+    assert.deepEqual(
+      allSubjects().filter((s) => s.includes(":environment:")),
+      ["repo:thegoodparty/gp-terraform-dataplatform:environment:production"]
+    );
   });
 
   // `sub` is per-ref, not per-workflow: every workflow on main shares it. The
@@ -58,34 +83,6 @@ describe("githubActionsPulumiDeployTrust", () => {
     );
   });
 
-  it("keeps no wildcard ops subject", () => {
-    assert.equal(
-      wildcardSubjects().some((s) =>
-        s.startsWith("repo:thegoodparty/ops:")
-      ),
-      false
-    );
-  });
-
-  // Exact equality, not inclusion: these two are the live repositories that
-  // still assume the role on a pull request, and another added to an
-  // administrator role's trust should fail the test rather than pass silently.
-  // The list only ever shrinks from here; docs/deploy-role-trust.md is the
-  // plan for emptying it.
-  it("leaves exactly the two pull request consumers wildcarded", () => {
-    assert.deepEqual(wildcardSubjects(), [
-      "repo:thegoodparty/gp-terraform-dataplatform:*",
-      "repo:thegoodparty/omni:*",
-    ]);
-  });
-
-  it("keeps no wildcard gpvpn subject", () => {
-    assert.equal(
-      wildcardSubjects().some((s) => s.startsWith("repo:thegoodparty/gpvpn:")),
-      false
-    );
-  });
-
   // The five removed in step 2 are archived, so they cannot run a workflow at
   // all. Named individually so re-adding one is a deliberate act.
   it("drops the archived repositories entirely", () => {
@@ -98,11 +95,7 @@ describe("githubActionsPulumiDeployTrust", () => {
     ];
     for (const repo of archived) {
       assert.equal(
-        subjectConditions().some((c) =>
-          (Array.isArray(c.value) ? c.value : [c.value]).some((s) =>
-            s.startsWith(`repo:thegoodparty/${repo}:`)
-          )
-        ),
+        allSubjects().some((s) => s.startsWith(`repo:thegoodparty/${repo}:`)),
         false,
         `${repo} is archived and must not be trusted`
       );
