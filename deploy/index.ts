@@ -11,6 +11,7 @@ import { createIdentityGroupSyncGrant } from "./components/identity-group-sync-g
 import { createBifrostVkReader } from "./components/bifrost-vk-reader";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
 import { createWorkbenchZoneDelegation } from "./components/workbench-zone-delegation";
+import { createGrafanaCloudwatchRead } from "./components/grafana-cloudwatch-read";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
 
 export = async () => {
@@ -57,6 +58,7 @@ export = async () => {
   createBifrostVkReader();
   createInfraZoneDelegation();
   createWorkbenchZoneDelegation();
+  createGrafanaCloudwatchRead();
 
   return {
     webhookUrl: webhook.url,
