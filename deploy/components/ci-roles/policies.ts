@@ -1281,168 +1281,6 @@ export const githubActionsPulumiPlan: PolicyDocument = {
 };
 
 // ---------------------------------------------------------------------------
-// The gp-api plan role (step 5b of docs/deploy-role-trust.md)
-//
-// omni's `gp-api-infrastructure-diffs.yml` runs `pulumi preview` of gp-api's
-// dev and prod stacks on pull requests that touch its deploy code, and today
-// assumes the shared admin deploy role to do it. Step 4b
-// (thegoodparty/omni#3507) stopped the program reading GP_API_DEV and
-// GP_API_PROD, which is what lets a read-only role run it.
-//
-// The Terraform plan role's shape, ReadOnlyAccess plus denies, for its reason:
-// a preview reads whatever the program looks up, and enumerating that breaks
-// every time a component adds a lookup. omni pull requests can already assume
-// the Terraform plan role, so ReadOnlyAccess's reach is not new to them. What
-// this role adds is what a Pulumi preview needs and a Terraform plan does not:
-// gp-api's current state, the passphrase that decrypts it, and the two Grafana
-// tokens its Grafana provider is configured with.
-//
-// The standing cost: anything gp-api's program stores in state as a secret, a
-// pull request can decrypt. On 2026-11-02 the only live ones were the Grafana
-// provider's two tokens, which this role reads from SSM anyway; the rest were
-// empty or public. docs/deploy-role-trust.md, "What step 5b found", lists them.
-//
-// Its own role rather than more statements on the Terraform one, because that
-// role's other subject, gp-terraform-dataplatform, should not read gp-api's
-// state.
-
-const STATE_PASSPHRASE_PARAMETER =
-  "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase";
-
-const GRAFANA_TOKEN_PARAMETERS = [
-  "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
-  "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
-];
-
-// The two stacks the diff previews, by exact name, and the backend's format
-// file. Exact rather than `stacks/gp-api/*`, which is what
-// `pulumiBackendReadStatements` would grant: that prefix also holds each
-// stack's `.json.bak`, the previous checkpoint, and the preview stacks. Older
-// copies of this state are also kept under `backups/` and `history/` and as S3
-// versions, and the ones written before step 4b hold the Aurora master
-// passwords. A preview reads only the current checkpoint.
-const GP_API_PLAN_READABLE = [
-  `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
-  `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
-  `${BUCKET}/.pulumi/meta.yaml`,
-];
-
-export const githubActionsGpApiPlanTrust: TrustPolicyDocument = {
-  Version: "2012-10-17",
-  Statement: [
-    {
-      Effect: "Allow",
-      Principal: {
-        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
-      },
-      Action: "sts:AssumeRoleWithWebIdentity",
-      Condition: {
-        StringEquals: {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          // No `job_workflow_ref` pin, for the reason given on the Terraform
-          // plan role: on a pull request the workflow file comes from the
-          // branch too, so the pin constrains nothing.
-          "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:pull_request",
-        },
-      },
-    },
-  ],
-};
-
-/**
- * Inline half of the gp-api plan role. The other half is the AWS-managed
- * `ReadOnlyAccess`, attached in ci-roles.ts, so the allows here document what
- * a preview uses and the denies are what bound it.
- *
- * No write of any kind. A DIY-backend `pulumi preview` takes no state lock
- * (only update, refresh, destroy and import do), and `stack select --create`
- * writes nothing for a stack that already exists ("What step 4 found").
- */
-export const githubActionsGpApiPlan: PolicyDocument = {
-  Version: "2012-10-17",
-  Statement: [
-    {
-      Sid: "PulumiStateBucket",
-      Effect: "Allow",
-      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
-      Resource: BUCKET,
-    },
-    {
-      Sid: "PulumiStateObjects",
-      Effect: "Allow",
-      Action: ["s3:GetObject"],
-      Resource: GP_API_PLAN_READABLE,
-    },
-    {
-      Sid: "PulumiStatePassphrase",
-      Effect: "Allow",
-      Action: ["ssm:GetParameter"],
-      Resource: STATE_PASSPHRASE_PARAMETER,
-    },
-    {
-      Sid: "GrafanaTokens",
-      Effect: "Allow",
-      // `infra-cli.ts` reads both on every dev and prod run and hands them to
-      // the Grafana provider, which a preview needs to compare the alert
-      // rules, dashboards and synthetic checks gp-api manages. A preview with
-      // the provider configured differently would report every one of them
-      // as changed.
-      Action: ["ssm:GetParameter"],
-      Resource: GRAFANA_TOKEN_PARAMETERS,
-    },
-    {
-      // ReadOnlyAccess grants `s3:GetObject` on `*`, so this deny, not the
-      // allow above, is what limits the role to gp-api's current state. Its
-      // NotResource must stay identical to that allow.
-      Sid: "DenyOtherS3Objects",
-      Effect: "Deny",
-      Action: ["s3:GetObject"],
-      NotResource: GP_API_PLAN_READABLE,
-    },
-    {
-      // Blanket, gp-api's own state included. The state bucket is versioned,
-      // and the versions written before step 4b hold the Aurora master
-      // passwords Pulumi no longer manages. The backend never passes a
-      // `versionId`, so nothing a preview does needs this.
-      Sid: "DenyObjectVersions",
-      Effect: "Deny",
-      Action: ["s3:GetObjectVersion"],
-      Resource: "*",
-    },
-    {
-      // Blanket. The program reads no secret value since step 4b. Its one
-      // remaining lookup, the alert filter's webhook password in
-      // AI_SECRETS_<ENV> (`components/grafana.ts`), catches the AccessDenied,
-      // warns and skips that contact point, which neither stack has created.
-      Sid: "DenySecretValues",
-      Effect: "Deny",
-      Action: ["secretsmanager:GetSecretValue"],
-      Resource: "*",
-    },
-    {
-      // Every parameter but the three this role reads. ReadOnlyAccess grants
-      // `ssm:GetParameter*` on `*`.
-      Sid: "DenyOtherParameters",
-      Effect: "Deny",
-      Action: [
-        "ssm:GetParameter",
-        "ssm:GetParameters",
-        "ssm:GetParametersByPath",
-      ],
-      NotResource: [STATE_PASSPHRASE_PARAMETER, ...GRAFANA_TOKEN_PARAMETERS],
-    },
-    {
-      // Including the three above: history returns earlier values in
-      // plaintext, and a preview needs only the current ones.
-      Sid: "DenyParameterHistory",
-      Effect: "Deny",
-      Action: ["ssm:GetParameterHistory"],
-      Resource: "*",
-    },
-  ],
-};
-
-// ---------------------------------------------------------------------------
 // The gp-api preview role boundary (step 6a of docs/deploy-role-trust.md)
 //
 // A permissions boundary, not a grant. omni's gp-api preview stack creates two
@@ -1646,6 +1484,13 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // it creates are capped by `gpApiPreviewRoleBoundary`, and it reads one
 // secret.
 //
+// It also runs omni's `gp-api-infrastructure-diffs.yml`, the `pulumi preview`
+// of gp-api's dev and prod stacks (step 5b). A pull request can assume every
+// role trusted on its subject, so a separate role for the diff would separate
+// nothing, and one role keeps what an omni pull request can reach in one
+// document. The diff adds reads only, each named, in the `Diff` statements
+// before `DenyProductionTagged`.
+//
 // Sized from the code on omni's main and from CloudTrail for one create, one
 // update and one teardown of a live preview under the shared role
 // (2026-10-28), not by enumerating services. Widened only by observed
@@ -1678,10 +1523,12 @@ export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
  * Backend access for one project's preview stacks, and none of its others.
  *
  * Not `pulumiBackendStatements("gp-api")`, which covers every gp-api stack.
- * gp-api's dev and prod stacks share the project prefix with its previews,
- * and their state holds the Aurora master passwords as Pulumi secrets, which
- * the shared passphrase below decrypts. The stack-name prefix is what keeps a
- * pull request to its own kind of stack.
+ * gp-api's dev and prod stacks share the project prefix with its previews.
+ * Their current state no longer holds the Aurora master passwords (step 4b),
+ * but their `.json.bak`, `backups/` and `history/` copies from before it do,
+ * and the shared passphrase below decrypts them. The stack-name prefix is
+ * what keeps a pull request's writes to its own kind of stack. The diff's
+ * read of the two current checkpoints is a separate grant, by exact name.
  *
  * Read and write, unlike `pulumiBackendReadStatements`: a new pull request's
  * stack does not exist yet, so `stack select --create` writes it, and
@@ -1746,6 +1593,12 @@ const SHARED_PREVIEW_LISTENER =
   "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener/app/gp-api-previews/*";
 const SHARED_PREVIEW_LISTENER_RULES =
   "arn:aws:elasticloadbalancing:us-west-2:333022194791:listener-rule/app/gp-api-previews/*";
+
+// The two prod resources the infrastructure diff reads (step 5b).
+const PROD_SERVICE =
+  "arn:aws:ecs:us-west-2:333022194791:service/gp-master-fargateCluster/gp-api-master";
+const PROD_APP_SECRET =
+  "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_PROD-??????";
 
 export const githubActionsPreviewDeploy: PolicyDocument = {
   Version: "2012-10-17",
@@ -2127,14 +1980,80 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       ],
     },
     {
+      // The infrastructure diff, step 5b, from here to `DenyProductionTagged`:
+      // `pulumi preview` of gp-api's dev and prod stacks. Sized from
+      // CloudTrail for the 21 diff runs on 2026-11-02 and 11-03 under the
+      // shared role. The rest of what they called is granted above for
+      // previews, or is a secret value the diff no longer needs
+      // (docs/deploy-role-trust.md, "What step 5b found").
+      //
+      // The two current checkpoints by exact name, and read only. Not
+      // `stacks/gp-api/*`, whose `.json.bak` files still hold the Aurora
+      // master passwords, and this role has no `s3:GetObjectVersion`
+      // anywhere. A preview takes no state lock and writes no state.
+      Sid: "DiffCheckpoints",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [
+        `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
+        `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+      ],
+    },
+    {
+      // `infra-cli.ts` configures the Grafana provider with these on dev and
+      // prod runs, and the diff cannot compare gp-api's Grafana resources
+      // without them. SecureStrings under alias/aws/ssm, like the passphrase.
+      Sid: "DiffGrafanaTokens",
+      Effect: "Allow",
+      Action: ["ssm:GetParameter"],
+      Resource: [
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      ],
+    },
+    {
+      // `index.ts` looks up the prod app secret's ARN for the task
+      // definition's `valueFrom`. Metadata only, as for GP_API_DEV above.
+      Sid: "DiffProdSecretMetadata",
+      Effect: "Allow",
+      Action: ["secretsmanager:DescribeSecret", "secretsmanager:GetResourcePolicy"],
+      Resource: PROD_APP_SECRET,
+    },
+    {
+      // The workflow diffs against the image dev and prod run now, so a
+      // code-only change shows no diff. `ecs:DescribeTaskDefinition` is
+      // already granted above, on `*`.
+      Sid: "DiffDeployedServices",
+      Effect: "Allow",
+      Action: ["ecs:DescribeServices"],
+      Resource: [
+        "arn:aws:ecs:us-west-2:333022194791:service/gp-develop-fargateCluster/gp-api-develop",
+        PROD_SERVICE,
+      ],
+    },
+    {
+      // The two prod resources the diff reads are tagged `Environment=prod`,
+      // so the deny below leaves them out, and this one holds them to the
+      // diff's three reads instead, tag or no tag. None returns a secret
+      // value.
+      Sid: "DiffProdReadsOnly",
+      Effect: "Deny",
+      NotAction: [
+        "ecs:DescribeServices",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+      ],
+      Resource: [PROD_SERVICE, PROD_APP_SECRET],
+    },
+    {
       // The plan's "no write to any resource carrying the production tags",
       // as a deny so it holds whatever is later added above. Nothing this role
-      // legitimately touches is tagged `Environment=prod`. The shared VPC is,
-      // and this role acts on nothing in it directly: ECS places the tasks.
+      // writes is tagged `Environment=prod`. The shared VPC is, and this role
+      // acts on nothing in it directly: ECS places the tasks.
       Sid: "DenyProductionTagged",
       Effect: "Deny",
       Action: "*",
-      Resource: "*",
+      NotResource: [PROD_SERVICE, PROD_APP_SECRET],
       Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
     },
   ],
