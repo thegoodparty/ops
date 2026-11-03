@@ -8,12 +8,12 @@ import * as aws from "@pulumi/aws";
 // Grafana's AWS account id. From the aws-cloudwatch-prod data source's
 // Authentication section (Settings tab, "How to create an IAM role for grafana
 // to assume"). Not published in Grafana's docs.
-export const GRAFANA_ACCOUNT_ID = "REPLACE_ME";
+export const GRAFANA_ACCOUNT_ID = "008923505280";
 
 // Our stack's external ID. From the aws-cloudwatch-prod data source's
 // Authentication section (Settings tab, "How to create an IAM role for grafana
 // to assume").
-export const GRAFANA_EXTERNAL_ID = "REPLACE_ME";
+export const GRAFANA_EXTERNAL_ID = "1532096";
 
 export const grafanaCloudwatchReadTrust = {
   Version: "2012-10-17",

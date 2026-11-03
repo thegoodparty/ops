@@ -1,8 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  GRAFANA_ACCOUNT_ID,
-  GRAFANA_EXTERNAL_ID,
   grafanaCloudwatchReadPolicy,
   grafanaCloudwatchReadTrust,
 } from "./components/grafana-cloudwatch-read";
@@ -14,10 +12,10 @@ describe("grafanaCloudwatchReadTrust", () => {
     assert.deepEqual(grafanaCloudwatchReadTrust.Statement, [
       {
         Effect: "Allow",
-        Principal: { AWS: `arn:aws:iam::${GRAFANA_ACCOUNT_ID}:root` },
+        Principal: { AWS: "arn:aws:iam::008923505280:root" },
         Action: "sts:AssumeRole",
         Condition: {
-          StringEquals: { "sts:ExternalId": GRAFANA_EXTERNAL_ID },
+          StringEquals: { "sts:ExternalId": "1532096" },
         },
       },
     ]);
