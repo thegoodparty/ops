@@ -23,17 +23,72 @@ fi
 # nowhere to push until something creates the repository -- and a full apply
 # would create it while also rolling the service onto an image that does not
 # exist yet, which is the outage this exists to prevent. So the workflow runs
-# this script once with DEPLOY_TARGET set to the stack's ECR repositories: a
-# `--target`ed update touches only what it matches, so there is no service in it
-# to drain, and the push that follows has somewhere to go. The full apply runs
-# afterwards, with the images already in ECR.
+# this script once in a constrained mode that holds the service back: the push
+# that follows has somewhere to go, and the task is not rolled onto an image ECR
+# does not have. The full apply runs afterwards, with the images already in ECR.
 #
-# One URN or glob, passed to `pulumi up --target`. `--target` updates the
-# resources it matches and leaves the rest of the stack alone; multi-value is
-# not needed here and would make the argument splitting below subtle. Ignored
-# in preview mode: a preview is not a write, and a targeted preview would be a
-# plan for something this script does not do.
-DEPLOY_TARGET=${DEPLOY_TARGET:-}
+# The constraint is `--exclude`, NOT `--target`, and that is a workaround for a
+# Pulumi engine bug, not a preference. A `--target`ed `up`/`preview` intermittently
+# fails with "Duplicate resource URN ..." naming a resource registered exactly
+# once, which nobody targeted, under a diagnostic that reads as a duplicate
+# declaration in our program (pulumi/pulumi#24359). The trigger is an untargeted
+# dependency edge that differs between the state and the program; the victim is
+# whatever bystander the step generator happens to lose a race over, so it moves
+# from run to run. It is upstream's, partly fixed in #24801 (merged 2026-10-06)
+# and open in #25434 and #24381, and no released version dodges it: 3.255.0,
+# 3.260.0, 3.267.0, 3.268.0, 3.272.0 and 3.273.0 all fail on the local repro, at
+# 10/15 to 20/20.
+#
+# The engine path that corrupts is `queueUntargetedDependencySames`, which is
+# entered only when `opts.Targets.IsConstrained()` or `TargetSnippets` is
+# non-empty (step_generator.go, v3.273.0). It pre-stamps URNs into the step
+# generator's seen-set and queues "untargeted same" steps for old-state
+# dependencies of a targeted resource; the duplicate is a resource that gets a
+# step through that path and then registers itself. Constraining by `--exclude`
+# leaves `Targets` unconstrained, so the function returns immediately and the
+# path is never taken.
+#
+# The numbers, from a local repro shaped like this pass (`--yes`, one repository
+# to create, one untargeted dependency edge changed between state and program,
+# and an ECS-service-shaped resource whose inputs change, so an arm that "passed"
+# by rolling it can be told apart). 25 trials per arm unless marked:
+#
+#   --target, type glob (what this used to be)   25 trials, 25 duplicated
+#   --target, explicit full URNs                 25 trials, 25 duplicated
+#   --target --skip-preview                      25 trials, 25 duplicated
+#   --target --continue-on-error                  7 trials,  7 duplicated
+#   --target --parallel 1                         9 trials,  9 duplicated
+#   --exclude service + task definition          25 trials,  0 duplicated,
+#                                                22 clean, 3 CLI crashes in the
+#                                                qemu-emulated binary (exit -1
+#                                                inside the CLI's own heap,
+#                                                unrelated to this bug)
+#
+# All 22 clean ones left the excluded service and task definition untouched in
+# the resulting snapshot -- their `length` input still held the old value, not
+# the new one -- which is the property this pass depends on. Constraining by
+# `--exclude` and completing was the only construction that did not duplicate,
+# out of everything tried; the arms with fewer than 25 trials were cut short once
+# they had clearly reproduced.
+#
+# It must be `--exclude` of both the service AND the task definition. Excluding
+# only the task definition is not enough: the service's diff reads the task
+# definition, so the service comes out as a create-replacement and drains the
+# task -- reproduced, not assumed. `--exclude-dependents` is not used and must
+# not be: it would exclude everything the service depends on, which is the
+# stack.
+#
+# Both patterns are matched by *type and name* with a glob over the stack and
+# project, for the same reason the repositories' target glob was: renaming the
+# stack does not silently stop matching. `deploy-workflow-order.test.ts` checks
+# these against the logical names `ecs.ts` declares, and checks that the ECR
+# repositories are not excluded, so a future edit cannot quietly let the service
+# into the pass or a repository out of it.
+#
+# Ignored in preview mode: a preview is not a write, and a constrained preview
+# would be a plan for something this script does not do.
+DEPLOY_EXCLUDE_SERVICE=${DEPLOY_EXCLUDE_SERVICE:-}
+DEPLOY_EXCLUDE_TASK_DEFINITION=${DEPLOY_EXCLUDE_TASK_DEFINITION:-}
 
 # Mirrors deploy-org/deploy.sh, plus the role names below.
 #
@@ -118,10 +173,18 @@ if [ "$PREVIEW" = "true" ]; then
 fi
 
 if [ "$CI" = "true" ]; then
-  if [ -n "$DEPLOY_TARGET" ]; then
-    # Quoted: the glob contains `*` and `:`, and the shell must not expand or
-    # split on either.
-    pulumi up --diff --yes --target "$DEPLOY_TARGET"
+  if [ -n "$DEPLOY_EXCLUDE_SERVICE" ] || [ -n "$DEPLOY_EXCLUDE_TASK_DEFINITION" ]; then
+    # Both must be set or neither: excluding one without the other is the
+    # silent drain described above, so a half-configured pair is an error rather
+    # than a pass that touches the service. Quoted, because each glob contains
+    # `*` and `:` and the shell must not expand or split on either.
+    if [ -z "$DEPLOY_EXCLUDE_SERVICE" ] || [ -z "$DEPLOY_EXCLUDE_TASK_DEFINITION" ]; then
+      echo "Error: set both DEPLOY_EXCLUDE_SERVICE and DEPLOY_EXCLUDE_TASK_DEFINITION, or neither" >&2
+      exit 1
+    fi
+    pulumi up --diff --yes \
+      --exclude "$DEPLOY_EXCLUDE_SERVICE" \
+      --exclude "$DEPLOY_EXCLUDE_TASK_DEFINITION"
   else
     # The pre-apply secret check. It runs here, after the stack has been
     # selected and configured and immediately before the apply that can drain
