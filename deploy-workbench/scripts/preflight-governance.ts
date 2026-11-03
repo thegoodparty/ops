@@ -9,7 +9,7 @@ import {
   type GovernanceProblem,
 } from "../bifrost/governance-desired-state";
 import { ENGINEERS_GROUP_ID } from "../bifrost/vk-mint-core";
-import { assumeRoleEnvironment, runAws } from "./aws-role";
+import { assumeRoleEnvironment, isNoSuchUser, runAws, tryRunAws } from "./aws-role";
 
 /**
  * The apply-time half of step 2's validation: is every email in the overrides
@@ -222,7 +222,7 @@ export const createCliDirectory = (args: {
 
   return {
     getUserId: async (email) => {
-      const raw = runAws(
+      const result = tryRunAws(
         [
           "identitystore",
           "get-user-id",
@@ -235,7 +235,20 @@ export const createCliDirectory = (args: {
         ],
         env,
       );
-      const parsed = JSON.parse(raw) as { UserId?: string };
+
+      if (!result.ok) {
+        // The mint's line, drawn at the CLI: a `GetUserId` that names no user
+        // is "not a member", and anything else is an outage this check must not
+        // read as an absence. Without it a typo or a deleted Identity Center
+        // user exits "could not complete", which tells the author nothing about
+        // the email they wrote.
+        if (isNoSuchUser(result.stderr)) return null;
+        throw new Error(
+          `aws identitystore get-user-id failed (exit ${result.status ?? "no exit"}): ${result.stderr}`,
+        );
+      }
+
+      const parsed = JSON.parse(result.stdout) as { UserId?: string };
       return parsed.UserId ?? null;
     },
 

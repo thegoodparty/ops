@@ -17,6 +17,7 @@ import {
   overridesPath,
   resolveMembership,
 } from "./scripts/preflight-governance";
+import { isNoSuchUser } from "./scripts/aws-role";
 
 /**
  * The apply-time half of step 2's validation: the `Engineers` membership check
@@ -76,6 +77,36 @@ describe("the membership read", () => {
     });
     assert.equal(result.memberEmails.size, 0);
     assert.deepEqual(result.notMembers, ["someone@goodparty.org"]);
+  });
+
+  it("treats a missing user as not-a-member, not as a directory outage", async () => {
+    // `GetUserId` on an address that names nobody fails with
+    // `ResourceNotFoundException`; every other failure is an outage. Without
+    // this split a typo in an email exits "could not complete" and never says
+    // which email is wrong, which is one of the messages the reviewer found.
+    assert.equal(
+      isNoSuchUser(
+        "An error occurred (ResourceNotFoundException) when calling the GetUserId operation: no such user",
+      ),
+      true,
+    );
+    assert.equal(isNoSuchUser("An error occurred (AccessDeniedException)"), false);
+    assert.equal(isNoSuchUser("Unable to locate credentials"), false);
+    assert.equal(isNoSuchUser(""), false);
+
+    // And the check's own half: a null user is a named non-member, an thrown
+    // read is an abort.
+    const directory = {
+      getUserId: async () => null,
+      listMemberUserIds: async () => ["user-1"],
+    };
+    const found = await checkOverridesAgainstDirectory({
+      text: documentText({ "typo@goodparty.org": {} }),
+      directory,
+    });
+    assert.equal(found.length, 1);
+    assert.equal(found[0].path, "typo@goodparty.org");
+    assert.match(found[0].message, /not in the Engineers group/);
   });
 
   it("propagates a directory read that fails, rather than reading it as absences", async () => {

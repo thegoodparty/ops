@@ -49,6 +49,57 @@ export const runAws = (args: string[], env: AwsEnvironment = process.env): strin
   run(args, env);
 
 /**
+ * The AWS CLI, with the failure itself rather than a thrown error.
+ *
+ * `runAws` above throws on any non-zero exit, which is right for a read with a
+ * single failure meaning. `GetUserId` does not have one: `ResourceNotFoundException`
+ * is "no such user", which is exactly the answer the membership check wants,
+ * and every other error is an outage. The mint draws that line in
+ * `createMembershipDirectory` (`vk-mint-handler.ts`); this is the CLI's half of
+ * it, and without it a typo in an email reads as a directory outage and the
+ * check exits "could not complete" instead of naming the person.
+ *
+ * Only the exit status and stderr are returned. A caller that has established
+ * the failure is a known one may read the text, and no stderr from either
+ * command can carry a secret.
+ */
+export const tryRunAws = (
+  args: string[],
+  env: AwsEnvironment = process.env,
+):
+  | { ok: true; stdout: string }
+  | { ok: false; status: number | null; stderr: string } => {
+  const result = spawnSync("aws", args, {
+    env,
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+
+  if (result.error) {
+    return { ok: false, status: null, stderr: result.error.message };
+  }
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      status: result.status,
+      stderr: (result.stderr ?? "").trim(),
+    };
+  }
+  return { ok: true, stdout: (result.stdout ?? "").trim() };
+};
+
+/**
+ * Whether an `identitystore` failure is "no such user" rather than an outage.
+ *
+ * The CLI prints `ResourceNotFoundException` in the message for a `GetUserId`
+ * on an address that names no user, and the SDK surfaces the same code as an
+ * exception class. Both callers of this map to "not a member", which is the
+ * answer that fails closed on membership while still naming the person.
+ */
+export const isNoSuchUser = (stderr: string): boolean =>
+  /ResourceNotFoundException/.test(stderr);
+
+/**
  * Assume `roleArn` from the current environment and return an environment for
  * child `aws` commands that use the resulting temporary credentials.
  */
