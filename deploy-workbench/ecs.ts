@@ -672,9 +672,10 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * `BIFROST_CONFIG`.
  *
  * Why a parameter rather than an `environment` entry with the JSON inlined in
- * the task definition: the file is ~3 KB today and grows when item 14 adds
- * teams and virtual keys, and task-definition environment entries are the
- * wrong place for a document that changes on its own schedule. Why SSM rather
+ * the task definition: the file is 4,014 bytes today (`wc -c`, measured on
+ * `deploy-workbench/bifrost/config.json`) and grows when item 14 adds teams and
+ * virtual keys, and task-definition environment entries are the wrong place for
+ * a document that changes on its own schedule. Why SSM rather
  * than Secrets Manager: the file holds no secret by construction - every
  * credential in it is an `env.NAME` reference, which `bifrost/config.test.ts`
  * enforces - so a secret container would buy nothing but a second out-of-band
@@ -689,10 +690,15 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
  * see what the gateway is actually running with.
  *
- * Standard tier, which holds 4 KiB. The file is about 2.5 KB today, so item
- * 14's teams and virtual key names have room; past 4 KiB this needs
- * `tier: "Advanced"` explicitly, because the provider would otherwise fail the
- * apply rather than truncate.
+ * Standard tier, which holds 4 KiB. The file is 4,014 bytes today, so there are
+ * **82 bytes** of headroom, not the couple of kilobytes an earlier version of
+ * this comment claimed; every addition from here is a deliberate byte budget
+ * rather than free space. Past 4 KiB this needs `tier: "Advanced"` explicitly
+ * (8 KiB, and AWS charges for it), because the provider would otherwise fail
+ * the apply rather than truncate. `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES`
+ * below pins the ceiling and `ecs.test.ts` fails the suite before the file
+ * crosses it, so the next person to add a provider finds out here rather than
+ * in a failed apply.
  *
  * The leading slash is not decoration: SSM rejects a hierarchical name that is
  * not fully qualified, so `PutParameter` fails with "Parameter name must be a
@@ -705,18 +711,142 @@ export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
 export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
 
 /**
- * A digest of the configuration's contents, carried into the task definition as
- * an environment variable so that a `config.json` change reaches the running
- * gateway.
+ * The standard tier's content limit for an SSM `String` parameter, in bytes.
+ *
+ * Named rather than written into a comment because `bifrost/config.json` is
+ * 4,014 bytes today, which leaves 82 bytes of headroom: the margin is small
+ * enough that the suite should fail when it is crossed, not a reviewer. An
+ * over-limit value is rejected by `PutParameter` rather than truncated, so the
+ * apply fails loudly, but only after a merge. Past this the parameter needs
+ * `tier: "Advanced"` (8 KiB, charged).
+ */
+export const BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES = 4096;
+
+/**
+ * One committed classification of a `config.json` path: either a boot-only path
+ * that `BIFROST_CONFIG_VERSION` must cover, or a live path the reconciler
+ * (`docs/bifrost-reconciler.md`) converges without a restart.
+ *
+ * `path` is dotted, with two wildcards: `*` matches exactly one object key and
+ * `[]` matches exactly one array index. `providers.*.keys[].value` is the entry
+ * that forces this to be a path list rather than a list of top-level keys:
+ * `providers` is a mixed section, where a key's `value` is boot-only (it holds
+ * an `env.` reference only the task can resolve) while the same key's `models`,
+ * `aliases` and `weight` all converge live. No set of top-level keys can say
+ * that, which is why "just hash `providers`" is the bug this allowlist exists
+ * to avoid: it rolls the task on an alias edit, which is the restart the plan
+ * is written to remove.
+ *
+ * `subtree` claims every leaf below `path` (for a section whose whole contents
+ * are on one side); otherwise the entry claims exactly the leaf at `path`.
+ */
+export interface BifrostConfigPathRule {
+  readonly path: string;
+  readonly subtree: boolean;
+}
+
+/**
+ * The boot-only subset: what `BIFROST_CONFIG_VERSION` hashes, and therefore the
+ * only part of `config.json` whose change rolls the task.
+ *
+ * From "The split" and decision 2 of `docs/bifrost-reconciler.md`: the two store
+ * connection blocks are read once when the pools are built, `encryption_key`
+ * cannot change without cleaning the database, `setup_token` is resolved at
+ * boot, and a provider key's *value* is an `env.` reference that only the task
+ * can resolve. `ecs.test.ts` walks every leaf of the committed file against this
+ * list and its live counterpart in both directions, so an omission or an
+ * over-claim is a failing test rather than a restart nobody can explain.
+ *
+ * Two leaves are classified here rather than in the plan, whose table does not
+ * place them, and both calls are deliberate:
+ *
+ * - `source_of_truth` is **boot-only**. It is read at boot and decides pruning
+ *   (`transports/bifrost-http/lib/config.go:454-459`, `:4752-4789`), and no
+ *   admin route changes it, so a reconciler cannot converge it: a change would
+ *   sit unapplied until a restart, which is the silent failure this digest
+ *   exists to prevent. It is a constant that moves only with a deliberate
+ *   source-of-truth decision (decision 16), and that decision should roll the
+ *   task.
+ * - `$schema` is **live**, i.e. excluded. It is an editor pointer with no
+ *   runtime effect at any point, so a change to it can never require a boot.
+ *   Excluding it is also the cheap direction of the asymmetry below.
+ */
+export const BIFROST_BOOT_ONLY_PATHS = [
+  { path: "config_store", subtree: true },
+  { path: "logs_store", subtree: true },
+  { path: "encryption_key", subtree: false },
+  { path: "setup_token", subtree: false },
+  { path: "providers.*.keys[].value", subtree: false },
+  { path: "source_of_truth", subtree: false },
+] as const satisfies readonly BifrostConfigPathRule[];
+
+/**
+ * The live subset: everything the reconciler converges into the running process,
+ * and therefore everything the digest must *not* cover.
+ *
+ * Committed for the same reason the boot-only list is, and not merely derived as
+ * "whatever is left": the drift test needs both sides to be a statement, so a
+ * leaf that lands on neither side fails the suite instead of quietly becoming
+ * live by default. It is also what makes "an allowlist entry that claims a leaf
+ * the reconciler converges live" a test failure: the two lists must partition
+ * the file, so an overlap is a misclassification in one of them.
+ *
+ * Sources are the rows of "The split": `PUT /api/config` for `client`,
+ * `PUT /api/providers/{provider}` for `network_config` and `prompt_cache`,
+ * the key update route for `name`/`models`/`aliases`/`weight`/
+ * `bedrock_key_config`, `PUT /api/models/catalog` for the catalog, and the
+ * governance routes for `governance`.
+ */
+export const BIFROST_LIVE_PATHS = [
+  { path: "$schema", subtree: false },
+  { path: "client", subtree: true },
+  { path: "governance", subtree: true },
+  { path: "providers.*.network_config", subtree: true },
+  { path: "providers.*.prompt_cache", subtree: true },
+  { path: "providers.*.keys[].name", subtree: false },
+  { path: "providers.*.keys[].models", subtree: true },
+  { path: "providers.*.keys[].aliases", subtree: true },
+  { path: "providers.*.keys[].weight", subtree: false },
+  { path: "providers.*.keys[].bedrock_key_config", subtree: true },
+] as const satisfies readonly BifrostConfigPathRule[];
+
+/**
+ * A digest of the configuration's *boot-only* contents, carried into the task
+ * definition as an environment variable so that a change there reaches the
+ * running gateway.
  *
  * Without it the seam is dead: the container's `secrets` entry names the
  * parameter's ARN (`valueFrom: configParameterArn`), and an ARN does not change
- * when the value does. A PR that edits `config.json` would update the parameter
- * and leave every running task on the file it booted with, which defeats
- * "configuration is a reviewed PR" — the apply would look like it had
- * converged. A value that changes with the file registers a new
+ * when the value does. A PR that edits a boot-only path in `config.json` would
+ * update the parameter and leave every running task on the file it booted with,
+ * which defeats "configuration is a reviewed PR" — the apply would look like it
+ * had converged. A value that changes with that subset registers a new
  * task-definition revision, and the service's stop-before-start rollout picks
  * the new config up.
+ *
+ * **Not the whole file, any more.** `docs/bifrost-reconciler.md` splits the file
+ * into what a declarative reconciler can converge into the running process
+ * (client config, provider metadata, key models/aliases/weight, the model
+ * catalog, governance) and what is only read at boot. Hashing the whole file
+ * made every live edit — an alias, a model list, a retention day — register a
+ * new revision and roll the task, which is the outage that plan exists to stop
+ * paying for. So the digest is computed from the parsed JSON, over the leaves
+ * that `BIFROST_BOOT_ONLY_PATHS` claims and nothing else. Parsed rather than
+ * raw, because the question is "did a boot-only *value* change", and whitespace,
+ * key order or a reformat is not a change: hashing the bytes answered a
+ * different question and rolled the task for both.
+ *
+ * The failure mode of getting this classification wrong is asymmetric, and both
+ * directions are pinned by `ecs.test.ts`:
+ *
+ * - A **boot-only leaf the allowlist misses** is a change that never rolls the
+ *   task and therefore never applies. It is silent, and it is exactly the class
+ *   of bug commit `75d30ae` was written to close. This is the direction the
+ *   drift test exists for, and the one that must never be traded away.
+ * - A **live leaf wrongly included** is a needless restart. It is visible (a
+ *   revision and a task ARN that should not have moved) and it is cheap (a
+ *   stop-before-start roll of one task), which is why the allowlist errs toward
+ *   including a leaf when the classification is genuinely unclear.
  *
  * The digest, not the parameter resource's `version` output. That version is
  * assigned by AWS, so at preview time it is an unknown for any apply that
@@ -726,7 +856,7 @@ export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
  * definition to read. That is what failed run 40725087936 (the merge of #393):
  * the preflight could not parse the sentinel, the apply never ran, and the
  * bug looked like a preflight defect rather than the unknown it was. A digest
- * of the same bytes is computed here, in the program, so it is known at
+ * of the same values is computed here, in the program, so it is known at
  * preview; it also answers "which config is this task running" from
  * `describe-task-definition` more precisely than a counter does, because the
  * value identifies the content rather than the number of writes.
@@ -743,18 +873,176 @@ export const BIFROST_CONFIG_VERSION_ENV_NAME = "BIFROST_CONFIG_VERSION";
  */
 const BIFROST_CONFIG_VERSION_LENGTH = 12;
 
+/** The wildcards a `BifrostConfigPathRule.path` may contain. */
+const BIFROST_PATH_ANY_KEY = "*";
+const BIFROST_PATH_ANY_INDEX = "[]";
+
+const escapeRegExpLiteral = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** One rule as a matcher over a leaf path such as `providers.fireworks.keys[0].value`. */
+const bifrostPathRuleRegExp = (rule: BifrostConfigPathRule): RegExp => {
+  const body = rule.path
+    .split(".")
+    .map((segment) =>
+      segment === BIFROST_PATH_ANY_KEY
+        ? "[^.[\\]]+"
+        : segment
+            .split(BIFROST_PATH_ANY_INDEX)
+            .map(escapeRegExpLiteral)
+            .join("\\[[0-9]+\\]"),
+    )
+    .join("\\.");
+  // A subtree entry claims everything below its path, so the boundary is a
+  // lookahead rather than the end of the string; a leaf entry ends there.
+  return new RegExp(`^${body}${rule.subtree ? "(?=$|\\.|\\[)" : "$"}`);
+};
+
+/**
+ * Every leaf of the parsed file, as `[path, value]` in document order. A leaf is
+ * any non-object value, `null` included; an empty object or array contributes
+ * none, which is why a rule that stops matching a leaf is a drift-test failure
+ * rather than a silently empty digest.
+ */
+const bifrostConfigLeaves = (
+  config: string,
+): Array<readonly [string, unknown]> => {
+  const out: Array<readonly [string, unknown]> = [];
+  const walk = (value: unknown, at: string): void => {
+    if (value !== null && typeof value === "object") {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => walk(entry, `${at}[${index}]`));
+      } else {
+        for (const [key, entry] of Object.entries(
+          value as Record<string, unknown>,
+        )) {
+          walk(entry, at ? `${at}.${key}` : key);
+        }
+      }
+      return;
+    }
+    out.push([at, value]);
+  };
+  walk(JSON.parse(config), "");
+  return out;
+};
+
+/** Every leaf path in the parsed file, in document order. */
+export const bifrostConfigLeafPaths = (
+  config: string = readBifrostConfig(),
+): string[] => bifrostConfigLeaves(config).map(([at]) => at);
+
+/**
+ * The leaves a set of rules claims, in document order. Parameterised over the
+ * rules so a test can hand it a deliberately broken list and check that the
+ * failure it produces is the one the drift test is supposed to produce.
+ */
+export const bifrostConfigClaimedLeaves = (
+  config: string,
+  rules: readonly BifrostConfigPathRule[],
+): string[] => {
+  const matchers = rules.map(bifrostPathRuleRegExp);
+  return bifrostConfigLeaves(config)
+    .map(([at]) => at)
+    .filter((at) => matchers.some((matches) => matches.test(at)));
+};
+
+/**
+ * The digest's input: one `path=value` line per boot-only leaf, sorted by path so
+ * that a reordering of keys in the file does not move the digest (key order is
+ * not a boot-only fact) while any changed value does.
+ *
+ * Exported because the drift test asserts against exactly this string: "every
+ * leaf whose path matches an allowlist entry is in the digest input, and every
+ * leaf whose path does not is excluded" is a statement about this value, not
+ * about the hash of it.
+ */
+export const bifrostConfigDigestInput = (
+  config: string = readBifrostConfig(),
+  rules: readonly BifrostConfigPathRule[] = BIFROST_BOOT_ONLY_PATHS,
+): string => {
+  const matchers = rules.map(bifrostPathRuleRegExp);
+  return bifrostConfigLeaves(config)
+    .filter(([at]) => matchers.some((matches) => matches.test(at)))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([at, value]) => `${at}=${JSON.stringify(value)}`)
+    .join("\n");
+};
+
+/**
+ * What is wrong with the committed classification, in both directions, as
+ * human-readable lines a test asserts is empty.
+ *
+ * Three failures, and the first is the one that matters: a leaf claimed by
+ * neither list is unclassified, and an unclassified boot-only leaf is the
+ * silent non-convergence this whole seam exists to prevent. A leaf claimed by
+ * both is an allowlist entry that claims something the reconciler converges
+ * live, which would turn every such edit into a restart. And a rule that
+ * matches no leaf is a stale entry, which is how an allowlist rots.
+ *
+ * Deliberately not called from the digest itself. A Pulumi program that threw on
+ * an unclassified leaf would turn a config edit into a failed apply with no way
+ * to make progress from the change being applied; the suite is where the
+ * classification is enforced, and the digest treats "unclaimed" as "live",
+ * which is the cheap direction of the asymmetry.
+ */
+export const bifrostConfigClassificationProblems = (
+  config: string = readBifrostConfig(),
+  rules: {
+    readonly bootOnly?: readonly BifrostConfigPathRule[];
+    readonly live?: readonly BifrostConfigPathRule[];
+  } = {},
+): string[] => {
+  const bootOnly = rules.bootOnly ?? BIFROST_BOOT_ONLY_PATHS;
+  const live = rules.live ?? BIFROST_LIVE_PATHS;
+  const leaves = bifrostConfigLeafPaths(config);
+  const problems: string[] = [];
+
+  const bootOnlyLeaves = new Set(bifrostConfigClaimedLeaves(config, bootOnly));
+  const liveLeaves = new Set(bifrostConfigClaimedLeaves(config, live));
+
+  for (const at of leaves) {
+    const boot = bootOnlyLeaves.has(at);
+    const liveClaimed = liveLeaves.has(at);
+    if (boot && liveClaimed) {
+      problems.push(
+        `${at} is claimed by both the boot-only and the live path lists: it cannot both roll the task and be converged live`,
+      );
+    } else if (!boot && !liveClaimed) {
+      problems.push(
+        `${at} is claimed by neither list: it is unclassified, and a boot-only leaf here would change without ever applying`,
+      );
+    }
+  }
+
+  for (const [kind, list] of [
+    ["boot-only", bootOnly],
+    ["live", live],
+  ] as const) {
+    for (const rule of list) {
+      if (!leaves.some((at) => bifrostPathRuleRegExp(rule).test(at))) {
+        problems.push(
+          `the ${kind} path "${rule.path}" matches no leaf in config.json: a stale allowlist entry, or a section the file lost`,
+        );
+      }
+    }
+  }
+
+  return problems;
+};
+
 /**
  * The digest carried as `BIFROST_CONFIG_VERSION`: a prefix of the SHA-256 of the
- * configuration's own bytes.
+ * boot-only leaves' `path=value` lines.
  *
- * Pure and computed from the file, so a test can pin it without a Pulumi
- * runtime and `pulumi preview` can know it before anything is applied.
+ * Pure and sync and computed from the file, so a test can pin it without a
+ * Pulumi runtime and `pulumi preview` can know it before anything is applied.
  */
 export const bifrostConfigVersion = (
   config: string = readBifrostConfig(),
 ): string =>
   createHash("sha256")
-    .update(config, "utf8")
+    .update(bifrostConfigDigestInput(config), "utf8")
     .digest("hex")
     .slice(0, BIFROST_CONFIG_VERSION_LENGTH);
 
@@ -1229,15 +1517,15 @@ export const createBifrostEcs = (args: {
   /**
    * The gateway's runtime configuration, as the SSM parameter the task
    * injects. Pulumi owns it and its value is the reviewed `config.json`, so a
-   * configuration change is a PR that registers a new task-definition revision
-   * rather than a console edit - which is what `source_of_truth: "config.json"`
-   * in the file expects.
+   * configuration change is a PR - and a change to the boot-only subset of it
+   * registers a new task-definition revision rather than being a console edit,
+   * which is what `source_of_truth: "config.json"` in the file expects.
    *
    * The file is read here rather than imported as an asset: the parameter's
    * value is a string, and an asset would make the diff depend on an uploaded
    * object key instead of the file's contents.
    *
-   * Read once, into a constant, because the same bytes are also hashed into
+   * Read once, into a constant, because the same bytes are also digested into
    * `BIFROST_CONFIG_VERSION` below; two reads could in principle disagree and
    * put a version on the task definition that does not describe the parameter.
    * The hash is computed here rather than in the task-definition block for the
@@ -1478,12 +1766,13 @@ export const createBifrostEcs = (args: {
             // instead -- `password_command.args` are literal strings and
             // nothing expands an `env.` reference in them.
             { name: PG_SECRET_ARN_ENV_NAME, value: databaseSecretArn },
-            // A config change has to roll the task; see the constant. This is
-            // a digest computed from the file in this program, deliberately
-            // not the parameter's preview-unknown version output: an unknown
-            // here collapses the whole `containerDefinitions` string into
-            // Pulumi's unknown sentinel, which is unreadable to the pre-apply
-            // secret check.
+            // A boot-only config change has to roll the task; see the
+            // constant. This is a digest computed from the file in this
+            // program, over the boot-only subset only, deliberately not the
+            // parameter's preview-unknown version output: an unknown here
+            // collapses the whole `containerDefinitions` string into Pulumi's
+            // unknown sentinel, which is unreadable to the pre-apply secret
+            // check.
             {
               name: BIFROST_CONFIG_VERSION_ENV_NAME,
               value: configVersion,

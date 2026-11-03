@@ -272,18 +272,35 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB; this file is about 2.5 KB, which leaves room for item 14's team,
-and past that it needs `tier: "Advanced"` rather than a silent truncation.
+holds 4 KiB and the file is **4,014 bytes**, so there are 82 bytes left rather
+than the room one earlier version of this paragraph claimed; every addition is
+now a deliberate byte budget, and `deploy-workbench/ecs.test.ts` fails the suite
+before the file crosses the ceiling. Past 4 KiB it needs `tier: "Advanced"`
+rather than a silent truncation.
 
-**A change to this file reaches the gateway.** The container's `secrets` entry
-names the parameter's ARN, and an ARN does not change when the value does, so
-the task definition also carries a digest of the file's contents as
-`BIFROST_CONFIG_VERSION`. A merged edit to `config.json` therefore registers a
-new task-definition revision and the service's stop-before-start rollout picks
-it up; without that, the apply would update the parameter and leave every
-running task on the file it booted with. The digest is also how an operator
-answers "which config is this task running" from `describe-task-definition`:
-the value names the content, not a write counter.
+**A change to this file reaches the gateway by rolling the task — but only a
+boot-only one.** The container's `secrets` entry names the parameter's ARN, and
+an ARN does not change when the value does, so the task definition also carries a
+digest as `BIFROST_CONFIG_VERSION`. That digest is **no longer over the whole
+file**: step 1 of [`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md)
+narrowed it to the boot-only subset, computed from the parsed JSON against a
+committed allowlist of leaf paths (`BIFROST_BOOT_ONLY_PATHS` in `ecs.ts`). What
+is boot-only is the two store connection blocks, `encryption_key`, `setup_token`,
+`source_of_truth` and `providers.*.keys[].value`; a change to any of those still
+registers a new task-definition revision and the service's stop-before-start
+rollout picks it up. A change to the live subset — client config, provider
+metadata, a key's models/aliases/weight, the model catalog, governance — no
+longer moves the digest, so it does not roll the task. **Until the reconciler
+lands (steps 3 to 5 of the same plan) that also means such a change does not
+reach the running task at all**: the parameter is updated and the running task
+keeps what it booted with until something else rolls it. That is the intended
+trade of the plan — the roll was an outage for an edit that needs none — and it
+is stated here because it is a behaviour this file's readers will otherwise
+assume away. Without the digest at all the apply would update the parameter and
+leave every running task on the file it booted with. The digest is also how an
+operator answers "which config is this task running" from
+`describe-task-definition`: the value names the boot-only content, not a write
+counter, so a task whose live subset is stale still has the same digest.
 
 The digest is computed in the Pulumi program (`bifrostConfigVersion` in
 `ecs.ts`), not read from the parameter resource. `aws.ssm.Parameter.version` is

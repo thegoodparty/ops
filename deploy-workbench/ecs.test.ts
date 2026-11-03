@@ -12,8 +12,11 @@ import {
   BIFROST_CONFIG_ENV_NAME,
   BIFROST_CONFIG_FILE_PATH,
   BIFROST_CONFIG_PARAMETER_NAME,
+  BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
   BIFROST_CONFIG_SOURCE_PATH,
   BIFROST_CONFIG_VERSION_ENV_NAME,
+  BIFROST_BOOT_ONLY_PATHS,
+  BIFROST_LIVE_PATHS,
   BIFROST_CONTAINER_COMMAND,
   BIFROST_CONTAINER_ENTRY_POINT,
   BIFROST_CLUSTER_NAME,
@@ -63,6 +66,9 @@ import {
   TASK_CPU,
   TASK_MEMORY,
   TASK_ROLE_NAME,
+  bifrostConfigClassificationProblems,
+  bifrostConfigDigestInput,
+  bifrostConfigLeafPaths,
   bifrostConfigVersion,
   executionRoleConfigParameterPolicyDocument,
   executionRoleSecretsPolicyDocument,
@@ -122,6 +128,45 @@ const BIFROST_CONFIG_SOURCE = fs.readFileSync(
   path.resolve(__dirname, "bifrost/config.json"),
   "utf8",
 );
+
+/** A parsed `config.json`, loose on purpose: the drift tests add leaves to it. */
+type BifrostConfigDocument = Record<string, any>;
+
+/**
+ * The committed file, with one edit applied to the parsed document.
+ *
+ * Re-serialised rather than string-spliced, so an edit here is a value change
+ * and nothing else. `bifrostConfigVersion` reads parsed JSON, so the whitespace
+ * `JSON.stringify` produces is already not part of the digest — which one of the
+ * assertions below relies on.
+ */
+const editedBifrostConfig = (
+  edit: (document: BifrostConfigDocument) => void,
+): string => {
+  const document = JSON.parse(BIFROST_CONFIG_SOURCE) as BifrostConfigDocument;
+  edit(document);
+  return JSON.stringify(document, null, 2);
+};
+
+/** The same document with every object's keys reversed, to pin order-independence. */
+const reorderedBifrostConfig = (): string => {
+  const reverseKeys = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(reverseKeys);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .reverse()
+          .map(([key, entry]) => [key, reverseKeys(entry)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(
+    reverseKeys(JSON.parse(BIFROST_CONFIG_SOURCE)),
+    null,
+    2,
+  );
+};
 const ALPHA_CONFIG_SOURCE = fs.readFileSync(
   path.resolve(__dirname, "bifrost/alpha-config.yaml"),
   "utf8",
@@ -486,13 +531,20 @@ describe("bifrost ecs", () => {
       !/Action:\s*(\[?\s*)?["'][a-z0-9]+:\*["']/.test(ECS_SOURCE),
       "ecs.ts must not contain a service-wildcard action",
     );
-    // The one bare wildcard the module may contain is the catalog read's
-    // resource, which Bedrock gives no resource type to scope. Anything else is
-    // a widening, and this is the assertion that keeps it to one.
-    assert.deepEqual(ECS_SOURCE.match(/"\*"/g), ["\"*\""]);
+    // The bare wildcards the module may contain: the catalog read's resource,
+    // which Bedrock gives no resource type to scope, and the config path
+    // allowlist's one-key wildcard (`BIFROST_PATH_ANY_KEY`, which matches a
+    // provider name in `providers.*.keys[].value`) — a path segment in a
+    // string comparison, not an IAM resource. Anything else is a widening, and
+    // this is the assertion that keeps it to those two.
+    assert.deepEqual(ECS_SOURCE.match(/"\*"/g), ['"*"', '"*"']);
     assert.ok(
       ECS_SOURCE.includes('export const TASK_BEDROCK_READ_RESOURCES = ["*"]'),
       "the wildcard must be the catalog read's resource",
+    );
+    assert.ok(
+      ECS_SOURCE.includes('const BIFROST_PATH_ANY_KEY = "*"'),
+      "the other wildcard must be the config path allowlist's key segment",
     );
     assert.ok(
       !/Resource:\s*(\[?\s*)?["']\*["']/.test(ECS_SOURCE),
@@ -1393,7 +1445,7 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("rolls the task when config.json changes, with a value known at preview", () => {
+  it("carries a preview-known config version, and changes it only for a boot-only edit", () => {
     // The ARN is stable across value changes, so a `secrets` entry alone leaves
     // every running task on the config it booted with: a merged `config.json`
     // PR would update the parameter and change nothing that is running. A
@@ -1414,15 +1466,27 @@ describe("bifrost ecs", () => {
       bifrostConfigVersion(BIFROST_CONFIG_SOURCE),
       "the default must be the reviewed config.json",
     );
+    // The shape is unchanged from what the preflight check accepts: a
+    // 12-hex-character prefix of a SHA-256.
     assert.match(bifrostConfigVersion(), /^[0-9a-f]{12}$/);
-    assert.notEqual(
-      bifrostConfigVersion(BIFROST_CONFIG_SOURCE),
-      bifrostConfigVersion(`${BIFROST_CONFIG_SOURCE} `),
-      "a changed config.json must produce a different version, or the task never rolls",
-    );
     assert.ok(
       !ECS_SOURCE.includes("configParameter.version"),
       "the parameter's version is unknown at preview; carrying it collapses containerDefinitions",
+    );
+
+    // What step 1 of `docs/bifrost-reconciler.md` changed: the digest is over
+    // PARSED JSON, so whitespace, key order and a reformat are not changes.
+    // Hashing the bytes answered "did the text change", which rolled the task
+    // for a live edit and equally for a reformat of the whole file.
+    assert.equal(
+      bifrostConfigVersion(editedBifrostConfig(() => {})),
+      bifrostConfigVersion(),
+      "a re-serialisation of the same values must not move the digest",
+    );
+    assert.equal(
+      bifrostConfigVersion(reorderedBifrostConfig()),
+      bifrostConfigVersion(),
+      "key order is not a boot-only fact, so reordering the file must not move the digest",
     );
 
     const bifrostBlock = containerDefinitionBlock("BIFROST_CONTAINER_NAME");
@@ -1436,6 +1500,366 @@ describe("bifrost ecs", () => {
     assert.ok(
       containerBlock().includes("configParameter.arn,"),
       "the task definition must still depend on the parameter resource",
+    );
+  });
+
+  it("classifies every leaf of config.json as boot-only or live, and both lists are real", () => {
+    // The drift test decision 2 asks for. Three failures, and the asymmetry of
+    // their consequences is why the first one matters most:
+    //
+    //   - a leaf on neither list is unclassified, and an unclassified boot-only
+    //     leaf is a change that never rolls the task and never applies (silent;
+    //     the `75d30ae` class of bug);
+    //   - a leaf on both lists is an allowlist entry claiming something the
+    //     reconciler converges live, so every edit to it restarts the task for
+    //     nothing;
+    //   - a rule matching no leaf is an allowlist that has rotted.
+    //
+    // There is deliberately no expected-path list here. The assertion is that
+    // the two committed lists partition the file, so a new leaf in
+    // `config.json` fails the suite until somebody classifies it.
+    assert.deepEqual(
+      bifrostConfigClassificationProblems(),
+      [],
+      "every leaf of bifrost/config.json must be classified boot-only or live, and every rule must match a leaf",
+    );
+    assert.ok(BIFROST_BOOT_ONLY_PATHS.length > 0);
+    assert.ok(BIFROST_LIVE_PATHS.length > 0);
+
+    // "In the digest" is asserted against the digest's own input, which is one
+    // `path=value` line per boot-only leaf, so a reader can see what is
+    // covered rather than having to invert a hash.
+    const digestLines = bifrostConfigDigestInput().split("\n");
+    assert.ok(digestLines.length > 0);
+    for (const line of digestLines) {
+      const at = line.slice(0, line.indexOf("="));
+      assert.ok(
+        bifrostConfigLeafPaths().includes(at),
+        `the digest claims ${at}, which is not a leaf of the file`,
+      );
+    }
+    for (const expected of [
+      "config_store.config.host=",
+      "config_store.enabled=",
+      "config_store.config.password_command.command=",
+      "logs_store.retention_days=",
+      "logs_store.config.max_open_conns=",
+      "encryption_key=",
+      "setup_token=",
+      "providers.fireworks.keys[0].value=",
+      "providers.bedrock.keys[0].value=",
+      "source_of_truth=",
+    ]) {
+      assert.ok(
+        digestLines.some((line) => line.startsWith(expected)),
+        `the boot-only digest is missing ${expected}\n${bifrostConfigDigestInput()}`,
+      );
+    }
+    // The live half, spot-checked against one line per class the plan's table
+    // puts on the live side. None of these may appear in the digest.
+    for (const excluded of [
+      "$schema=",
+      "client.",
+      "governance.",
+      "providers.fireworks.network_config.",
+      "providers.bedrock.prompt_cache.",
+      "providers.fireworks.keys[0].models",
+      "providers.fireworks.keys[0].aliases.",
+      "providers.fireworks.keys[0].weight=",
+      "providers.fireworks.keys[0].name=",
+      "providers.bedrock.keys[0].bedrock_key_config.",
+    ]) {
+      assert.ok(
+        !digestLines.some((line) => line.startsWith(excluded)),
+        `${excluded} is converged live and must not be in the digest`,
+      );
+    }
+  });
+
+  it("registers no new digest for a provider metadata, alias or model-catalog edit", () => {
+    // The first visible evidence the split is real (success criterion 1): these
+    // are exactly the edits that used to roll the task, and that
+    // `docs/bifrost-reconciler.md` exists to stop rolling it. Every one of them
+    // is in the plan's "Live" column.
+    const before = bifrostConfigVersion();
+    const edits: Array<[string, (doc: BifrostConfigDocument) => void]> = [
+      [
+        "provider network_config.base_url",
+        (doc) => {
+          doc.providers.fireworks.network_config.base_url =
+            "https://us.api.fireworks.ai/inference/v1";
+        },
+      ],
+      [
+        "provider key models (the model catalog)",
+        (doc) => {
+          doc.providers.bedrock.keys[0].models = [
+            "us.anthropic.claude-sonnet-5-5",
+          ];
+        },
+      ],
+      [
+        "provider key aliases: the model_id an alias points at",
+        (doc) => {
+          doc.providers.fireworks.keys[0].aliases["worker-default"].model_id =
+            "accounts/fireworks/routers/another-router";
+        },
+      ],
+      [
+        "provider key aliases: a whole new alias",
+        (doc) => {
+          doc.providers.fireworks.keys[0].aliases["new-alias"] = {
+            model_id:
+              "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+            model_name:
+              "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
+          };
+        },
+      ],
+      [
+        "provider key weight",
+        (doc) => {
+          doc.providers.fireworks.keys[0].weight = 7;
+        },
+      ],
+      [
+        "provider prompt cache",
+        (doc) => {
+          doc.providers.bedrock.prompt_cache.auto_inject = false;
+        },
+      ],
+      [
+        "client config",
+        (doc) => {
+          doc.client.log_retention_days = 30;
+        },
+      ],
+      [
+        "governance auth config",
+        (doc) => {
+          doc.governance.auth_config.is_enabled = true;
+        },
+      ],
+    ];
+
+    for (const [what, edit] of edits) {
+      assert.equal(
+        bifrostConfigVersion(editedBifrostConfig(edit)),
+        before,
+        `${what} is converged live and must not register a new task-definition revision`,
+      );
+    }
+  });
+
+  it("registers a new digest for a store, key-value, encryption, setup-token or source-of-truth edit", () => {
+    // Success criterion 4: a boot-only edit still rolls the task. This is the
+    // direction whose failure is silent, so each class gets its own case rather
+    // than one shared "something changed" assertion.
+    const before = bifrostConfigVersion();
+    const edits: Array<[string, (doc: BifrostConfigDocument) => void]> = [
+      [
+        "config_store connection detail",
+        (doc) => {
+          doc.config_store.config.max_open_conns = 51;
+        },
+      ],
+      [
+        "a logs_store leaf outside the connection block",
+        (doc) => {
+          doc.logs_store.retention_days = 30;
+        },
+      ],
+      [
+        "logs_store password_command timeout",
+        (doc) => {
+          doc.logs_store.config.password_command.timeout = "45s";
+        },
+      ],
+      [
+        "encryption_key",
+        (doc) => {
+          doc.encryption_key = "env.SOME_OTHER_ENCRYPTION_KEY";
+        },
+      ],
+      [
+        "setup_token",
+        (doc) => {
+          doc.setup_token = "env.SOME_OTHER_SETUP_TOKEN";
+        },
+      ],
+      [
+        "providers.*.keys[].value",
+        (doc) => {
+          doc.providers.fireworks.keys[0].value =
+            "env.ROTATED_FIREWORKS_API_KEY";
+        },
+      ],
+      [
+        "providers.*.keys[].value, where the value was the empty string",
+        (doc) => {
+          doc.providers.bedrock.keys[0].value = "env.SOMETHING";
+        },
+      ],
+      [
+        "source_of_truth",
+        (doc) => {
+          doc.source_of_truth = "database";
+        },
+      ],
+    ];
+
+    for (const [what, edit] of edits) {
+      assert.notEqual(
+        bifrostConfigVersion(editedBifrostConfig(edit)),
+        before,
+        `${what} is read at boot and must register a new task-definition revision`,
+      );
+    }
+  });
+
+  it("tells keys[].value apart from keys[].aliases in the same array entry", () => {
+    // The reason the allowlist is a list of paths and not of top-level keys, and
+    // the case open item 1 names as the first to pin: `providers` is a mixed
+    // section. A key list cannot say "roll on `keys[].value`, converge on
+    // `keys[].aliases`": with `providers` on the list an alias edit rolls the
+    // task and the plan is decorative, and with `providers` off it a key-value
+    // change never applies.
+    const valueEdit = editedBifrostConfig((doc) => {
+      doc.providers.fireworks.keys[0].value = "env.ROTATED_FIREWORKS_API_KEY";
+    });
+    const aliasEdit = editedBifrostConfig((doc) => {
+      doc.providers.fireworks.keys[0].aliases["worker-default"].description =
+        "a different description for the same target";
+    });
+
+    // Both edits touch the same object in the same array; only one is boot-only.
+    assert.notEqual(
+      bifrostConfigVersion(valueEdit),
+      bifrostConfigVersion(),
+      "a provider key's value is resolved by the task at boot, so it must roll the task",
+    );
+    assert.equal(
+      bifrostConfigVersion(aliasEdit),
+      bifrostConfigVersion(),
+      "an alias in the same key entry converges live, so it must not roll the task",
+    );
+  });
+
+  it("fails the drift test on an unclaimed leaf, an overlap, and a stale entry", () => {
+    // A drift test that only passes on the happy path is not a drift test. Each
+    // failure is provoked here with a deliberately broken input, so the
+    // assertions above are known to be load-bearing rather than vacuous.
+    const unclassified = editedBifrostConfig((doc) => {
+      doc.governance.brand_new_leaf = { enabled: true };
+    });
+    // `governance` is a live subtree, so a new leaf under it is classified by
+    // the subtree rule and is not a problem. That is asserted, because a
+    // subtree rule that quietly stopped matching would otherwise only show up
+    // as an unclaimed leaf in production.
+    assert.deepEqual(bifrostConfigClassificationProblems(unclassified), []);
+
+    // A top-level section nobody classified, added at the root: this is the
+    // shape of an upstream schema addition, and it fails.
+    const unclassifiedRoot = editedBifrostConfig((doc) => {
+      doc.vector_store = { enabled: true, type: "postgres" };
+    });
+    const rootProblems = bifrostConfigClassificationProblems(unclassifiedRoot);
+    assert.ok(
+      rootProblems.some(
+        (problem) =>
+          problem.startsWith("vector_store.enabled ") ||
+          problem.startsWith("vector_store.type "),
+      ),
+      `a leaf neither list claims must fail the drift test:\n${rootProblems.join("\n")}`,
+    );
+
+    // A boot-only rule that claims a live leaf. This is what putting
+    // `providers` on the list wholesale would look like: the "needless
+    // restart" direction, cheap but wrong.
+    const overlapping = bifrostConfigClassificationProblems(
+      BIFROST_CONFIG_SOURCE,
+      {
+        bootOnly: [
+          ...BIFROST_BOOT_ONLY_PATHS,
+          { path: "providers.*.keys[].aliases", subtree: true },
+        ],
+      },
+    );
+    assert.ok(
+      overlapping.some((problem) =>
+        problem.includes(
+          "providers.fireworks.keys[0].aliases.worker-default.description",
+        ),
+      ),
+      `an entry claiming a leaf the reconciler converges live must fail:\n${overlapping.join("\n")}`,
+    );
+
+    // A stale entry: the section is gone from the file, or the name was never
+    // right. Either way an allowlist nobody prunes stops describing the file.
+    const stale = bifrostConfigClassificationProblems(BIFROST_CONFIG_SOURCE, {
+      bootOnly: [
+        ...BIFROST_BOOT_ONLY_PATHS,
+        { path: "vector_store", subtree: true },
+      ],
+    });
+    assert.ok(
+      stale.some((problem) =>
+        problem.includes('the boot-only path "vector_store" matches no leaf'),
+      ),
+      `an allowlist entry that matches no leaf must fail:\n${stale.join("\n")}`,
+    );
+
+    // A missing boot-only rule is the silent direction: the digest simply stops
+    // covering a leaf that is read at boot, and the leaf's change never applies.
+    const missing = bifrostConfigClassificationProblems(BIFROST_CONFIG_SOURCE, {
+      bootOnly: BIFROST_BOOT_ONLY_PATHS.filter(
+        (rule) => rule.path !== "setup_token",
+      ),
+    });
+    assert.ok(
+      missing.some((problem) => problem.startsWith("setup_token ")),
+      `dropping a boot-only rule must fail, or that leaf changes without applying:\n${missing.join("\n")}`,
+    );
+
+    // And the wildcard is what makes `providers.*.keys[].value` cover every
+    // provider and every key, rather than the two that happen to be in the file
+    // today. A second key under a provider is claimed without editing a rule.
+    const twoKeys = editedBifrostConfig((doc) => {
+      doc.providers.fireworks.keys.push({
+        name: "fireworks-secondary",
+        value: "env.OTHER_FIREWORKS_API_KEY",
+        models: [],
+        weight: 1,
+      });
+    });
+    assert.deepEqual(bifrostConfigClassificationProblems(twoKeys), []);
+    assert.ok(
+      bifrostConfigDigestInput(twoKeys).includes(
+        "providers.fireworks.keys[1].value=",
+      ),
+      "a second key's value is boot-only without the allowlist needing an entry per key",
+    );
+  });
+
+  it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
+    // 4,014 bytes against the standard tier's 4 KiB, measured at step 1 of
+    // `docs/bifrost-reconciler.md`: 82 bytes of headroom, not the couple of
+    // kilobytes a comment in `ecs.ts` and one in `bifrost/README.md` used to
+    // claim. The number is asserted rather than left to a comment, because the
+    // failure mode of getting it wrong is a rejected `PutParameter` in an
+    // apply that has already merged.
+    assert.equal(BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES, 4096);
+    const bytes = Buffer.byteLength(BIFROST_CONFIG_SOURCE, "utf8");
+    assert.ok(
+      bytes < BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
+      `bifrost/config.json is ${bytes} bytes and the standard tier holds ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; past that the parameter needs tier: "Advanced"`,
+    );
+    // The headroom is small enough to be worth naming exactly, which is what
+    // the comment block does. If this fails the comment is the stale part.
+    assert.equal(
+      BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
+      82,
+      "the 82-byte headroom in the ecs.ts comment block must be the measured one",
     );
   });
 
