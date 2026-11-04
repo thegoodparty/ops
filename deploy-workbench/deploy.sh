@@ -219,6 +219,39 @@ if [ "$CI" = "true" ]; then
       --preview "$PREFLIGHT_DIR/preview.json" \
       --stack-export "$PREFLIGHT_DIR/stack.json"
 
+    # Step 2 of docs/bifrost-reconciler.md: the per-person governance overrides
+    # are validated twice, and the split is which caller can do which half.
+    #
+    # The shape half -- an unknown field, a malformed budget, a duplicate
+    # reset_duration, a misplaced inherit -- runs in the Pulumi program, so a
+    # malformed file already fails the preview above. This script is the second
+    # caller of it, with the document's paths in the message, and `npm test` is
+    # the third, in the credential-free job.
+    #
+    # The membership half is the one a Pulumi program cannot do, and this job
+    # cannot either. `bifrost-vk-reader`'s trust admits exactly the two Lambdas'
+    # execution roles (`deploy/components/bifrost-vk-reader.ts`), and the
+    # first-hop role in this job may assume only the workbench `pulumi-deploy`
+    # (`deploy/components/ci-roles/policies.ts`). Widening either is an IAM
+    # change in `deploy/` that makes CI a third holder of a grant whose point is
+    # that it is narrow: a separate reviewed change, not a line here, so this
+    # script does not attempt that assume in the deploy.
+    #
+    # So membership runs when a member set is supplied, and the check says out
+    # loud which half it ran rather than implying both. `GOVERNANCE_OVERRIDES_MEMBERS`
+    # is the hook: a comma-separated list of the document's emails, which the
+    # person adding the first override supplies, since they are looking at that
+    # email in review anyway. Absent it, the shape half runs alone and the log
+    # says so. The deploy never fails for not holding a grant it was never given.
+    #
+    # Before the apply either way, because the apply is what writes the
+    # parameter: a document that cannot converge is one a reconciler would
+    # retry a 400 against forever, and before the drain for the same reason the
+    # secrets check is. A malformed file is a non-zero exit under `set -e`, not
+    # a pass.
+    npx --no-install tsx "$SCRIPT_DIR/scripts/preflight-governance.ts" \
+      ${GOVERNANCE_OVERRIDES_MEMBERS:+--members "$GOVERNANCE_OVERRIDES_MEMBERS"}
+
     pulumi up --diff --yes
   fi
 else
