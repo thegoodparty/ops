@@ -983,7 +983,7 @@ export const governanceBody = (
 
   // Always, even empty: see the comment above. `provider_configs` is the field
   // whose omission deletes the entries' budgets and rate limits, so leaving it
-  // out while a diff compared it is the one shape that never converges.
+  // out while the diff compared it is the one shape that never converges.
   body.provider_configs = (state.provider_configs ?? []).map((config) => {
     const entry: Record<string, unknown> = { provider: config.provider };
     if (config.allowed_models !== undefined) {
