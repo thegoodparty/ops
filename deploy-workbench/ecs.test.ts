@@ -1367,10 +1367,10 @@ describe("bifrost ecs", () => {
       ECS_SOURCE.includes("${gatewayRepositoryUrl}:${BIFROST_GATEWAY_TAG}"),
       ECS_SOURCE,
     );
-    assert.match(BIFROST_GATEWAY_TAG, /^v2\.3\.2-[0-9a-f]{12}$/);
+    assert.match(BIFROST_GATEWAY_TAG, /^v2\.4\.0-[0-9a-f]{12}$/);
     // That tag starts from the upstream release the mirror pins, so a bump still
     // moves one version and not two.
-    assert.equal(BIFROST_UPSTREAM_TAG, "v2.3.2");
+    assert.equal(BIFROST_UPSTREAM_TAG, "v2.4.0");
     assert.ok(ECS_SOURCE.includes('cpuArchitecture: "X86_64"'));
     // The sidecar's tag is content-addressed on the allowlist, so it comes
     // from oauth2-proxy-image.ts rather than a literal in the task definition.

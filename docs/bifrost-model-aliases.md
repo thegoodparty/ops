@@ -56,7 +56,8 @@ Success, in the order it should be proven:
 ## What exists, verified
 
 Everything below was read from code, not recalled. The gateway facts are from
-`maximhq/bifrost` at the pinned tag `transports/v2.3.2`
+`maximhq/bifrost`, read at `transports/v2.3.2` and re-checked at
+`transports/v2.4.0`, the tag now pinned
 ([`bifrost-gateway.md`](./bifrost-gateway.md), "Upstream basis and version");
 the `gp-pi` facts are from the installed copies of its helpers
 (`/usr/local/bin/gp-delegate`, `/usr/local/bin/gp-bifrost-key`,
@@ -186,7 +187,7 @@ Settled in review; the section after this one is the work they produce.
    `models` so `--model bifrost/<id>` kept working. It no longer resolves, and
    a developer who wants another model picks one of the served names.
 9. **`gp-pi` fills in the role names' metadata from their sibling.** The role
-   names list bare (decision 8 does not change that, and Bifrost v2.3.2 gives
+   names list bare (decision 8 does not change that, and Bifrost v2.4.0 gives
    config no way to attach metadata to a name). Every entry the gateway lists
    carries `alias`, the wire id it resolves to, so `gp-bifrost.ts` groups
    entries on it and gives an entry without a context window or price those of

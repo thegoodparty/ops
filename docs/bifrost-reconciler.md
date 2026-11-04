@@ -96,8 +96,18 @@ restart remains, and "What this is not" says so.
 
 ## The split: what converges live, and what needs a restart
 
-Established from the source at the pinned tag `transports/v2.3.2` (git tag
-`transports/v2.3.2`, commit `a05ea20`), not from the docs.
+Established from the source at `transports/v2.3.2` (git tag
+`transports/v2.3.2`, commit `a05ea20`), not from the docs. Those are the tags
+and line numbers the table was read at; the image is now pinned at `v2.4.0`
+(`deploy-workbench/bifrost-image.ts`), and the citations below have **not** been
+re-walked at it. What was re-checked at `v2.4.0` is that every route the
+reconciler calls still exists with the same shape (`PUT /api/config`,
+`PUT /api/providers/{provider}`, `PUT /api/providers/{provider}/keys/{key_id}`,
+`PUT /api/models/catalog`, `PUT /api/governance/virtual-keys/{vk_id}`, and
+`GET /api/governance/virtual-keys`), and that the two omissions the loop relies
+on still hold: `network_config` is assigned unconditionally on a provider
+update, and `prompt_cache` is still one of the "only when carried" blocks. The
+line numbers moved; the facts did not.
 
 | Setting | Live | Where the proof is |
 |---|---|---|
@@ -1076,7 +1086,9 @@ In this repository:
 | The archived plan, kept as evidence | `docs/archived/bifrost-zero-downtime-deploys.md` |
 | The spend-alert wiring an alarm would join | `deploy-workbench/index.ts:290-352`; `deploy-infrastructure/group-sync-lambda.ts:355-400` (the topic and its CloudWatch policy) |
 
-In Bifrost, at the pinned tag `transports/v2.3.2` (commit `a05ea20`):
+In Bifrost, at `transports/v2.3.2` (commit `a05ea20`), which is the tag these
+lines were read at; the pin has since moved to `v2.4.0` and the line numbers
+below are the `v2.3.2` ones:
 
 | Fact | Source |
 |---|---|

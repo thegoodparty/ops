@@ -360,15 +360,29 @@ it to the proxy's sign-in flow.
 At the pinned tag the routes Bifrost registers are `/api/*`, `/v1/*`,
 `/anthropic/*`, `/openai/*`, `/genai/*`, `/cohere/*`, `/litellm/*`,
 `/langchain/*`, `/pydanticai/*`, `/bedrock/*`, `/typesafe/*`, `/cursor/*`,
-the seven `*_passthrough/*` prefixes, `/mcp` and `/mcp/{slug}`, `/agents/a2a/*`,
-`/ws`, `/realtime`, `/.well-known/*`, `/oauth2/{authorize,register,token}`,
-`/robots.txt`, `/` and `/{filepath:*}`, `/metrics` and `/health`
-(`transports/bifrost-http` route registrations at `transports/v2.3.0`; the
-route table is unchanged at `v2.3.2`). The
+`/azure/*`, the eight `*_passthrough/*` prefixes (`openai`, `anthropic`,
+`genai`, `azure`, `bedrock`, `runware`, `sagemaker`, `chatgpt`), `/relay/*`,
+`/mcp` and `/mcp/{slug}`, `/agents/a2a/*`, `/ws`, `/realtime`, `/.well-known/*`,
+`/oauth2/{authorize,register,token}`, `/robots.txt`, `/` and `/{filepath:*}`,
+`/metrics` and `/health` (`transports/bifrost-http` route registrations at
+`transports/v2.4.0`). Three of those are new since the table was first read at
+`v2.3.0`: `/azure/*` (the Azure AI Speech and Azure OpenAI paths of a resource
+base URL), `/relay/*` (Relays, `relay/{endpoint}/{path}`) and
+`/sagemaker_passthrough/*`. The
 per-route table, and which credential each route carries, is in the pull
 request that made this change; the only ones any rule sends to Bifrost are the
 inference prefixes and `/health`, and `deploy-workbench/ingress.test.ts` fails
 if a rule adds another.
+
+None of the three is reachable from the internet: the HTTPS listener's default
+action is oauth2-proxy, and the only rules that forward straight to Bifrost are
+the four inference prefixes plus `/health` (`ingress.ts`). `/azure/*` and
+`/relay/*` therefore land on the proxy's sign-in flow, and
+`/sagemaker_passthrough/*` does too — none of them is in the inference rule's
+path patterns, which are enumerated rather than wildcarded for exactly this
+reason. `/relay/*` is additionally only mounted when at least one relay is
+configured (`server.go`, `if s.relays != nil`), and this deployment configures
+none.
 
 **Configuration**, following `agent-swarm/host/docker-compose.yml` where the
 options survive:
@@ -418,7 +432,7 @@ options survive:
 **Bifrost's own login is off, and the OSS setup lock is satisfied by the
 sidecar.** `governance.auth_config.is_enabled` is false in `config.json`, so
 there is no shared admin login to answer and no password on the human path.
-That is not the same as "the API is open" at `v2.3.0` (still true at `v2.3.2`),
+That is not the same as "the API is open" at `v2.3.0` (still true at `v2.4.0`),
 and this is the detail
 a future session will otherwise get wrong:
 
@@ -531,12 +545,16 @@ audit records, no per-person role, and no way to revoke one person without
 editing the allowlist — turning the shared password off does not create a user.
 That needs Enterprise. A plugin cannot supply it at
 this tag either, which the earlier version of this section got wrong: the
-plugin interfaces at `v2.3.2` are LLM, MCP, A2A, HTTP-transport and
-observability (`core/schemas/plugin.go`), with no hook on the dashboard or
-management auth path; and the shared-object loader goes through Go's
+plugin interfaces at `v2.4.0` are LLM, MCP, A2A, HTTP-transport and
+observability (`core/schemas/plugin.go`), and nothing in that list can
+authorise a dashboard or management call — the transport plugin phases are
+appended to `inferenceMiddlewares` only (`server.go`), so a plugin can supply
+or translate a credential for a model request but is not in the path of
+`/api/*`; and the shared-object loader goes through Go's
 `plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
-pinned image's `/app/main` — a statically linked executable with no
-dynamically linked Go runtime to share. So the allowlist plus the proxy is the
+pinned image's `/app/main` — a statically linked executable
+(`-extldflags '-static'`) with no dynamically linked Go runtime to share. So the
+allowlist plus the proxy is the
 whole of what this design gets, and per-person attribution stays an
 Enterprise question.
 
@@ -842,7 +860,7 @@ Two causes, both fixed:
   discarded a top-level `cache_control` and nested a `cachePoint` inside
   `toolResult.content` instead, which Bedrock accepts while caching nothing
   (maximhq/bifrost#8541, fixed by #8595 in `v2.3.1`). The image is pinned at
-  `v2.3.2`, so the marker that reaches the converter becomes a `cachePoint`
+  `v2.4.0`, so the marker that reaches the converter becomes a `cachePoint`
   after the last cacheable block. A config-only fix on `v2.3.0` would have
   looked applied and cached nothing.
 
@@ -970,7 +988,7 @@ Virtual keys are Bifrost's primary governance entity
   "snapshot into the same VPC plus the same Secrets Manager values". A
   restore must be rehearsed once, because a backup nobody has restored is a
   belief.
-- **Upgrade.** Pin the image by tag and digest (`maximhq/bifrost:v2.3.2` at
+- **Upgrade.** Pin the image by tag and digest (`maximhq/bifrost:v2.4.0` at
   the time of writing) and update it in a PR that also bumps the digest. The
   procedure is: RDS snapshot, register a new task definition, update the
   service, watch `/health` and the logs. Bifrost runs store migrations at
@@ -1207,7 +1225,7 @@ network or a permission can land before the item that creates it.
    `deploy-workbench/` and the NS record to `deploy/`, in the
    infra-zone-delegation shape. The NS record must exist before ACM
    validation.
-3. **Mirror the image.** Mirror `maximhq/bifrost:v2.3.2` into an ECR
+3. **Mirror the image.** Mirror `maximhq/bifrost:v2.4.0` into an ECR
    repository in the workbench account, pinned by digest, following the
    delegate image's build/push pattern in `.github/workflows/deploy.yml`.
    Decide the digest upgrade cadence.
@@ -1416,13 +1434,23 @@ network or a permission can land before the item that creates it.
 The plan is based on the upstream repository at tag **`transports/v2.3.0`**
 (2026-10-13) and the matching container image
 **`docker.io/maximhq/bifrost:v2.3.0`** (published 2026-10-13). The image the
-gateway runs is pinned at **`v2.3.2`**: the same release plus the v2.3.1
-Bedrock cache-point fix and a Go `crypto/x509` security release, with no
-database migrations of its own. The facts this plan states were read at
-`v2.3.0` and re-checked at `v2.3.2` where a bump could have changed them; see
+gateway runs is pinned at **`v2.4.0`** (`transports/v2.4.0`, published
+2026-10-29): the v2.3.1 Bedrock cache-point fix, the v2.3.2 `crypto/x509`
+security release, and v2.4.0's own additions. v2.4.0 **does** carry store
+migrations. None of them drops a table or column v2.3.2 created, and none
+deletes or rewrites stored rows; the one that is not purely additive widens two
+OAuth2 `client_id` columns to `text`, and this deployment configures no OAuth2
+server so both are empty. An older binary therefore ignores what it did not
+write, and the pin can be rolled back on the previous digest alone — the
+mechanism is that `framework/migrator` does not reject a migration ledger ahead
+of the binary's list (`ValidateUnknownMigrations` defaults to false in both
+versions). The RDS snapshot stays item 24's rollback of last resort, and that
+rehearsal is still outstanding. The facts this plan
+states were read at `v2.3.0` and re-checked at `v2.4.0` where a bump could have
+changed them; see
 "Prompt caching" under Provider configuration. Its docs
-under `docs/`. The Helm chart at that tag is `2.1.44` with a stale
-`appVersion: 1.5.12`; the image tag, not the chart `appVersion`, is the
+under `docs/`. The Helm chart at `transports/v2.4.0` is `2.1.46` with a stale
+`appVersion: 2.3.1`; the image tag, not the chart `appVersion`, is the
 version that matters. The repository's default branch is `dev`, and the
 `docs/quickstart/cli/coding-agents.mdx` page cited above was fetched from
 `main`, which is ahead of the tag; the harness table is stable but should be

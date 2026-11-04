@@ -4,14 +4,16 @@
 > of [`bifrost-gateway.md`](./bifrost-gateway.md) and changes only
 > `deploy-workbench/bifrost/config.json`, the virtual-key template and their tests.
 >
-> Verified against: transports/v2.3.2
+> Verified against: transports/v2.4.0
 
 > The source excerpts and line references below were read at `v2.3.0`, the tag
 > they were checked against when this was written; they were re-checked at
-> `v2.3.2`, the tag now pinned, where the Fireworks adapter's `/v1/models`
-> construction, the alias handling in `core/bifrost.go` and the datasheet lookup
-> are unchanged (v2.3.1 and v2.3.2 change routing rules, fallback key pinning,
-> MCP, the Bedrock converter and dependencies, not this path).
+> `v2.4.0`, the tag now pinned, where the Fireworks adapter's `/v1/models`
+> construction, the alias handling, the datasheet lookup and the enrichment are
+> unchanged (v2.4.0 adds relays, Warp topics, new providers and Bedrock
+> converter fixes; `listModelsByKey`, `BackfillModels`, `ToBifrostListModelsResponse`,
+> `GetPricingEntryForModel` and `ApplyModelInfo` are byte-identical to `v2.3.2`).
+> The line numbers in this document are the `v2.4.0` ones.
 
 ## The bug
 
@@ -52,27 +54,29 @@ one the gateway serves. Fireworks documents the US routers
 list does not enumerate them. So even a perfect passthrough could deliver a
 context window and nothing else, and could deliver that for the base model only.
 
-**Hop 2.** `core/providers/fireworks/fireworks.go` at `transports/v2.3.0`,
-`ListModels`/`listModelsByKey` (lines 74-96): "Fireworks serverless has no
+**Hop 2.** `core/providers/fireworks/fireworks.go` at `transports/v2.4.0`,
+`ListModels`/`listModelsByKey` (lines 80-98, unchanged from `v2.3.0`): "Fireworks serverless has no
 usable OpenAI-style /v1/models endpoint ... so models are sourced from config
 rather than a live API call". It passes the key's `models`, `blacklisted_models`
 and `aliases` to `OpenAIListModelsResponse{}.ToBifrostListModelsResponse` with
 an empty response, so every entry comes from `BackfillModels`
-(`core/providers/utils/models.go:350-383`), which sets only `ID`, `Name` and
+(`core/providers/utils/models.go:350`), which sets only `ID`, `Name` and
 `Alias`. I reproduced it by running `listModelsByKey` from the v2.3.0 checkout
 with this repo's key config; it returns exactly the bare entry above.
-`ToBifrostListModelsResponse` (`core/providers/openai/models.go:34-48`) would
+`ToBifrostListModelsResponse` (`core/providers/openai/models.go:11-51`) would
 copy `context_window` from a live response, but this provider never has one.
 The upstream passthrough work (issue #8914, PR #9201, both open) is about that
 live-response path and is not merged, so it would not reach this provider even
 after a bump.
 
 **Hop 3.** The only thing that fills a Fireworks entry is
-`enrichListModelsResponse` (`transports/bifrost-http/handlers/inference.go:1119`),
-a fill-only backfill: it looks the entry up with
+`ModelCatalog.EnrichListModelsResponse`
+(`transports/bifrost-http/handlers/inference.go:1043`, the method at
+`framework/modelcatalog/modelinfo.go:49`), a fill-only backfill: it looks the
+entry up with
 `catalog.GetPricingEntryForModel(<listed name>, fireworks)`, then with the
 alias value, and applies `ApplyModelInfo`
-(`framework/modelcatalog/modelinfo.go:61`). The catalog is the public
+(`framework/modelcatalog/modelinfo.go:92`). The catalog is the public
 datasheet <https://getbifrost.ai/datasheet> (`DefaultURL`,
 `framework/modelcatalog/datasheet/store.go:19`), synced into the config store
 every 24 hours. I downloaded it on 2026-10-30 (5 641 rows) and loaded it
@@ -91,8 +95,13 @@ match on `model|provider|mode` (`datasheet/store.go:182`), so a near miss is a
 miss. That is the whole bug. The seven Bedrock `us.*` profiles each have a row
 (`bedrock/us.moonshotai.kimi-k3` and the other six), which is why they are rich.
 
+The datasheet was re-downloaded on 2026-11-04 and the same gap is there (5 714
+rows): `fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash-1017-us` is a
+row with $0.45 / $1.80 per 1M, 1 048 576 context and 393 216 max output, and
+`.../routers/deepseek-v4p1-flash-1017-us` is still absent.
+
 Catalog sync URL: `framework.pricing.pricing_url` is a supported config.json key
-(and accepts `file://`, `datasheet/sync.go:187`), so issue #3238's "hardcoded,
+(and accepts `file://`, `datasheet/sync.go:262`), so issue #3238's "hardcoded,
 no override" is out of date for the pricing datasheet at this tag. It is the
 heavy hook (replace the whole catalog, including Bedrock's rows with a file that
 goes stale until rebuilt), and it was not used.
@@ -100,7 +109,7 @@ goes stale until rebuilt), and it was not used.
 ## What the same gap does to cost
 
 Cost has the same gap. With no row, `resolvePricing`
-(`datasheet/cost.go:2229`) finds no base price and returns nil, so a request on
+(`datasheet/cost.go:2479`) finds no base price and returns nil, so a request on
 the router id is logged at cost 0 with no error. Reproduced on the v2.3.0 code:
 1M input + 1M output tokens on the router id prices at **$0** from the catalog
 alone. The gateway's per-key cost attribution has been recording zero for every
@@ -148,7 +157,7 @@ catalog-named entry needs **no change to the `gp-pi` extension**. The role names
 do not get this entry; they rely on item I, above.
 
 **Cost is fixed by the same edit.** Request cost resolves the alias's
-`model_name` first (`resolvePricing`, `datasheet/cost.go:2229`), so a request
+`model_name` first (`resolvePricing`, `datasheet/cost.go:2479`), so a request
 for the alias is priced from the catalog's own row for the `models/...-us` id.
 Measured on the v2.3.0 code: 1M in + 1M out through the alias costs **$2.25**
 ($0.45 + $1.80), from $0, with no pricing override. That row is the US-only
@@ -237,3 +246,14 @@ datasheet for the four ids above; the handler's lookup and `ApplyModelInfo` for
 the alias; `Store.CalculateCost` for a response routed through the alias (with
 and without `ResolvedKeyAlias`); and the real `ConfigData` parser plus
 `KeyAliases.Validate` over the new `config.json`.
+
+The re-check for `v2.4.0` on 2026-11-04 repeated the parts that could have moved:
+the datasheet (downloaded fresh), `listModelsByKey`, `BackfillModels`,
+`ToBifrostListModelsResponse`, `ModelCatalog.GetPricingEntryForModel` and
+`ApplyModelInfo` read at `transports/v2.4.0`, and the `config.json` provider and
+alias shape against that tag's `config.schema.json` (`providers.fireworks` and
+`$defs/provider` are byte-identical to `v2.3.2` apart from an added, unused
+`passthrough` block). `v2.4.0` also changed the list-models plumbing: the
+handler's private `enrichListModelsResponse` became
+`ModelCatalog.EnrichListModelsResponse`, so the integration and native list
+routes now share one enrichment. The lookup order is the same.

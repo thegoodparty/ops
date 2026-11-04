@@ -5,7 +5,8 @@
 > phase E of [`bifrost-gateway.md`](./bifrost-gateway.md), which is the
 > gateway's plan and the place to start: this document assumes the gateway, its
 > oauth2-proxy admin surface, its RDS config store and the image pinned at
-> `v2.3.0` described there, re-checked at `v2.3.2`, the tag now pinned. It changes
+> `v2.4.0` described there, read at `v2.3.0` and re-checked at `v2.3.2` and
+> `v2.4.0`. It changes
 > no code and no infrastructure.
 > Implementation PRs follow, and a PR names this document and the step it
 > implements in its body; progress is derived from those PRs and is not written
@@ -282,7 +283,7 @@ Every part of that is checked against the pinned source rather than assumed:
   reloads the key into the running gateway's governance manager before it
   answers.
 
-Routes, at `transports/v2.3.2`
+Routes, at `transports/v2.3.2` (unchanged at `v2.4.0`)
 (`transports/bifrost-http/handlers/governance.go`):
 
 | Call | Route |
@@ -775,7 +776,12 @@ Step: 2
 
 ## Cited so the next session can check
 
-In Bifrost, at the pinned tag `transports/v2.3.2`:
+In Bifrost, at `transports/v2.3.2`, which is the tag these lines were read at;
+the pin has since moved to `v2.4.0` and the line numbers cited below are the
+`v2.3.2` ones. What was re-checked at `v2.4.0`: every virtual-key route below
+still exists at the same path, `TableVirtualKey.MarshalJSON` still emits the
+plaintext `value` as a resolved plain string, and `CreateVirtualKeyRequest`
+gained only an optional `relay_grants` (this repo sets none):
 
 | Fact | Source |
 | --- | --- |
