@@ -616,6 +616,17 @@ third holds secret values:
    deployment actually provides. The mechanism, including a digest of the
    file's contents carried in the task definition so an edit rolls the task,
    is documented in `deploy-workbench/bifrost/README.md`.
+
+   **Amended 2026-11-04:** "an edit rolls the task" is no longer true of the
+   whole file, and this paragraph is the one that used to say so. As of step 1
+   of [`bifrost-reconciler.md`](./bifrost-reconciler.md) the digest covers only
+   the boot-only subset, so an edit to the live subset — a provider alias, a
+   model list, a weight — reaches the running task without a new revision and
+   without a restart. A `config_store`, `logs_store`, `encryption_key` or
+   `providers.*.keys[].value` edit still rolls the task, which is the same
+   restart the entry above describes. The README's digest section carries the
+   current split, and "Persistence, backup and upgrade" says the same thing in
+   the availability section above.
    `source_of_truth: "config.json"` makes the file authoritative for the
    sections it declares, so a redeploy converges to the repo instead of
    preserving UI drift; the upstream "missing vs empty" caveat in
