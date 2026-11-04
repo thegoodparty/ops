@@ -388,6 +388,58 @@ describe("the loop", () => {
     });
   });
 
+  it("never writes the admin account back, even when the server returns one", async () => {
+    // The one key the echo must not carry. `GET /api/config` includes
+    // `auth_config` whenever the admin row exists (bifrost/README.md, citing
+    // `getConfig`), and `config.json` provisions that row with `is_enabled:
+    // false`, so this gateway's read path returns it on every run. Echoing it
+    // would make every deploy a write to the admin block -- the thing the
+    // `governance` skip exists to refuse -- and what such a write does with a
+    // masked password is pinned nowhere in this repo.
+    //
+    // The fake returns a redacted block deliberately: a real one would carry the
+    // password, and the point is that neither shape reaches the PUT.
+    const { gateway, configPuts } = harness({
+      observedClient: { enable_logging: false },
+    });
+    const observedWithAuth = {
+      ...matchingObserved(),
+      client_config: { enable_logging: false },
+      auth_config: {
+        admin_username: "admin",
+        // Masked, hashed, or real -- the loop writes none of them.
+        admin_password: "********",
+        is_enabled: false,
+      },
+    };
+    const withAuth: ConfigGateway = {
+      ...gateway,
+      getConfig: async () => observedWithAuth,
+    };
+
+    await convergeConfig({
+      gateway: withAuth,
+      desired: liveConfigDesiredState(clientOnly()),
+    });
+
+    assert.equal(configPuts.length, 1, "the client edit still converges");
+    assert.ok(
+      !("auth_config" in configPuts[0]),
+      `the PUT body must not carry auth_config: ${JSON.stringify(Object.keys(configPuts[0]))}`,
+    );
+    // And the rest of the echo is intact: dropping the admin block must not be a
+    // licence to drop the settings the file does not name, which is why this is
+    // an echo at all.
+    assert.deepEqual(configPuts[0].framework_config, {
+      pricing_url: "https://example.test/pricing",
+    });
+    assert.deepEqual(configPuts[0].client_config, {
+      enable_logging: true,
+    });
+    // Nothing of the admin credential reaches the body in any other spelling.
+    assert.doesNotMatch(JSON.stringify(configPuts[0]), /admin_password/);
+  });
+
   it("applies a provider edit by merging onto the stored block", async () => {
     const { gateway, providerPuts } = harness({
       providers: {

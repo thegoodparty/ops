@@ -59,6 +59,14 @@
  * claim container, so it is applied today; this loop names it in `skipped` with
  * `env-reference` rather than silently dropping it.
  *
+ * And that refusal has to reach the client-config write, not only the skip list.
+ * `GET /api/config` includes `auth_config` whenever the admin row exists, so the
+ * echo that keeps the client config complete would otherwise carry the block
+ * every deploy — writing the admin account from a convergence loop, with a
+ * masked password of unknown meaning. `clientConfigBody` drops the key; see its
+ * comment. The refusal and the echo have to agree, or the loop does the thing it
+ * says it will not.
+ *
  * ## Why the diff is a counted number here too
  *
  * Decision 6's argument does not change with the caller. An unconditional
@@ -473,14 +481,39 @@ export const differingKeyFields = (
  * Never a fragment. See the header: the handler assigns several client fields
  * unconditionally, so a body carrying only what `config.json` names would clear
  * everything else the store holds.
+ *
+ * **`auth_config` is dropped, and it is the one key that is not an echo.**
+ * `GET /api/config` includes `auth_config` whenever the admin row exists
+ * (`bifrost/README.md`, "Bifrost's login is off", citing `handlers/config.go`'s
+ * `getConfig`), and `config.json` provisions that row with
+ * `is_enabled: false`, so on this gateway every deploy-triggered convergence
+ * would carry it. `PUT /api/config` decodes `auth_config` whenever the body
+ * carries it, which would make every deploy a write to the admin-account block —
+ * the exact thing this module's header says the loop refuses to do, and the
+ * reason `governance` is skipped as `env-reference` rather than converged.
+ *
+ * What that write would do is not pinned by anything in this repo: if the read
+ * path masks `admin_password`, the echo stores the mask as the credential; if the
+ * write path runs the password policy or a setup-token check, every deploy fails.
+ * Neither is a risk worth carrying for a block this loop has no business writing.
+ * An omitted block is left alone (`PUT /api/config` updates each field only when
+ * the raw body carried it, the rule the header already relies on for
+ * `network_config`), so dropping it is free.
+ *
+ * `bootstrap.sh` is the path that *does* write `auth_config`, deliberately, when
+ * claiming a store with no admin row. That is a human decision behind the setup
+ * token, not a convergence.
  */
 export const clientConfigBody = (
   observedConfig: Record<string, unknown>,
   desired: LiveClientConfig,
-): Record<string, unknown> => ({
-  ...observedConfig,
-  client_config: { ...record(observedConfig.client_config), ...desired },
-});
+): Record<string, unknown> => {
+  const { auth_config: _authConfig, ...rest } = observedConfig;
+  return {
+    ...rest,
+    client_config: { ...record(observedConfig.client_config), ...desired },
+  };
+};
 
 /**
  * The `PUT /api/providers/{provider}` body: the stored `network_config` with the
