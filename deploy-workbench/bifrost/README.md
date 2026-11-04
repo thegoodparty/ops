@@ -406,8 +406,11 @@ Validation has two halves, and the split is the point:
   preview and a test, in the credential-free job;
 - **membership** in the `Engineers` group is a directory read, so it runs in
   `scripts/preflight-governance.ts` from `deploy.sh`, before the apply that would
-  write the parameter. It assumes `bifrost-vk-reader` — the role both Lambdas
-  assume — and a directory read that fails is a non-zero exit, never a pass.
+  write the parameter. The deploy job cannot assume `bifrost-vk-reader` (the role
+  both Lambdas assume admits only them), so the check runs against a member set
+  supplied as `GOVERNANCE_OVERRIDES_MEMBERS`; without one the deploy logs that
+  membership was not checked. A directory read that fails is a non-zero exit,
+  never a pass, and an unknown email is named, not reported as an outage.
 
 Durations are Bifrost's own (`1d`, `1w`, `1M` = 30 days, `1Q`, `1Y`, or Go's
 `30s`, `5m`, `1h30m`); a lowercase `1q` is not a quarter there and is refused

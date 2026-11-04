@@ -16,6 +16,7 @@ import {
   formatCheckFailure,
   overridesPath,
   resolveMembership,
+  SHAPE_ONLY_NOTE,
 } from "./scripts/preflight-governance";
 import { isNoSuchUser } from "./scripts/aws-role";
 
@@ -272,14 +273,26 @@ describe("the deploy job can actually run it", () => {
     assert.match(assumeBlock, /pulumi-deploy/);
     assert.ok(!/bifrost-vk-reader/.test(assumeBlock));
 
-    // And the script reads the grant it needs before doing the read, so a
-    // caller without it takes the shape-only path instead of throwing.
+    // And the script takes the shape-only path when it holds no reader-role
+    // grant, instead of throwing. The reader-role branch is entered only through
+    // READER_ROLE_ARN, which no workflow sets. GOVERNANCE_CHECK_MEMBERSHIP used to
+    // route there too, and the message that named it told the deploy job to do
+    // the one thing it cannot (the review's finding, pinned below).
     const scriptSource = fs.readFileSync(
       path.resolve(__dirname, "scripts/preflight-governance.ts"),
       "utf8",
     );
-    assert.match(scriptSource, /GOVERNANCE_CHECK_MEMBERSHIP/);
+    assert.doesNotMatch(scriptSource, /GOVERNANCE_CHECK_MEMBERSHIP/);
     assert.match(scriptSource, /--members/);
+    assert.match(scriptSource, /GOVERNANCE_OVERRIDES_MEMBERS/);
+  });
+
+  it("never tells the deploy job to set a flag that assumes the reader role", () => {
+    // The advice printed on a shape-only success names a member-set remedy the
+    // deploy job can take, and not the flag that routes into createCliDirectory.
+    assert.doesNotMatch(SHAPE_ONLY_NOTE, /GOVERNANCE_CHECK_MEMBERSHIP/);
+    assert.match(SHAPE_ONLY_NOTE, /--members/);
+    assert.match(SHAPE_ONLY_NOTE, /GOVERNANCE_OVERRIDES_MEMBERS/);
   });
 
   it("takes an explicit member set, which is the form a caller without the grant uses", () => {

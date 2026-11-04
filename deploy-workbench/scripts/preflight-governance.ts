@@ -22,11 +22,12 @@ import { assumeRoleEnvironment, isNoSuchUser, runAws, tryRunAws } from "./aws-ro
  * runs as the admin deploy role (`pulumicons`'s whole design is that it is not
  * the reader).
  *
- * So this script makes the read the way the two Lambdas do, through
- * `bifrost-vk-reader` in the management account, and applies the same
- * validation with the member set it read. It runs in the deploy workflow before
- * the apply, on the first-hop credentials, which is the last moment before the
- * parameter is written with the email's override in it.
+ * So the membership read is made by whoever holds the grant, and this script
+ * applies the same validation to the member set it is given. The deploy job
+ * cannot hold it (`bifrost-vk-reader` admits only the two Lambdas), so the deploy
+ * passes that set through `GOVERNANCE_OVERRIDES_MEMBERS`, and a caller with the
+ * reader role can still read it itself. It runs in the deploy workflow before
+ * the apply, which is the last moment before the parameter is written.
  *
  * Why not in `npm test`: `deploy.yml` runs the suite in a job with no AWS
  * credentials and no OIDC token, deliberately, because the tests execute
@@ -151,6 +152,17 @@ export const checkOverridesAgainstDirectory = async (args: {
     })),
   ];
 };
+
+/**
+ * What a shape-only success says about membership. It is the line a deploy log
+ * shows, so it names the remedy the deploy job can actually take (`--members`,
+ * fed by `GOVERNANCE_OVERRIDES_MEMBERS`) and not the reader-role flag, which
+ * the deploy job cannot satisfy: the flag routes to `createCliDirectory`, which
+ * assumes `bifrost-vk-reader`, and that role's trust admits only the two
+ * Lambdas. Pinned by `preflight-governance.test.ts`.
+ */
+export const SHAPE_ONLY_NOTE =
+  "shape only; membership in Engineers was not checked, because no member set was given. Pass --members a@x,b@x, or set GOVERNANCE_OVERRIDES_MEMBERS in deploy.sh's environment, to check it. The reader-role check needs bifrost-vk-reader, which only the two Lambdas and a breakglass session can assume, so the deploy job cannot run it";
 
 /** The line a failed run prints, with the file named. */
 export const formatCheckFailure = (problems: readonly GovernanceProblem[]): string =>
@@ -332,11 +344,11 @@ const main = async (): Promise<void> => {
   // No member set and no reader role on this caller: the shape half is still
   // worth failing a deploy for, and the message says exactly what was and was
   // not checked so nobody reads a green run as proof of membership.
-  if (!process.env.READER_ROLE_ARN && !process.env.GOVERNANCE_CHECK_MEMBERSHIP) {
+  if (!process.env.READER_ROLE_ARN) {
     const problems = checkGovernanceOverrides(text);
     console.log(
       problems.length === 0
-        ? `${GOVERNANCE_OVERRIDES_FILE} is valid (shape only; membership in Engineers was not checked, because this caller holds no reader-role grant -- pass --members or GOVERNANCE_CHECK_MEMBERSHIP=1 to require it)`
+        ? `${GOVERNANCE_OVERRIDES_FILE} is valid (${SHAPE_ONLY_NOTE})`
         : formatCheckFailure(problems),
     );
     if (problems.length > 0) process.exitCode = 1;
