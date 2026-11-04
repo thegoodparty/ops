@@ -369,6 +369,20 @@ says, so the deploy's correctness does not depend on a flag or on a profile
 setting; `verify-convergence.test.ts` pins the real argument list, since the
 retry loop's injected invoke cannot see it.
 
+**Step 4 lands in two PRs, and this is the split.** Everything in
+`deploy-workbench/` — the poll, the contract module, the config half, the
+handler's reply shape — is one PR, because that tree is de-owned and its
+failures are all in one place. The workflow change that *calls* the poll is a
+second PR, because `.github/workflows/` stays human code-owner owned: a workflow
+added on `main` can assume the deploy roles (OIDC trust keys on the ref, not the
+filename), so the file that decides what runs with a credential keeps a human
+behind it. The order is A then B, not a preference: the step invokes
+`scripts/verify-convergence.ts`, so a B that landed first would call a script
+that is not on `main` yet. The script is inert until the workflow calls it,
+which is what makes A safe to merge alone — and why the two ordering assertions
+in `deploy-workflow-order.test.ts` are written as "where the step is present"
+on A and become unconditional on B.
+
 **`reservedConcurrentExecutions: 1` turns a collision into a failed deploy.**
 The function is capped at one concurrent execution (`bifrost-vk-janitor.ts:120`)
 so a reconcile cannot read its own partial state, and that cap stays. But a
@@ -961,6 +975,32 @@ that are now stale.
    task inside one deploy run with the same task ARN, a deliberately broken
    convergence fails the run, and a tick that is already running when the deploy
    invokes does not fail the run.
+
+   **Two PRs, and the order is load-bearing.** The step lands as A then B rather
+   than as one change:
+
+   - **4a, `deploy-workbench/` and this document.** The poll
+     (`scripts/verify-convergence.ts`), the timing contract
+     (`bifrost/vk-janitor-contract.ts`), the scheduled rule at five minutes, the
+     config-convergence half, and the handler's reply shape. This tree is
+     de-owned, so it merges on the delegate reviewer's approval.
+   - **4b, `.github/workflows/deploy-workbench.yml` only.** The converge step and
+     the job's `timeout-minutes` going 20 → 30. `.github/workflows/` stays human
+     code-owner owned on purpose: OIDC trust keys on the ref rather than the
+     filename, so a workflow added on `main` can assume the deploy roles, and
+     the file that decides what runs with a credential keeps a human behind it.
+     De-owning it to make this step merge faster would be the security change
+     the opt-out list's own rules say needs a human reviewer, and the list is
+     deliberately as short as it is.
+
+   The order is not a convenience. The step runs
+   `scripts/verify-convergence.ts`, so a B that landed before A would call a
+   script that is not on `main`. The script is inert until the workflow calls
+   it, which is what makes A safe to merge on its own: nothing in
+   `deploy-workbench/` invokes it in production until B lands. `Plan:`/`Step:` in
+   both PR bodies name this step, so the status gate reads one step from two
+   PRs; A's body says the workflow moved to B and why, so a reader who expected
+   one PR is not left guessing.
 5. **The minter applies overrides at create.** `bifrost/vk-mint-core.ts` and its
    handler compute the same desired state for the caller's email, so a new key
    starts converged and the first reconciler tick has nothing to do. Proves: a

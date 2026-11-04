@@ -246,7 +246,13 @@ describe("the retry window the script uses", () => {
     );
   });
 
-  it("is a step in the workflow, after the service check and before Bedrock", () => {
+  it("is wired into the workflow's step once that step exists", () => {
+    // The ordering rule is `deploy-workflow-order.test.ts`'s, and it lives in
+    // `deploy-workbench/` for exactly that reason. This copy stays only as far as
+    // it can: the script and the step are one change, but they are two PRs, and
+    // the workflow one is human-reviewed on its own. So the assertion is the
+    // ordering where the step is present, and the absence where it is not; the
+    // workflow PR restores it to unconditional.
     const workflow = fs.readFileSync(
       path.resolve(__dirname, "../.github/workflows/deploy-workbench.yml"),
       "utf8",
@@ -254,7 +260,13 @@ describe("the retry window the script uses", () => {
     const converge = workflow.indexOf(
       "- name: Converge the running gateway to the committed configuration",
     );
-    assert.notEqual(converge, -1, "no convergence step");
+    if (converge === -1) {
+      // Not there yet: this is the PR with the script, not the PR with the step.
+      // Assert the absence is a real absence rather than a renamed step, so a
+      // typo in a later PR fails here instead of passing by being invisible.
+      assert.doesNotMatch(workflow, /scripts\/verify-convergence\.ts/);
+      return;
+    }
 
     const service = workflow.indexOf(
       "- name: Verify the service returned to a steady state",
