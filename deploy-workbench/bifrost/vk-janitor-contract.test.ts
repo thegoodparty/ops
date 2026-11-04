@@ -143,26 +143,16 @@ describe("the deploy's retry window", () => {
     assert.match(problems[0], /must be positive/);
   });
 
-  it("is the number the workflow passes when it runs the poll", () => {
+  it("is what the workflow actually passes", () => {
     // A module constant nothing reads is a comment. The step passes the window
     // explicitly, and the value is the same number.
     //
-    // The step itself lands with the workflow change, not with this module: the
-    // script and its budget are `deploy-workbench/`'s, and the workflow that
-    // calls them is human code-owner reviewed in its own PR. So this asserts the
-    // match where the step exists, and says so where it does not yet — deleting
-    // the workflow from this PR must not delete the fact that the two numbers
-    // are one number once the step is there.
+    // Strict on this branch, which is the one that adds the step; the branch
+    // that adds the script alone reads it tolerantly and says why.
     const step = /- name: Converge the running gateway to the committed configuration([\s\S]*?)(?:\n {6}- |$)/.exec(
       WORKFLOW_SOURCE,
     );
-    if (!step) {
-      // Pin the absence deliberately rather than skipping silently: if the step
-      // is gone, the number here is still the number the script defaults to, and
-      // `VK_JANITOR_RETRY_WINDOW_SECONDS` is asserted above.
-      assert.doesNotMatch(WORKFLOW_SOURCE, /scripts\/verify-convergence\.ts/);
-      return;
-    }
+    assert.ok(step, "the workflow has no convergence step");
     assert.match(
       step[1],
       new RegExp(

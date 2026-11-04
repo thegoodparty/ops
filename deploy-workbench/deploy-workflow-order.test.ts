@@ -448,29 +448,21 @@ describe("deploy-workbench.yml deploy health checks", () => {
   /**
    * Step 4 of `docs/bifrost-reconciler.md`: the post-apply invoke.
    *
-   * **This assertion moved to the PR that changes the workflow.** Order is the
-   * rule, so the test stays here; the step's *content* is the other PR's
-   * subject, and a suite that asserted a step this branch does not add would be
-   * red on a branch that is correct. What is left, below, is the rule that holds
-   * either way: if the step exists it must sit in the right place and must not
-   * have grown a skip path. It becomes the full assertion by reading the step
-   * with no tolerance once the workflow lands, which is the same test with the
-   * `if the step exists` bracket removed.
+   * The invariant is the same shape as the health check's and for a sharper
+   * reason. Step 1 narrowed `BIFROST_CONFIG_VERSION` to the boot-only subset, so
+   * a live config edit no longer registers a task-definition revision and no
+   * longer restarts the task: this step is the *only* thing that applies it. A
+   * step that could skip, warn, or continue past a failed convergence would be
+   * green over a config that never landed, which is the `75d30ae` class of bug
+   * with a new mechanism.
+   *
+   * Strict here, and tolerant on the branch that adds the script without the
+   * step: this is the PR that adds the step, so the step existing is this PR's
+   * claim to make.
    */
-  it("keeps the converge step, when it is there, after the service check and before Bedrock", () => {
+  it("converges the running gateway after the service check, and fails on anything but converged", () => {
     const name = "Converge the running gateway to the committed configuration";
-    const convergeAt = steps().findIndex((step) => step.name === name);
-    if (convergeAt === -1) {
-      // The workflow in this checkout has no converge step: this is the branch
-      // that adds the script and the poll but not the workflow step that calls
-      // it, and the step is inert until the workflow does. The ordering rule has
-      // nothing to order.
-      //
-      // The PR that adds the step replaces this branch with the strict version;
-      // see the test's doc comment. Nothing else in this file depends on the
-      // step existing, which is what makes the split safe.
-      return;
-    }
+    const convergeAt = stepIndex(name);
     assert.ok(
       convergeAt > stepIndex("Deploy"),
       "the converge step must run after the apply it is confirming",
@@ -515,22 +507,9 @@ describe("deploy-workbench.yml deploy health checks", () => {
     // own `timeout-minutes` has to cover them plus a normal apply, or a slow but
     // legal run gets killed and loses its diagnosis.
     //
-    // **Split by which PR owns which number.** The converge step's window is part
-    // of the sum only once the workflow calls it. Two things are asserted, and
-    // the second is the one the original test was really protecting:
-    //
-    // 1. Always: the timeout covers every bounded wait plus a ten-minute budget
-    //    for the apply and the image builds. On the branch that adds the script
-    //    but not the step, that is the health check alone against the 20-minute
-    //    job main already has, and it holds.
-    // 2. When the converge step is present: the timeout must leave *slack* on top
-    //    of that, because adding a bounded wait without raising the timeout is
-    //    the killed-run failure this test exists to catch. The workflow PR
-    //    raises it to 30 minutes and this is the assertion it satisfies.
-    //
-    // Splitting it this way rather than deleting it means the rule is never
-    // unasserted: whichever branch you are on, the sum is checked against the
-    // timeout that branch actually ships.
+    // Strict on this branch: the converge step and the 20 -> 30 bump are the same
+    // change, so a converge step that appears without the bump is exactly the
+    // killed-run failure this test exists to catch.
     const APPLY_FLOOR_SECONDS = 600;
     const timeoutMatch = /^ {4}timeout-minutes: (\d+)$/m.exec(SOURCE);
     assert.ok(timeoutMatch, "the deploy job has no timeout-minutes");
@@ -543,34 +522,20 @@ describe("deploy-workbench.yml deploy health checks", () => {
     );
     assert.ok(serviceTimeout > 0, "the health check must bound its own wait");
 
-    const convergeStep = steps().find(
-      (step) =>
-        step.name === "Converge the running gateway to the committed configuration",
+    const convergeStep = stepNamed(
+      "Converge the running gateway to the committed configuration",
     );
-    // One run of up to the function's timeout on top of the retry window, and
-    // only when there is a step that retries.
-    const convergeBudget = convergeStep
-      ? Number(
-          /--retry-window-seconds\s+(\d+)/.exec(convergeStep.body)?.[1] ?? 0,
-        ) + 120
-      : 0;
-    if (convergeStep) {
-      assert.ok(
-        convergeBudget > 120,
-        "the converge step is present, so its window must be an explicit number",
-      );
-    }
+    const retryWindow = Number(
+      /--retry-window-seconds\s+(\d+)/.exec(convergeStep.body)?.[1] ?? 0,
+    );
+    assert.ok(retryWindow > 0, "the converge step must bound its retries");
+    // One run of up to the function's timeout on top of the retry window.
+    const convergeBudget = retryWindow + 120;
 
     const bounded = serviceTimeout + convergeBudget + APPLY_FLOOR_SECONDS;
     assert.ok(
-      bounded <= jobSeconds,
-      `the post-apply checks plus an apply budget (${bounded}s) do not fit inside the job's ${jobSeconds}s`,
+      bounded < jobSeconds,
+      `a converge step added without raising the timeout is a run killed at ${jobSeconds}s with its own diagnosis lost; the sum is ${bounded}s`,
     );
-    if (convergeStep) {
-      assert.ok(
-        bounded < jobSeconds,
-        `a converge step added without raising the timeout is a run killed at ${jobSeconds}s with its own diagnosis lost; the sum is ${bounded}s`,
-      );
-    }
   });
 });
