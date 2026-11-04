@@ -673,3 +673,11 @@ export const vkBifrostJanitorFunctionArn = vkJanitor.function.arn;
 
 /** The EventBridge rule's name, so step 5's check does not start with a hunt. */
 export const vkBifrostJanitorScheduleRuleName = vkJanitor.rule.name;
+
+/**
+ * The failure alarm and the topic it publishes to, exported so the stack's
+ * outputs name them: an alarm nobody can find is an alarm nobody answers, and
+ * the runbook entry quotes the topic's subscription address.
+ */
+export const vkBifrostJanitorAlarmName = vkJanitor.janitorAlarm.name;
+export const vkBifrostJanitorAlertTopicArn = vkJanitor.alertTopic.arn;

@@ -22,6 +22,9 @@ import {
   VK_READER_ROLE_ARN,
 } from "./bifrost-vk-mint";
 import {
+  VK_JANITOR_ALARM_DESCRIPTION,
+  VK_JANITOR_ALARM_EVALUATION_PERIODS,
+  VK_JANITOR_ALERT_EMAIL,
   VK_JANITOR_FUNCTION_DESCRIPTION,
   VK_JANITOR_FUNCTION_NAME,
   VK_JANITOR_INTERVAL_MINUTES,
@@ -256,6 +259,8 @@ describe("the function, its schedule and its network", () => {
     assert.match(INDEX_SOURCE, /createBifrostVkJanitor\(\{\s*provider,\s*network\s*\}\)/);
     assert.match(INDEX_SOURCE, /export const vkBifrostJanitorFunctionArn/);
     assert.match(INDEX_SOURCE, /export const vkBifrostJanitorScheduleRuleName/);
+    assert.match(INDEX_SOURCE, /export const vkBifrostJanitorAlarmName/);
+    assert.match(INDEX_SOURCE, /export const vkBifrostJanitorAlertTopicArn/);
   });
 });
 
@@ -313,6 +318,12 @@ describe("the descriptions stay inside the limits the services enforce", () => {
       max: 1000,
       from: "iam:CreateRole, Description: 'Maximum length of 1000'",
     },
+    {
+      what: "the alarm's description",
+      value: VK_JANITOR_ALARM_DESCRIPTION,
+      max: 1024,
+      from: "cloudwatch:PutMetricAlarm, AlarmDescription: 'Maximum length of 1024'",
+    },
   ];
 
   it("keeps every one of them under its limit", () => {
@@ -328,6 +339,7 @@ describe("the descriptions stay inside the limits the services enforce", () => {
     assert.match(SOURCE, /description:\s*VK_JANITOR_FUNCTION_DESCRIPTION/);
     assert.match(SOURCE, /description:\s*VK_JANITOR_RULE_DESCRIPTION/);
     assert.match(SOURCE, /description:\s*VK_JANITOR_ROLE_DESCRIPTION/);
+    assert.match(SOURCE, /alarmDescription:\s*VK_JANITOR_ALARM_DESCRIPTION/);
   });
 
   /**
@@ -505,6 +517,60 @@ describe("the shared secret and the grants", () => {
     assert.equal(vkJanitorEnvironment().CONFIG_PARAMETER_NAME, BIFROST_CONFIG_PARAMETER_NAME);
     assert.match(SOURCE, /CONFIG_PARAMETER_NAME:\s*BIFROST_CONFIG_PARAMETER_NAME/);
     assert.ok((RECONCILER_PARAMETERS as readonly string[]).includes(BIFROST_CONFIG_PARAMETER_NAME));
+  });
+});
+
+describe("the three-consecutive-failure alarm (step 6)", () => {
+  it("counts three consecutive failing runs, not a rate over time", () => {
+    // The plan's success criterion 7 is "a stuck reconciler pages". A rate
+    // statistic would page on a burst and sleep through a steady stream of
+    // failures, which is the shape a stuck reconciler actually has: one failed
+    // run every five minutes, forever. Consecutive `Errors` with
+    // evaluationPeriods 3 is the metric that describes it.
+    assert.match(SOURCE, /metricName:\s*"Errors"/);
+    assert.match(SOURCE, /evaluationPeriods:\s*VK_JANITOR_ALARM_EVALUATION_PERIODS/);
+    assert.match(SOURCE, /threshold:\s*1/);
+    assert.equal(VK_JANITOR_ALARM_EVALUATION_PERIODS, 3);
+  });
+
+  it("treats no data as not breaching", () => {
+    // A function that has not run yet publishes no Errors datapoint. Missing
+    // data is the young-account case, not a failure, and the spend-alert
+    // comment in `index.ts` records the same trap for forecasts.
+    assert.match(SOURCE, /treatMissingData:\s*"notBreaching"/);
+  });
+
+  it("publishes to an SNS topic that subscribes the workbench address", () => {
+    // CloudWatch alarms cannot email directly; the account's spend alerts use
+    // Budgets' own subscriber field, which an alarm has no equivalent of. This
+    // is therefore the account's first alarm-to-email wire, modelled on the
+    // infrastructure account's `sheriff-lambda.ts`.
+    assert.match(SOURCE, /new aws\.sns\.Topic\(/);
+    assert.match(SOURCE, /new aws\.sns\.TopicSubscription\(/);
+    assert.match(SOURCE, /protocol:\s*"email"/);
+    assert.match(SOURCE, /endpoint:\s*VK_JANITOR_ALERT_EMAIL/);
+    assert.equal(VK_JANITOR_ALERT_EMAIL, "aws-workbench@goodparty.org");
+  });
+
+  it("lets CloudWatch publish to the topic, and only this account", () => {
+    // The default topic policy does not admit the CloudWatch service
+    // principal, so without this the alarm fires and nothing is delivered.
+    assert.match(SOURCE, /Principal:\s*\{ Service: "cloudwatch\.amazonaws\.com" \}/);
+    assert.match(SOURCE, /SNS:Publish/);
+    assert.match(SOURCE, /"aws:SourceAccount"/);
+    // Conditioned on this account, not the alarm ARN: naming the alarm would
+    // make the topic policy and the alarm depend on each other.
+    assert.doesNotMatch(SOURCE, /aws:SourceArn/);
+  });
+
+  it("alarms on the reconciler function's own errors, and takes the action", () => {
+    assert.match(SOURCE, /namespace:\s*"AWS\/Lambda"/);
+    assert.match(SOURCE, /dimensions:\s*\{\s*FunctionName/);
+    assert.match(SOURCE, /alarmActions:\s*\[alertTopic\.arn\]/);
+  });
+
+  it("is returned from the constructor, so a caller can wire or read it", () => {
+    assert.match(SOURCE, /return \{[^}]*janitorAlarm/s);
   });
 });
 

@@ -205,6 +205,36 @@ export const VK_JANITOR_ROLE_DESCRIPTION =
   "Bifrost reconcile loop: deactivates virtual keys whose owner has left the Engineers group and converges every managed key to the committed governance (steps 5 of docs/bifrost-virtual-keys.md and 3 of docs/bifrost-reconciler.md).";
 
 /**
+ * The address the failure alarm emails. The same group alias the spend alerts
+ * use (`index.ts`, `SPEND_ALERT_EMAIL`), because it is the same operator
+ * question — "something in the workbench account is wrong" — and a second alias
+ * would split the answer in two.
+ */
+export const VK_JANITOR_ALERT_EMAIL = "aws-workbench@goodparty.org";
+
+/**
+ * How many consecutive failing runs mean "stuck". Three, per the plan's step 6
+ * and decision 15, at a five-minute cadence: fifteen minutes of a reconciler
+ * that cannot converge, with two more runs already observed than a single
+ * transient needs.
+ *
+ * Consecutive rather than a rate, deliberately. A rate statistic pages on a
+ * burst and sleeps through a steady trickle, and a stuck reconciler is a
+ * trickle: one failure every five minutes until someone acts. `Errors` summed
+ * over three consecutive periods of one failure each is the metric that
+ * describes that shape, and it does not fire on a single bad run.
+ */
+export const VK_JANITOR_ALARM_EVALUATION_PERIODS = 3;
+
+/**
+ * The alarm's own name and description, named from the function so the alarm,
+ * the function and the runbook entry are one string a reader can search.
+ */
+export const VK_JANITOR_ALARM_NAME = `${VK_JANITOR_NAME}-not-converging`;
+export const VK_JANITOR_ALARM_DESCRIPTION =
+  `The Bifrost reconciler has failed ${VK_JANITOR_ALARM_EVALUATION_PERIODS} consecutive runs, so gateway config and virtual-key governance are drifting from the committed state. Answer: docs/runbooks.md, "The Bifrost reconciler is not converging".`;
+
+/**
  * The non-secret configuration: the gateway's private address, the setup-token
  * container's name and JSON key, and the reader role's ARN and session name.
  * The token itself is not here and never will be, because a Lambda environment
@@ -590,6 +620,107 @@ export const createBifrostVkJanitor = (args: {
     { provider },
   );
 
+  // Step 6: the failure alarm, and the wire that gets its message out.
+  //
+  // CloudWatch alarms cannot email directly. The account's spend alerts
+  // (`index.ts`, step 13) use Budgets' own `subscriberEmailAddresses` field,
+  // which a `MetricAlarm` has no equivalent of, so this is the account's first
+  // alarm-to-email wire. It follows the infrastructure account's
+  // `sheriff-lambda.ts` and `group-sync-lambda.ts`, which is the pattern that
+  // already works here: a topic, an email subscription, a topic policy that
+  // admits the CloudWatch principal, and the alarm publishing to it.
+  //
+  // The subscription stays unconfirmed until someone accepts the AWS email,
+  // exactly as the sheriff's does. That is a manual step and the PR body says
+  // so; an unconfirmed subscription means the alarm fires and nobody is told.
+  const alertTopic = new aws.sns.Topic(
+    "bifrostVkJanitorAlertTopic",
+    {
+      name: VK_JANITOR_ALARM_NAME,
+      tags,
+    },
+    { provider },
+  );
+
+  new aws.sns.TopicSubscription(
+    "bifrostVkJanitorAlertSubscription",
+    {
+      topic: alertTopic.arn,
+      protocol: "email",
+      endpoint: VK_JANITOR_ALERT_EMAIL,
+    },
+    { provider },
+  );
+
+  // CloudWatch publishes to the topic as the CloudWatch service principal,
+  // which the default topic policy does not admit. The condition is the
+  // account, not the alarm ARN: naming the alarm would make the topic policy
+  // and the alarm depend on each other, and `sheriff-lambda.ts` records the
+  // same reasoning.
+  new aws.sns.TopicPolicy(
+    "bifrostVkJanitorAlertTopicPolicy",
+    {
+      arn: alertTopic.arn,
+      policy: alertTopic.arn.apply((topicArn) =>
+        JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Sid: "CloudWatchAlarms",
+              Effect: "Allow",
+              Principal: { Service: "cloudwatch.amazonaws.com" },
+              Action: "SNS:Publish",
+              Resource: topicArn,
+              Condition: {
+                StringEquals: {
+                  "aws:SourceAccount": WORKBENCH_ACCOUNT_ID,
+                },
+              },
+            },
+          ],
+        }),
+      ),
+    },
+    { provider },
+  );
+
+  // The function's own `Errors` metric, three consecutive periods of at least
+  // one error. `Errors` is what Lambda increments when the handler rethrows,
+  // and the handler rethrows a `JanitorFailure` on purpose for exactly this
+  // counter (`bifrost/vk-janitor-handler.ts`: "rethrows, so the invocation
+  // fails and step 6's alarm can count it"). It is the metric the plan names.
+  //
+  // Throttles are deliberately not this alarm's job: a `TooManyRequestsException`
+  // from the deploy's invoke is a scheduling collision, which the deploy's
+  // poll retries, and the plan keeps the two signals separate ("a throttle is
+  // counted separately and loudly enough to be seen"). Nothing counts throttles
+  // here yet, and the step entry records it rather than this comment implying
+  // otherwise.
+  const janitorAlarm = new aws.cloudwatch.MetricAlarm(
+    "bifrostVkJanitorNotConvergingAlarm",
+    {
+      name: VK_JANITOR_ALARM_NAME,
+      alarmDescription: VK_JANITOR_ALARM_DESCRIPTION,
+      namespace: "AWS/Lambda",
+      metricName: "Errors",
+      dimensions: { FunctionName: fn.name },
+      statistic: "Sum",
+      // One period is one scheduled tick, so three periods is three consecutive
+      // failing runs rather than fifteen minutes of wall clock that could span
+      // a successful run.
+      period: VK_JANITOR_INTERVAL_MINUTES * 60,
+      evaluationPeriods: VK_JANITOR_ALARM_EVALUATION_PERIODS,
+      threshold: 1,
+      comparisonOperator: "GreaterThanOrEqualToThreshold",
+      // A reconciler that has not run yet publishes no `Errors` datapoint.
+      // Missing data is the young-account case, not a failure.
+      treatMissingData: "notBreaching",
+      alarmActions: [alertTopic.arn],
+      tags,
+    },
+    { provider, dependsOn: [alertTopic, fn] },
+  );
+
   return {
     function: fn,
     role,
@@ -597,5 +728,7 @@ export const createBifrostVkJanitor = (args: {
     securityGroup,
     logGroup,
     rule,
+    alertTopic,
+    janitorAlarm,
   };
 };
