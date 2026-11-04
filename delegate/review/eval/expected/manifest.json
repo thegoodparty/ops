@@ -254,5 +254,83 @@
     "split": "holdout",
     "source": "simulated",
     "kind": "bug"
+  },
+  {
+    "id": "omni-3004-admin-action-rejects-serve",
+    "key": "reviews/thegoodparty/omni/3004/e21744093841dffd2f8c48fc8b17cfcad8dab661/847e1ab1-3815-4a38-8a8a-ccbcaed30adb.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/testFixtures/testFixturesVendorMocks.controller.ts",
+        "packages/gp-api/src/testFixtures/services/testFixtures.service.ts"
+      ]
+    },
+    "tests": "The new POST test-fixtures/vendor-mocks/outreach/:id/admin-actions route runs assertOutreachOwner, which 404s any outreach row with a null campaignId, while the same PR's applyOutreachAdminAction accepts null campaignId. Serve sends are org-scoped with campaignId null, so the route is dead for the Serve outreach it was built to drive. Production approved; ecf00407de fixed it.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-3298-abandoned-resend-hidden",
+    "key": "reviews/thegoodparty/omni/3298/52fb25fc9c4782ba6690ded20915d627fc6b4432/3d66b647-952c-43ef-a00b-9ea7b1398bb4.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/outreach/services/outreachRobocall.service.ts",
+        "packages/gp-api/src/outreach/services/outreach.service.ts"
+      ]
+    },
+    "tests": "Resending a payment-failed robocall runs convertDraft, which moves settleState from hold_failed to pending_payment before payment. If the candidate leaves the pay step, findByScope hides the row (it shows pending_payment only for a hold_failed robocall) and the cancel sweep only claims hold_failed rows, so the send vanishes from history and cannot be resent. Production approved; b1f7b4ae58 fixed it.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2588-hold-skips-free-texts",
+    "key": "reviews/thegoodparty/omni/2588/44a4370a508555f01d81ebc5c850bc7dd20241e1/61d0182f-86c2-4038-bdcd-a119d263fc80.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/outreach/services/outreachPurchase.service.ts",
+        "packages/gp-api/src/payments/services/purchase.service.ts"
+      ]
+    },
+    "tests": "With WIN_SMS_HOLD_BILLING on, the hold path prices a free-texts-eligible P2P send (5,000 contacts or fewer) at the undiscounted amount, while SmsReviewStep still computes isFree and calls complete-free-purchase, which purchase.service rejects for a non-zero amount. The send can never go out. Production approved; dcd48fb923 (#2811) fixed it.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2702-multi-office-skip",
+    "key": "reviews/thegoodparty/omni/2702/99c785718cbb1e28d374f6c5cadfd67b50f18075/10d1b0d8-c5cc-48f0-bd0f-ef20133a4b9b.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked on a multi-office org silently skipping a community issue in priorityOnboarding.service.ts. ElectedOffice.organizationSlug is @unique, so an org holds one office and the path cannot happen; the reviewer's own earlier run at this sha falsified the same lead. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "omni-2986-vitest-undefined-key",
+    "key": "reviews/thegoodparty/omni/2986/27404f2505d3c9bbfa7f34cf1060ed6212ac10b3/89e02f95-e5d9-41a9-9903-7b9c880fcdbd.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked claiming clerk-auth.service.test.ts would break because verifyToken now gets an options key set to undefined. Vitest's toHaveBeenCalledWith uses non-strict equality, so an undefined key matches a missing one, and the tests passed. The prior commit's review falsified the same lead. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "gp-data-platform-1235-serve-month-start",
+    "key": "reviews/thegoodparty/gp-data-platform/1235/ba6ccefc0965d3c93ea73de1b5ae0a9d39bb75c8/7abd6ec1-adb2-4313-a25f-545a9822dcc7.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked saying the Serve month grid in user_lookup_peer_grids.sql drops steps before serve_started_at. That is the documented intent: the model's yaml says the grid runs from the signup or Serve start month to today. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
   }
 ]
