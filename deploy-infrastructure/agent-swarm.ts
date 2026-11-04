@@ -40,6 +40,78 @@ const listFiles = (dir: string): string[] =>
     )
     .sort();
 
+// gp-api ingests a wave's Scale to Win export from this prefix; its bucket
+// policy grants the other half, since the buckets live in the management
+// account. Write-only: the swarm never reads replies back.
+export const panelRepliesPutStatement = {
+  Sid: "PutPanelReplies",
+  Effect: "Allow",
+  Action: "s3:PutObject",
+  Resource: [
+    "arn:aws:s3:::tevyn-poll-csvs-develop/agent-replies/*",
+    "arn:aws:s3:::tevyn-poll-csvs-master/agent-replies/*",
+  ],
+};
+
+// The host role's inline policy, kept pure so a test can read its statements.
+export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "ReadSwarmSecret",
+      Effect: "Allow",
+      Action: "secretsmanager:GetSecretValue",
+      Resource: secretArn,
+    },
+    {
+      Sid: "ContainerLogs",
+      Effect: "Allow",
+      Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      Resource: [
+        `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/delegate-swarm/*`,
+        `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/delegate-swarm/*:log-stream:*`,
+      ],
+    },
+    {
+      Sid: "ReadHostFiles",
+      Effect: "Allow",
+      Action: "s3:GetObject",
+      Resource: `${bucketArn}/host/*`,
+    },
+    {
+      Sid: "ListHostFiles",
+      Effect: "Allow",
+      Action: "s3:ListBucket",
+      Resource: bucketArn,
+      Condition: { StringLike: { "s3:prefix": ["host/*", "host/"] } },
+    },
+    // The SSM agent uploads run output with a bucket-owner ACL and
+    // checks the bucket's encryption first.
+    {
+      Sid: "WriteSsmOutput",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:PutObjectAcl"],
+      Resource: `${bucketArn}/ssm-output/*`,
+    },
+    panelRepliesPutStatement,
+    {
+      Sid: "ReadBucketEncryption",
+      Effect: "Allow",
+      Action: "s3:GetEncryptionConfiguration",
+      Resource: bucketArn,
+    },
+    // The agents' production reads go through this role in the
+    // management account; worker containers reach the instance
+    // role through IMDS, which is why the hop limit is 2.
+    {
+      Sid: "AssumeProdRead",
+      Effect: "Allow",
+      Action: "sts:AssumeRole",
+      Resource: PROD_READ_ROLE_ARN,
+    },
+  ],
+});
+
 export const hostFiles = () =>
   listFiles(HOST_DIR).map((file) => path.relative(HOST_DIR, file));
 
@@ -210,62 +282,7 @@ export const createAgentSwarm = (args: {
       policy: pulumi
         .all([secret.arn, configBucket.arn])
         .apply(([secretArn, bucketArn]) =>
-          JSON.stringify({
-            Version: "2012-10-17",
-            Statement: [
-              {
-                Sid: "ReadSwarmSecret",
-                Effect: "Allow",
-                Action: "secretsmanager:GetSecretValue",
-                Resource: secretArn,
-              },
-              {
-                Sid: "ContainerLogs",
-                Effect: "Allow",
-                Action: ["logs:CreateLogStream", "logs:PutLogEvents"],
-                Resource: [
-                  `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/delegate-swarm/*`,
-                  `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/delegate-swarm/*:log-stream:*`,
-                ],
-              },
-              {
-                Sid: "ReadHostFiles",
-                Effect: "Allow",
-                Action: "s3:GetObject",
-                Resource: `${bucketArn}/host/*`,
-              },
-              {
-                Sid: "ListHostFiles",
-                Effect: "Allow",
-                Action: "s3:ListBucket",
-                Resource: bucketArn,
-                Condition: { StringLike: { "s3:prefix": ["host/*", "host/"] } },
-              },
-              // The SSM agent uploads run output with a bucket-owner ACL and
-              // checks the bucket's encryption first.
-              {
-                Sid: "WriteSsmOutput",
-                Effect: "Allow",
-                Action: ["s3:PutObject", "s3:PutObjectAcl"],
-                Resource: `${bucketArn}/ssm-output/*`,
-              },
-              {
-                Sid: "ReadBucketEncryption",
-                Effect: "Allow",
-                Action: "s3:GetEncryptionConfiguration",
-                Resource: bucketArn,
-              },
-              // The agents' production reads go through this role in the
-              // management account; worker containers reach the instance
-              // role through IMDS, which is why the hop limit is 2.
-              {
-                Sid: "AssumeProdRead",
-                Effect: "Allow",
-                Action: "sts:AssumeRole",
-                Resource: PROD_READ_ROLE_ARN,
-              },
-            ],
-          }),
+          JSON.stringify(swarmHostPolicy(secretArn, bucketArn)),
         ),
     },
     { provider },

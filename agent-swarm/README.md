@@ -291,8 +291,16 @@ agent wave and send replies back through S3. They read these global config
 keys (not secret except the token): `SLACK_BOT_TOKEN` (needs `channels:history`
 and `files:read`), `TEVYN_API_CHANNEL_ID`, `HANDOFF_ENV` (`dev` or `prod`; dev
 and prod share the channel, so only posts whose block `env` matches are taken)
-and `REPLIES_BUCKET` (dev first; optional `REPLIES_BUCKET_REGION`, default
-`us-west-2`).
+and `REPLIES_BUCKET` (`tevyn-poll-csvs-develop` for dev, `-master` for prod;
+optional `REPLIES_BUCKET_REGION`, default `us-west-2`). `bootstrap.sh` writes
+all four. `HANDOFF_ENV` and `REPLIES_BUCKET` start on dev and are only written
+when missing, so switching to prod is setting both in the dashboard, and a
+rerun keeps it. The token is copied from `.env` as a secret that is not
+exported to agent env: it stays out of agent shells and child processes, but
+any agent can still read it unmasked from its own `/api/config/resolved`. It
+is the Delegate bot's token, which the lead already holds. The host role may
+only `s3:PutObject` under `agent-replies/` in the two buckets; gp-api's bucket
+policy grants the other half.
 
 - `tevyn-handoffs-new` returns the hand-off posts it has not returned before,
   as compact JSON (outreachId, sendAt, timeZone, mode, repliesKey, message,

@@ -5,7 +5,9 @@ import * as path from "node:path";
 import {
   hostFiles,
   hostFilesHash,
+  panelRepliesPutStatement,
   SWARM_HOSTNAME,
+  swarmHostPolicy,
   syncCommand,
   userData,
 } from "./agent-swarm";
@@ -85,5 +87,20 @@ describe("delegate swarm user data", () => {
     const script = userData("vol-0123456789abcdef0");
     assert.ok(script.includes("vol-0123456789abcdef0"));
     assert.ok(!script.includes("__DATA_VOLUME_ID__"));
+  });
+});
+
+describe("panel replies grant", () => {
+  it("only puts objects under agent-replies/ in the dev and prod buckets", () => {
+    assert.equal(panelRepliesPutStatement.Action, "s3:PutObject");
+    assert.deepEqual(panelRepliesPutStatement.Resource, [
+      "arn:aws:s3:::tevyn-poll-csvs-develop/agent-replies/*",
+      "arn:aws:s3:::tevyn-poll-csvs-master/agent-replies/*",
+    ]);
+  });
+
+  it("is in the host role's policy", () => {
+    const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+    assert.ok(Statement.includes(panelRepliesPutStatement));
   });
 });
