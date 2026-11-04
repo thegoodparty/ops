@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds the swarm state that lives only in SQLite: the global SETUP_SCRIPT,
-# the grafana and clickup MCP servers, the lead's soul, and each agent's
-# harness and model.
+# the grafana and clickup MCP servers, the catalog scripts in scripts/, the
+# lead's soul, and each agent's harness and model.
 # Run as root on the host once the stack is up. Safe to run again, but a rerun
 # replaces any edits the lead made to its own SOUL.md and IDENTITY.md with the
 # copies in soul/.
@@ -97,6 +97,18 @@ if api GET "/api/mcp-oauth/$clickup/status" | jq -e '.connected' >/dev/null; the
 else
   echo "clickup mcp: not connected, not installed; Connect it in the dashboard (MCP servers, clickup), then run bootstrap.sh again"
 fi
+
+# Global catalog scripts. Global writes need the lead, and the upsert
+# typechecks, so a script that does not compile fails the run here. Saving
+# identical source again is a no-op.
+for src in scripts/*.ts; do
+  [[ "$src" == *.test.ts ]] && continue
+  name="$(basename "$src" .ts)"
+  jq -n --arg n "$name" --rawfile s "$src" \
+    '{name: $n, source: $s, scope: "global", intent: "bootstrap.sh from scripts/"}' \
+    | api POST /api/scripts/upsert -H "X-Agent-ID: $LEAD" -d @- \
+    | jq -r '"script \(.name): v\(.version), unchanged: \(.contentDeduped)"'
+done
 
 if api GET "/api/agents/$LEAD" | jq -e --rawfile s soul/SOUL.md --rawfile i soul/IDENTITY.md \
   '.soulMd == $s and .identityMd == $i' >/dev/null; then

@@ -267,9 +267,10 @@ prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
 rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
 `host/global-setup-script.sh` (runs as root at every agent container start),
-the grafana and clickup MCP servers, the lead's soul from `host/soul/`, and
-each agent's harness and model from `.env`. To change one, edit the file,
-merge, then on the host:
+the grafana and clickup MCP servers, the global catalog scripts from
+`host/scripts/` (each `*.ts` that is not a test, named by its file name), the
+lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
+To change one, edit the file, merge, then on the host:
 
 ```sh
 sudo /opt/agent-swarm/bootstrap.sh
@@ -278,6 +279,12 @@ cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-revi
 
 A rerun replaces any edits the lead made to its own soul. If those matter,
 read them first from `GET /api/agents/{id}` and copy them into `host/soul/`.
+
+`s2w-2fa-code` computes the Scale to Win sign-in code from the config key
+`S2W_TOTP_SEED`, which a human sets at agent scope on the coder agent. It
+returns only the 6-digit code, and waits for the next 30-second step when under
+5 seconds remain. A rejected code usually means worker clock drift, so check
+NTP before touching the seed.
 
 Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
 add.
