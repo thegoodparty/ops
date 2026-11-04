@@ -100,6 +100,26 @@ describe("the janitor's gateway client over real HTTP", () => {
               expires_at: "2027-01-27T00:00:00Z",
               delete_after_expire: true,
               description: VK_DESCRIPTION,
+              // The governance the reconciler's diff reads, as the list route
+              // hydrates it from the VK-scoped model configs.
+              calendar_aligned: true,
+              budgets: [
+                { max_limit: 250, reset_duration: "1M", current_usage: 12.5 },
+              ],
+              provider_configs: [
+                {
+                  id: 7,
+                  provider: "bedrock",
+                  allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+                  allow_all_keys: true,
+                  keys: [],
+                },
+              ],
+              rate_limit: {
+                request_max_limit: 600,
+                request_reset_duration: "5m",
+                request_current_usage: 3,
+              },
             },
             { id: "vk-2", name: "x@goodparty.org" },
           ],
@@ -120,9 +140,31 @@ describe("the janitor's gateway client over real HTTP", () => {
       expires_at: "2027-01-27T00:00:00Z",
       delete_after_expire: true,
       description: VK_DESCRIPTION,
+      calendar_aligned: true,
+      budgets: [{ max_limit: 250, reset_duration: "1M", current_usage: 12.5 }],
+      provider_configs: [
+        {
+          id: 7,
+          provider: "bedrock",
+          allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+          allow_all_keys: true,
+          keys: [],
+        },
+      ],
+      rate_limit: {
+        request_max_limit: 600,
+        request_reset_duration: "5m",
+        request_current_usage: 3,
+      },
     });
     assert.equal(page.keys[1].description, null);
     assert.equal(page.keys[1].is_active, null);
+    // A key with no governance of its own reads as "nothing there" rather than
+    // as a malformed shape, so the diff compares against empty rather than
+    // against a value it invented.
+    assert.equal(page.keys[1].calendar_aligned, null);
+    assert.equal(page.keys[1].rate_limit, null);
+    assert.equal(page.keys[1].budgets, undefined);
   });
 
   it("updates with a PUT to the key's own path", async () => {

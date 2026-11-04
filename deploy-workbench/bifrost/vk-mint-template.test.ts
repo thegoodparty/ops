@@ -272,14 +272,22 @@ describe("bifrost virtual-key template", () => {
       );
     }
 
-    // Decision 5: per-person budgets and rate limits are skipped for pass one,
-    // because AWS and Fireworks already impose provider-level limits and a
-    // number chosen before there is usage data can starve a person mid-task.
-    // Coming back is a field in this file.
+    // Per-person budgets and rate limits are deliberately not here, and the
+    // reason changed with `docs/bifrost-reconciler.md` (decisions 12 and 13)
+    // without changing this assertion. They come back as per-person overrides
+    // in `governance-overrides.json`, not as a template field: because the
+    // reconciler converges every existing key to template plus override, a
+    // value in the template is not "applies to new keys", it is "applies to
+    // the whole fleet on the next tick". A fleet-wide limit introduced by one
+    // line here is exactly the silent default decision 12 refuses, and a
+    // budget chosen before there is usage data is the guess #404 was right to
+    // defer. Per-key budgets are back now that the log store has a quarter of
+    // per-request cost data; they go in an override, naming the people they
+    // apply to.
     for (const forbidden of ["budgets", "rate_limit"] as const) {
       assert.ok(
         !(forbidden in template),
-        `the template must carry no ${forbidden} (decision 5)`,
+        `the template must carry no ${forbidden}: it would apply to the whole fleet on the next reconcile, and a limit belongs in a per-person override (docs/bifrost-reconciler.md decisions 12 and 13)`,
       );
     }
 

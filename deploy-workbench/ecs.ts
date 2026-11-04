@@ -2044,6 +2044,13 @@ export const createBifrostEcs = (args: {
     logGroup,
     executionRole,
     taskRole,
+    /**
+     * The `/bifrost/config` parameter, so the reconciler's read grant can name
+     * its ARN. It is returned rather than re-read because a `get` here would be
+     * a second statement of the name, and the grant and the resource have to
+     * agree about which parameter the loop reads.
+     */
+    configParameter,
     /** For a stack output, so a human can find the task without the console. */
     containerName: BIFROST_CONTAINER_NAME,
     /** The sidecar's container name, for the same reason. */

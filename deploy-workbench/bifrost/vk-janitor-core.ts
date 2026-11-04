@@ -31,11 +31,33 @@
  */
 
 import { isManagedKeyDescription } from "./vk-marker";
+import { isEmailShaped } from "./key-name";
 import type {
   KeyPage,
   MembershipDirectory,
   VirtualKey,
 } from "./vk-mint-core";
+import {
+  GOVERNANCE_INHERIT,
+  desiredStateFor,
+  type GovernanceBudget,
+  type GovernanceDesiredState,
+  type GovernanceOverrides,
+  type GovernanceProviderConfig,
+  type GovernanceRateLimit,
+} from "./governance-desired-state";
+import type {
+  ObservedGovernance,
+  ObservedRateLimit,
+} from "./vk-governance-observed";
+
+/**
+ * Re-exported from `key-name.ts`, which is where it now lives: the governance
+ * desired-state module needs the same guard and imports it from there, so
+ * keeping the one copy here would make the two modules import each other.
+ * Callers that already take it from this module keep working unchanged.
+ */
+export { isEmailShaped };
 
 /**
  * The retention window before Bifrost deletes a deactivated key, in days.
@@ -49,35 +71,6 @@ import type {
 export const VK_RETENTION_DAYS = 90;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-/**
- * The shape of a key name this job is willing to resolve.
- *
- * Decision 4 makes the name "the lowercase email": the string the Identity
- * Store holds as the user's `userName` and the one `GetUserId` resolves on
- * `emails.value`. Open item 6 is the identity where those two diverge — a
- * `userName` that is not an email mints a key whose name is not an address at
- * all — and the janitor cannot tell that person from a departed one by
- * looking, because `ListGroupMemberships` returns user ids and neither job is
- * granted `DescribeUser`.
- *
- * So the guard here is the shape of the name, and it is deliberately
- * conservative. A marker-bearing key whose name is *not* email-shaped is
- * logged and skipped, never deactivated: the name is not the identity string
- * this design resolves, and turning a shape mismatch into a revocation would
- * take a working person's only key on a guess. A name that *is* email-shaped
- * and resolves to no user is a different case — a departed person whose
- * Identity Center user is gone — and that one is deactivated, in the
- * fail-closed direction decision 6 requires. Neither outcome is silent; see
- * `owner-not-an-email` and `owner-unresolved` below.
- *
- * What this cannot catch, stated so nobody assumes it does: an email-shaped
- * `userName` that is a real address but not *the person's* email resolves to
- * no user and is deactivated, exactly like a departed person. That residual is
- * why the run log names every deactivation with its reason.
- */
-export const isEmailShaped = (value: string): boolean =>
-  /^[^\s@]+@[^\s@.]+(\.[^\s@.]+)+$/.test(value);
 
 /** One page of the gateway's list response, as far as the janitor reads it. */
 export type JanitorKeyQuery = { limit: number; offset: number };
@@ -93,8 +86,19 @@ export type JanitorGateway = {
   update: (id: string, body: Record<string, unknown>) => Promise<VirtualKey>;
 };
 
-/** Why a run stopped without reconciling anything. */
-export type JanitorFailureCode = "membership-unavailable" | "gateway-unavailable";
+/**
+ * Why a run stopped without reconciling anything.
+ *
+ * `desired-state-unavailable` is the reconciler's: one of the governance
+ * documents could not be read, so the run had nothing to converge *to*. It is a
+ * separate code from `gateway-unavailable` because a deploy that wrote a
+ * parameter and a gateway that refused a write are different failures to go and
+ * look at, and the three-in-a-row alarm (step 6) counts a run either way.
+ */
+export type JanitorFailureCode =
+  | "membership-unavailable"
+  | "gateway-unavailable"
+  | "desired-state-unavailable";
 
 export class JanitorFailure extends Error {
   constructor(
@@ -329,5 +333,552 @@ export const reconcileVirtualKeys = async (args: {
     }
     result.deactivated.push({ name: verdict.name, reason: verdict.reason });
   }
+  return result;
+};
+
+/* =========================================================================
+ * Governance convergence
+ *
+ * Step 3 of `docs/bifrost-reconciler.md`. The same function shape as the
+ * revocation loop above, over the same gateway and the same directory, because
+ * the plan makes one reconciler with two jobs rather than two functions with two
+ * copies of the credential, the network and the directory hop (decision 3).
+ *
+ * Every rule below is one of the plan's decisions, so the module reads as the
+ * decision list rather than as a pipeline:
+ *
+ * - **Diff before write, and "converged" is a counted number** (decision 6). At
+ *   five minutes an unconditional write is 288 `PUT`s per key per day, each one
+ *   calling `ReloadVirtualKey` and rebuilding that key's governance. So the run
+ *   reads, compares, and writes only what differs, and `changed` is a number the
+ *   caller can assert — not a log line a reader has to trust. "Nothing changed"
+ *   is an empty request set, not a request that happens to be a no-op.
+ * - **The composition is a complete set, never a patch.** `provider_configs` on a
+ *   virtual-key update is a replacement set: a supplied entry updates or is
+ *   created, and an entry the request omits is *deleted* with its budgets and
+ *   rate limit (`governance.go` at the pinned tag, the delete loop and
+ *   `collectProviderConfigDeleteIDs`). So every `PUT` carries the whole composed
+ *   list, and the diff compares the lists whole. Omitting `key_ids` is the one
+ *   narrow exception that leaves associations alone; this module never relies on
+ *   it.
+ * - **`inherit` is distinct from absent** (decision 9), even where the two
+ *   resolve to the same value: `"provider_configs": "inherit"` in an override
+ *   says "keep the template's" out loud, and the composed state records which of
+ *   the two produced the list so that distinction is assertable rather than
+ *   implied.
+ * - **`rate_limit` has no default** (decision 12). The field is in the shape and
+ *   nothing sets it, so a composed state with no limit carries no `rate_limit`
+ *   at all: on the update path an omitted one means "leave the key's alone",
+ *   where an empty object means "remove it". The diff compares the field only
+ *   when git names one, so a limit set by hand in the dashboard is not drift this
+ *   loop fights.
+ * - **`calendar_aligned: true`, and budgets by `reset_duration`** (decision 11,
+ *   success criterion 3). Budgets carry no ids and the body never carries
+ *   `reset_budget_usage`: the update path matches an existing budget by `id`, or
+ *   by `reset_duration` when no id is given, and copies `current_usage` and
+ *   `last_reset` back from the stored row on every write. That is what makes a
+ *   retune keep a person's month.
+ * - **It mints nothing** (decision 7). Desired state is computed for keys that
+ *   exist, matched by the marker and the name. A roster member with no key
+ *   produces no key, and `minted: 0` says so out loud. Granting access is the
+ *   mint's, so there is one code path that grants and one that converges.
+ * - **Nothing disables itself, and a failure is not swallowed** (decision 15). A
+ *   failed read or write throws a `JanitorFailure`, so the invocation fails and
+ *   step 6's three-consecutive-failures alarm has something to count.
+ * ====================================================================== */
+
+/**
+ * The fields convergence owns and the diff compares.
+ *
+ * `description` and `is_active` are deliberately **not** here even though the
+ * template carries them. The template's `description` is the marker this job
+ * matches on, and `is_active` is a decision two other jobs own: the janitor sets
+ * it false with a deletion timer, and the mint sets it true to reactivate. A
+ * convergence loop that re-asserted the template's `is_active: true` every five
+ * minutes would undo a revocation within one tick.
+ */
+export const RECONCILED_FIELDS = [
+  "provider_configs",
+  "budgets",
+  "rate_limit",
+  "calendar_aligned",
+] as const;
+
+export type ReconciledField = (typeof RECONCILED_FIELDS)[number];
+
+/**
+ * The template as convergence reads it: the governance fields, with no metadata
+ * and no per-call fields.
+ *
+ * A structural superset of the mint's `VirtualKeyTemplate` rather than a second
+ * declaration of it: the create path and this converge path read the same SSM
+ * document, so a field the template gains is a field both see.
+ */
+export type GovernanceTemplate = {
+  description?: string;
+  is_active?: boolean;
+  provider_configs?: GovernanceProviderConfig[];
+  budgets?: GovernanceBudget[];
+  rate_limit?: GovernanceRateLimit;
+  calendar_aligned?: boolean;
+};
+
+/**
+ * Where the composed `provider_configs` came from.
+ *
+ * Decision 9's whole point is that "inherit" and "absent" mean the same value
+ * and different statements, so the composition records which it was. Nothing on
+ * the wire reads it; a test does.
+ */
+export type ProviderConfigsSource = "override" | "inherit" | "absent";
+
+export type ComposedDesiredState = {
+  /** The complete desired governance for one key, ready for `convergenceBody`. */
+  state: GovernanceDesiredState;
+  providerConfigsSource: ProviderConfigsSource;
+};
+
+/**
+ * The desired state for one key: the template merged field by field with that
+ * person's override.
+ *
+ * The merge is `desiredStateFor` from `governance-desired-state.ts`, not a
+ * second copy of the rules: step 2 owns the merge and the validation, and the
+ * mint (step 5) will call the same function. What this adds is the narrowing to
+ * the fields convergence owns, and the `calendar_aligned` default.
+ *
+ * `calendar_aligned` is asserted rather than inherited. Decision 11 is the
+ * fleet's rule, not a per-document one, so a template that forgot the field still
+ * converges every key to a calendar-aligned window. An override that says
+ * `false` still wins, because the document is the authority for the people it
+ * names.
+ */
+export const composeDesiredState = (args: {
+  template: GovernanceTemplate;
+  overrides: GovernanceOverrides;
+  email: string;
+}): ComposedDesiredState => {
+  const merged = desiredStateFor(
+    args.template as GovernanceDesiredState,
+    args.overrides,
+    args.email,
+  );
+
+  const state: GovernanceDesiredState = {};
+  for (const field of RECONCILED_FIELDS) {
+    const value = (merged as Record<string, unknown>)[field];
+    if (value === undefined) continue;
+    (state as Record<string, unknown>)[field] = value;
+  }
+
+  // Decision 11. Set on the composed state rather than on the template so no
+  // future document edit can drop it by accident.
+  if (state.calendar_aligned === undefined) state.calendar_aligned = true;
+  // An empty `rate_limit` would mean "remove the key's limit" on the wire,
+  // which is the opposite of a field with no default (decision 12).
+  if (state.rate_limit && Object.keys(state.rate_limit).length === 0) {
+    delete state.rate_limit;
+  }
+
+  const fromOverride = args.overrides[args.email.toLowerCase()]?.provider_configs;
+  const providerConfigsSource: ProviderConfigsSource =
+    fromOverride === undefined
+      ? "absent"
+      : fromOverride === GOVERNANCE_INHERIT
+        ? "inherit"
+        : "override";
+
+  return { state, providerConfigsSource };
+};
+
+/**
+ * The complete `PUT` body for one key.
+ *
+ * Complete is the load-bearing word, and it is what makes the whole approach
+ * safe against a replacement set. The body carries the whole composed
+ * `provider_configs`, every budget, and the key's own `calendar_aligned`; it
+ * carries no budget ids (git holds none, and the update path matches on
+ * `reset_duration` when none is given) and never `reset_budget_usage` (clearing
+ * usage is opt-in on the wire, and this loop has no reason to opt in).
+ */
+export const convergenceBody = (
+  state: GovernanceDesiredState,
+): Record<string, unknown> => {
+  const body: Record<string, unknown> = {};
+
+  if (state.calendar_aligned !== undefined) {
+    body.calendar_aligned = state.calendar_aligned;
+  }
+
+  if (state.provider_configs !== undefined) {
+    body.provider_configs = state.provider_configs.map((config) => {
+      const entry: Record<string, unknown> = { provider: config.provider };
+      if (config.allowed_models !== undefined) {
+        entry.allowed_models = config.allowed_models;
+      }
+      if (config.blacklisted_models !== undefined) {
+        entry.blacklisted_models = config.blacklisted_models;
+      }
+      if (config.weight !== undefined) entry.weight = config.weight;
+      if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
+      return entry;
+    });
+  }
+
+  if (state.budgets !== undefined) {
+    body.budgets = state.budgets.map((budget) => ({
+      max_limit: budget.max_limit,
+      reset_duration: budget.reset_duration,
+    }));
+  }
+
+  if (state.rate_limit !== undefined) {
+    const limit: Record<string, unknown> = {};
+    for (const field of [
+      "token_max_limit",
+      "token_reset_duration",
+      "request_max_limit",
+      "request_reset_duration",
+    ] as const) {
+      const value = state.rate_limit[field];
+      if (value !== undefined) limit[field] = value;
+    }
+    body.rate_limit = limit;
+  }
+
+  return body;
+};
+
+/** One budget as either side reports it, for the comparison. */
+type BudgetLike = { max_limit?: unknown; reset_duration?: unknown };
+
+/**
+ * One provider entry as either side reports it.
+ *
+ * Deliberately loose rather than the union of the two typed shapes: the desired
+ * side has `key_ids` and the observed side has `allow_all_keys`/`keys`, and the
+ * conversion below has to read whichever arrived.
+ */
+
+/**
+ * A budget set as a sorted list of the two fields git owns.
+ *
+ * The gateway reports `current_usage`, `last_reset` and its override columns
+ * alongside them, and none of those is git's to own: comparing them would make
+ * every tick see a difference on a number the accounting writes itself, which is
+ * the fight the diff exists to avoid. Sorted, because `reset_duration` is the
+ * field both sides match on and a row reordering is not a change.
+ */
+const budgetSetKey = (budgets: readonly BudgetLike[] | undefined): string[] =>
+  (budgets ?? [])
+    .map((budget) => JSON.stringify([budget.reset_duration, budget.max_limit]))
+    .sort();
+
+/**
+ * A rate limit as a sorted list of its set (maximum, duration) pairs.
+ *
+ * A missing or empty limit is the empty string, so "no limit anywhere" and "no
+ * limit here" compare equal; the caller only reaches this when a document named
+ * one (decision 12).
+ */
+const rateLimitKey = (
+  limit: GovernanceRateLimit | ObservedRateLimit | null | undefined,
+): string => {
+  if (!limit || typeof limit !== "object") return "";
+  const pairs: unknown[][] = [];
+  for (const [maximum, duration] of [
+    ["token_max_limit", "token_reset_duration"],
+    ["request_max_limit", "request_reset_duration"],
+  ] as const) {
+    const value = (limit as Record<string, unknown>)[maximum];
+    if (value === undefined || value === null) continue;
+    pairs.push([value, (limit as Record<string, unknown>)[duration] ?? null]);
+  }
+  return pairs.length === 0 ? "" : JSON.stringify(pairs);
+};
+
+/**
+ * One provider entry as the diff sees it: the fields a `PUT` can set, with the
+ * key association expressed the way the desired state expresses it.
+ *
+ * The gateway reports the association the other way round — `allow_all_keys`
+ * plus a `keys` array of key rows — so it is converted here. Without that,
+ * every run would read `key_ids: ["*"]` against "no key_ids" as a difference and
+ * rewrite every key every tick, which is precisely the no-op traffic the diff
+ * exists to prevent.
+ */
+type ProviderConfigLike = {
+  provider?: unknown;
+  allowed_models?: unknown;
+  blacklisted_models?: unknown;
+  weight?: unknown;
+  key_ids?: unknown;
+  allow_all_keys?: unknown;
+  keys?: unknown;
+};
+
+const providerConfigKey = (config: ProviderConfigLike): string => {
+  const keyIds = Array.isArray(config.key_ids)
+    ? [...(config.key_ids as string[])].sort()
+    : config.allow_all_keys === true
+      ? ["*"]
+      : Array.isArray(config.keys)
+        ? (config.keys as Array<{ key_id?: string }>)
+            .map((key) => key.key_id ?? "")
+            .sort()
+        : [];
+
+  return JSON.stringify([
+    config.provider ?? null,
+    [...((config.allowed_models as string[] | undefined) ?? [])].sort(),
+    [...((config.blacklisted_models as string[] | undefined) ?? [])].sort(),
+    config.weight ?? null,
+    keyIds,
+  ]);
+};
+
+/** A provider-config set as sorted strings, for the same reasons as budgets. */
+const providerConfigSetKey = (
+  configs: readonly ProviderConfigLike[] | undefined,
+): string[] => (configs ?? []).map(providerConfigKey).sort();
+
+/**
+ * The governance fields on which the desired state and the gateway disagree, or
+ * an empty list when the key is already converged.
+ *
+ * Each field is compared as a whole value rather than field by field inside it,
+ * because each one is a **replacement set** on the wire: a provider list that
+ * differs in one entry is still a different set, and the `PUT` that fixes it
+ * carries all of it.
+ */
+export const differingFields = (
+  desired: GovernanceDesiredState,
+  observed: ObservedGovernance,
+): ReconciledField[] => {
+  const differ: ReconciledField[] = [];
+
+  if (
+    JSON.stringify(
+      providerConfigSetKey(desired.provider_configs),
+    ) !==
+    JSON.stringify(providerConfigSetKey(observed.provider_configs))
+  ) {
+    differ.push("provider_configs");
+  }
+
+  if (
+    JSON.stringify(budgetSetKey(desired.budgets)) !==
+    JSON.stringify(budgetSetKey(observed.budgets))
+  ) {
+    differ.push("budgets");
+  }
+
+  // Only when git names one: a limit set by hand is not drift this loop fights,
+  // and treating "the gateway has one, git does not" as a difference would
+  // remove a limit nobody asked it to remove (decision 12).
+  if (
+    desired.rate_limit !== undefined &&
+    rateLimitKey(desired.rate_limit) !== rateLimitKey(observed.rate_limit)
+  ) {
+    differ.push("rate_limit");
+  }
+
+  if (
+    desired.calendar_aligned !== undefined &&
+    Boolean(observed.calendar_aligned) !== desired.calendar_aligned
+  ) {
+    differ.push("calendar_aligned");
+  }
+
+  return differ;
+};
+
+/** Why a managed key was left alone by convergence. */
+export type ReconcileSkipReason =
+  /** The name is not the lowercase email this design resolves (open item 6). */
+  | "owner-not-an-email"
+  /** The key's owner is not in the desired state's member set: the janitor's. */
+  | "not-a-member";
+
+/** One key that differed, with the fields that did. */
+export type ConvergedKey = { name: string; fields: ReconciledField[] };
+
+export type ReconcileResult = {
+  /**
+   * `aborted` is the empty-group case: the read succeeded and said "nobody",
+   * which is not a reason to write everybody's governance. Nothing was written.
+   */
+  outcome: "converged" | "aborted";
+  abortReason?: "group-empty";
+  /** How many members the directory returned. */
+  memberCount: number;
+  /** How many keys carried the marker at all. */
+  managedKeyCount: number;
+  /** How many keys the gateway was told about. The honest "changed" number. */
+  changed: number;
+  /** How many managed keys were already at their desired state. */
+  unchanged: number;
+  /** The keys written, with the fields that differed. */
+  applied: ConvergedKey[];
+  /** The keys left alone, with the reason. */
+  skipped: Array<{ name: string; reason: ReconcileSkipReason }>;
+  /**
+   * Always zero, as a number rather than an omission: decision 7 makes it the
+   * run's own statement that convergence grants nothing.
+   */
+  minted: 0;
+};
+
+/**
+ * Step 3's loop: the desired state, the `GET`, the diff, and one `PUT` per key
+ * that differs.
+ *
+ * `members` is the `Engineers` user id set the loop reads for itself, through
+ * the same directory the revocation loop uses: one adapter, one role, one read
+ * per run, and the abort-on-empty guard in one shape.
+ *
+ * A managed key whose owner is not a member is skipped, not converged: taking
+ * access away is the revocation loop's job and granting it is the mint's, so
+ * this loop has no opinion about a departing person's key. A member with no key
+ * produces nothing at all.
+ */
+export const reconcileGovernance = async (args: {
+  gateway: JanitorGateway;
+  /** The same directory the revocation loop reads, scoped to `Engineers`. */
+  directory: MembershipDirectory;
+  template: GovernanceTemplate;
+  overrides: GovernanceOverrides;
+}): Promise<ReconcileResult> => {
+  const { gateway, directory, template, overrides } = args;
+
+  // The member set first, for the same reason the revocation loop reads it
+  // first: a failed or empty read is not a reason to write anybody's
+  // governance, and neither can be followed by a write.
+  let members: readonly string[];
+  try {
+    members = await directory.listMemberUserIds();
+  } catch {
+    throw new JanitorFailure(
+      "membership-unavailable",
+      "could not read Engineers' memberships",
+    );
+  }
+
+  // The guard both other jobs apply, for the same reason: an empty group is
+  // indistinguishable from a failed read at the far end, and the safe reading of
+  // "everybody's governance is now the template" is to not write it.
+  if (members.length === 0) {
+    return {
+      outcome: "aborted",
+      abortReason: "group-empty",
+      memberCount: 0,
+      managedKeyCount: 0,
+      changed: 0,
+      unchanged: 0,
+      applied: [],
+      skipped: [],
+      minted: 0,
+    };
+  }
+  const memberIds = new Set(members);
+
+  let keys: VirtualKey[];
+  try {
+    keys = await listAllKeys(gateway);
+  } catch (error) {
+    if (error instanceof JanitorFailure) throw error;
+    throw new JanitorFailure(
+      "gateway-unavailable",
+      "could not list the gateway's virtual keys",
+    );
+  }
+
+  const managed = keys.filter((key) => isManagedKeyDescription(key.description));
+
+  // Phase one: every read, no writes. A directory or composition failure leaves
+  // the gateway untouched rather than half-converged, the same ordering the
+  // revocation loop applies.
+  type Verdict =
+    | {
+        kind: "apply";
+        name: string;
+        key: VirtualKey;
+        body: Record<string, unknown>;
+        fields: ReconciledField[];
+      }
+    | { kind: "skip"; name: string; reason: ReconcileSkipReason }
+    | { kind: "unchanged"; name: string };
+
+  const verdicts: Verdict[] = [];
+  for (const key of managed) {
+    const name = key.name.trim().toLowerCase();
+
+    if (!isEmailShaped(name)) {
+      verdicts.push({ kind: "skip", name, reason: "owner-not-an-email" });
+      continue;
+    }
+
+    let userId: string | null;
+    try {
+      userId = await directory.getUserId(name);
+    } catch {
+      throw new JanitorFailure(
+        "membership-unavailable",
+        `could not resolve the owner of a managed key (${name})`,
+      );
+    }
+    if (userId === null || !memberIds.has(userId)) {
+      verdicts.push({ kind: "skip", name, reason: "not-a-member" });
+      continue;
+    }
+
+    const { state } = composeDesiredState({ template, overrides, email: name });
+    const fields = differingFields(state, key);
+    if (fields.length === 0) {
+      verdicts.push({ kind: "unchanged", name });
+      continue;
+    }
+    verdicts.push({
+      kind: "apply",
+      name,
+      key,
+      body: convergenceBody(state),
+      fields,
+    });
+  }
+
+  // Phase two: the only writes in the run.
+  const result: ReconcileResult = {
+    outcome: "converged",
+    memberCount: members.length,
+    managedKeyCount: managed.length,
+    changed: 0,
+    unchanged: 0,
+    applied: [],
+    skipped: [],
+    minted: 0,
+  };
+
+  for (const verdict of verdicts) {
+    if (verdict.kind === "skip") {
+      result.skipped.push({ name: verdict.name, reason: verdict.reason });
+      continue;
+    }
+    if (verdict.kind === "unchanged") {
+      result.unchanged++;
+      continue;
+    }
+    try {
+      await gateway.update(verdict.key.id, verdict.body);
+    } catch {
+      throw new JanitorFailure(
+        "gateway-unavailable",
+        `could not converge a key (${verdict.name})`,
+      );
+    }
+    result.applied.push({ name: verdict.name, fields: verdict.fields });
+    result.changed++;
+  }
+
   return result;
 };
