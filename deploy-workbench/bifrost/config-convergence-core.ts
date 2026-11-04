@@ -157,14 +157,19 @@ export type ConfigDesiredState = {
  * carrying only a status. `getProvider` answers `null` for a provider the
  * gateway does not have, because convergence does not create providers: adding
  * one is a boot-only change in `config.json` that rolls the task, and minting
- * access is the mint's (decision 7).
+ * access is the mint's (decision 7). `listProviderKeys` answers `null` for the
+ * same `404`, so the two reads cannot disagree about a provider that is only in
+ * the file: the keys loop below skips it as `not-present` rather than surfacing
+ * `config-unavailable` and failing the invocation.
  */
 export type ConfigGateway = {
   getConfig: () => Promise<Record<string, unknown>>;
   putConfig: (body: Record<string, unknown>) => Promise<void>;
   getProvider: (provider: string) => Promise<Record<string, unknown> | null>;
   putProvider: (provider: string, body: Record<string, unknown>) => Promise<void>;
-  listProviderKeys: (provider: string) => Promise<Array<Record<string, unknown>>>;
+  listProviderKeys: (
+    provider: string,
+  ) => Promise<Array<Record<string, unknown>> | null>;
   putProviderKey: (
     provider: string,
     keyId: string,
@@ -630,7 +635,7 @@ export const convergeConfig = async (args: {
   }
 
   for (const key of desired.keys) {
-    let observedKeys: Array<Record<string, unknown>>;
+    let observedKeys: Array<Record<string, unknown>> | null;
     try {
       observedKeys = await gateway.listProviderKeys(key.provider);
     } catch {
@@ -638,6 +643,20 @@ export const convergeConfig = async (args: {
         "config-unavailable",
         `could not list a provider's keys (${key.provider})`,
       );
+    }
+    if (observedKeys === null) {
+      // The provider itself is not in the running gateway, so neither are its
+      // keys. That is the same `not-present` the provider loop names above, and
+      // it must not be the one difference that fails a deploy: a `404` here is
+      // an answer about the configuration, not an outage. A provider "not
+      // present" is a boot-only change (`docs/bifrost-reconciler.md`, the split
+      // table), so it is named and skipped, and the provider loop's own entry
+      // for it is already in `skipped`.
+      result.skipped.push({
+        path: `providers.${key.provider}.keys[name=${key.name}]`,
+        reason: "not-present",
+      });
+      continue;
     }
     const observed = observedKeys.find((entry) => entry.name === key.name);
     if (!observed) {

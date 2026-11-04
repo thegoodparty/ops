@@ -125,33 +125,73 @@ export const isThrottle = (stderr: string): boolean =>
 export const isFunctionError = (stdout: string): boolean =>
   /"FunctionError"\s*:|FunctionError|Unhandled exception|Runtime\.\w+/.test(stdout);
 
+/**
+ * The argument list `invokeOnce` hands the CLI, exported so a test can pin it.
+ *
+ * The payload is a `fileb://` path and there is never an inline JSON `--payload`.
+ * A test that only drove `pollForConvergence`'s injected invoke would never see
+ * this list, which is how the base64 defect reached review in the first place.
+ */
+export const invokeArguments = (args: {
+  functionName: string;
+  region: string;
+  payloadFile: string;
+  outFile: string;
+}): string[] => [
+  "lambda",
+  "invoke",
+  "--function-name",
+  args.functionName,
+  "--invocation-type",
+  // Load-bearing. `Event` returns before the work does and is green on a
+  // failed convergence, which is the bug this whole script is here to stop.
+  "RequestResponse",
+  // The payload goes in as a file, and `fileb://` rather than `--payload`.
+  //
+  // `--payload` is a blob argument, so its value is **base64-decoded** by
+  // default (`cli_binary_format=base64`, AWS CLI v2). A raw JSON payload is
+  // usually not valid base64 — `{` and `}` are not in the alphabet — so the CLI
+  // exits 255 with `Invalid base64` before the request is signed, and the event
+  // the function would have received is never sent. That is neither a throttle
+  // nor a `FunctionError`, so the step would exit as "could not complete"
+  // instead of retrying or reading a summary.
+  //
+  // `--cli-binary-format raw-in-base64-out` fixes the same thing, and `fileb://`
+  // is the one form the CLI reads as bytes regardless of `cli_binary_format`
+  // (its own config docs say so). It is preferred here because it holds even if
+  // a profile or an `AWS_CLI_BINARY_FORMAT` in the job's environment sets the
+  // format back, and because the event then has one source: the file, not an
+  // argv element a retry could rebuild differently. A `file://` payload would
+  // stay subject to the same decoding, so it would need the flag back.
+  "--payload",
+  `fileb://${args.payloadFile}`,
+  // The function's own timeout plus slack, so a slow run is reported as its own
+  // result rather than cut off by the CLI's default three-second read.
+  "--cli-read-timeout",
+  String(VK_JANITOR_TIMEOUT_SECONDS + 60),
+  "--region",
+  args.region,
+  args.outFile,
+];
+
 const invokeOnce = (args: {
   functionName: string;
   region: string;
   env: NodeJS.ProcessEnv;
-  payload: string;
+  /**
+   * The event, already on disk. A path rather than the JSON, because the CLI
+   * has to read it as bytes — see `invokeArguments` above.
+   */
+  payloadFile: string;
   outFile: string;
 }): InvokeAttempt => {
   const result = tryRunAws(
-    [
-      "lambda",
-      "invoke",
-      "--function-name",
-      args.functionName,
-      "--invocation-type",
-      // Load-bearing. `Event` returns before the work does and is green on a
-      // failed convergence, which is the bug this whole script is here to stop.
-      "RequestResponse",
-      "--payload",
-      args.payload,
-      // The function's own timeout plus slack, so a slow run is reported as its
-      // own result rather than cut off by the CLI's default three-second read.
-      "--cli-read-timeout",
-      String(VK_JANITOR_TIMEOUT_SECONDS + 60),
-      "--region",
-      args.region,
-      args.outFile,
-    ],
+    invokeArguments({
+      functionName: args.functionName,
+      region: args.region,
+      payloadFile: args.payloadFile,
+      outFile: args.outFile,
+    }),
     args.env,
   );
 
@@ -291,6 +331,17 @@ export const main = async (
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "vk-reconciler-"));
     const outFile = path.join(directory, "out.json");
 
+    // The event on disk, which the CLI reads as bytes with `fileb://`. The
+    // deploy's trigger label: the function runs the same work either way, and
+    // the label is what tells a throttle-driven pattern from a convergence
+    // failure in the log, and what step 6's alarm will report on. Written once
+    // and reused across the retries; nothing about a retry changes the event.
+    const payloadFile = path.join(directory, "event.json");
+    fs.writeFileSync(
+      payloadFile,
+      JSON.stringify({ action: "reconcile", trigger: "deploy" }),
+    );
+
     try {
       const { outcome, decisions } = await pollForConvergence({
         invoke: () =>
@@ -298,11 +349,7 @@ export const main = async (
             functionName,
             region,
             env,
-            // The deploy's trigger label. The function runs the same work either
-            // way; the label is what tells a throttle-driven pattern from a
-            // convergence failure in the log, and what step 6's alarm will
-            // report on.
-            payload: JSON.stringify({ action: "reconcile", trigger: "deploy" }),
+            payloadFile,
             outFile,
           }),
         retryWindowMs: retryWindowSeconds * 1000,

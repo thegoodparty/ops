@@ -157,7 +157,51 @@ const configConverged = (args: {
   args.config.outcome === "converged" ||
   (args.config.outcome === "not-run" && args.trigger !== "deploy");
 
+/**
+ * The loops every summary carries, so a reply that has an `outcome` but no
+ * counts cannot be read as converged: `decideInvokeAttempt` and the failure
+ * message both dereference these, and a TypeError inside the poll would report
+ * itself as "could not complete" rather than as the unreadable reply it is.
+ */
+const LOOP_FIELDS = ["revocation", "governance", "config"] as const;
+
 /** A summary if the value looks like one, otherwise `undefined`. */
+const asSummary = (value: unknown): ReconcilerSummary | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const candidate = value as Record<string, unknown>;
+  if (candidate.outcome !== "converged" && candidate.outcome !== "not-converged") {
+    return undefined;
+  }
+  for (const field of LOOP_FIELDS) {
+    const loop = candidate[field];
+    if (typeof loop !== "object" || loop === null) return undefined;
+  }
+  return candidate as ReconcilerSummary;
+};
+
+/**
+ * The summary out of what the function actually returned.
+ *
+ * **Both shapes are accepted, and that is the fix for the defect this function
+ * shipped with.** In one deploy run the payload is a `JanitorRun` —
+ * `{ revocation, governance, config, summary }` (`vk-janitor-handler.ts`) — so
+ * `outcome` sits one level down, and a parser that read only the top level
+ * returned `undefined` for every successful run: `decideInvokeAttempt` then said
+ * "the run returned no summary", and the converge step failed on every deploy,
+ * including a fully converged one. Fail-closed, but a step that can never pass.
+ *
+ * The unwrap is here rather than the handler returning a bare summary because
+ * the `JanitorRun` shape is the Lambda's public reply, already the contract from
+ * step 3 (`docs/bifrost-virtual-keys.md`), asserted by the janitor's own tests,
+ * and what an operator sees when they invoke the function by hand. Narrowing it
+ * to suit one caller would drop the audit shape from the reply; widening the
+ * caller to read either shape costs one object lookup. A bare summary is still
+ * accepted because that is the shape the classification table is written
+ * against, and a test drives both.
+ *
+ * The top level is tried first, so a summary that ever gains its own `summary`
+ * field keeps reading the way it always did.
+ */
 export const parseReconcilerSummary = (
   payload: unknown,
 ): ReconcilerSummary | undefined => {
@@ -173,9 +217,7 @@ export const parseReconcilerSummary = (
       : payload;
   if (typeof value !== "object" || value === null) return undefined;
   const candidate = value as Record<string, unknown>;
-  return candidate.outcome === "converged" || candidate.outcome === "not-converged"
-    ? (candidate as ReconcilerSummary)
-    : undefined;
+  return asSummary(candidate) ?? asSummary(candidate.summary);
 };
 
 /**

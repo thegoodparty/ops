@@ -94,7 +94,7 @@ const matchingObserved = () => ({
 const harness = (options: {
   observedClient?: Record<string, unknown>;
   providers?: Record<string, Record<string, unknown> | null>;
-  keys?: Record<string, Array<Record<string, unknown>>>;
+  keys?: Record<string, Array<Record<string, unknown>> | null>;
   failPutConfig?: boolean;
   failPutProvider?: boolean;
   failPutKey?: boolean;
@@ -119,7 +119,14 @@ const harness = (options: {
       if (options.failPutProvider) throw new Error("PUT /api/providers refused");
       providerPuts.push({ provider, body });
     },
-    listProviderKeys: async (provider) => options.keys?.[provider] ?? [],
+    // `null` in `options.keys` is the gateway's `404`: a provider the running
+    // process does not have answers that way to its key list as well as to the
+    // provider read. The fake keeps the two in one option so a test that says
+    // "this provider is not there" cannot set one and not the other.
+    listProviderKeys: async (provider) =>
+      options.keys?.[provider] === null
+        ? null
+        : options.keys?.[provider] ?? [],
     putProviderKey: async (provider, id, body) => {
       if (options.failPutKey) throw new Error("PUT /api/providers/keys refused");
       keyPuts.push({ provider, id, body });
@@ -517,6 +524,72 @@ describe("the loop", () => {
     assert.equal(
       result.skipped.filter((entry) => entry.reason === "not-present").length,
       4,
+    );
+  });
+});
+
+describe("a provider the running gateway does not have", () => {
+  /**
+   * The two reads have to answer a `404` the same way, and this is the test that
+   * says so at the loop rather than at the adapter.
+   *
+   * `getProvider` has always mapped `404` to `null`, so the provider loop skips a
+   * provider that is only in the file. `listProviderKeys` threw on the same
+   * `404`, so the keys loop one step later surfaced `config-unavailable` and
+   * failed the whole invocation: a boot-only change, which the plan's split
+   * table says is what adding a provider is, turned into a failed deploy. The
+   * adapter half of the fix is in `config-convergence-gateway.test.ts`; this is
+   * the half that proves the loop does the right thing with `null`.
+   */
+  it("skips its keys as not-present instead of failing the invocation", async () => {
+    const { gateway, keyPuts } = harness({
+      // Nothing about either provider exists on the gateway: the provider read
+      // and the key list both come back as the `404`'s `null`.
+      providers: {},
+      keys: { fireworks: null, bedrock: null },
+    });
+
+    const result = await convergeConfig({
+      gateway,
+      desired: liveConfigDesiredState(configText()),
+    });
+
+    assert.equal(result.outcome, "converged");
+    assert.deepEqual(keyPuts, [], "convergence never creates a key");
+    // Both providers, both their keys, plus the two sections the file names and
+    // the loop refuses. Nothing is `unchanged`, because nothing was found.
+    const notPresent = result.skipped.filter((entry) => entry.reason === "not-present");
+    assert.deepEqual(
+      notPresent.map((entry) => entry.path),
+      [
+        "providers.fireworks",
+        "providers.bedrock",
+        "providers.fireworks.keys[name=fireworks-primary]",
+        "providers.bedrock.keys[name=bedrock-task-role]",
+      ],
+    );
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1, "the client config still matches");
+  });
+
+  it("still fails the run on a 5xx from the key list, which is an outage", async () => {
+    // The other half of the rule: only a `404` is "not there". A `503` is the
+    // gateway refusing to answer, and a deploy that read it as `not-present`
+    // would go green over a loop that never ran.
+    const failing: ConfigGateway = {
+      ...harness({}).gateway,
+      listProviderKeys: async () => {
+        throw new Error("503");
+      },
+    };
+
+    await assert.rejects(
+      convergeConfig({
+        gateway: failing,
+        desired: liveConfigDesiredState(configText()),
+      }),
+      (error: unknown) =>
+        error instanceof JanitorFailure && error.code === "config-unavailable",
     );
   });
 });

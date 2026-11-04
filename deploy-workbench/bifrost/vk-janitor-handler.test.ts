@@ -9,6 +9,11 @@ import {
 } from "./vk-janitor-core";
 import type { ConfigGateway } from "./config-convergence-core";
 import { createJanitorHandler, type JanitorDeps } from "./vk-janitor-handler";
+import {
+  decideInvokeAttempt,
+  parseReconcilerSummary,
+  type ReconcilerSummary,
+} from "./reconciler-summary";
 
 /**
  * The handler's wiring: the summary and per-key lines a run emits, the
@@ -618,5 +623,74 @@ describe("the janitor handler", () => {
       trigger: "deploy",
     });
     assert.doesNotMatch(JSON.stringify(logs), /AccessDenied/);
+  });
+});
+
+/**
+ * The contract the deploy's poll actually depends on: the handler's **real
+ * return value**, JSON-serialised the way `aws lambda invoke` writes it to the
+ * outfile, read back by `parseReconcilerSummary`.
+ *
+ * This test exists because the defect it covers could not be seen from either
+ * side alone. `reconciler-summary.test.ts` fed the parser a bare
+ * `ReconcilerSummary`, and the tests above assert on `result.summary`; both were
+ * green while the two never met, because the handler returns a `JanitorRun` and
+ * the parser read only the top level. Every deploy's converge step failed with
+ * "the run returned no summary", including a fully converged one.
+ *
+ * So it drives the real handler and passes its real reply through the
+ * serialisation boundary, not a hand-written fixture.
+ */
+describe("the reply the deploy's poll reads", () => {
+  it("parses the handler's own return value, serialised, as converged", async () => {
+    const { handler } = harness({ keys: [], members: ["user-1"] });
+
+    const run = await handler({ action: "reconcile", trigger: "deploy" });
+    const decision = decideInvokeAttempt({
+      kind: "ok",
+      payload: JSON.stringify(run),
+    });
+
+    assert.equal(
+      decision.kind,
+      "converged",
+      `a converged run must not read as "no summary": ${JSON.stringify(decision)}`,
+    );
+    assert.equal(parseReconcilerSummary(JSON.stringify(run))?.trigger, "deploy");
+  });
+
+  it("reads a scheduled tick's reply too, which is the same shape", async () => {
+    // The tick returns the same `JanitorRun`, so the shape is one contract
+    // rather than a deploy-only one. Its config half is `not-run`, and a tick is
+    // allowed to say that where a deploy is not.
+    const { handler } = harness({ keys: [], members: ["user-1"] });
+
+    const run = await handler({ action: "reconcile", trigger: "schedule" });
+    const summary = parseReconcilerSummary(JSON.stringify(run));
+
+    assert.equal(summary?.outcome, "converged");
+    assert.equal(summary?.trigger, "schedule");
+    assert.equal(summary?.config.outcome, "not-run");
+  });
+
+  it("reads the wrapper's counts, so the failure line names the loop", async () => {
+    // `not-converged` from a deploy whose config half never ran: the parse has to
+    // survive to the counts, because `formatFailure` and the failure line print
+    // them. A parse that returned the wrapper's outline without its loops would
+    // get a summary the poll then dereferenced.
+    const { handler } = harness({ keys: [], members: [] });
+
+    const run = await handler({ action: "reconcile", trigger: "deploy" });
+    const decision = decideInvokeAttempt({
+      kind: "ok",
+      payload: JSON.stringify(run),
+    });
+
+    assert.equal(decision.kind, "not-converged");
+    assert.equal(
+      (decision as { summary?: ReconcilerSummary }).summary?.governance.outcome,
+      "aborted",
+      "the poll's failure message reads governance.outcome off the parsed summary",
+    );
   });
 });

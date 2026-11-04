@@ -131,9 +131,20 @@ describe("the config gateway over real HTTP", () => {
     ]);
     const keys = await gateway().listProviderKeys("fireworks");
 
+    assert.ok(keys, "a 200 must not read as the 404's null");
     assert.equal(keys.length, 1);
     assert.equal(keys[0].id, "key-1");
     assert.equal(keys[0].name, "fireworks-primary");
+  });
+
+  it("answers null for a provider's key list when the provider does not exist", async () => {
+    // The same `404` `getProvider` answers `null` for. Both routes are nested
+    // under the provider, so a provider that is only in the file answers the
+    // same way to both reads; throwing here and not there is what made a
+    // provider that should be `not-present` fail the whole invocation
+    // (`config-convergence-core.ts`, the keys loop).
+    reset([{ status: 404, body: { error: "Provider not found" } }]);
+    assert.equal(await gateway().listProviderKeys("bedrock"), null);
   });
 
   it("turns a non-2xx on a write into a status-only failure", async () => {

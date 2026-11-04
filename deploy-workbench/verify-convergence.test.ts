@@ -10,6 +10,7 @@ import {
 import type { ReconcilerSummary } from "./bifrost/reconciler-summary";
 import {
   formatFailure,
+  invokeArguments,
   isFunctionError,
   isThrottle,
   pollForConvergence,
@@ -268,5 +269,63 @@ describe("the retry window the script uses", () => {
       converge < bedrock,
       "a failed convergence must stop the run before it mutates the account further",
     );
+  });
+});
+
+/**
+ * The argument list the CLI is actually handed.
+ *
+ * `pollForConvergence` takes an injected `invoke`, so nothing above this reaches
+ * `aws` and nothing above it could have caught the defect this covers:
+ * `--payload` with raw JSON, no `--cli-binary-format`, which AWS CLI v2 decodes
+ * as base64 and rejects with `Invalid base64` before the request is signed. That
+ * is neither a throttle nor a `FunctionError`, so the step exited "could not
+ * complete" rather than reading a summary — on every deploy.
+ */
+describe("the invoke's argument list", () => {
+  const args = invokeArguments({
+    functionName: "bifrost-vk-janitor",
+    region: "us-west-2",
+    payloadFile: "/tmp/vk-reconciler-abc/event.json",
+    outFile: "/tmp/vk-reconciler-abc/out.json",
+  });
+
+  /** The value after `--flag`, or `undefined` when the flag is absent. */
+  const valueOf = (flag: string): string | undefined => {
+    const index = args.indexOf(flag);
+    return index === -1 ? undefined : args[index + 1];
+  };
+
+  it("hands the payload to the CLI as a file, never as inline JSON", () => {
+    // The whole point. An inline `--payload` is a blob argument and is
+    // base64-decoded by default, so raw JSON is either rejected outright or
+    // delivered as garbage; `fileb://` is read as bytes regardless of
+    // `cli_binary_format`.
+    assert.equal(
+      valueOf("--payload"),
+      "fileb:///tmp/vk-reconciler-abc/event.json",
+    );
+    assert.ok(
+      !args.some((entry) => entry.trimStart().startsWith("{")),
+      `no argument may be raw JSON: ${args.join(" ")}`,
+    );
+    // `file://` would stay subject to the same decoding; only `fileb://` is
+    // exempt.
+    assert.ok(!args.some((entry) => entry.startsWith("file://")));
+  });
+
+  it("invokes synchronously, with the region and a read timeout above the function's", () => {
+    // The three remaining load-bearing flags. `Event` would go green on a failed
+    // convergence; a read timeout at or below the function's own timeout would
+    // cut a legal run off and report it as the CLI's failure rather than the
+    // run's result.
+    assert.equal(valueOf("--invocation-type"), "RequestResponse");
+    assert.equal(valueOf("--function-name"), "bifrost-vk-janitor");
+    assert.equal(valueOf("--region"), "us-west-2");
+    assert.ok(
+      Number(valueOf("--cli-read-timeout")) > VK_JANITOR_TIMEOUT_SECONDS,
+    );
+    // The response metadata lands on stdout and the payload in the outfile.
+    assert.equal(args.at(-1), "/tmp/vk-reconciler-abc/out.json");
   });
 });

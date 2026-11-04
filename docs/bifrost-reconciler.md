@@ -280,7 +280,11 @@ computation:
 - **config convergence**: the live subset of `config.json`, diffed against the
   provider, key and client state the gateway reports, applied by `PUT` to the
   endpoints in the table above. Triggered by an `InvokeFunction` from the deploy
-  workflow after the Pulumi apply.
+  workflow after the Pulumi apply. A provider or key the running gateway does
+  not have is reported `not-present` and skipped rather than created (decision
+  7), and a `404` means the same thing on both of that provider's reads — the
+  provider itself and its key list — so a provider that is only in the file
+  cannot fail the invoke it is supposed to be a note about.
 
 Same desired-state computation, two callers, and the minter is a third
 (decision 7).
@@ -341,6 +345,29 @@ already take (`deploy-workbench/scripts/aws-role.ts`, the pattern
 `github-actions-workbench-deploy` role carries the Pulumi backend grant and the
 one SSM read, not `lambda:*` (`deploy/components/ci-roles/policies.ts:926-952`),
 while `pulumi-deploy` is `AdministratorAccess` (`deploy-workbench/deploy-role.ts:66-127`).
+
+The reply is a `JanitorRun`, not a bare summary. The handler returns
+`{ revocation, governance, config, summary }` and the run's own verdict is
+`summary.outcome`, because the `JanitorRun` shape is already the Lambda's public
+reply from step 3 (`docs/bifrost-virtual-keys.md`, the janitor's run log and its
+own tests) and narrowing it to suit the one new caller would drop the audit
+shape an operator reads when they invoke the function by hand. So the poll
+accepts both: `parseReconcilerSummary` reads `outcome` at the top level and one
+level down at `summary.outcome`, and
+`vk-janitor-handler.test.ts` drives the handler's real return value through the
+JSON serialisation the CLI's outfile applies and then through the parser. That
+integration test is the point: the two sides were each tested against their own
+shape, which is how a reply nobody could read stayed green in the suite.
+
+The payload is written to a file and passed as `fileb://path`, never as inline
+`--payload` JSON. `--payload` is a blob argument, so AWS CLI v2 base64-decodes
+it by default (`cli_binary_format=base64`) and rejects raw JSON with
+`Invalid base64` before the request is signed — which is neither a throttle nor
+a `FunctionError`, so the step would exit "could not complete" on every deploy.
+`fileb://` is the one form the CLI reads as bytes whatever `cli_binary_format`
+says, so the deploy's correctness does not depend on a flag or on a profile
+setting; `verify-convergence.test.ts` pins the real argument list, since the
+retry loop's injected invoke cannot see it.
 
 **`reservedConcurrentExecutions: 1` turns a collision into a failed deploy.**
 The function is capped at one concurrent execution (`bifrost-vk-janitor.ts:120`)
@@ -617,6 +644,13 @@ converge. See "The deploy must poll the invoke", including the
 `reservedConcurrentExecutions: 1` collision: a throttled invoke is retried with
 backoff for a window sized against the function's own timeout, and only a run that
 ran and did not converge fails the deploy.
+
+The result it reads is `summary.outcome` on the `JanitorRun` the function
+returns, with the bare-summary shape accepted too, and the event reaches the
+function as a `fileb://` file rather than inline `--payload` JSON. Both are in
+"The deploy must poll the invoke" and both are pinned by tests that drive the
+real reply and the real argument list, because a poll whose two halves each
+match their own assumption is a poll that never ran.
 
 Rejected: **`Event` invocation, or `Request` without reading the body.** Both
 return before the work does, both are green on a failed convergence, and both put

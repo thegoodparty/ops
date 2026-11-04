@@ -136,6 +136,55 @@ describe("a run that did not converge", () => {
     assert.equal(parseReconcilerSummary(null), undefined);
   });
 
+  it("reads the summary one level down, which is what the Lambda returns", () => {
+    // The function's reply is a `JanitorRun` -- `{ revocation, governance,
+    // config, summary }` (`vk-janitor-handler.ts`) -- so `outcome` sits under
+    // `summary`. A parser that read only the top level said "the run returned no
+    // summary" for every successful run, and the converge step failed on every
+    // deploy. `vk-janitor-handler.test.ts` drives the real return value through
+    // this; this case pins the shape at the unit level.
+    const wrapped = {
+      revocation: { outcome: "ok", kept: 1, deactivated: 0, skipped: 0 },
+      governance: { outcome: "converged", changed: 0, unchanged: 2, skipped: 0 },
+      config: { outcome: "converged", changed: 1, unchanged: 0, skipped: 2 },
+      summary: summary(),
+    };
+
+    assert.equal(
+      decideInvokeAttempt({ kind: "ok", payload: JSON.stringify(wrapped) }).kind,
+      "converged",
+    );
+    // The counts come through too, not just the verdict: the poll's failure
+    // message reads them.
+    assert.equal(parseReconcilerSummary(wrapped)?.config.skipped, 0);
+    assert.equal(parseReconcilerSummary(wrapped)?.trigger, "deploy");
+  });
+
+  it("keeps failing closed on a reply that is neither shape", () => {
+    // The unwrap must not become a way for anything to read as converged. An
+    // object with an `outcome` but no loops would be a summary the poll then
+    // dereferences, which would come out as "could not complete" rather than as
+    // the unreadable reply it is; and an object with neither an `outcome` nor a
+    // summary is still no summary.
+    for (const payload of [
+      { summary: {} },
+      { summary: { outcome: "converged" } },
+      { outcome: "converged" },
+      { summary: { outcome: "converged", revocation: {} } },
+      { summary: "converged" },
+    ]) {
+      assert.equal(
+        parseReconcilerSummary(payload),
+        undefined,
+        `${JSON.stringify(payload)} must not parse as a summary`,
+      );
+      assert.equal(
+        decideInvokeAttempt({ kind: "ok", payload: JSON.stringify(payload) }).kind,
+        "not-converged",
+      );
+    }
+  });
+
   it("stops the poll on the first non-retry decision", () => {
     const decisions = [
       decideInvokeAttempt({ kind: "throttled" }),

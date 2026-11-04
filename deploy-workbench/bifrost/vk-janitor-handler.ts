@@ -655,11 +655,13 @@ export const createJanitorGateway = (args: {
  * share is the transport and the credential, which is the setup token's own
  * story (`bifrost-gateway.md`, "Protecting the admin surface").
  *
- * `getProvider` answers `null` for a `404` rather than throwing. A provider the
- * running gateway does not have is not an outage: it is a boot-only change, and
- * convergence names it as skipped instead of pretending to have written it.
- * Every other non-2xx is a `GatewayFailure` carrying only the status, so no
- * error path can put a response body into a log.
+ * `getProvider` answers `null` for a `404` rather than throwing, and so does
+ * `listProviderKeys`: a provider the running gateway does not have is not an
+ * outage. It is a boot-only change, and convergence names it as skipped instead
+ * of pretending to have written it — on both routes, because a provider answers
+ * the same way whether you ask for it or for its keys. Every other non-2xx is a
+ * `GatewayFailure` carrying only the status, so no error path can put a response
+ * body into a log.
  */
 export const createConfigGateway = (args: {
   baseUrl: string;
@@ -731,6 +733,14 @@ export const createConfigGateway = (args: {
         "GET",
         `/api/providers/${encodeURIComponent(provider)}/keys`,
       );
+      // The same `404` `getProvider` answers `null` for, and it has to be the
+      // same answer here. Both routes are namespaced under the provider, so a
+      // provider the running gateway does not have is a `404` on the provider
+      // and on its key list; throwing on the second and not the first would
+      // make a provider that should be `not-present` fail the whole invocation
+      // (`config-convergence-core.ts`), which is the deploy-time shape of the
+      // boot-only change this loop is meant to name rather than fail on.
+      if (status === 404) return null;
       if (status !== 200) throw new GatewayFailure(status);
       const keys = record(payload).keys;
       return Array.isArray(keys) ? keys.map(record) : [];
