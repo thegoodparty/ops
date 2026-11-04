@@ -700,18 +700,20 @@ are referenced by name, never written down here or in git.
   `GET /foundation-models` (AWS's `ListFoundationModels`) and not from the key
   list, so an invoke-only role serves inference and shows the provider warning
   where the models should be. Bedrock defines no resource type for that action,
-  and Bifrost then invokes the underlying
-  foundation model in whichever region it routes to, so a grant covering only
-  the profile fails the moment routing leaves home. The pinned provider calls no
-  `ListInferenceProfiles`/`GetInferenceProfile`: the `global.` profiles the
-  config allows are listed from the key's own `models` allowlist (the list
-  pipeline backfills allowlist entries the foundation-model response does not
-  contain) and invoked through their profile ARNs, which the invoke statement
-  already grants. The SCP's existing `bedrock` exemption keeps cross-region
-  calls working, and it is a requirement rather than a convenience: a blocked
-  destination region fails the request outright. This is what lets the gateway
-  take over Bedrock entirely, including the per-user attribution the invocation
-  log provides today.
+  which is the one wildcard in the role. Invoking needs more than the profile
+  ARN as well: the request names the inference profile, and Bedrock then
+  invokes the underlying foundation model in whichever region it routes to, so
+  a grant covering only the profile fails the moment routing leaves home.
+
+  The pinned provider calls no `ListInferenceProfiles`/`GetInferenceProfile`:
+  the `global.` profiles the config allows are listed from the key's own
+  `models` allowlist (the list pipeline backfills allowlist entries the
+  foundation-model response does not contain) and invoked through their profile
+  ARNs, which the invoke statement already grants. The SCP's existing `bedrock`
+  exemption keeps cross-region calls working, and it is a requirement rather
+  than a convenience: a blocked destination region fails the request outright.
+  This is what lets the gateway take over Bedrock entirely, including the
+  per-user attribution the invocation log provides today.
 - **Other providers** (Anthropic direct, OpenAI direct) are added only if a
   harness needs them, each with its own `env.` reference. Provider fallback
   between Fireworks and Bedrock is a configuration choice; it is the main
