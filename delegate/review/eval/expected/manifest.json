@@ -225,5 +225,34 @@
     "split": "holdout",
     "source": "simulated",
     "kind": "bug"
+  },
+  {
+    "id": "omni-2594-free-texts-stamp-before-cas",
+    "bundle": "omni-2594-free-texts-stamp-before-cas.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/outreach/services/outreachPurchase.service.ts",
+        "packages/gp-api/src/outreach/services/outreachP2pSmsHold.service.ts"
+      ]
+    },
+    "tests": "Simulated from omni#2594, focused to its non-test source. The purchase webhook stamps the send's freeTextsApplied before redeemFreeTexts runs the campaign's one-time-offer CAS, so two concurrent eligible sends on one campaign can both be stamped while only one wins, and capture undercharges the loser by the free-texts discount (about $175). Production approved it; #2657 fixed it by stamping inside the CAS transaction.",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2368-issue-tag-insert-race",
+    "bundle": "omni-2368-issue-tag-insert-race.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/constituentFeedback/services/feedbackSynthesisIngest.service.ts"
+      ]
+    },
+    "tests": "Simulated from omni#2368 (19k lines), focused to the ingest service, its contracts, schema and queue consumer. Ingest reads IssueTag by (organizationSlug, normalizedName) and creates it when missing, so two synthesis runs in one org that propose the same theme both insert; the second hits the unique constraint, its whole ingest transaction rolls back, and the run stays running until the sweep fails it. The per-effort activeKey does not serialize runs across efforts. Production approved it; #2753 fixed it with createMany skipDuplicates and a re-read.",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "bug"
   }
 ]
