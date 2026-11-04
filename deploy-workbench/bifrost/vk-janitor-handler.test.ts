@@ -280,9 +280,59 @@ describe("the janitor handler", () => {
     ]);
   });
 
-  it("fails the invocation, before any write, when a governance document cannot be read", async () => {
-    const { handler, logs, updates } = harness({
+  it("keeps the revocation audit when the convergence half fails afterwards", async () => {
+    // The key is deactivated before the convergence half's read fails. The name
+    // and reason must still reach the log: on the next tick that key carries its
+    // deletion timer, is counted as `already-inactive`, and never appears again,
+    // so losing this line loses the only record of who was revoked and why.
+    const { handler, logs } = harness({
       keys: [key({ name: "gone@goodparty.org" })],
+      members: ["user-1"],
+      userIds: {},
+      // The revocation loop reads the group and the keys; this fails later, in
+      // the convergence half's desired-state read.
+      overrides: { "gone@goodparty.org": { budgets: [{ max_limit: 1, reset_duration: "1M" }] } },
+      governanceError: new Error("AccessDenied on /bifrost/governance-overrides"),
+    });
+
+    await assert.rejects(
+      handler({ action: "reconcile" }),
+      (error: unknown) =>
+        error instanceof JanitorFailure &&
+        error.code === "desired-state-unavailable",
+    );
+
+    // The audit lines come first, then the failure. The order is the assertion:
+    // revocation logged what it did before the run went red.
+    assert.deepEqual(logs, [
+      {
+        event: "vk-janitor",
+        outcome: "ok",
+        members: 1,
+        managedKeys: 1,
+        kept: 0,
+        deactivated: 1,
+        skipped: 0,
+      },
+      {
+        event: "vk-janitor",
+        outcome: "deactivated",
+        name: "gone@goodparty.org",
+        reason: "owner-unresolved",
+      },
+      {
+        event: "vk-janitor",
+        outcome: "failed",
+        reason: "desired-state-unavailable",
+      },
+    ]);
+  });
+
+  it("fails the invocation when a governance document cannot be read, after revocation has run", async () => {
+    const { handler, logs } = harness({
+      // No managed key, so revocation writes nothing and the only write the run
+      // could make is a convergence one — which it never reaches.
+      keys: [],
       members: ["user-1"],
       userIds: {},
       governanceError: new Error("AccessDenied on /bifrost/governance-overrides"),
@@ -294,12 +344,19 @@ describe("the janitor handler", () => {
         error instanceof JanitorFailure &&
         error.code === "desired-state-unavailable",
     );
-    // A run with no desired state converges nothing and deactivates nothing: the
-    // read is before the writes, so a parameter the deploy has not written yet
-    // is a red invocation rather than a guess at what the fleet should look
-    // like. Step 6's alarm counts the failure either way.
-    assert.deepEqual(updates, []);
+    // Revocation ran and said so; convergence then failed the run. A parameter
+    // the deploy has not written yet is a red invocation rather than a guess at
+    // the fleet's shape, and step 6's alarm counts it.
     assert.deepEqual(logs, [
+      {
+        event: "vk-janitor",
+        outcome: "ok",
+        members: 1,
+        managedKeys: 0,
+        kept: 0,
+        deactivated: 0,
+        skipped: 0,
+      },
       {
         event: "vk-janitor",
         outcome: "failed",

@@ -175,8 +175,41 @@ export const createJanitorHandler =
         );
       }
 
-      // The desired state, before the first write. A missing or malformed
-      // document fails the run rather than converging to a guess.
+      const gateway = deps.createGateway(setupToken);
+      revocation = await reconcileVirtualKeys({
+        directory,
+        gateway,
+        now: deps.now(),
+      });
+
+      // The revocation half is logged the moment it returns, before the
+      // convergence half can throw. "Who was revoked, when and why" is the
+      // audit trail the retention window exists to make reviewable, and it must
+      // not be lost because the run failed one step later: on the next tick those
+      // keys carry their deletion timer, so they are counted as
+      // `already-inactive` and their names never appear again.
+      if (revocation.outcome === "aborted") {
+        // The group read succeeded and returned nobody. Decision 6: do nothing
+        // and say so. Convergence reads the same group and would abort for the
+        // same reason, so it is not run at all — the one line is the record.
+        deps.log({
+          event: "vk-janitor",
+          outcome: "aborted",
+          reason: revocation.abortReason,
+          members: revocation.memberCount,
+        });
+        governance = abortedReconcile();
+        return { revocation, governance };
+      }
+      logRevocation(deps, revocation);
+
+      // The desired state, read after the revocation half has already decided
+      // and written. Revocation is the fail-closed job and must not wait on a
+      // parameter: a deploy that has not written `/bifrost/governance-overrides`
+      // yet, or a parameter somebody deleted, would otherwise leave a departed
+      // person's key active for as long as it took to notice. Convergence fails
+      // the run on the same read, which is decision 15's "report it, do not
+      // disable" — the alarm counts it and nothing keeps a working key active.
       let governanceDocuments: {
         template: GovernanceTemplate;
         overrides: GovernanceOverrides;
@@ -190,12 +223,6 @@ export const createJanitorHandler =
         );
       }
 
-      const gateway = deps.createGateway(setupToken);
-      revocation = await reconcileVirtualKeys({
-        directory,
-        gateway,
-        now: deps.now(),
-      });
       governance = await reconcileGovernance({
         directory,
         gateway,
@@ -211,87 +238,105 @@ export const createJanitorHandler =
       throw error;
     }
 
-    if (revocation.outcome === "aborted" || governance.outcome === "aborted") {
-      // The group read succeeded and returned nobody. Decision 6: do nothing and
-      // say so. Neither loop called `update`, so the message is the whole record.
-      deps.log({
-        event: "vk-janitor",
-        outcome: "aborted",
-        reason: revocation.abortReason ?? governance.abortReason,
-        members: revocation.memberCount,
-      });
-      return { revocation, governance };
-    }
-
-    deps.log({
-      event: "vk-janitor",
-      outcome: "ok",
-      members: revocation.memberCount,
-      managedKeys: revocation.managedKeyCount,
-      kept: revocation.kept.length,
-      deactivated: revocation.deactivated.length,
-      skipped: revocation.skipped.length,
-    });
-    // One line per key, because "who was revoked, when and why" is the audit
-    // trail the deactivation window exists to make reviewable. The name is the
-    // owner's email and the reason is a verdict; no key value and no body.
-    for (const entry of revocation.deactivated) {
-      deps.log({
-        event: "vk-janitor",
-        outcome: "deactivated",
-        name: entry.name,
-        reason: entry.reason,
-      });
-    }
-    for (const entry of revocation.skipped) {
-      // The hourly `already-inactive` skip is the steady state and would be one
-      // line per deactivated key per hour; the summary counts it. The
-      // open-item-6 guard is the one worth a name on every run, because it is a
-      // mismatch a human has to fix.
-      if (entry.reason !== "owner-not-an-email") continue;
-      deps.log({
-        event: "vk-janitor",
-        outcome: "skipped",
-        name: entry.name,
-        reason: entry.reason,
-      });
-    }
-
-    // The convergence summary. `changed` is the number decision 6 makes the
-    // signal: a run with nothing to do and a run that keeps finding the same
-    // difference must not read the same in the log.
-    deps.log({
-      event: "vk-reconciler",
-      outcome: governance.outcome,
-      members: governance.memberCount,
-      managedKeys: governance.managedKeyCount,
-      changed: governance.changed,
-      unchanged: governance.unchanged,
-      skipped: governance.skipped.length,
-      minted: governance.minted,
-    });
-    // One line per key that changed, with the fields that differed. A steady
-    // stream of the same names is the fight worth looking at, so the names are
-    // as load-bearing here as the count.
-    for (const entry of governance.applied) {
-      deps.log({
-        event: "vk-reconciler",
-        outcome: "converged",
-        name: entry.name,
-        fields: entry.fields,
-      });
-    }
-    for (const entry of governance.skipped) {
-      deps.log({
-        event: "vk-reconciler",
-        outcome: "skipped",
-        name: entry.name,
-        reason: entry.reason,
-      });
-    }
-
+    logConvergence(deps, governance);
     return { revocation, governance };
   };
+
+/** A run's revocation summary and its per-key lines. */
+const logRevocation = (deps: JanitorDeps, result: JanitorResult): void => {
+  deps.log({
+    event: "vk-janitor",
+    outcome: "ok",
+    members: result.memberCount,
+    managedKeys: result.managedKeyCount,
+    kept: result.kept.length,
+    deactivated: result.deactivated.length,
+    skipped: result.skipped.length,
+  });
+  // One line per key, because "who was revoked, when and why" is the audit
+  // trail the deactivation window exists to make reviewable. The name is the
+  // owner's email and the reason is a verdict; no key value and no body.
+  for (const entry of result.deactivated) {
+    deps.log({
+      event: "vk-janitor",
+      outcome: "deactivated",
+      name: entry.name,
+      reason: entry.reason,
+    });
+  }
+  for (const entry of result.skipped) {
+    // The hourly `already-inactive` skip is the steady state and would be one
+    // line per deactivated key per hour; the summary counts it. The open-item-6
+    // guard is the one worth a name on every run, because it is a mismatch a
+    // human has to fix.
+    if (entry.reason !== "owner-not-an-email") continue;
+    deps.log({
+      event: "vk-janitor",
+      outcome: "skipped",
+      name: entry.name,
+      reason: entry.reason,
+    });
+  }
+};
+
+/** The convergence summary and one line per key it changed or skipped. */
+const logConvergence = (deps: JanitorDeps, result: ReconcileResult): void => {
+  if (result.outcome === "aborted") {
+    deps.log({
+      event: "vk-reconciler",
+      outcome: "aborted",
+      reason: result.abortReason,
+      members: result.memberCount,
+    });
+    return;
+  }
+
+  // `changed` is the number decision 6 makes the signal: a run with nothing to
+  // do and a run that keeps finding the same difference must not read the same
+  // in the log.
+  deps.log({
+    event: "vk-reconciler",
+    outcome: result.outcome,
+    members: result.memberCount,
+    managedKeys: result.managedKeyCount,
+    changed: result.changed,
+    unchanged: result.unchanged,
+    skipped: result.skipped.length,
+    minted: result.minted,
+  });
+  // One line per key that changed, with the fields that differed. A steady
+  // stream of the same names is the fight worth looking at, so the names are as
+  // load-bearing here as the count.
+  for (const entry of result.applied) {
+    deps.log({
+      event: "vk-reconciler",
+      outcome: "converged",
+      name: entry.name,
+      fields: entry.fields,
+    });
+  }
+  for (const entry of result.skipped) {
+    deps.log({
+      event: "vk-reconciler",
+      outcome: "skipped",
+      name: entry.name,
+      reason: entry.reason,
+    });
+  }
+};
+
+/** The convergence result a run reports when it never got that far. */
+const abortedReconcile = (): ReconcileResult => ({
+  outcome: "aborted",
+  abortReason: "group-empty",
+  memberCount: 0,
+  managedKeyCount: 0,
+  changed: 0,
+  unchanged: 0,
+  applied: [],
+  skipped: [],
+  minted: 0,
+});
 
 /** A failure's reason for the log line: a code, never a body or a key. */
 const failureReason = (error: unknown): string =>
