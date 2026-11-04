@@ -98,6 +98,24 @@ else
   echo "clickup mcp: not connected, not installed; Connect it in the dashboard (MCP servers, clickup), then run bootstrap.sh again"
 fi
 
+# Config for the panel hand-off scripts. The Slack token comes from .env and
+# stays out of agent env, so only those scripts read it, through
+# ctx.swarm.config.
+for kv in "TEVYN_API_CHANNEL_ID=C09JMECMP89" "HANDOFF_ENV=dev" "REPLIES_BUCKET=tevyn-poll-csvs-develop"; do
+  jq -n --arg k "${kv%%=*}" --arg v "${kv#*=}" \
+    '{scope: "global", key: $k, value: $v, description: "Panel hand-off scripts (bootstrap.sh)"}' \
+    | api PUT /api/config -d @- >/dev/null
+done
+if ! grep -q '^SLACK_BOT_TOKEN=.' .env; then
+  echo "bootstrap: SLACK_BOT_TOKEN is empty in .env" >&2
+  exit 1
+fi
+sed -n 's/^SLACK_BOT_TOKEN=//p' .env | tr -d '\n' \
+  | jq -Rs '{scope: "global", key: "SLACK_BOT_TOKEN", value: ., isSecret: true, exportToEnv: false,
+      description: "Delegate bot token for the panel hand-off scripts (bootstrap.sh)"}' \
+  | api PUT /api/config -d @- >/dev/null
+echo "hand-off config: channel, env, bucket and Slack token saved as global config"
+
 # Global catalog scripts. Global writes need the lead, and the upsert
 # typechecks, so a script that does not compile fails the run here. Saving
 # identical source again is a no-op.

@@ -40,6 +40,19 @@ const listFiles = (dir: string): string[] =>
     )
     .sort();
 
+// gp-api ingests a wave's Scale to Win export from this prefix; its bucket
+// policy grants the other half, since the buckets live in the management
+// account. Write-only: the swarm never reads replies back.
+export const panelRepliesPutStatement = {
+  Sid: "PutPanelReplies",
+  Effect: "Allow",
+  Action: "s3:PutObject",
+  Resource: [
+    "arn:aws:s3:::tevyn-poll-csvs-develop/agent-replies/*",
+    "arn:aws:s3:::tevyn-poll-csvs-master/agent-replies/*",
+  ],
+};
+
 export const hostFiles = () =>
   listFiles(HOST_DIR).map((file) => path.relative(HOST_DIR, file));
 
@@ -249,6 +262,7 @@ export const createAgentSwarm = (args: {
                 Action: ["s3:PutObject", "s3:PutObjectAcl"],
                 Resource: `${bucketArn}/ssm-output/*`,
               },
+              panelRepliesPutStatement,
               {
                 Sid: "ReadBucketEncryption",
                 Effect: "Allow",
