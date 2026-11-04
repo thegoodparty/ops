@@ -398,7 +398,7 @@ the template's" would invite a reader to think the two differ. Naming
 wire, so an override that narrows one provider states the whole list it means.
 
 The reason it is a second parameter and not more of the first is the tier
-ceiling: `config.json` is already 3,794 bytes against the standard tier's 4 KiB,
+ceiling: `config.json` is **4,014 bytes** against the standard tier's 4 KiB,
 and the two governance documents have separate lifetimes anyway. Both are
 checked against the ceiling by `governance-parameters.test.ts`, which fails the
 build rather than the apply.

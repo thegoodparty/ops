@@ -547,8 +547,26 @@ serve.
 [`runbooks.md`](./runbooks.md). Three, not one, because a single `503` from a
 restarting task is not a reconciler problem. **No auto-disable**: a reconciler
 that turns itself off is a reconciler whose failures stop paging, which is the
-opposite of what the alarm is for. `runbooks.md` is a stub today; the entry lands
-with the alarm, not before it.
+opposite of what the alarm is for. `runbooks.md` was a stub when this was
+written; the entry lands with the alarm, not before it, and did — see below.
+
+**Built 2026-11-04 (step 6).** The alarm is a `MetricAlarm` on the function's
+own `AWS/Lambda` `Errors` metric, `Sum` over three consecutive five-minute
+periods, published to an SNS topic subscribed to `aws-workbench@goodparty.org`.
+Two things that decision did not anticipate, recorded because a later session
+will hit them:
+
+- **The account had no alarm-to-email wire to reuse.** The spend alerts are
+  `aws.budgets.Budget` resources with `subscriberEmailAddresses`, and a
+  `MetricAlarm` has no equivalent field, so this is the workbench account's
+  first SNS topic. It follows the infrastructure account's
+  `deploy-infrastructure/sheriff-lambda.ts` rather than inventing a pattern.
+- **Throttles are not counted by this alarm**, and the sentence in the
+  `reservedConcurrentExecutions` section above ("counted separately and loudly
+  enough to be seen") is still not implemented. Nothing counts a throttle yet.
+  The deploy's poll retries one, so a deploy is not silently green, but a
+  pattern of throttles between deploys is invisible. Recorded as a gap rather
+  than papered over.
 
 **Source of truth is unchanged, and the window widens.** `config.json` already
 sets `source_of_truth: "config.json"` (`deploy-workbench/bifrost/config.json`,
@@ -1016,22 +1034,21 @@ that are now stale.
    mint for an overridden email produces a key the reconciler then reports as
    unchanged.
 6. **The alarm, the runbook and the document corrections.** Three-consecutive-
-   failure alarm on the reconciler (a CloudWatch alarm on the function's errors,
-   with the notification wiring the account already uses for spend alerts), the
-   `runbooks.md` entry that answers it, the `bifrost-virtual-keys.md`
-   "Deferred"/"Update accepts only" corrections this plan makes true, the
-   gateway plan's "Persistence, backup and upgrade" amendments (this PR's, kept
-   consistent), its phase item 10 sentence about the digest being what makes an
-   edit roll the task (true when written, false once step 1 lands), the
-   `config.json` size figures in `ecs.ts` and
-   `deploy-workbench/bifrost/README.md`, including that README's paragraph on
-   the digest, which still says a change to the file rolls the task. `docs/` is
-   human-owned, so the doc half is a review of its own; the code halves ride in
-   the PRs that made them necessary where possible. Proves: no document still
-   describes the whole-file digest as the seam, and the alarm has an answer
-   written down.
+   failure alarm on the reconciler (a CloudWatch alarm on the `AWS/Lambda`
+   `Errors` metric, publishing to an SNS topic subscribed to
+   `aws-workbench@goodparty.org`), the [`runbooks.md`](./runbooks.md) entry that
+   answers it, and the corrections to the documents steps 1-5 made stale.
 
 ## Cited so the next session can check
+
+> **Note, 2026-11-04:** several facts below describe the repository as it was
+> when this plan was written, and the "today" column in the two tables is that
+> snapshot, not the current tree. Where a step has landed, the code is the
+> authority: the digest no longer covers the whole file (step 1), the interval
+> is five minutes (step 4), and the janitor now converges governance and live
+> config as well as revoking (steps 3-5). The rows are kept as written because
+> they are the evidence the plan's arguments were made against; a future
+> session should read them as the starting point and the code as the result.
 
 In this repository:
 

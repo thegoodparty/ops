@@ -346,8 +346,8 @@ uniform and a mistake is uniform:
 ### 6. The janitor: a scheduled reconcile loop
 
 **Agreed in review, the engineer's idea.** A second Lambda on an EventBridge
-schedule, roughly hourly, that makes the set of Lambda-managed keys follow the
-group:
+schedule, every five minutes, that makes the set of Lambda-managed keys follow
+the group:
 
 1. List the `Engineers` group's members from the Identity Store.
 2. List every virtual key in the gateway and keep the ones carrying the
@@ -373,6 +373,21 @@ Rules, each of which is a decision:
   back is a mint, which is the path that also clears the deletion timer
   (decision 4), so there is one code path that grants and one that revokes and
   neither undoes the other by accident.
+
+  **Amended 2026-11-04:** "takes access away" is now too narrow a description of
+  the loop, though the invariant it protects is unchanged. From step 3 of
+  [`bifrost-reconciler.md`](./bifrost-reconciler.md) the same run also
+  **converges** an existing managed key's governance to the committed desired
+  state — `provider_configs`, `budgets`, `rate_limit` and `calendar_aligned`,
+  the fields `deploy-workbench/bifrost/governance-desired-state.ts` reconciles.
+  Convergence can therefore narrow access (a provider or model removed from the
+  overrides file) as well as widen it back (a limit raised), which is why the
+  invariant is stated more precisely as: **it creates no key and it can only
+  converge the fields the overrides file owns.** It still cannot grant access
+  where there was none, a directory member with no key still needs a mint, and
+  it never touches a field the template and the overrides do not name
+  (criterion 8 and decision 7 of that plan).
+
 - **Touch only marker-bearing keys.** Not "keys that look like emails": a
   person's own test key, or a key a human made in the dashboard, is never
   deactivated by a job. The marker is the whole safety property.
@@ -391,6 +406,23 @@ Rules, each of which is a decision:
   reversible. An hour, and not five minutes, because a person who has left is
   not a five-minute emergency and a job that runs often enough to page on is a
   job that pages for a bad reason.
+
+  **Amended 2026-11-04:** the interval is **five minutes**, not an hour, and the
+  argument above is kept because the objection in it is still the right one —
+  it was answered rather than ignored. Decision 4 of
+  [`bifrost-reconciler.md`](./bifrost-reconciler.md) changes what the interval
+  is for: the same tick now also bounds how long a person's governance override
+  can sit unapplied, and that is a number worth being small. The "pages for a
+  bad reason" half is answered by the failure alarm, which counts three
+  consecutive convergence failures rather than the cadence
+  ([`runbooks.md`](./runbooks.md), "The Bifrost reconciler is not converging").
+  Revocation at five minutes instead of sixty costs one group read and one key
+  list per tick, and cannot take access away from anyone who is still a member,
+  so the faster cadence is harmless in the direction that matters. The number
+  and its guards live in `deploy-workbench/bifrost/vk-janitor-contract.ts`, and
+  the revocation bound is therefore about five minutes plus the fifteen-minute
+  Workspace sync above, not an hour and a quarter.
+
 - **The janitor is in the workbench account and reads the directory
   cross-account, through the same role the mint uses.** It has to be in the
   workbench account — it is the second caller of the VPC-internal admin API —
@@ -584,7 +616,7 @@ not decided here.
    the entry is under 12 hours old, prints the key.
 3. No Lambda call, and no network call at all on the common path.
 
-**The janitor, hourly.**
+**The janitor, every five minutes.**
 
 1. EventBridge invokes the janitor Lambda.
 2. It assumes the read-only role in the management account — the same role the
@@ -598,8 +630,17 @@ not decided here.
 6. A key whose owner is not a member **and which is still active** gets one
    `PUT`: `is_active: false`, `expires_at: now + 90 days`,
    `delete_after_expire: true`. A key that is already inactive with an expiry
-   set is skipped, so an hourly run does not restart the 90-day clock.
+   set is skipped, so a five-minute run does not restart the 90-day clock.
 7. Nothing else is touched, and a failed or empty group read means no writes.
+
+**Amended 2026-11-04:** the loop above is revocation only, and it is now one
+third of what a tick does. Since steps 3 and 4 of
+[`bifrost-reconciler.md`](./bifrost-reconciler.md) the same invocation also
+converges each managed key's governance to the committed desired state and the
+gateway's live config to `config.json`, and the interval is five minutes rather
+than hourly. The revocation steps are unchanged in substance; the governed
+fields are `provider_configs`, `budgets`, `rate_limit` and `calendar_aligned`,
+and the diff-and-apply loop is `deploy-workbench/bifrost/vk-janitor-core.ts`.
 
 ## The key, as the Lambda sends it
 
@@ -669,7 +710,8 @@ adding one later is adding a field here.
   the task role's; this only decides which models a person's key may reach.
 - **Not a per-request check of group membership.** Membership is checked when a
   key is minted, `is_active` is checked on every request, and the janitor
-  reconciles the two hourly. The gateway itself knows nothing about the group.
+  reconciles the two on every tick. The gateway itself knows nothing about the
+  group.
 
 ## Implementation plan
 
@@ -718,7 +760,7 @@ Step: 2
    order; the permission is useless until the function does). This is the step
    that lets a person reach the mint at all, and the one that needs a human's
    sign-off, because it is an identity-policy change.
-5. **The janitor.** The Lambda plus its hourly `EventBridge` rule in
+5. **The janitor.** The Lambda plus its `EventBridge` rule in
    `deploy-workbench/`, assuming step 2's read-only role and granted the same
    single-container read of `BIFROST_SETUP_TOKEN` from `bifrost/gateway` that
    step 3 has (`secretsmanager:GetSecretValue` on that ARN pattern and nothing
@@ -784,10 +826,13 @@ Everything else:
    the `409` on a duplicate name, that a created key authenticates against
    `/v1` immediately, and that `key_ids: ["*"]` is what makes a pinned
    `provider_configs` entry usable.
-3. **The janitor interval.** Hourly is this document's choice. It is worth
-   revisiting if the gateway's request logs show a revoked key still being used
-   after an hour, or if the janitor's own runs turn out to be the noisiest
-   thing in the account.
+3. **The janitor interval — resolved, not open.** This document chose hourly;
+   decision 4 of [`bifrost-reconciler.md`](./bifrost-reconciler.md) changed it to
+   five minutes, because the same tick now also bounds how long a governance
+   override can sit unapplied. It is worth revisiting again if the gateway's
+   request logs show a revoked key still being used well after the sync window,
+   or if the janitor's own runs turn out to be the noisiest thing in the
+   account.
 4. **Which secret the mint Lambda reads — resolved, not open.** Both Lambdas
    read `BIFROST_SETUP_TOKEN` from `bifrost/gateway`, and the dedicated
    `bifrost/vk-mint` container is gone from the design and from
