@@ -25,8 +25,9 @@ not pass. The check cannot pass for a gateway model: `pi auth check` builds its
 runtime without loading `gp-bifrost.ts`, so the `bifrost` provider is
 `provider_not_found` every time. The fallback is then the saved model, and the
 saved model in a fresh volume is whichever gateway model sorts first. A worker
-was observed running a whole research brief on `bedrock/us.anthropic.claude-haiku-5-5`
-for exactly that reason.
+was observed running a whole research brief on `bedrock/anthropic.claude-haiku-5-5`
+(the profile of the day; it is a `global.` profile today) for exactly that
+reason.
 
 The gateway already has the right primitive. Bifrost's **key aliases** map a
 short name to a provider model id on the provider key, and the gateway lists
@@ -46,7 +47,8 @@ Success, in the order it should be proven:
    `deploy-workbench/bifrost/config.json`. The alias resolves at the gateway on
    every request, so no key, cache or container changes with it.
 3. **Residency stays a property of the deployment.** A test in this repository
-   fails if either alias target is not a US-only model the gateway allows.
+   fails if either alias target is not a model the gateway allows under its
+   provider's rule: a US-only Fireworks router, or a `global.` Bedrock profile.
 4. **A missing alias is a loud refusal.** `dispatch` stops with a message that
    names the alias. It never starts workers on a different model.
 5. **Cost and context are right.** A request through an alias is priced and
@@ -280,12 +282,13 @@ turned into a mint per prompt. If the retry still fails, `dispatch` refuses
 ### Residency becomes an ops test
 
 `config.test.ts` and `vk-mint-template.test.ts` assert today that every model
-id in the key and the template is a `-us` router or a `us.` profile. The alias
-names are not model ids and must not be asserted that way, so the tests grow a
-second path instead of a looser first one:
+id in the key and the template is a `-us` Fireworks router or a `global.`
+Bedrock profile. The alias names are not model ids and must not be asserted
+that way, so the tests grow a second path instead of a looser first one:
 
-- for every alias in `config.json`, `model_id` satisfies the same US-only
-  rule as a model id (`-us` router on Fireworks, `us.` profile on Bedrock), and
+- for every alias in `config.json`, `model_id` satisfies the same per-provider
+  rule as a model id (a `-us` router on Fireworks, a `global.` profile on
+  Bedrock), and
   is not itself a served name (decision 8);
 - `model_name` is non-empty on every alias, because without it cost attribution
   is wrong;

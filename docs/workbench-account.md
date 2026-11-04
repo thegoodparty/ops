@@ -405,23 +405,30 @@ Facts discovered during implementation go here as they are learned:
   into a steady refusal. Recorded because the wrong diagnosis is plausible
   enough to be reached again.
 - **Cross-region inference is still worth knowing about**, even though it was
-  not the cause. The `us.` ids route each request across the profile's member
-  regions rather than staying in `AWS_REGION`, and member sets differ per
-  model: the Anthropic profiles span three regions, `us.moonshotai.kimi-k3`
-  spans five. This is why the IAM resources wildcard the region and enumerate
-  the model rather than the reverse.
+  not the cause, and it is now the account's default rather than a footnote.
+  The `us.` ids route each request across the profile's member regions rather
+  than staying in `AWS_REGION`, and member sets differ per model: the Anthropic
+  profiles span three regions, `us.moonshotai.kimi-k3` spans five. A `global.`
+  profile, which every entry selects since 2026-11-04, routes more widely still:
+  any commercial region AWS offers the model in, with no way to narrow it (see
+  "Changing a model's inference profile" below). Either way the destination
+  set is not the caller's region, which is why the IAM resources wildcard the
+  region and enumerate the model rather than the reverse.
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
   list imported by both the IAM policy that permits them and the script that
-  subscribes to them. Geo profiles unless noted: `anthropic.claude-opus-5-5`,
+  subscribes to them. Every entry selects a `global.` cross-region inference
+  profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
   `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
   `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
-  `moonshotai.kimi-k3`, plus `deepseek.v3.2` kept region-pinned by choice. Sonnet 5.5 was the one
-  exception — it launched with only a `global.` profile, which routes outside
-  US geography — until AWS added `us.anthropic.claude-sonnet-5-5` on
-  2026-10-01. The entry moved to the geo profile; the `global.` ARN stays
-  permitted through a transition until `gp-pi` ships the same switch. See
+  `moonshotai.kimi-k3`. Each entry's outgoing `us.` profile stays permitted
+  through `transitionalInvokeIds` until `gp-pi` has shipped the switch. The
+  account was on `us.` geo profiles for residency before that; Sonnet 5.5 was
+  briefly the reverse exception, launched on `global.` alone on 2026-09-28 and
+  moved to `us.` when AWS added it on 2026-10-01 — both of those dates are
+  superseded, and the current state is `global.` for everything. See
   "Changing a model's inference profile" under "Adding a Bedrock model
-  later".
+  later". `deepseek.v3.2` was removed in the same change: it has no `global.`
+  profile and no `us.` one, so there was nothing left for it to select.
 - **The Anthropic first-time-use form is assumed already submitted.** It is
   required once per account or once at the organization's management account,
   and a submission at the root is inherited by every account in the
@@ -429,13 +436,15 @@ Facts discovered during implementation go here as they are learned:
   be covered; it is an assumption rather than something checked. If it is not,
   `PutUseCaseForModelAccess` takes `companyName`, `companyWebsite`,
   `intendedUsers`, `industryOption`, `otherIndustryOption` and `useCases`.
-- **`us.moonshotai.kimi-k3` has no in-region support in any region**, so a geo
-  profile is mandatory for it rather than a preference. Its model card also
-  lists `ca-central-1` as geo-supported while its prose says the `us.` profile
-  routes only among US-geography regions to respect US data residency. Those
-  disagree, and the script leaves `ca-central-1` out pending a resolution.
-  Worth settling deliberately given what GoodParty holds: if routing does
-  reach it, K3 fails intermittently until it is added.
+- **`moonshotai.kimi-k3` has no in-region support in any region**, so a
+  cross-region inference profile is mandatory for it rather than a preference.
+  Its model card also lists `ca-central-1` as geo-supported while its prose
+  says the `us.` profile routes only among US-geography regions to respect US
+  data residency. Those disagree, and the script leaves `ca-central-1` out
+  pending a resolution. That question is now historical for the model the
+  account invokes, which is `global.moonshotai.kimi-k3` and is not limited to
+  the `us.` profile's members at all; it still decides what the outgoing `us.`
+  profile's `ca-central-1` subscription does during the rollover.
 - **Kimi K3 through Converse is documented as broken for multi-turn
   reasoning.** AWS's card says Converse raises `InternalServerException` when
   reasoning content from earlier turns is included, and recommends the
@@ -1008,11 +1017,15 @@ inference profile support page:
 > Regions remain allowed.
 
 So the exemption is a requirement, not a precaution, and the failure without
-it is total rather than partial: every geo-profile call fails, and
-`moonshotai.kimi-k3` has no in-region fallback to degrade to. The same page
-also notes that prompts and outputs may be stored in opt-in destination
-regions for abuse detection, which is worth knowing given what GoodParty
-holds.
+it is total rather than partial: every cross-region profile call fails, and
+`moonshotai.kimi-k3` has no in-region fallback to degrade to. That is more
+sharply true since 2026-11-04, when every entry moved to a `global.` profile
+whose destination set is wider and is not fixed: a `global.` profile is either
+allowed whole or unusable, and there is no "global but US-only" middle setting.
+The same page also notes that prompts and outputs may be stored in opt-in
+destination regions for abuse detection, which is worth knowing given what
+GoodParty holds; the residency decision and its scope are in
+[`bifrost-gateway.md`](./bifrost-gateway.md), "Inference residency".
 
 Step 11 turned the original suspicion into evidence independently. A
 sandbox session invoked
@@ -1271,11 +1284,13 @@ system-defined profile, not only a foundation model, which matters because
 `moonshotai.kimi-k3` has no in-region support anywhere. Pulumi has the
 resource. The cost is in the shape.
 
-A profile is tied to one model, so you need one per engineer per model. Eight
-models and five engineers is forty, and because each is model-specific, every
-model version bump mints a new generation of them. `bedrockInvokeResources()`
+A profile is tied to one model, so you need one per engineer per model. Seven
+models and five engineers is thirty-five, and because each is model-specific,
+every model version bump mints a new generation of them. `bedrockInvokeResources()`
 would have to name them all, growing an enumerated policy that step 15
-deliberately narrowed, against a 10240 byte limit it currently uses 3698 of.
+deliberately narrowed, against a 10240 byte limit it used 3698 of at the time
+and 4,967 of after the 2026-11-04 move to `global.` profiles (see "What a model
+costs the policy").
 `gp-pi` could not bake them in either: model ids live in
 `etc/pi/extensions/gp-models.ts`, which is copied into the image, and
 `config_digest()` marks a container stale when it changes, so per-engineer
@@ -1362,10 +1377,12 @@ and region, and metadata is recorded only where the call is made. We invoke
 the `us-west-2` endpoint, so one configuration there should capture
 everything.
 
-"Should" again. Step 11 established that cross-region intuition is unreliable
-here: geo profiles route by capacity and enablement turned out to be per
-destination region. If invocation logging also follows the destination, this
-needs four copies of all three resources, and the provider warns the
+"Should" again, and now more sharply: step 11 established that cross-region
+intuition is unreliable here — profiles route by capacity and enablement turned
+out to be per destination region — and since 2026-11-04 every entry is a
+`global.` profile whose destination set is wider still and is not fixed. If
+invocation logging follows the destination, this needs a copy of all three
+resources per region, and the provider warns the
 configuration is a per-region singleton that must not be declared twice, so
 that would be a structural change rather than a loop. The same single
 invocation that tests the metadata question tests this one.
@@ -1451,73 +1468,99 @@ model that is not yet in the list.
 
 ### Changing a model's inference profile
 
-Sonnet 5.5 was the first entry here that was not a `us.` geo profile, and the
-only one ever. Its model card at launch, on 2026-09-28, listed `In-Region` and
-`Geo` as unsupported in every commercial region and offered only
-`global.anthropic.claude-sonnet-5-5`. A geo profile routes among US regions; a
-global profile routes by capacity anywhere in the world, so enabling the model
-was a data-residency decision rather than a list edit. The account's convention
-is to stay in the United States — every other cross-region model is a `us.`
-profile and the SCP's region deny was written around that posture — but nothing
-in AWS enforces it: the region statement exempts `bedrock` wholesale, because
-the `us.` profiles need that too, and no policy distinguishes a `global.`
-profile from a `us.` one. The line is held by this file, so the decision on
-2026-09-28, on request, was to allow the exception: the model was wanted and
-global was the only profile AWS offered for it.
+**The convention is a `global.` cross-region inference profile for every model.
+It was a `us.` geo profile until 2026-11-04, and the account moved for cost,
+not by accident.** Both directions are recorded here because the mechanics are
+the same either way and the reasoning is what changed.
 
-That changed on 2026-10-01, when AWS added `us.anthropic.claude-sonnet-5-5`
-(and an `eu.` sibling). The model card now lists both under Geo, and the US
-profile "keeps data within US and Canada regions". With a US profile available
-the exception no longer has a reason to stand, so the entry moved to it:
-`invokeId` is `us.anthropic.claude-sonnet-5-5`, and `gp-pi` offers it as
-`Claude Sonnet 5.5 (US)` with the Geo pricing table's 2.2 in, 11 out, 2.75 for
-a five minute cache write and 0.22 cache read. The `global.` figures the entry
-carried before — 2, 10, 2.5, 0.2 — are the Global Cross-region Inference
-table, about 10% cheaper, and would understate spend on the geo profile.
+The history, kept because the document is a record and not a snapshot:
+
+- **2026-09-28: Sonnet 5.5 arrived on `global.` alone.** Its model card at
+  launch listed `In-Region` and `Geo` as unsupported in every commercial region
+  and offered only `global.anthropic.claude-sonnet-5-5`. A geo profile routes
+  among US regions; a global profile routes by capacity anywhere in the world,
+  so enabling the model was a data-residency decision rather than a list edit.
+  The account's convention then was to stay in the United States — every other
+  cross-region model was a `us.` profile, and the SCP's region deny was written
+  around that posture — but nothing in AWS enforced it: the region statement
+  exempts `bedrock` wholesale, because the `us.` profiles need that too, and no
+  policy distinguishes a `global.` profile from a `us.` one. The line was held
+  by this file, so the decision on 2026-09-28, on request, was to allow the
+  exception: the model was wanted and global was the only profile AWS offered
+  for it.
+- **2026-10-01: AWS added `us.anthropic.claude-sonnet-5-5`** (and an `eu.`
+  sibling), and the entry moved to it. The model card listed both under Geo,
+  the US profile "keeps data within US and Canada regions", and with a US
+  profile available the residency exception no longer had a reason to stand.
+  `gp-pi` offered it as `Claude Sonnet 5.5 (US)` at the Geo table's 2.2 in,
+  11 out, 2.75 for a five minute cache write and 0.22 cache read.
+  **Superseded on 2026-11-04.**
+- **2026-11-04: every entry moved to `global.`, and the paid geo premium was
+  the reason.** Global cross-region inference is about 10% cheaper: Sonnet 5.5
+  is 2 in, 10 out, 2.5 for a five minute cache write and 0.2 cache read on the
+  global table, against the geo figures just above. The residency position that
+  made `us.` the convention is scoped differently now, and the reasoning is in
+  [`bifrost-gateway.md`](./bifrost-gateway.md), "Inference residency": the
+  workbench account carries coding traffic and no product or voter data, no
+  Bedrock destination region is in a restricted country, and a `global.`
+  profile cannot be narrowed by an SCP (blocking any one destination region
+  fails the request). It is a decision about *this account*, not a general
+  permission for product workloads. `deepseek.v3.2` was removed in the same
+  change because it has no `global.` profile and no `us.` one, so it cannot be
+  served as a profile at all.
 
 A profile change is not a model change, and the difference matters to the
 order. The foundation-model `id` is unchanged, so the agreement already exists
 and `scripts/enable-bedrock-models.ts` has nothing to create. Only the IAM
 resource moves: `bedrockInvokeResources()` names the inference profile ARN,
 and a request for a profile the policy does not name is refused. Dropping the
-`global.` ARN in the same change that adds `us.` would therefore take access
-away from every `gp-pi` image still selecting global — the same mid-session
+old profile's ARN in the same change that adds the new one would therefore take
+access away from every `gp-pi` image still selecting it — the same mid-session
 AccessDenied the three-merge order exists to prevent, just with one fewer
 moving part. The old profile stays permitted through `transitionalInvokeIds`
 on the entry until `gp-pi` has shipped the switch, and is removed in a
 follow-up. That is the model-replacement shape with the subscription step taken
-out:
+out. Written for the 2026-11-04 switch, in the direction it actually ran:
 
-1. `ops` switches `invokeId` to `us.` and lists `global.` in
-   `transitionalInvokeIds`, so both profiles are permitted.
-2. `gp-pi` switches its entry to the `us.` id.
-3. `ops` removes `transitionalInvokeIds`, once nothing offers the global
-   profile any more.
+1. `ops` switches `invokeId` to the `global.` profile and lists the outgoing
+   `us.` profile in `transitionalInvokeIds`, so both profiles are permitted.
+2. `gp-pi` switches its entry to the `global.` id.
+3. `ops` removes `transitionalInvokeIds`, once nothing offers the `us.` profile
+   any more.
 
 An entry that keeps a `transitionalInvokeIds` is a permanent second profile,
-which is the data-residency decision above rather than a transition; empty it
-in the follow-up.
+which is a residency decision rather than a transition; empty it in the
+follow-up.
 
 ### What a model costs the policy
 
 Each cross-region model adds two resource ARNs, the inference profile and the
-foundation model, and about 150 bytes to the composed inline policy. Step 15
-recorded 14 ARNs at 3698 bytes; Opus 5.5 took that to 16 ARNs at 3842, and
-retiring Opus 5 on 2026-09-23 brought it back to 14 ARNs at 3702 of the 10240 byte
-permission set limit. Not 3698: the replacement's id is four characters longer
-across its two ARNs, which is the kind of detail worth getting right in a document
-that asks people to check numbers. Re-measured on 2026-09-28 after the
-invocation-logging and `cloudwatch:GenerateQuery` changes, those same 14 ARNs
-compose to 3729, and Sonnet 5.5's two bring it to 16 ARNs and 3881 bytes.
-Retiring Sonnet 5 on 2026-09-28, once 5.5 had replaced it in `gp-pi`, brought
-that back to 14 ARNs at 3737. That is the count while Sonnet 5.5's entry has no
-`transitionalInvokeIds`. Moving it to the US profile puts a fifteenth ARN in the
-policy — the `global.` profile, still permitted for old `gp-pi` images — and the
-follow-up that clears the field takes it back to 14. So there is room for
-roughly forty more models
-before the
-limit is the thing to think about, which is worth knowing mainly so nobody trims
-the list to save space.
+foundation model, and about 150 bytes to the composed inline policy. The
+history, because the numbers are a record: step 15 recorded 14 ARNs at 3698
+bytes; Opus 5.5 took that to 16 ARNs at 3842, and retiring Opus 5 on 2026-09-23
+brought it back to 14 ARNs at 3702 of the 10240 byte permission set limit. Not
+3698: the replacement's id is four characters longer across its two ARNs, which
+is the kind of detail worth getting right in a document that asks people to
+check numbers. Re-measured on 2026-09-28 after the invocation-logging and
+`cloudwatch:GenerateQuery` changes, those same 14 ARNs composed to 3729, and
+Sonnet 5.5's two brought it to 16 ARNs and 3881 bytes. Retiring Sonnet 5 on
+2026-09-28, once 5.5 had replaced it in `gp-pi`, brought that back to 14 ARNs
+at 3737 — the count while Sonnet 5.5's entry had no `transitionalInvokeIds`.
+
+**Re-measured on 2026-11-04, for the move to `global.` profiles.** The composed
+`WorkbenchAccess` inline policy (the admin-reserved denies plus the set's own
+statements, `JSON.stringify`) is **21 ARNs at 4,967 bytes** of the 10240-byte
+limit. That is 14 inference-profile ARNs — seven `global.` profiles the sandbox
+selects plus seven `us.` profiles in `transitionalInvokeIds` — and seven
+foundation-model ARNs. DeepSeek V3.2's two ARNs left with the entry and the
+seven transitional `us.` profiles arrived, so the policy grew by five ARNs and
+412 bytes over the 16 ARNs at 4,555 bytes on `main` just before this change.
+Not 3,881: the virtual-key mint grant and other statements landed after the
+2026-09-28 measurement, so anyone checking has to measure rather than continue
+the old series. The follow-up that clears `transitionalInvokeIds` takes it back
+to 14 ARNs at 4,445 bytes. At about 150 bytes a model there is room for roughly
+thirty-five more before the limit is the thing to think about, which is worth
+knowing mainly so nobody trims the list to save space.
 
 ### Removing a model, and what removal does not do
 
@@ -1995,19 +2038,23 @@ needed, and so the asynchronous parts have a human gap after them.
   the actual payoff of the exercise, and it is a follow-up rather than part of
   this work. Needs care, since something may depend on it.
 - ~~**Cross-region inference profiles.**~~ Settled by circumstance rather than
-  by decision: the model ids pi ships are already geo profiles, so we are
+  by decision: the model ids pi ships are already profiles, so we are
   using them. The cost is in the facts above, and it is that enablement is per
-  member region and getting it wrong fails intermittently.
+  member region and getting it wrong fails intermittently. **Superseded on
+  2026-11-04**: every entry now selects a `global.` profile, reversed for cost
+  and scoped to this account. See "Changing a model's inference profile".
 - ~~**Per-engineer cost visibility.**~~ Settled 2026-09-23 as step 17: model
   invocation logging, metadata only, attributing by the `identity.arn` that
   Identity Center already puts in every record. Application inference
   profiles tagged per engineer were rejected, and a gateway was not needed to
   reject them. Reasoning is in "Tracking Bedrock usage by user".
 - ~~**Region.**~~ Settled. `us-west-2` is where requests are sent and where the
-  two region-pinned models live, matching the rest of our footprint. The check
+  region-pinned models live, matching the rest of our footprint. The check
   this asked for mattered more than expected: availability does differ by
-  region, and because the geo profiles route away from `us-west-2` anyway,
-  "the region" is a set rather than one place. See the facts above.
+  region, and because the profiles route away from `us-west-2` anyway,
+  "the region" is a set rather than one place. See the facts above. Still true
+  after 2026-11-04 (`global.` profiles are invoked from `us-west-2`, and route
+  further), and the last region-pinned model, `deepseek.v3.2`, is gone.
 
 ## Context: the management account
 

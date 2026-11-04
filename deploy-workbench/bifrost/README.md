@@ -12,10 +12,10 @@ files that belong in review:
   "`config.json`" below.
 - `config.test.ts` — the checks that keep `config.json` honest: valid JSON,
   both providers, both stores in Postgres, every `env.` reference a name the
-  deployment actually provides, no credential literal, the US-only model rule
-  (no `global.` id, `us.` Bedrock profiles only, Fireworks US router ids and
+  deployment actually provides, no credential literal, the per-provider model
+  rules (`global.` Bedrock profiles only, Fireworks US router ids and
   the `us.api.fireworks.ai` endpoint, and the agreed class set pinned as
-  literals), and Bedrock's US-profile subset matching
+  literals), and Bedrock's `global.`-profile subset matching
   `utils/bedrock-models.ts` (the list the task role's IAM is built from,
   alongside the `bedrock:ListFoundationModels` grant that renders it).
 - `vk-mint-template.json` — the default per-person virtual key shape, as data
@@ -23,7 +23,7 @@ files that belong in review:
   step 1). See "Virtual-key template" and "Governance overrides" below.
 - `vk-mint-template.test.ts` — pins the template's provider and model lists to
   `config.json`, its Lambda-managed marker, decision 5's absences, and the same
-  US-only rule from the key's side, since a key may not name a model the
+  per-provider rules from the key's side, since a key may not name a model the
   gateway would refuse.
 - `governance-overrides.json` — the per-person overrides of that shape, keyed by
   lowercase email, with its own `$comment` stating the merge rules
@@ -105,15 +105,19 @@ a later tag. It holds:
   (`accounts/fireworks/routers/<model>-us`) rather than `*`; and `bedrock`,
   whose key carries no credential at all: Bifrost inherits the ECS **task
   role** through the AWS default credential chain, so `bedrock_key_config`
-  sets only the region. The Bedrock model list is the `us.`-profile subset of
+  sets only the region. The Bedrock model list is the `global.`-profile subset of
   `utils/bedrock-models.ts`, which is what the task role's IAM policy
   enumerates; the test fails if the two drift, because a model in one and not
   the other is a 404 or an `AccessDenied` at runtime. The IAM grant is allowed
-  to be wider than the gateway's list — it is the sandbox's direct path too —
-  and that is why the config carries no bare foundation-model id and no
-  `global.` profile: US-only inference is the rule (`docs/bifrost-gateway.md`,
-  "US-only inference"), and DeepSeek V3.2 is the class it costs, since Bedrock
-  publishes no `us.deepseek.v3.2` profile. Listing that list is a separate
+  to be wider than the gateway's list — it is the sandbox's direct path too,
+  and during the 2026-11-04 rollover it still permits each model's outgoing
+  `us.` profile through `transitionalInvokeIds` — and that is why the config
+  carries no bare foundation-model id and no `us.` profile: the gateway selects
+  `global.` cross-region inference profiles, which is a cost decision recorded
+  in `docs/bifrost-gateway.md`, "Inference residency". Fireworks did not change
+  and is still US-only by contract. DeepSeek V3.2 is gone from both files:
+  Bedrock publishes no inference profile for it, `global.` or `us.`, so it can
+  no longer be selected at all. Listing that list is a separate
   permission from invoking it: the provider renders its model list from a
   signed `GET /foundation-models`, so the task role also holds
   `bedrock:ListFoundationModels` (on `*`, since Bedrock defines no resource
@@ -283,7 +287,7 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB and the file is **4,014 bytes**, so there are 82 bytes left rather
+holds 4 KiB and the file is **4,042 bytes**, so there are 54 bytes left rather
 than the room one earlier version of this paragraph claimed; every addition is
 now a deliberate byte budget, and `deploy-workbench/ecs.test.ts` fails the suite
 before the file crosses the ceiling. Past 4 KiB it needs `tier: "Advanced"`
@@ -361,8 +365,9 @@ What it carries, and why each is a decision (decision 5):
 - **`provider_configs` pinned explicitly**, to the model lists `config.json`
   already allows for `bedrock` and `fireworks`. An empty list is deny-by-default
   and `"*"` for a Bedrock model list is exactly the widening this design exists
-  to avoid, so the template names models — the US-only ones, so a key can never
-  name a model the gateway refuses. The test fails if either list drifts, in
+  to avoid, so the template names models — the gateway's own lists, so a key
+  can never name a model the gateway refuses. The test fails if either list
+  drifts, in
   either direction, because a model in one file and not the other is a `404`
   or an `AccessDenied` at request time.
 - **`key_ids: ["*"]` on each entry**, because a provider config with no keys
@@ -398,7 +403,7 @@ the template's" would invite a reader to think the two differ. Naming
 wire, so an override that narrows one provider states the whole list it means.
 
 The reason it is a second parameter and not more of the first is the tier
-ceiling: `config.json` is **4,014 bytes** against the standard tier's 4 KiB,
+ceiling: `config.json` is **4,042 bytes** against the standard tier's 4 KiB,
 and the two governance documents have separate lifetimes anyway. Both are
 checked against the ceiling by `governance-parameters.test.ts`, which fails the
 build rather than the apply.

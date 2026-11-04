@@ -144,7 +144,8 @@ provider that project requires:
   that renders the provider's model list — `bedrock:ListFoundationModels`,
   which Bedrock gives no resource type to scope and which the dashboard's
   provider page needs — and the SCP's existing `bedrock` exemption keeps
-  geo-profile calls working.
+  cross-region profile calls working (a `us.` geo profile and a `global.` one
+  alike; see "Inference residency").
 
 Alternatives considered and not chosen: the EC2 + EBS + DLM host pattern in
 `deploy-infrastructure/agent-swarm.ts` (the engineer's direction is Fargate,
@@ -689,7 +690,7 @@ are referenced by name, never written down here or in git.
   shape. The key is `env.FIREWORKS_API_KEY`, injected from Secrets Manager,
   and the config allows only the models the fleet actually uses rather than
   `*`. It is pinned to Fireworks' US-only Serverless endpoint and US router
-  ids; see "US-only inference" below.
+  ids; see "Inference residency" below.
 - **Bedrock** is the second provider. Upstream supports inherited IAM-role
   authentication (`docs/providers/supported-providers/bedrock.mdx`), and on
   Fargate that is the ECS task role, so no static AWS key is stored anywhere.
@@ -699,24 +700,28 @@ are referenced by name, never written down here or in git.
   `GET /foundation-models` (AWS's `ListFoundationModels`) and not from the key
   list, so an invoke-only role serves inference and shows the provider warning
   where the models should be. Bedrock defines no resource type for that action,
-  which is the one wildcard in the role. The pinned provider calls no
-  `ListInferenceProfiles`/`GetInferenceProfile`: the `us.` profiles the config
-  allows are listed from the key's own `models` allowlist (the list pipeline
-  backfills allowlist entries the foundation-model response does not contain)
-  and invoked through their profile ARNs, which the invoke statement already
-  grants. The SCP's existing `bedrock` exemption keeps geo-profile calls
-  working. This is what lets the gateway take over Bedrock entirely, including
-  the per-user attribution the invocation log provides today.
+  and Bifrost then invokes the underlying
+  foundation model in whichever region it routes to, so a grant covering only
+  the profile fails the moment routing leaves home. The pinned provider calls no
+  `ListInferenceProfiles`/`GetInferenceProfile`: the `global.` profiles the
+  config allows are listed from the key's own `models` allowlist (the list
+  pipeline backfills allowlist entries the foundation-model response does not
+  contain) and invoked through their profile ARNs, which the invoke statement
+  already grants. The SCP's existing `bedrock` exemption keeps cross-region
+  calls working, and it is a requirement rather than a convenience: a blocked
+  destination region fails the request outright. This is what lets the gateway
+  take over Bedrock entirely, including the per-user attribution the invocation
+  log provides today.
 - **Other providers** (Anthropic direct, OpenAI direct) are added only if a
   harness needs them, each with its own `env.` reference. Provider fallback
   between Fireworks and Bedrock is a configuration choice; it is the main
   reliability argument for the gateway, and it should be turned on
   deliberately with a model mapping rather than left to a default.
 
-### US-only inference
+### Inference residency
 
-**Decision: no request may be served outside the United States, and the
-enforcement is the provider model lists in
+**Decision: Fireworks stays US-only by contract, and Bedrock runs on `global.`
+cross-region inference profiles. The enforcement is the provider model lists in
 `deploy-workbench/bifrost/config.json`.** The gateway is the only path a harness
 has to a model, so the lists are where the rule can be a property of the
 deployment rather than a convention: a model not in a key's list is refused
@@ -724,24 +729,13 @@ before any provider call, and the virtual-key template that a minted key is
 created from carries the same lists (`bifrost-virtual-keys.md`, decision 5), so
 a person's key cannot ask for what the gateway would not route.
 
-What that means per provider, all of it checked by
-`deploy-workbench/bifrost/config.test.ts`:
+The two providers are on different rules on purpose, and it is worth saying why
+they diverged rather than averaging them:
 
-- **Every Bedrock id in the list is a real, active inference profile.** Checked
-  against the account on 2026-10-29 with
-  `bedrock:ListInferenceProfiles` and `GetInferenceProfile` in `us-west-2`: all
-  seven are `SYSTEM_DEFINED`, `ACTIVE`, and route to `us-east-1`,
-  `us-east-2` and `us-west-2`. `ListFoundationModels` also reports each of the
-  seven as `inferenceTypesSupported: [INFERENCE_PROFILE]` with lifecycle
-  `ACTIVE`, so the profile is not an option for these models — it is the only
-  way to invoke them, which is why a bare id would have been a dead entry.
-  `global.` variants exist for all seven, so their removal from this file is a
-  residency choice and not a cleanup of ids that never existed.
-
-- **Fireworks is on US-only Serverless.** The provider block carries
-  `network_config.base_url: "https://us.api.fireworks.ai/inference"`, and the
-  models are Fireworks' US router ids, `accounts/fireworks/routers/<model>-us`
-  (for the one class the fleet uses,
+- **Fireworks is US-only, unchanged and not negotiable.** The provider block
+  carries `network_config.base_url: "https://us.api.fireworks.ai/inference"`,
+  and the models are Fireworks' US router ids,
+  `accounts/fireworks/routers/<model>-us` (for the one class the fleet uses,
   `accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`). Both halves are
   needed: the router id scopes the model and the endpoint scopes the traffic.
   `network_config.base_url` is the only `base_url` in Bifrost's schema at the
@@ -763,32 +757,81 @@ What that means per provider, all of it checked by
   the US endpoint), it is what the fleet's own container default names
   (`accounts/fireworks/models/deepseek-v4p1-flash-1017`), and it was the newest
   V4.1 Flash release in the model library and the changelog on 2026-10-29.
-  The cost of pinning is that the gateway does not follow the next release by
-  itself: moving to it is a reviewed edit here, which is the right trade for a
-  list that is itself the residency control.
-- **Bedrock keeps only `us.` cross-region inference profiles.** Every
-  `global.` id is gone, because `global.` is worldwide by definition, and every
-  bare foundation-model id is gone, because a bare id is not a US commitment at
-  all. The test refuses a `global.` anywhere in the file and any Bedrock model
-  id without the `us.` prefix, so a `global.` never comes back as a quiet
-  addition to a model list.
-- **DeepSeek V3.2 is not served by the gateway**, and this is the one class the
-  US-only rule costs. Bedrock has no `us.deepseek.v3.2` inference profile —
-  `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-10-29 returned
-  `us.deepseek.r1-v1:0` as the only DeepSeek profile — so the only way to keep
-  the class would have been the bare id, which is exactly the unqualified
-  routing the rule forbids. Worth recording precisely, because it is the
-  reason this is a rule rather than an oversight: `ListFoundationModels`
-  reports `deepseek.v3.2` as `inferenceTypesSupported: [ON_DEMAND]`, so it is
-  invocable in-region in `us-west-2` and nothing else. A bare id here would
-  therefore not route anywhere outside the US — but it would also not be
-  distinguishable in this file from a bare id that does, which is why the rule
-  is "profile-prefixed ids only" and the class is removed rather than kept as
-  an exception. Keeping it would be an explicit exception, and that is the
-  engineer's call rather than a side effect of a tightening. It stays in
-  `utils/bedrock-models.ts`, because that list is the sandbox's direct
-  `WorkbenchAccess` grant rather than the gateway's, and IAM may be wider than
-  what the gateway serves.
+  `config.test.ts` and `vk-mint-template.test.ts` keep enforcing it from both
+  sides: every served Fireworks name must resolve on the wire to
+  `accounts/fireworks/routers/<model>-us`, every alias target too, and the
+  endpoint must be the US host.
+
+- **Bedrock moved to `global.` profiles on 2026-11-04, reversing the earlier
+  US-geo convention.** Every entry in the list is a `global.` cross-region
+  inference profile, and the outgoing `us.` geo profile of each is permitted
+  only through `transitionalInvokeIds` while the fleet rolls over
+  (`utils/bedrock-models.ts`). This is a deliberate reversal of the decision
+  recorded in `docs/workbench-account.md`, not a drift, and the reasoning is
+  below. What it replaced, for the record: until this change every Bedrock
+  entry was a `us.` geo profile, chosen for residency, and `global.` was the
+  rejected exception that Sonnet 5.5 briefly carried when AWS offered no `us.`
+  profile for it.
+
+- **`global.` is exactly what it says, and it cannot be narrowed.** A `global.`
+  profile routes by capacity to any commercial region that offers the model.
+  The destination list is not frozen — AWS may add commercial regions to it —
+  and it cannot be pruned with an SCP. AWS's own inference-profile
+  documentation states that if any destination region in a cross-region
+  inference profile is blocked in the SCP, the request fails even if the other
+  regions remain allowed. So there is no "global but US-only" middle setting: a
+  `global.` profile is either allowed whole or unusable. The SCP's existing
+  `bedrock` exemption (see below) means nothing at the account boundary
+  distinguishes a `global.` profile from a `us.` one either, so the model list
+  is the only control, and it is now a control over *which models*, not over
+  geography.
+
+- **Prompts and outputs may leave the United States.** With a `global.`
+  profile, prompts and outputs can be stored in destination regions, including
+  opt-in regions that are not enabled in the account, for abuse detection. That
+  is the actual cost, stated without softening: the residency guarantee on
+  Bedrock is gone, and what is left is the geographic argument below.
+
+- **No Bedrock destination region is in a restricted country, and that check is
+  what makes this acceptable.** Verified in a compliance review of the
+  providers: China is a separate partition (`aws-cn`) and is unreachable from a
+  commercial-partition account, Hong Kong (`ap-east-1`) is not a Bedrock
+  region at all, and `ap-east-2` is Taipei rather than Hong Kong. So the
+  geography a `global.` profile can reach does not include the countries this
+  account must not send data to. The destination list can still grow, which is
+  why the review is the basis of the decision rather than a region list in
+  code: a new region would have to be reviewed, and nothing here would notice
+  it on its own.
+
+- **Why it is acceptable here specifically.** This decision is scoped to the
+  workbench account and is **not** a general permission for product workloads.
+  The workbench account exists so coding agents run somewhere other than the
+  account holding product and voter data, and coding traffic carries none of
+  it: the prompts are source code and tool output. A `global.` profile for a
+  coding agent therefore raises a much smaller question than the same setting
+  would for a voter-facing service, and that difference in scope is the whole
+  argument. Nothing here should be read as a residency decision for `serve`'s
+  product Bedrock usage, which stays where its own review puts it.
+
+- **Every Bedrock id in the list is a real, active `global.` inference
+  profile.** Checked against the account on 2026-11-04 with
+  `bedrock:ListInferenceProfiles` and `GetInferenceProfile` in `us-west-2`: all
+  seven are `SYSTEM_DEFINED` and `ACTIVE`. `ListFoundationModels` also reports
+  each of the seven as `inferenceTypesSupported: [INFERENCE_PROFILE]`, so the
+  profile is not an option for these models — it is the only way to invoke
+  them, which is why a bare id would be a dead entry. The `us.` sibling exists
+  for all seven, so the rollover is available in both directions.
+
+- **DeepSeek V3.2 is removed from the gateway and from the IAM list**, and that
+  is unrelated to residency: it has no `global.` inference profile, and no
+  `us.` one either. `bedrock:ListInferenceProfiles` in `us-west-2` returns
+  `us.deepseek.r1-v1:0` as the only DeepSeek profile, and `GetFoundationModel`
+  reports `deepseek.v3.2` as `inferenceTypesSupported: [ON_DEMAND]`, invocable
+  in-region only. It was the single class kept region-pinned, and it is the
+  class this change retires rather than converts. It is gone from
+  `utils/bedrock-models.ts` as well as from `config.json`: it cannot be a global
+  model, so there is nothing left for it to be, and a test asserts it is absent
+  from both the list and the composed ARNs so it cannot come back silently.
 
 Two consequences are accepted with the decision:
 
@@ -801,7 +844,10 @@ Two consequences are accepted with the decision:
   router id at all, so item 16's reconciliation against a week of real billing
   is what proves the per-key numbers and produces the override. The DeepSeek
   V4.1 Flash class above is the only one on this provider today, so the premium
-  is one model's worth.
+  is one model's worth. Bedrock does not have this problem any more, which is
+  the point of the change: the `global.` profile is the cheaper side of the
+  table, so the gateway's catalog prices are now the ones the bill shows.
+
 - **Fireworks Enterprise data residency is deliberately not enabled.** The
   endpoint and the router ids scope the gateway's traffic; they do not scope
   the account. The same `FIREWORKS_API_KEY`, used outside Bifrost, can still
@@ -812,16 +858,23 @@ Two consequences are accepted with the decision:
   is a known one: if account-wide residency is ever needed, it is a Fireworks
   contract change, not another edit to this file.
 
-One limit of the word "US" is worth writing down rather than discovering from a
-bill or an audit. A `us.` profile is a **geo** profile: AWS routes it among the
-profile's member regions, and for the Anthropic models the model card describes
-that geography as "within US and Canada" (`utils/bedrock-models.ts` records the
-same fact for Sonnet 5.5). So on Bedrock this rule means US geography as AWS
-defines it, which is the account's existing convention, not literal US soil.
-Only in-region invocation would be narrower, and several of these models
-support no in-region profile at all (Opus 5.5, Kimi K3), so it is not available
-for the set. The Fireworks half is stricter, because US-only Serverless is US
-inference by contract.
+**What the Bedrock change costs, in numbers.** Global cross-region inference is
+roughly 10% cheaper than the geographic profile. For Sonnet 5.5, one million
+tokens each way: geo is 2.2 input, 11 output, 2.75 for a five-minute cache
+write and 0.22 cache read; global is 2, 10, 2.5 and 0.2. A gateway that logs
+geo prices while the call routes globally (or the reverse) overstates or
+understates spend by that factor, and Bifrost's catalog has to agree with the
+profile the config selects — which is now `global.`.
+
+**What is left of the residency posture, stated plainly.** Fireworks is US-only
+in practice and by contract on this deployment, and it is the provider the
+fleet's default model runs on. Bedrock is not: it is globally routed, and the
+only account-level control that would differentiate it from a globally routed
+Fireworks call does not exist, because the SCP exempts `bedrock` wholesale
+(the `us.` profiles needed that too). The line is held by the model list, and
+since 2026-11-04 that list is a decision about models rather than about
+geography. `config.test.ts` asserts both halves, separately, so neither can go
+soft by being rewritten into the other.
 
 ### Prompt caching
 
@@ -1168,13 +1221,15 @@ What genuinely remains open:
   guides run (`postgres:16-alpine`); 17 is documented as supported but never
   exercised upstream. What remains is not a decision but a test: item 23
   rehearses the restore.
-- **Model allowlist: answered under "US-only inference" in "Provider
-  configuration".** The lists are US-only, eight classes, and the Fireworks
-  endpoint is the US-only host. What is left of this question is the pricing
-  half, and it is sharper rather than smaller: US-only Serverless is 1.5x
+- **Model allowlist: answered under "Inference residency" in "Provider
+  configuration".** The Bedrock list is seven `global.` profiles and the
+  Fireworks list is one US-only router on the US-only host, and the Bedrock
+  half is no longer a residency control. What is left of this question is the
+  pricing half, and it is sharper rather than smaller: US-only Serverless is 1.5x
   the base price from 2026-09-01, so a catalog entry that prices the base model
-  is wrong by that factor and every per-key cost number inherits the error.
-  Wrong pricing makes a future budget wrong. Item 16.
+  is wrong by that factor and every per-key cost number inherits the error,
+  while the Bedrock entries moved from the geo table to the global one and must
+  agree with it. Wrong pricing makes a future budget wrong. Item 16.
 - **How a person is designated for a higher tier.** One key per person and one
   default tier are designed; "who may reach the higher-grade models" is
   deliberately deferred, with the two candidate shapes — a second Identity

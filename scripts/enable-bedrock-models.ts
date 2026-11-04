@@ -82,6 +82,12 @@ const DEPLOY_ROLE_ARN = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy
 /**
  * Every region a `us.` geo profile can route to, per the model cards.
  *
+ * The `us.` profiles are the outgoing side of the 2026-11-04 rollover now: every
+ * entry in `utils/bedrock-models.ts` selects a `global.` profile, and `us.` is
+ * permitted only through `transitionalInvokeIds` while `gp-pi` ships the same
+ * switch. The walk is unchanged, and it has to be: the agreement is on the
+ * foundation model, which is the same one either profile routes to.
+ *
  * `ca-central-1` is the open question and is left out on purpose. Kimi K3's
  * card lists it as geo-supported while its prose says the `us.` profile
  * "routes requests only among US-geography Regions to respect US data
@@ -92,18 +98,22 @@ const DEPLOY_ROLE_ARN = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy
 const REGIONS = ["us-east-1", "us-east-2", "us-west-1", "us-west-2"];
 
 /**
- * Regions for the models pinned to a single region rather than a geo profile.
- * Matches `region` in `gp-pi`'s `etc/aws-config`; if that moves, this moves.
+ * Regions for models invoked in one region only, matching `region` in
+ * `gp-pi`'s `etc/aws-config`; if that moves, this moves. Empty in practice:
+ * `deepseek.v3.2` was the last entry with `crossRegion: false` and was removed
+ * on 2026-11-04 for having no inference profile at all. The walk stays, so the
+ * next region-pinned model is a list edit rather than a code change.
  */
 const PINNED_REGIONS = ["us-west-2"];
 
 /**
  * Subscription is per foundation model, so this works from `id` rather than
- * the `us.` profile the sandbox selects: the prefix is routing, and asking
- * about a profile would be asking the wrong question.
+ * the inference profile the sandbox selects: the prefix is routing, and asking
+ * about a profile would be asking the wrong question. That is unchanged by the
+ * 2026-11-04 move from `us.` to `global.` profiles.
  *
  * Models that are not cross-region only ever run where the sandbox points, so
- * they are handled separately below rather than walked across the geo set.
+ * they are handled separately below rather than walked across the profile set.
  */
 const MODELS = WORKBENCH_MODELS;
 
@@ -248,8 +258,11 @@ async function enableInRegion(
         // Not necessarily wrong. AWS names Amazon, DeepSeek, Mistral AI, Meta
         // and Qwen as providers not sold through AWS Marketplace, with no
         // product ids, so there is no subscription to create and nothing to
-        // offer. `deepseek.v3.2` is on our list and is expected to land here.
+        // offer. `xai.grok-4.7` is on our list and is expected to land here.
         //
+        // `deepseek.v3.2` was the example here until 2026-11-04, when it left
+        // the list: it has no `global.` inference profile and no `us.` one, so
+        // there is nothing left to subscribe to.
         // Reported rather than failed for that reason, but reported loudly:
         // the alternative reading is that a model which does need an
         // agreement could not be offered one, and the two look identical from
@@ -379,11 +392,16 @@ export default async function main() {
   const geoModels = MODELS.filter((m) => m.crossRegion);
   const pinnedModels = MODELS.filter((m) => !m.crossRegion);
 
+  // `geoModels` is every entry in practice: `crossRegion` means "invoked through
+  // an inference profile", and since 2026-11-04 every entry is a `global.` one.
+  // The variable name is the older, narrower reading of the same flag.
   for (const region of REGIONS) {
     await enableInRegion(region, geoModels, credentials);
   }
-  // The region-pinned models are deliberately not walked across the geo
-  // set: they are selected by bare model id, so they never route elsewhere.
+  // The region-pinned models are deliberately not walked across that set: they
+  // are selected by bare model id, so they never route elsewhere. No entry has
+  // `crossRegion: false` today, so this loop is empty and kept for the next
+  // region-pinned model.
   for (const region of PINNED_REGIONS) {
     await enableInRegion(region, pinnedModels, credentials);
   }

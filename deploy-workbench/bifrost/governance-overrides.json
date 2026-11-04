@@ -17,7 +17,7 @@
     "Three shapes, as they are written:",
     "  \"someone@goodparty.org\": { \"budgets\": [{ \"max_limit\": 250, \"reset_duration\": \"1M\" }] }",
     "  \"someone@goodparty.org\": { \"rate_limit\": { \"request_max_limit\": 600, \"request_reset_duration\": \"5m\" } }",
-    "  \"someone@goodparty.org\": { \"provider_configs\": [ { \"provider\": \"bedrock\", \"allowed_models\": [\"us.anthropic.claude-sonnet-5-5\"], \"key_ids\": [\"*\"] } ], \"calendar_aligned\": true }",
+    "  \"someone@goodparty.org\": { \"provider_configs\": [ { \"provider\": \"bedrock\", \"allowed_models\": [\"global.anthropic.claude-sonnet-5-5\"], \"key_ids\": [\"*\"] } ], \"calendar_aligned\": true }",
     "",
     "Empty is the correct state until there is usage data to choose a number from: every key gets the template, and the reconciler has nothing to do."
   ]

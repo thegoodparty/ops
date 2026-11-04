@@ -672,7 +672,7 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * `BIFROST_CONFIG`.
  *
  * Why a parameter rather than an `environment` entry with the JSON inlined in
- * the task definition: the file is 4,014 bytes today (`wc -c`, measured on
+ * the task definition: the file is 4,042 bytes today (`wc -c`, measured on
  * `deploy-workbench/bifrost/config.json`) and grows when item 14 adds teams and
  * virtual keys, and task-definition environment entries are the wrong place for
  * a document that changes on its own schedule. Why SSM rather
@@ -690,8 +690,8 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
  * see what the gateway is actually running with.
  *
- * Standard tier, which holds 4 KiB. The file is 4,014 bytes today, so there are
- * **82 bytes** of headroom, not the couple of kilobytes an earlier version of
+ * Standard tier, which holds 4 KiB. The file is 4,042 bytes today, so there are
+ * **54 bytes** of headroom, not the couple of kilobytes an earlier version of
  * this comment claimed; every addition from here is a deliberate byte budget
  * rather than free space. Past 4 KiB this needs `tier: "Advanced"` explicitly
  * (8 KiB, and AWS charges for it), because the provider would otherwise fail
@@ -714,7 +714,7 @@ export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
  * The standard tier's content limit for an SSM `String` parameter, in bytes.
  *
  * Named rather than written into a comment because `bifrost/config.json` is
- * 4,014 bytes today, which leaves 82 bytes of headroom: the margin is small
+ * 4,042 bytes today, which leaves 54 bytes of headroom: the margin is small
  * enough that the suite should fail when it is crossed, not a reviewer. An
  * over-limit value is rejected by `PutParameter` rather than truncated, so the
  * apply fails loudly, but only after a merge. Past this the parameter needs

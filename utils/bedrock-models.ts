@@ -15,6 +15,18 @@ import { WORKBENCH_ACCOUNT_ID } from "./accounts";
  * withholding a subscription. So this list, expressed as resource ARNs on the
  * permission set, is what decides which models an agent can reach.
  *
+ * Every entry is a `global.` cross-region inference profile, and that is a
+ * decision rather than a default: the global profile is about 10% cheaper than
+ * the geographic one, and the workbench account is scoped to coding traffic,
+ * which carries no product or voter data. The residency reasoning, and what it
+ * costs, is in `docs/bifrost-gateway.md` under "Inference residency" and in
+ * `docs/workbench-account.md` under "Changing a model's inference profile".
+ *
+ * The `us.` geo profile of each entry is still permitted, through
+ * `transitionalInvokeIds`, because a container built before the switch selects
+ * it. That is a rollover, not a convention: the follow-up that clears the
+ * field returns the policy to one profile per model.
+ *
  * See `docs/workbench-account.md`, steps 11 and 15.
  */
 
@@ -26,9 +38,9 @@ export type BedrockModel = {
    */
   id: string;
   /**
-   * What the sandbox actually selects, which is not always the same thing. A
-   * `us.` geo inference profile for most of these, and the bare model id for
-   * the two deliberately kept in one region.
+   * What the sandbox actually selects: a `global.` cross-region inference
+   * profile for every entry. The bare foundation-model id is never selected,
+   * and several of these models have no in-region invocation at all.
    */
   invokeId: string;
   /** True when `invokeId` is a cross-region inference profile. */
@@ -48,6 +60,11 @@ export type BedrockModel = {
    * second profile, which is a data-residency decision rather than a
    * transition. See `docs/workbench-account.md`, "Changing a model's
    * inference profile".
+   *
+   * Every entry below carries the outgoing `us.` geo profile for exactly this
+   * reason: `invokeId` moved from `us.` to `global.` on 2026-11-04, and a
+   * container built before that still selects `us.`. The follow-up clears the
+   * field once nothing does.
    */
   transitionalInvokeIds?: string[];
   note?: string;
@@ -55,63 +72,60 @@ export type BedrockModel = {
 
 export const WORKBENCH_MODELS: BedrockModel[] = [
   {
-    // Sonnet 5.5's profile, not its model, changed on 2026-10-01: AWS added
-    // `us.anthropic.claude-sonnet-5-5`, a geo profile that keeps data in US
-    // and Canadian regions, where the model card had listed In-Region and Geo
-    // as unsupported when the model was added on 2026-09-28. The account's
-    // convention is to stay in the United States, so the sandbox moves to the
-    // geo profile and off `global.anthropic.claude-sonnet-5-5`, which routes
-    // by capacity anywhere in the world. The global profile stays permitted
-    // through `transitionalInvokeIds` until `gp-pi` has shipped the same
-    // switch, then comes out. See `docs/workbench-account.md` under "Changing
-    // a model's inference profile".
+    // Sonnet 5.5 has moved twice, which is why its history is the longest.
+    // It launched on 2026-09-28 with only `global.anthropic.claude-sonnet-5-5`
+    //; AWS added `us.anthropic.claude-sonnet-5-5` on 2026-10-01 and the entry
+    // moved to the geo profile for residency, keeping `global.` transitional.
+    // On 2026-11-04 the account moved every Bedrock model back to its
+    // `global.` profile to stop paying the geo premium, so the pair swapped
+    // again: `invokeId` is `global.` and `us.` is the rollover.
     id: "anthropic.claude-sonnet-5-5",
-    invokeId: "us.anthropic.claude-sonnet-5-5",
+    invokeId: "global.anthropic.claude-sonnet-5-5",
     crossRegion: true,
-    transitionalInvokeIds: ["global.anthropic.claude-sonnet-5-5"],
-    note: "the US geo profile was added after launch, replacing the global-only profile this entry was created with; it keeps data in US and Canadian regions",
+    transitionalInvokeIds: ["us.anthropic.claude-sonnet-5-5"],
+    note: "moved to the global profile on 2026-11-04, about 10% cheaper than the geo profile; the us. profile was added 2026-10-01 and is now the rollover",
   },
   {
     id: "anthropic.claude-opus-5-5",
-    invokeId: "us.anthropic.claude-opus-5-5",
+    invokeId: "global.anthropic.claude-opus-5-5",
     crossRegion: true,
-    note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and the geo profile is mandatory",
+    transitionalInvokeIds: ["us.anthropic.claude-opus-5-5"],
+    note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and a cross-region profile is mandatory",
   },
   {
     id: "moonshotai.kimi-k3",
-    invokeId: "us.moonshotai.kimi-k3",
+    invokeId: "global.moonshotai.kimi-k3",
     crossRegion: true,
-    note: "no in-region support in any region, so the geo profile is mandatory",
+    transitionalInvokeIds: ["us.moonshotai.kimi-k3"],
+    note: "no in-region support in any region, so a cross-region profile is mandatory",
   },
   {
     id: "openai.gpt-6.1-sol",
-    invokeId: "us.openai.gpt-6.1-sol",
+    invokeId: "global.openai.gpt-6.1-sol",
     crossRegion: true,
+    transitionalInvokeIds: ["us.openai.gpt-6.1-sol"],
     note: "Marketplace product prod-qco655ut2vn54; replaced gpt-5.6-sol and gpt-5.6-terra",
   },
   {
     id: "anthropic.claude-haiku-5-5",
-    invokeId: "us.anthropic.claude-haiku-5-5",
+    invokeId: "global.anthropic.claude-haiku-5-5",
     crossRegion: true,
+    transitionalInvokeIds: ["us.anthropic.claude-haiku-5-5"],
     note: "Marketplace product prod-6cyn7tgqazjhu",
   },
   {
     id: "xai.grok-4.7",
-    invokeId: "us.xai.grok-4.7",
+    invokeId: "global.xai.grok-4.7",
     crossRegion: true,
+    transitionalInvokeIds: ["us.xai.grok-4.7"],
     note: "not sold through Marketplace, IAM only; replaced grok-4.6",
   },
   {
     id: "zai.glm-5.3",
-    invokeId: "us.zai.glm-5.3",
+    invokeId: "global.zai.glm-5.3",
     crossRegion: true,
-    note: "us. profile only; access in this account is unverified when granted; replaced glm-5",
-  },
-  {
-    id: "deepseek.v3.2",
-    invokeId: "deepseek.v3.2",
-    crossRegion: false,
-    note: "AWS lists DeepSeek among the providers not sold through Marketplace, so expect no agreement offer and nothing to subscribe to",
+    transitionalInvokeIds: ["us.zai.glm-5.3"],
+    note: "global. and us. profiles both exist; access in this account is unverified when granted; replaced glm-5",
   },
 ];
 
@@ -121,16 +135,18 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
  * Two kinds, because cross-region inference needs both. The request names an
  * inference profile in the account, and Bedrock then invokes the underlying
  * foundation model in whichever region it routes to, so a grant covering only
- * the profile fails the moment routing leaves home.
+ * the profile fails the moment routing leaves home. That is more true of a
+ * `global.` profile, not less: its destination set is every commercial region
+ * AWS chooses, and AWS may add to it.
  *
  * The region is wildcarded on purpose, and this is the part worth reading
  * twice. Enumerating regions was the original objection to narrowing this
- * policy at all, and it was right: the destination set differs per model,
- * `us.moonshotai.kimi-k3` spans five regions where the Anthropic profiles
- * span three, and `ca-central-1` is still unresolved. A wrong region list
- * fails intermittently and looks identical to missing model access. Region
- * was never the control we wanted; the model is. So the model is enumerated
- * and the region is not.
+ * policy at all, and it was right: the destination set differs per model, it
+ * is not frozen, and AWS's documentation says a request fails if any single
+ * destination region is blocked, so a "global but US-only" middle setting does
+ * not exist. A wrong region list fails intermittently and looks identical to
+ * missing model access. Region was never the control we wanted; the model is.
+ * So the model is enumerated and the region is not.
  */
 export const bedrockInvokeResources = (
   accountId = WORKBENCH_ACCOUNT_ID
