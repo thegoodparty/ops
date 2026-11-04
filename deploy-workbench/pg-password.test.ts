@@ -202,7 +202,7 @@ describe("the command's dependence on Bifrost's environment inheritance", () => 
    * at the point that would break. The two details that make it hold are that
    * `RunPasswordCommand` builds the command as
    * `exec.Command(config.Command, config.Args...)` at
-   * `framework/postgresconn/postgresconn.go:563` (tag `transports/v2.3.2`) and
+   * `framework/postgresconn/postgresconn.go:563` (tag `transports/v2.4.0`) and
    * never assigns `cmd.Env` anywhere in the file, and that the command is not
    * run through a shell, which would be a second environment to lose them at.
    */

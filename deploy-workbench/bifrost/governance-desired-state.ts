@@ -223,7 +223,7 @@ const isInherit = (value: unknown): value is GovernanceInherit =>
 
 /**
  * `tables.ParseDuration` at the pinned tag
- * (`framework/configstore/tables/utils.go`, `transports/v2.3.2`), transcribed.
+ * (`framework/configstore/tables/utils.go`, `transports/v2.4.0`), transcribed.
  *
  * The suffix forms are Bifrost's own and are not Go's: `d`, `w`, `M`, `Q` and
  * `Y` are multiplied out of a bare number — `ParseDuration("1M")` is 30 days —

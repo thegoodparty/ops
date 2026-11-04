@@ -187,7 +187,7 @@ describe("the merge, field by field (decision 9)", () => {
 });
 
 describe("durations are Bifrost's, not an approximation of them", () => {
-  /** The table is the gateway's own `ParseDuration`, at `transports/v2.3.2`. */
+  /** The table is the gateway's own `ParseDuration`, at `transports/v2.4.0`. */
   const ACCEPTED: Array<[string, number]> = [
     // Bifrost's suffixed forms, multiplied out of a bare number.
     ["1d", 24 * 60 * 60 * 1000],

@@ -9,7 +9,7 @@
 # then failed with `SQLSTATE 28P01`, `/health` pings the stores, the container
 # went unhealthy and ECS replaced the task — 2 min 50 s of outage after about
 # 7 h 20 min in which inference worked while request logging and usage
-# accounting failed silently. At the pinned tag (`transports/v2.3.2`)
+# accounting failed silently. At the pinned tag (`transports/v2.4.0`)
 # `framework/postgresconn/postgresconn.go` runs this command from an
 # `OptionBeforeConnect` for every new physical connection, behind a
 # `singleflight` group and a TTL cache whose failures are never cached, so a
@@ -32,7 +32,7 @@
 #
 # That inheritance is a dependency on upstream, not an accident, so it is named
 # here where a change to it would be read. At the pinned tag
-# (`transports/v2.3.2`) `RunPasswordCommand` in
+# (`transports/v2.4.0`) `RunPasswordCommand` in
 # `framework/postgresconn/postgresconn.go` builds the command at line 563 with
 # `cmd := exec.Command(config.Command, config.Args...)` and never assigns
 # `cmd.Env`. In Go a nil `cmd.Env` means the child inherits the parent's

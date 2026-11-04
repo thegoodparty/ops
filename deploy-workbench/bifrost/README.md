@@ -80,7 +80,7 @@ its own. Those secrets are written to Secrets Manager out of band (phase 2 item
 
 `config.json` is the deployment's declarative Bifrost configuration, authored
 against `transports/config.schema.json` at the pinned upstream tag
-`maximhq/bifrost:v2.3.2` (`deploy-workbench/bifrost-image.ts`), not the docs at
+`maximhq/bifrost:v2.4.0` (`deploy-workbench/bifrost-image.ts`), not the docs at
 a later tag. It holds:
 
 - **The stores.** `config_store` and `logs_store` both point at the RDS
@@ -136,7 +136,7 @@ a later tag. It holds:
   image matters for this half too — at `v2.3.0` the Bedrock converter dropped a
   top-level `cache_control` instead of emitting a `cachePoint`
   (maximhq/bifrost#8541), so the block only does anything on the pinned
-  `v2.3.2`. See "Prompt caching" in [`docs/bifrost-gateway.md`](../../docs/bifrost-gateway.md).
+  `v2.4.0`. See "Prompt caching" in [`docs/bifrost-gateway.md`](../../docs/bifrost-gateway.md).
 - **Client settings.** Inference auth is enforced
   (`enforce_auth_on_inference: true`), direct provider keys are refused
   (`allow_direct_keys: false`), content logging is off with no per-request
@@ -163,7 +163,7 @@ a later tag. It holds:
 - **The first-run claim.** Top-level `"setup_token":
   "env.BIFROST_SETUP_TOKEN"` (phase 2 item 11). It is top-level and not under
   `governance` because that is where `transports/config.schema.json` puts it at
-  `v2.3.2`, and `resolveSetupToken` also reads the `BIFROST_SETUP_TOKEN`
+  `v2.4.0`, and `resolveSetupToken` also reads the `BIFROST_SETUP_TOKEN`
   environment variable when the file does not set one. The value is a
   credential: a reference only, never a literal, and the test fails if one
   appears.
@@ -674,7 +674,7 @@ That early exit is what makes the claim safe with auth disabled, and it is
 worth naming the two upstream facts it rests on, because neither is obvious
 from this repo:
 
-- `loadAuthConfig` (`transports/bifrost-http/lib/config.go` at `v2.3.2`)
+- `loadAuthConfig` (`transports/bifrost-http/lib/config.go` at `v2.4.0`)
   persists the admin account from a file's `auth_config` even with
   `is_enabled: false`, so the row exists on the first boot after
   `BIFROST_CONFIG` is injected.
@@ -766,12 +766,16 @@ it. What that does **not** buy is per-person identity: every allowlisted
 address acts as the same Bifrost admin, and Bifrost's own records cannot tell
 them apart. Enterprise SSO is what separates them. A plugin cannot stand in for
 it at this tag, which an earlier version of this section claimed it could: the
-plugin interfaces at `v2.3.2` are LLM, MCP, A2A, HTTP-transport and
-observability (`core/schemas/plugin.go` in the Bifrost source), with no hook on
-the dashboard or management auth path, and the shared-object loader uses Go's
+plugin interfaces at `v2.4.0` are LLM, MCP, A2A, HTTP-transport and
+observability (`core/schemas/plugin.go` in the Bifrost source), and nothing in
+that list can authorise a dashboard or management call: the transport plugin
+phases run only on the inference routes (`server.go`, which appends
+`TransportPreAuthInterceptorMiddleware` to `inferenceMiddlewares`), so a plugin
+can supply or translate a virtual key for a model request and cannot sit in
+front of `/api`; and the shared-object loader uses Go's
 `plugin.Open` (`framework/plugins/soloader.go`), which cannot load into the
-pinned image's statically linked `/app/main`. The plugin route is therefore not
-available here, not merely unbuilt.
+pinned image's statically linked `/app/main`, built with `-extldflags '-static'`.
+The plugin route is therefore not available here, not merely unbuilt.
 
 `governance.auth_config` in the injected file provisions the same admin
 account at boot, which makes the claim container a no-op from the first start

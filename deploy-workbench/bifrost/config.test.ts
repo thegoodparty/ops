@@ -25,7 +25,7 @@ import { BIFROST_UPSTREAM_TAG } from "../bifrost-image";
  * file, which is why the test can be strict about shape without a deploy.
  *
  * The upstream schema is `transports/config.schema.json` at the pinned
- * `maximhq/bifrost` tag (`v2.3.2`, `deploy-workbench/bifrost-image.ts`), not
+ * `maximhq/bifrost` tag (`v2.4.0`, `deploy-workbench/bifrost-image.ts`), not
  * the docs at a later tag. Two things were checked against it rather than
  * assumed:
  *
@@ -188,7 +188,7 @@ const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
  * The wire id a served model name is sent to the provider as: the alias's
  * `model_id` when the name is a key alias, the name itself otherwise. Residency
  * is a property of this id, not of the name a client sees (`routing` resolves
- * the alias after key selection, `core/bifrost.go` at v2.3.0, unchanged at v2.3.2).
+ * the alias after key selection, `core/bifrost.go` at v2.3.0, unchanged at v2.4.0).
  */
 const wireId = (key: ProviderKey, name: string): string =>
   key.aliases?.[name]?.model_id ?? name;
@@ -721,7 +721,7 @@ describe("bifrost config.json", () => {
   it("moves both stores to the password command in one change, never one", () => {
     // The schema makes `password` and `password_command` a mutually exclusive
     // `oneOf` per store (`transports/config.schema.json` at
-    // `transports/v2.3.2`: `config_store.config.anyOf[1].then` and
+    // `transports/v2.4.0`: `config_store.config.anyOf[1].then` and
     // `logs_store.config.oneOf[1].then`, each with
     // `additionalProperties: false`), so a half-migrated config is a validation
     // error rather than two stores disagreeing about the password. Moving one
@@ -784,7 +784,7 @@ describe("bifrost config.json", () => {
     assert.equal(auth.is_enabled, false);
     assert.equal(auth.admin_username, "env.BIFROST_ADMIN_USERNAME");
     assert.equal(auth.admin_password, "env.BIFROST_ADMIN_PASSWORD");
-    // The schema marks this deprecated and ignored (v2.3.0 through v2.3.2); the client flag is
+    // The schema marks this deprecated and ignored (v2.3.0 through v2.4.0); the client flag is
     // the control, and setting both would suggest the file can override it.
     assert.ok(
       !("disable_auth_on_inference" in auth),
@@ -813,7 +813,7 @@ describe("bifrost config.json", () => {
   // ---------------------------------------------------------------------------
 
   it("does not invent per-model metadata keys the pinned tag would ignore", () => {
-    // v2.3.2 has no config.json way to set context_length, max_input_tokens,
+    // v2.4.0 has no config.json way to set context_length, max_input_tokens,
     // max_output_tokens or a model description for a provider model: the
     // schema's only context/metadata-looking keys are unrelated, the Fireworks
     // adapter builds /v1/models from the key's `models` and `aliases` alone,
@@ -854,12 +854,12 @@ describe("bifrost config.json", () => {
   it("lists the Fireworks model under a catalog name, so /v1/models carries its context window and price", () => {
     // /v1/models enriches each entry from the datasheet by the *listed name*,
     // then by the alias's wire id (`enrichListModelsResponse`,
-    // transports/bifrost-http/handlers/inference.go at v2.3.2). The datasheet has
+    // transports/bifrost-http/handlers/inference.go at v2.4.0). The datasheet has
     // no row for the router id, so the router's own entry is bare (128K, $0 in
     // pi). It does have `accounts/fireworks/models/<model>-us`, so listing the
     // model under that name with the router as the alias target gives pi a
     // full entry while requests still go to the router. Checked on 2026-10-30
-    // against the v2.3.0 code (re-checked at v2.3.2) and the public datasheet: context_length and
+    // against the v2.3.0 code (re-checked at v2.4.0) and the public datasheet: context_length and
     // max_input_tokens 1048576, max_output_tokens 393216, prompt $0.45/M,
     // completion $1.80/M, cached input $0.009/M.
     const key = provider(loadConfig(), "fireworks").keys[0];
@@ -872,7 +872,7 @@ describe("bifrost config.json", () => {
     );
     // model_name is what request cost resolves first, so the logged price is
     // the catalog's own US-only row ($0.45 / $1.80 per 1M), not $0. Measured on
-    // the v2.3.0 code (pricing unchanged at v2.3.2): 1M in + 1M out through the alias costs $2.25.
+    // the v2.3.0 code (pricing unchanged at v2.4.0): 1M in + 1M out through the alias costs $2.25.
     assert.equal(alias.model_name, "accounts/fireworks/models/deepseek-v4p1-flash-1017-us");
   });
 
