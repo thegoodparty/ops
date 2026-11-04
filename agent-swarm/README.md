@@ -286,6 +286,28 @@ returns only the 6-digit code, and waits for the next 30-second step when under
 5 seconds remain. A rejected code usually means worker clock drift, so check
 NTP before touching the seed.
 
+The hand-off scripts find work in the `#tevyn-api` posts gp-api writes for an
+agent wave and send replies back through S3. They read these global config
+keys (not secret except the token): `SLACK_BOT_TOKEN` (needs `channels:history`
+and `files:read`), `TEVYN_API_CHANNEL_ID`, `HANDOFF_ENV` (`dev` or `prod`; dev
+and prod share the channel, so only posts whose block `env` matches are taken)
+and `REPLIES_BUCKET` (dev first; optional `REPLIES_BUCKET_REGION`, default
+`us-west-2`).
+
+- `tevyn-handoffs-new` returns the hand-off posts it has not returned before,
+  as compact JSON (outreachId, sendAt, timeZone, mode, repliesKey, message,
+  recipientCount, channel, ts). It keeps a cursor in KV (`tevyn:cursor`) and
+  claims each outreach id as `handoff:<outreachId>` = `{ state: 'new', slackTs }`,
+  so an id is returned once. Posts without the "Delegate is handling this wave"
+  note or with an invalid machine block are skipped.
+- `tevyn-handoff-csv` (`channel`, `ts`) saves the post's recipient CSV under
+  `/afs/tevyn-handoffs/` and returns only that path, never the Slack URL.
+- `s2w-replies-upload` (`outreachId`, `exportPath`) PUTs the export to
+  `agent-replies/<outreachId>.csv` in `REPLIES_BUCKET`, signed with SigV4 from
+  the instance role's IMDS credentials (the swarm API container reaches IMDS
+  at hop limit 2), returns the key and byte count, then deletes the export from
+  agent-fs. A failed PUT keeps the export.
+
 Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
 add.
 
