@@ -22,11 +22,14 @@ import {
   VK_READER_ROLE_ARN,
 } from "./bifrost-vk-mint";
 import {
+  VK_JANITOR_FUNCTION_DESCRIPTION,
   VK_JANITOR_FUNCTION_NAME,
   VK_JANITOR_INTERVAL_MINUTES,
   VK_JANITOR_LOG_GROUP_NAME,
   VK_JANITOR_LOG_RETENTION_DAYS,
   VK_JANITOR_MEMORY_MB,
+  VK_JANITOR_ROLE_DESCRIPTION,
+  VK_JANITOR_RULE_DESCRIPTION,
   VK_JANITOR_NAME,
   VK_JANITOR_RESERVED_CONCURRENCY,
   VK_JANITOR_ROLE_NAME,
@@ -253,6 +256,103 @@ describe("the function, its schedule and its network", () => {
     assert.match(INDEX_SOURCE, /createBifrostVkJanitor\(\{\s*provider,\s*network\s*\}\)/);
     assert.match(INDEX_SOURCE, /export const vkBifrostJanitorFunctionArn/);
     assert.match(INDEX_SOURCE, /export const vkBifrostJanitorScheduleRuleName/);
+  });
+});
+
+/**
+ * The descriptions this stack writes, against the length each service enforces.
+ *
+ * This exists because one of them already failed an apply. `Deploy workbench`
+ * on `main` (run 41892991673, the merge of #453) died on
+ *
+ *     Lambda: UpdateFunctionConfiguration ValidationException:
+ *     1.validation error detected: Value 'Deactivates Bifrost virtual keys ...'
+ *     at 'description' failed to satisfy constraint: Member must have length
+ *     less than or equal to 256
+ *
+ * The string was 276 characters. Nothing before the apply could see it:
+ * `pulumi preview` does not apply a service's field constraints, and a
+ * TypeScript type has no length, so the run that found out was the one that had
+ * already moved the rule's schedule and left the stack half-migrated. So the
+ * check lives here, in the suite every PR runs.
+ *
+ * The assertion is against the *interpolated* constant, not the source text of
+ * it, which is why the two descriptions are exported from the Pulumi module
+ * rather than written inline: a `SOURCE` regex would have to re-implement the
+ * template substitution to know how long the apply's string is, and the number
+ * that matters is the one AWS is sent.
+ *
+ * The table is per service on purpose. There is no single "AWS description
+ * limit"; each entry names the call that enforces its number, and only
+ * constraints that are written down in the API reference are here. Adding a
+ * row means finding the limit first, not guessing one.
+ */
+describe("the descriptions stay inside the limits the services enforce", () => {
+  const AWS_LIMITS: {
+    what: string;
+    value: string;
+    max: number;
+    /** The documentation the number comes from, quoted in the failure. */
+    from: string;
+  }[] = [
+    {
+      what: "the Lambda function's description",
+      value: VK_JANITOR_FUNCTION_DESCRIPTION,
+      max: 256,
+      from: "CreateFunction/UpdateFunctionConfiguration: 'Member must have length less than or equal to 256'",
+    },
+    {
+      what: "the EventBridge rule's description",
+      value: VK_JANITOR_RULE_DESCRIPTION,
+      max: 512,
+      from: "events:PutRule, Description: 'Maximum length of 512'",
+    },
+    {
+      what: "the execution role's description",
+      value: VK_JANITOR_ROLE_DESCRIPTION,
+      max: 1000,
+      from: "iam:CreateRole, Description: 'Maximum length of 1000'",
+    },
+  ];
+
+  it("keeps every one of them under its limit", () => {
+    const over = AWS_LIMITS.filter((entry) => entry.value.length > entry.max).map(
+      (entry) =>
+        `${entry.what} is ${entry.value.length} characters, over the ${entry.max} ` +
+        `that ${entry.from} allows: ${JSON.stringify(entry.value)}`,
+    );
+    assert.deepEqual(over, []);
+  });
+
+  it("applies the exported strings, so a longer inline copy cannot sneak past", () => {
+    assert.match(SOURCE, /description:\s*VK_JANITOR_FUNCTION_DESCRIPTION/);
+    assert.match(SOURCE, /description:\s*VK_JANITOR_RULE_DESCRIPTION/);
+    assert.match(SOURCE, /description:\s*VK_JANITOR_ROLE_DESCRIPTION/);
+  });
+
+  /**
+   * Fitting is not the same as still describing the function, and the fix for
+   * a length failure must not be a sentence that lost a job. Every behaviour
+   * (revocation, governance convergence, config convergence) and both triggers
+   * are named in the string, so a later trim that drops one of them fails here
+   * rather than in a review.
+   */
+  it("still names every job and both triggers it was shortened to keep", () => {
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /^Deactivates Bifrost virtual keys/);
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /owner has left the Engineers group/);
+    // Governance convergence and config convergence, the two halves of the loop.
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /governance/);
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /live config/);
+    // The five-minute tick and the deploy's invoke, which are the two triggers.
+    assert.match(
+      VK_JANITOR_FUNCTION_DESCRIPTION,
+      new RegExp(`every ${VK_JANITOR_INTERVAL_MINUTES} minutes`),
+    );
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /on every workbench deploy/);
+    // The plan references stay, because they are what tells an operator which
+    // design the sentence is true against.
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /docs\/bifrost-virtual-keys\.md/);
+    assert.match(VK_JANITOR_FUNCTION_DESCRIPTION, /docs\/bifrost-reconciler\.md/);
   });
 });
 
