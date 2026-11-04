@@ -7,6 +7,7 @@ import {
   hostFilesHash,
   panelRepliesPutStatement,
   SWARM_HOSTNAME,
+  swarmHostPolicy,
   syncCommand,
   userData,
 } from "./agent-swarm";
@@ -96,5 +97,10 @@ describe("panel replies grant", () => {
       "arn:aws:s3:::tevyn-poll-csvs-develop/agent-replies/*",
       "arn:aws:s3:::tevyn-poll-csvs-master/agent-replies/*",
     ]);
+  });
+
+  it("is in the host role's policy", () => {
+    const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+    assert.ok(Statement.includes(panelRepliesPutStatement));
   });
 });

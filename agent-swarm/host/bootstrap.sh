@@ -21,6 +21,10 @@ for v in LEAD CODER REVIEWER HARNESS LEAD_MODEL WORKER_MODEL; do
     exit 1
   fi
 done
+if ! grep -q '^SLACK_BOT_TOKEN=.' .env; then
+  echo "bootstrap: SLACK_BOT_TOKEN is empty in .env" >&2
+  exit 1
+fi
 
 # The key goes to curl through a file, not argv, so ps never shows it.
 AUTH="$(mktemp)"
@@ -99,22 +103,28 @@ else
 fi
 
 # Config for the panel hand-off scripts. The Slack token comes from .env and
-# stays out of agent env, so only those scripts read it, through
-# ctx.swarm.config.
-for kv in "TEVYN_API_CHANNEL_ID=C09JMECMP89" "HANDOFF_ENV=dev" "REPLIES_BUCKET=tevyn-poll-csvs-develop"; do
-  jq -n --arg k "${kv%%=*}" --arg v "${kv#*=}" \
+# is not exported to agent env, so it stays out of agent shells; an agent can
+# still read it unmasked through its own /api/config/resolved.
+# HANDOFF_ENV and REPLIES_BUCKET start on dev and are only written when
+# missing, so a rerun after the switch to prod keeps prod.
+hand_off_config() {
+  jq -n --arg k "$1" --arg v "$2" \
     '{scope: "global", key: $k, value: $v, description: "Panel hand-off scripts (bootstrap.sh)"}' \
     | api PUT /api/config -d @- >/dev/null
+}
+hand_off_config TEVYN_API_CHANNEL_ID C09JMECMP89
+for kv in "HANDOFF_ENV=dev" "REPLIES_BUCKET=tevyn-poll-csvs-develop"; do
+  if api GET "/api/config?scope=global&key=${kv%%=*}" | jq -e '.configs | length > 0' >/dev/null; then
+    echo "hand-off config: ${kv%%=*} already set, kept"
+  else
+    hand_off_config "${kv%%=*}" "${kv#*=}"
+  fi
 done
-if ! grep -q '^SLACK_BOT_TOKEN=.' .env; then
-  echo "bootstrap: SLACK_BOT_TOKEN is empty in .env" >&2
-  exit 1
-fi
 sed -n 's/^SLACK_BOT_TOKEN=//p' .env | tr -d '\n' \
   | jq -Rs '{scope: "global", key: "SLACK_BOT_TOKEN", value: ., isSecret: true, exportToEnv: false,
       description: "Delegate bot token for the panel hand-off scripts (bootstrap.sh)"}' \
   | api PUT /api/config -d @- >/dev/null
-echo "hand-off config: channel, env, bucket and Slack token saved as global config"
+echo "hand-off config: channel and Slack token saved as global config"
 
 # Global catalog scripts. Global writes need the lead, and the upsert
 # typechecks, so a script that does not compile fails the run here. Saving
