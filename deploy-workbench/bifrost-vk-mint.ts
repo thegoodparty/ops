@@ -7,7 +7,10 @@ import { MANAGEMENT_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
 import { BIFROST_DISCOVERY_DNS_NAME, type BifrostDiscovery } from "./discovery";
 import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
-import { VK_MINT_TEMPLATE_PARAMETER_NAME } from "./governance-parameters";
+import {
+  GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+  VK_MINT_TEMPLATE_PARAMETER_NAME,
+} from "./governance-parameters";
 import {
   BIFROST_PORT,
   REGION,
@@ -97,14 +100,15 @@ export const VK_MINT_LOG_GROUP_NAME = `/aws/lambda/${VK_MINT_FUNCTION_NAME}`;
 export const VK_MINT_LOG_RETENTION_DAYS = 30;
 
 /**
- * The SSM parameter the template is stored in, in the gateway's own namespace.
+ * The two SSM parameters the mint reads, in the gateway's own namespace.
  *
  * Imported from `governance-parameters.ts` and re-exported rather than declared
  * here: step 2 of `docs/bifrost-reconciler.md` publishes the template beside the
- * per-person overrides, so one module owns both parameters and the mint names
- * the one it reads. The name, the tier and the mint's read grant are unchanged.
+ * per-person overrides, so one module owns both parameters. The mint reads both
+ * — the template for the shape and the overrides for the caller's delta (step 5)
+ * — and the names, the tier and the read grant are the same for each.
  */
-export { VK_MINT_TEMPLATE_PARAMETER_NAME };
+export { VK_MINT_TEMPLATE_PARAMETER_NAME, GOVERNANCE_OVERRIDES_PARAMETER_NAME };
 
 /**
  * The gateway's own container, read for `BIFROST_SETUP_TOKEN` (decision 3).
@@ -162,6 +166,12 @@ export const VK_MINT_MEMORY_MB = 256;
 export const vkMintEnvironment = (): Record<string, string> => ({
   BIFROST_BASE_URL: `http://${BIFROST_DISCOVERY_DNS_NAME}:${BIFROST_PORT}`,
   TEMPLATE_PARAMETER_NAME: VK_MINT_TEMPLATE_PARAMETER_NAME,
+  // The per-person overrides document step 2 added beside the template. Named,
+  // not valued: the mint computes the caller's desired state from the two
+  // documents and creates the key already converged (step 5 of
+  // `docs/bifrost-reconciler.md`), which is what leaves the first tick after a
+  // mint nothing to do.
+  OVERRIDES_PARAMETER_NAME: GOVERNANCE_OVERRIDES_PARAMETER_NAME,
   SETUP_TOKEN_SECRET_NAME,
   SETUP_TOKEN_SECRET_JSON_KEY,
   READER_ROLE_ARN: VK_READER_ROLE_ARN,
@@ -194,8 +204,16 @@ export type PolicyDocument = {
 
 /**
  * The execution role's whole grant, as data: assume the one reader role, read
- * the one setup-token secret, read the one template parameter, write its own
+ * the one setup-token secret, read the two governance documents, write its own
  * log streams.
+ *
+ * The two parameters are the template and the overrides, by ARN, one
+ * `ssm:GetParameter` statement rather than two: they are one desired state and
+ * the mint reads them together, so a grant that named one and not the other
+ * would be a function that mints a key from half its input. Step 5 of
+ * `docs/bifrost-reconciler.md` adds the overrides ARN to the statement step 3's
+ * template had, which is the only IAM change the step needs — the parameter,
+ * its tier and its write already landed in step 2.
  *
  * Deliberately absent, and asserted by `bifrost-vk-mint.test.ts`:
  *
@@ -205,15 +223,15 @@ export type PolicyDocument = {
  *   whose policy admits the account, the same reasoning `group-sync-lambda.ts`
  *   records;
  * - `logs:CreateLogGroup` — Pulumi creates the group;
- * - `ssm:GetParameters`, `ssm:GetParametersByPath` and every write — one
- *   parameter, read one way;
+ * - `ssm:GetParameters`, `ssm:GetParametersByPath` and every write — the two
+ *   parameters are known by name, read one way;
  * - `secretsmanager:GetSecretValue` on anything but `bifrost/gateway`'s own ARN
  *   pattern — one container, the token's own JSON key, nothing else. That is
  *   the decision recorded in the header, and the test fails if a second secret
  *   appears in this document.
  */
 export const vkMintExecutionPolicy = (args: {
-  templateParameterArn: string;
+  governanceParameterArns: string[];
   logGroupArn: string;
 }): PolicyDocument => ({
   Version: "2012-10-17",
@@ -238,10 +256,10 @@ export const vkMintExecutionPolicy = (args: {
       Resource: [secretArnPattern(SETUP_TOKEN_SECRET_NAME)],
     },
     {
-      Sid: "ReadTemplate",
+      Sid: "ReadGovernanceDocuments",
       Effect: "Allow",
       Action: ["ssm:GetParameter"],
-      Resource: [args.templateParameterArn],
+      Resource: [...args.governanceParameterArns],
     },
     {
       Sid: "WriteOwnLogs",
@@ -282,15 +300,20 @@ export const createBifrostVkMint = (args: {
   network: ReturnType<typeof createWorkbenchNetwork>;
   discovery: BifrostDiscovery;
   /**
-   * The published template, from `governance-parameters.ts`.
+   * The published governance documents, from `governance-parameters.ts`.
    *
-   * Passed in rather than created here: the function's read grant names this
-   * parameter's ARN, and step 2 publishes it in the same apply as the per-person
-   * overrides, so the two documents are one dependency edge and one owner.
+   * Passed in rather than created here: the function's read grant names both
+   * parameters' ARNs, and step 2 publishes them in one apply, so the two
+   * documents are one dependency edge and one owner. The template decides the
+   * shape and the overrides document the person's delta; the mint reads both
+   * together because a create body composed from one and not the other is the
+   * drift step 5 exists to prevent.
    */
   templateParameter: aws.ssm.Parameter;
+  overridesParameter: aws.ssm.Parameter;
 }) => {
-  const { provider, network, discovery, templateParameter } = args;
+  const { provider, network, discovery, templateParameter, overridesParameter } =
+    args;
   const tags = { Name: VK_MINT_NAME, Project: "bifrost-virtual-keys" };
 
   // The function's own group, created bare with each rule as its own resource
@@ -389,20 +412,20 @@ export const createBifrostVkMint = (args: {
     { provider },
   );
 
-  // The template parameter itself is created by `governance-parameters.ts` and
-  // arrives as `args.templateParameter`. It stays a `String` and not a
-  // `SecureString` for the reason it always was: a reviewed file in git with no
-  // secret in it (decision 5), and a SecureString would need `kms:Decrypt` for
-  // no confidentiality. Reading the committed file at deploy time is what keeps
-  // the live value from drifting from the reviewed one, and that read now lives
-  // beside the overrides document's.
+  // The governance parameters are created by `governance-parameters.ts` and
+  // arrive as `args.templateParameter` and `args.overridesParameter`. They stay
+  // `String`s and not `SecureString`s for the reason they always were: a
+  // reviewed file in git with no secret in it (decision 5), and a SecureString
+  // would need `kms:Decrypt` for no confidentiality. Reading the committed files
+  // at deploy time is what keeps the live values from drifting from the reviewed
+  // ones.
 
   const role = new aws.iam.Role(
     "bifrostVkMintRole",
     {
       name: VK_MINT_ROLE_NAME,
       description:
-        "Bifrost vk-mint Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read BIFROST_SETUP_TOKEN from bifrost/gateway, read the key template, write its own logs. No identitystore action, no other secret.",
+        "Bifrost vk-mint Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read BIFROST_SETUP_TOKEN from bifrost/gateway, read the key template and the per-person overrides, create the caller's key already converged, write its own logs. No identitystore action, no other secret.",
       assumeRolePolicy: JSON.stringify(vkMintTrust),
       managedPolicyArns: [LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN],
       tags,
@@ -416,10 +439,16 @@ export const createBifrostVkMint = (args: {
       name: VK_MINT_NAME,
       role: role.name,
       policy: pulumi
-        .all([templateParameter.arn, logGroup.arn])
-        .apply(([templateParameterArn, logGroupArn]) =>
+        .all([templateParameter.arn, overridesParameter.arn, logGroup.arn])
+        .apply(([templateParameterArn, overridesParameterArn, logGroupArn]) =>
           JSON.stringify(
-            vkMintExecutionPolicy({ templateParameterArn, logGroupArn }),
+            vkMintExecutionPolicy({
+              governanceParameterArns: [
+                templateParameterArn,
+                overridesParameterArn,
+              ],
+              logGroupArn,
+            }),
           ),
         ),
     },
@@ -452,7 +481,7 @@ export const createBifrostVkMint = (args: {
     // The log group and the inline policy must exist before the first
     // invocation: without the group the function logs to an implicit one, and
     // without the policy the missing grant is invisible until a caller tries.
-    { provider, dependsOn: [logGroup, rolePolicy, templateParameter] },
+    { provider, dependsOn: [logGroup, rolePolicy, templateParameter, overridesParameter] },
   );
 
   // The URL, IAM-gated. No `lambda:Permission` resource: `AWS_IAM` means AWS
@@ -482,6 +511,7 @@ export const createBifrostVkMint = (args: {
     securityGroup,
     logGroup,
     templateParameter,
+    overridesParameter,
     functionUrl: url.functionUrl,
     /** The task's private name, exported so a human can resolve it. */
     bifrostHostname: discovery.dnsName,

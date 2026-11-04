@@ -23,6 +23,7 @@ import {
   vkMintExecutionPolicy,
 } from "./bifrost-vk-mint";
 import {
+  GOVERNANCE_OVERRIDES_PARAMETER_NAME,
   VK_MINT_TEMPLATE_PARAMETER_NAME,
   readVkMintTemplate,
 } from "./governance-parameters";
@@ -58,7 +59,13 @@ const TEMPLATE = JSON.parse(readVkMintTemplate()) as {
 
 const policy = () =>
   vkMintExecutionPolicy({
-    templateParameterArn: `arn:aws:ssm:us-west-2:${WORKBENCH_ACCOUNT_ID}:parameter${VK_MINT_TEMPLATE_PARAMETER_NAME}`,
+    // Both governance documents, by ARN, in the order the apply passes them:
+    // the mint reads them together, so a grant naming one is a mint composed
+    // from half its input (step 5 of `docs/bifrost-reconciler.md`).
+    governanceParameterArns: [
+      `arn:aws:ssm:us-west-2:${WORKBENCH_ACCOUNT_ID}:parameter${VK_MINT_TEMPLATE_PARAMETER_NAME}`,
+      `arn:aws:ssm:us-west-2:${WORKBENCH_ACCOUNT_ID}:parameter${GOVERNANCE_OVERRIDES_PARAMETER_NAME}`,
+    ],
     logGroupArn: `arn:aws:logs:us-west-2:${WORKBENCH_ACCOUNT_ID}:log-group:${VK_MINT_LOG_GROUP_NAME}`,
   });
 
@@ -160,16 +167,16 @@ describe("the function, its URL and its network", () => {
   });
 
   it("is wired into the stack, and the ECS service registers itself for discovery", () => {
-    // The mint receives the published template rather than creating it: step 2
-    // of `docs/bifrost-reconciler.md` moved the parameter into
-    // `governance-parameters.ts`, beside the per-person overrides, because the
-    // two documents are one desired state. The four arguments are the whole
-    // wiring, and the template's presence here is what keeps the grant's ARN
-    // bound to the parameter the apply actually creates.
-    assert.match(
-      INDEX_SOURCE,
-      /createBifrostVkMint\(\{\s*provider,\s*network,\s*discovery,\s*templateParameter:\s*governance\.template,?\s*\}\)/,
-    );
+    // The mint receives the published governance documents rather than creating
+    // them: step 2 of `docs/bifrost-reconciler.md` moved the parameters into
+    // `governance-parameters.ts`, because the two documents are one desired
+    // state. Step 5 gave the mint the second one, so it creates a key already
+    // converged; both arguments are what keeps the grant's ARNs bound to the
+    // parameters the apply actually creates.
+    const wiring = /createBifrostVkMint\(\{([\s\S]*?)\n\}\)/.exec(INDEX_SOURCE);
+    assert.ok(wiring, "index.ts does not call createBifrostVkMint");
+    assert.match(wiring[1], /templateParameter:\s*governance\.template/);
+    assert.match(wiring[1], /overridesParameter:\s*governance\.overrides/);
     assert.match(INDEX_SOURCE, /createBifrostDiscovery\(\{\s*provider,\s*vpcId:\s*network\.vpc\.id\s*\}\)/);
     assert.match(ECS_SOURCE, /serviceRegistries:\s*\{\s*registryArn:\s*discovery\.service\.arn\s*\}/);
   });
@@ -237,6 +244,7 @@ describe("the template, the secret and the logs", () => {
     const environment = vkMintEnvironment();
     assert.deepEqual(Object.keys(environment).sort(), [
       "BIFROST_BASE_URL",
+      "OVERRIDES_PARAMETER_NAME",
       "READER_ROLE_ARN",
       "READER_SESSION_NAME",
       "SETUP_TOKEN_SECRET_JSON_KEY",
@@ -244,6 +252,27 @@ describe("the template, the secret and the logs", () => {
       "TEMPLATE_PARAMETER_NAME",
     ]);
     assert.ok(!Object.values(environment).some((value) => /token-[a-z0-9]/i.test(value)));
+  });
+
+  it("reads both governance documents, and the grant names both parameters", () => {
+    // Step 5 of `docs/bifrost-reconciler.md`: the mint computes the caller's
+    // desired state from the template and the overrides before it creates the
+    // key, so it reads the same pair the reconciler does.
+    assert.equal(
+      vkMintEnvironment().OVERRIDES_PARAMETER_NAME,
+      GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+    );
+    assert.equal(GOVERNANCE_OVERRIDES_PARAMETER_NAME, "/bifrost/governance-overrides");
+
+    const read = policy().Statement.filter((s) => s.Action.includes("ssm:GetParameter"));
+    assert.equal(read.length, 1, "one statement, not one per document");
+    assert.deepEqual(read[0].Resource, [
+      `arn:aws:ssm:us-west-2:${WORKBENCH_ACCOUNT_ID}:parameter${VK_MINT_TEMPLATE_PARAMETER_NAME}`,
+      `arn:aws:ssm:us-west-2:${WORKBENCH_ACCOUNT_ID}:parameter${GOVERNANCE_OVERRIDES_PARAMETER_NAME}`,
+    ]);
+    // Named parameters, never a path walk or a wildcard: the read is the two
+    // documents and nothing else in the account's namespace.
+    assert.ok(!read[0].Resource.some((arn) => arn.includes("*") || arn.endsWith("/bifrost")));
   });
 
   it("grants no identitystore action, no CreateLogGroup, no KMS and no SSM write", () => {
