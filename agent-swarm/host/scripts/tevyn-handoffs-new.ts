@@ -176,6 +176,9 @@ const fetchHistory = async (
     cursor = parsed.data.response_metadata?.next_cursor || undefined
     if (!cursor) break
   }
+  // Slack pages newest first, so leftover pages are the older posts; moving
+  // the cursor past them would skip their hand-offs for good.
+  if (cursor) throw new Error('Slack history exceeded the page limit')
   return messages
 }
 

@@ -170,6 +170,22 @@ describe('run', () => {
     assert.equal(h.kv.data.size, 0)
   })
 
+  it('claims nothing and keeps the cursor when pages remain past the cap', async () => {
+    const h = harness([])
+    h.deps.fetchFn = async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          messages: [post('1762560000.000100')],
+          response_metadata: { next_cursor: 'more' },
+        }),
+      )
+    await assert.rejects(run(h.deps), {
+      message: 'Slack history exceeded the page limit',
+    })
+    assert.equal(h.kv.data.size, 0)
+  })
+
   it('never puts the token in a result or an error', async () => {
     const h = harness([post('1762560000.000100')])
     assert.ok(!JSON.stringify(await run(h.deps)).includes(TOKEN))
