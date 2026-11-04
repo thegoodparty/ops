@@ -280,11 +280,7 @@ computation:
 - **config convergence**: the live subset of `config.json`, diffed against the
   provider, key and client state the gateway reports, applied by `PUT` to the
   endpoints in the table above. Triggered by an `InvokeFunction` from the deploy
-  workflow after the Pulumi apply. A provider or key the running gateway does
-  not have is reported `not-present` and skipped rather than created (decision
-  7), and a `404` means the same thing on both of that provider's reads — the
-  provider itself and its key list — so a provider that is only in the file
-  cannot fail the invoke it is supposed to be a note about.
+  workflow after the Pulumi apply.
 
 Same desired-state computation, two callers, and the minter is a third
 (decision 7).
@@ -345,43 +341,6 @@ already take (`deploy-workbench/scripts/aws-role.ts`, the pattern
 `github-actions-workbench-deploy` role carries the Pulumi backend grant and the
 one SSM read, not `lambda:*` (`deploy/components/ci-roles/policies.ts:926-952`),
 while `pulumi-deploy` is `AdministratorAccess` (`deploy-workbench/deploy-role.ts:66-127`).
-
-The reply is a `JanitorRun`, not a bare summary. The handler returns
-`{ revocation, governance, config, summary }` and the run's own verdict is
-`summary.outcome`, because the `JanitorRun` shape is already the Lambda's public
-reply from step 3 (`docs/bifrost-virtual-keys.md`, the janitor's run log and its
-own tests) and narrowing it to suit the one new caller would drop the audit
-shape an operator reads when they invoke the function by hand. So the poll
-accepts both: `parseReconcilerSummary` reads `outcome` at the top level and one
-level down at `summary.outcome`, and
-`vk-janitor-handler.test.ts` drives the handler's real return value through the
-JSON serialisation the CLI's outfile applies and then through the parser. That
-integration test is the point: the two sides were each tested against their own
-shape, which is how a reply nobody could read stayed green in the suite.
-
-The payload is written to a file and passed as `fileb://path`, never as inline
-`--payload` JSON. `--payload` is a blob argument, so AWS CLI v2 base64-decodes
-it by default (`cli_binary_format=base64`) and rejects raw JSON with
-`Invalid base64` before the request is signed — which is neither a throttle nor
-a `FunctionError`, so the step would exit "could not complete" on every deploy.
-`fileb://` is the one form the CLI reads as bytes whatever `cli_binary_format`
-says, so the deploy's correctness does not depend on a flag or on a profile
-setting; `verify-convergence.test.ts` pins the real argument list, since the
-retry loop's injected invoke cannot see it.
-
-**Step 4 lands in two PRs, and this is the split.** Everything in
-`deploy-workbench/` — the poll, the contract module, the config half, the
-handler's reply shape — is one PR, because that tree is de-owned and its
-failures are all in one place. The workflow change that *calls* the poll is a
-second PR, because `.github/workflows/` stays human code-owner owned: a workflow
-added on `main` can assume the deploy roles (OIDC trust keys on the ref, not the
-filename), so the file that decides what runs with a credential keeps a human
-behind it. The order is A then B, not a preference: the step invokes
-`scripts/verify-convergence.ts`, so a B that landed first would call a script
-that is not on `main` yet. The script is inert until the workflow calls it,
-which is what makes A safe to merge alone — and why the two ordering assertions
-in `deploy-workflow-order.test.ts` are written as "where the step is present"
-on A and become unconditional on B.
 
 **`reservedConcurrentExecutions: 1` turns a collision into a failed deploy.**
 The function is capped at one concurrent execution (`bifrost-vk-janitor.ts:120`)
@@ -658,13 +617,6 @@ converge. See "The deploy must poll the invoke", including the
 `reservedConcurrentExecutions: 1` collision: a throttled invoke is retried with
 backoff for a window sized against the function's own timeout, and only a run that
 ran and did not converge fails the deploy.
-
-The result it reads is `summary.outcome` on the `JanitorRun` the function
-returns, with the bare-summary shape accepted too, and the event reaches the
-function as a `fileb://` file rather than inline `--payload` JSON. Both are in
-"The deploy must poll the invoke" and both are pinned by tests that drive the
-real reply and the real argument list, because a poll whose two halves each
-match their own assumption is a poll that never ran.
 
 Rejected: **`Event` invocation, or `Request` without reading the body.** Both
 return before the work does, both are green on a failed convergence, and both put
@@ -975,32 +927,6 @@ that are now stale.
    task inside one deploy run with the same task ARN, a deliberately broken
    convergence fails the run, and a tick that is already running when the deploy
    invokes does not fail the run.
-
-   **Two PRs, and the order is load-bearing.** The step lands as A then B rather
-   than as one change:
-
-   - **4a, `deploy-workbench/` and this document.** The poll
-     (`scripts/verify-convergence.ts`), the timing contract
-     (`bifrost/vk-janitor-contract.ts`), the scheduled rule at five minutes, the
-     config-convergence half, and the handler's reply shape. This tree is
-     de-owned, so it merges on the delegate reviewer's approval.
-   - **4b, `.github/workflows/deploy-workbench.yml` only.** The converge step and
-     the job's `timeout-minutes` going 20 → 30. `.github/workflows/` stays human
-     code-owner owned on purpose: OIDC trust keys on the ref rather than the
-     filename, so a workflow added on `main` can assume the deploy roles, and
-     the file that decides what runs with a credential keeps a human behind it.
-     De-owning it to make this step merge faster would be the security change
-     the opt-out list's own rules say needs a human reviewer, and the list is
-     deliberately as short as it is.
-
-   The order is not a convenience. The step runs
-   `scripts/verify-convergence.ts`, so a B that landed before A would call a
-   script that is not on `main`. The script is inert until the workflow calls
-   it, which is what makes A safe to merge on its own: nothing in
-   `deploy-workbench/` invokes it in production until B lands. `Plan:`/`Step:` in
-   both PR bodies name this step, so the status gate reads one step from two
-   PRs; A's body says the workflow moved to B and why, so a reader who expected
-   one PR is not left guessing.
 5. **The minter applies overrides at create.** `bifrost/vk-mint-core.ts` and its
    handler compute the same desired state for the caller's email, so a new key
    starts converged and the first reconciler tick has nothing to do. Proves: a
