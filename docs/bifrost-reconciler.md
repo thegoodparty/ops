@@ -249,10 +249,9 @@ key name is the lowercase email") and what the mint lowercases before it compare
 who is not in the `Engineers` group, or a budget `reset_duration` Bifrost will
 reject, fails a test over the committed file at the apply that wrote it. It is
 not allowed to surface as a reconciler that retries the same `400` forever behind
-an alarm. The group membership the test checks is a directory read, which the
-deploy job cannot make (the reader role admits only the two Lambdas), so the
-deploy checks a member set supplied to it (`GOVERNANCE_OVERRIDES_MEMBERS`);
-`npm test` holds no credentials.
+an alarm. The group membership the test checks is a directory read, so the test
+runs where the deploy role can make it (the deploy workflow, in the existing
+`npx --no-install tsx` step slot), not in `npm test`, which holds no credentials.
 
 ### One reconciler, two triggers
 
@@ -690,11 +689,11 @@ decision, and the decision was no.
 
 ### 10. Validation fails at apply
 
-A test over the committed overrides file runs where the deploy runs and checks
-every email against the `Engineers` membership supplied to that run, and checks
-every budget against Bifrost's own duration rules (`ParseDuration` and the
-"duplicate reset_duration" rule, `governance.go:905-919`), so a bad override
-fails the run that wrote it.
+A test over the committed overrides file runs where the deploy runs, checks every
+email against the `Engineers` group through the reader role, and checks every
+budget against Bifrost's own duration rules (`ParseDuration` and the "duplicate
+reset_duration" rule, `governance.go:905-919`), so a bad override fails the run
+that wrote it.
 
 Rejected: **validate in the reconciler.** A malformed override would be a `400`
 on every tick, retried forever, behind an alarm that fires for a reason a human
