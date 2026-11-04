@@ -249,12 +249,10 @@ key name is the lowercase email") and what the mint lowercases before it compare
 who is not in the `Engineers` group, or a budget `reset_duration` Bifrost will
 reject, fails a test over the committed file at the apply that wrote it. It is
 not allowed to surface as a reconciler that retries the same `400` forever behind
-an alarm. The shape half runs in `npm test` and in the Pulumi program. The
-membership half is a directory read, which the deploy job cannot make: the reader
-role admits only the two Lambdas, and the CI role may assume only `pulumi-deploy`.
-So membership is checked at the apply only when a member set is supplied
-(`GOVERNANCE_OVERRIDES_MEMBERS`, which the person adding an override provides);
-otherwise the deploy log says membership was not checked.
+an alarm. The group membership the test checks is a directory read, which the
+deploy job cannot make (the reader role admits only the two Lambdas), so the
+deploy checks a member set supplied to it (`GOVERNANCE_OVERRIDES_MEMBERS`);
+`npm test` holds no credentials.
 
 ### One reconciler, two triggers
 
@@ -692,15 +690,11 @@ decision, and the decision was no.
 
 ### 10. Validation fails at apply
 
-A test over the committed overrides file checks every email against the
-`Engineers` group, and checks every budget against Bifrost's own duration rules (`ParseDuration` and the "duplicate
-reset_duration" rule, `governance.go:905-919`), so a bad override fails the run
-that wrote it.
-
-Revised in review (PR #449): the deploy job cannot run the membership check
-through the reader role, so at the apply it is a member-set check, not an assume.
-The reconciler still checks membership at convergence, where the Lambda holds the
-grant.
+A test over the committed overrides file runs where the deploy runs and checks
+every email against the `Engineers` membership supplied to that run, and checks
+every budget against Bifrost's own duration rules (`ParseDuration` and the
+"duplicate reset_duration" rule, `governance.go:905-919`), so a bad override
+fails the run that wrote it.
 
 Rejected: **validate in the reconciler.** A malformed override would be a `400`
 on every tick, retried forever, behind an alarm that fires for a reason a human
