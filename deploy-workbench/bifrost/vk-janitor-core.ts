@@ -500,6 +500,18 @@ export const composeDesiredState = (args: {
  * carries no budget ids (git holds none, and the update path matches on
  * `reset_duration` when none is given) and never `reset_budget_usage` (clearing
  * usage is opt-in on the wire, and this loop has no reason to opt in).
+ *
+ * **`budgets` and `provider_configs` are always sent, even when the composed
+ * state names none**, because both are replacement sets and the body has to
+ * match what the diff compared. The asymmetry with `rate_limit` below is not an
+ * inconsistency: `rate_limit` omission genuinely means "leave the key's alone"
+ * and the diff skips it for that reason, while an omitted `budgets` or
+ * `provider_configs` also means "leave them alone" — so leaving either out
+ * would make the diff report a difference the `PUT` cannot fix, and the run
+ * would rewrite that key forever with `changed` never reaching zero. An empty
+ * array is what actually clears a set the desired state no longer names, which
+ * is what makes "rollback is a revert plus one tick" true for a budget an
+ * override drops (success criterion 6).
  */
 export const convergenceBody = (
   state: GovernanceDesiredState,
@@ -510,27 +522,29 @@ export const convergenceBody = (
     body.calendar_aligned = state.calendar_aligned;
   }
 
-  if (state.provider_configs !== undefined) {
-    body.provider_configs = state.provider_configs.map((config) => {
-      const entry: Record<string, unknown> = { provider: config.provider };
-      if (config.allowed_models !== undefined) {
-        entry.allowed_models = config.allowed_models;
-      }
-      if (config.blacklisted_models !== undefined) {
-        entry.blacklisted_models = config.blacklisted_models;
-      }
-      if (config.weight !== undefined) entry.weight = config.weight;
-      if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
-      return entry;
-    });
-  }
+  // Always, even empty: see the comment above. `provider_configs` is the field
+  // whose omission deletes the entries' budgets and rate limits, so leaving it
+  // out while the diff compared it is the one shape that never converges.
+  body.provider_configs = (state.provider_configs ?? []).map((config) => {
+    const entry: Record<string, unknown> = { provider: config.provider };
+    if (config.allowed_models !== undefined) {
+      entry.allowed_models = config.allowed_models;
+    }
+    if (config.blacklisted_models !== undefined) {
+      entry.blacklisted_models = config.blacklisted_models;
+    }
+    if (config.weight !== undefined) entry.weight = config.weight;
+    if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
+    return entry;
+  });
 
-  if (state.budgets !== undefined) {
-    body.budgets = state.budgets.map((budget) => ({
-      max_limit: budget.max_limit,
-      reset_duration: budget.reset_duration,
-    }));
-  }
+  // Always, even empty, for the same reason: an empty list is how the desired
+  // state says "this key has no budgets", and it is the only thing that removes
+  // one an override has dropped.
+  body.budgets = (state.budgets ?? []).map((budget) => ({
+    max_limit: budget.max_limit,
+    reset_duration: budget.reset_duration,
+  }));
 
   if (state.rate_limit !== undefined) {
     const limit: Record<string, unknown> = {};

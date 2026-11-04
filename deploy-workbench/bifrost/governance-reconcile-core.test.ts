@@ -328,6 +328,18 @@ describe("the complete-set body (acceptance 4)", () => {
     assert.ok(!("rate_limit" in body));
   });
 
+  it("always sends the two replacement sets, empty when the desired state names none", () => {
+    // `provider_configs` and `budgets` are replacement sets whose omission means
+    // "leave the existing ones alone", so a body that left either out while the
+    // diff compared it would report a difference no PUT could ever fix: the key
+    // would be rewritten every tick and `changed` would never reach zero. An
+    // empty array is how the desired state says "none", and it is what removes a
+    // budget an override has dropped (success criterion 6).
+    const body = convergenceBody({ calendar_aligned: true });
+    assert.deepEqual(body.provider_configs, []);
+    assert.deepEqual(body.budgets, []);
+  });
+
   it("sends a rate limit with both halves of whatever pair it names", () => {
     const body = convergenceBody({
       rate_limit: { request_max_limit: 600, request_reset_duration: "5m" },
@@ -399,7 +411,7 @@ describe("the diff (acceptance 2 and 5)", () => {
     assert.deepEqual(differingFields(state, observed), []);
   });
 
-  it("finds a rate limit difference when a document names one", () => {
+  it("finds no rate limit difference when the gateway already holds the named one", () => {
     const { state } = composeDesiredState({
       template: template(),
       overrides: {
@@ -414,6 +426,44 @@ describe("the diff (acceptance 2 and 5)", () => {
       rate_limit: { request_max_limit: 600, request_reset_duration: "5m" },
     } as Partial<VirtualKey> & { name: string });
     assert.deepEqual(differingFields(state, observed), []);
+  });
+
+  it("finds a rate limit difference when a document names a different limit", () => {
+    // The half that would otherwise be unprotected: without this, a
+    // `differingFields` that never compared `rate_limit` at all would pass the
+    // whole suite, and decision 12's field would never converge.
+    const { state } = composeDesiredState({
+      template: template(),
+      overrides: {
+        "jeff@goodparty.org": {
+          rate_limit: { request_max_limit: 600, request_reset_duration: "5m" },
+        },
+      },
+      email: "jeff@goodparty.org",
+    });
+
+    const differentMaximum = convergedKey({
+      name: "jeff@goodparty.org",
+      rate_limit: { request_max_limit: 100, request_reset_duration: "5m" },
+    } as Partial<VirtualKey> & { name: string });
+    assert.deepEqual(differingFields(state, differentMaximum), ["rate_limit"]);
+
+    const differentWindow = convergedKey({
+      name: "jeff@goodparty.org",
+      rate_limit: { request_max_limit: 600, request_reset_duration: "1h" },
+    } as Partial<VirtualKey> & { name: string });
+    assert.deepEqual(differingFields(state, differentWindow), ["rate_limit"]);
+
+    // A key with no limit at all is a difference when the document names one.
+    assert.deepEqual(
+      differingFields(
+        state,
+        convergedKey({ name: "jeff@goodparty.org", rate_limit: null } as Partial<VirtualKey> & {
+          name: string;
+        }),
+      ),
+      ["rate_limit"],
+    );
   });
 
   it("reads the gateway's allow_all_keys and keys as the key_ids the desired state uses", () => {
@@ -558,6 +608,50 @@ describe("the converge loop (acceptance 1, 2, 3, 6)", () => {
     assert.equal(result.minted, 0);
     assert.deepEqual(result.applied, []);
     assert.deepEqual(updates, []);
+  });
+
+  it("removes a budget git no longer names, in one PUT that clears the set", async () => {
+    // The reviewer's case: an override's budget is reverted, so the desired
+    // state names none while the key still holds one. The body has to carry the
+    // empty list, because an omitted `budgets` means "leave them alone" on the
+    // update path: without it the key would be rewritten every run and `changed`
+    // would never reach zero, which is the one shape "rollback is a revert plus
+    // a tick" (success criterion 6) cannot survive.
+    const { gateway, updates } = fakeGateway({
+      keys: [
+        convergedKey({
+          name: "jeff@goodparty.org",
+          budgets: [{ max_limit: 250, reset_duration: "1M", current_usage: 88 }],
+        } as Partial<VirtualKey> & { name: string }),
+      ],
+    });
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: template(),
+      overrides: {},
+    });
+
+    assert.deepEqual(result.applied, [{ name: "jeff@goodparty.org", fields: ["budgets"] }]);
+    assert.equal(result.changed, 1);
+    assert.equal(updates.length, 1);
+    assert.deepEqual(updates[0].body.budgets, []);
+
+    // And the run that follows that PUT has nothing left to do: the body it
+    // wrote is an observation the diff agrees with.
+    const after = fakeGateway({
+      keys: [convergedKey({ name: "jeff@goodparty.org" })],
+    });
+    const second = await reconcileGovernance({
+      gateway: after.gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: template(),
+      overrides: {},
+    });
+    assert.equal(second.changed, 0);
+    assert.equal(second.unchanged, 1);
+    assert.deepEqual(after.updates, []);
   });
 
   it("converges only the keys that differ, and counts both sides honestly", async () => {
