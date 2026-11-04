@@ -38,18 +38,43 @@ import type {
   VirtualKey,
 } from "./vk-mint-core";
 import {
-  GOVERNANCE_INHERIT,
-  desiredStateFor,
-  type GovernanceBudget,
+  governanceBody,
+  governanceDesiredState,
   type GovernanceDesiredState,
   type GovernanceOverrides,
-  type GovernanceProviderConfig,
   type GovernanceRateLimit,
+  type GovernanceTemplate,
+  type ReconciledField,
 } from "./governance-desired-state";
 import type {
   ObservedGovernance,
   ObservedRateLimit,
 } from "./vk-governance-observed";
+
+/*
+ * The composed desired state, its complete-set body, the fields governance owns
+ * and the `inherit` source are all `governance-desired-state.ts`'s, re-exported
+ * here because that is where callers already take them from.
+ *
+ * They moved there in step 5 of `docs/bifrost-reconciler.md`, when the mint
+ * became the second caller: a copy of the merge, the narrowing or the body on
+ * the mint's side is the defect the step exists to prevent, and the module they
+ * moved to is the one that already owned the merge and the validation (step 2).
+ * Keeping them here would have made `vk-mint-core.ts` import the janitor's core
+ * to create a key, which is the wrong direction — this module is the loop, and
+ * the loop is not the desired state.
+ */
+export {
+  RECONCILED_FIELDS,
+  composeDesiredState,
+  convergenceBody,
+  governanceBody,
+  governanceDesiredState,
+  type ComposedDesiredState,
+  type GovernanceTemplate,
+  type ProviderConfigsSource,
+  type ReconciledField,
+} from "./governance-desired-state";
 
 /**
  * Re-exported from `key-name.ts`, which is where it now lives: the governance
@@ -392,183 +417,14 @@ export const reconcileVirtualKeys = async (args: {
  * - **Nothing disables itself, and a failure is not swallowed** (decision 15). A
  *   failed read or write throws a `JanitorFailure`, so the invocation fails and
  *   step 6's three-consecutive-failures alarm has something to count.
+ *
+ * The desired state itself — the merge, the narrowing to the fields governance
+ * owns, the `calendar_aligned` default and the complete-set body — lives in
+ * `governance-desired-state.ts` and is re-exported below. Step 5 made the mint
+ * its second caller, so it cannot live here without the mint importing the
+ * janitor's loop to create a key; see that module's header for the argument, and
+ * `vk-mint-core.ts` for the create path.
  * ====================================================================== */
-
-/**
- * The fields convergence owns and the diff compares.
- *
- * `description` and `is_active` are deliberately **not** here even though the
- * template carries them. The template's `description` is the marker this job
- * matches on, and `is_active` is a decision two other jobs own: the janitor sets
- * it false with a deletion timer, and the mint sets it true to reactivate. A
- * convergence loop that re-asserted the template's `is_active: true` every five
- * minutes would undo a revocation within one tick.
- */
-export const RECONCILED_FIELDS = [
-  "provider_configs",
-  "budgets",
-  "rate_limit",
-  "calendar_aligned",
-] as const;
-
-export type ReconciledField = (typeof RECONCILED_FIELDS)[number];
-
-/**
- * The template as convergence reads it: the governance fields, with no metadata
- * and no per-call fields.
- *
- * A structural superset of the mint's `VirtualKeyTemplate` rather than a second
- * declaration of it: the create path and this converge path read the same SSM
- * document, so a field the template gains is a field both see.
- */
-export type GovernanceTemplate = {
-  description?: string;
-  is_active?: boolean;
-  provider_configs?: GovernanceProviderConfig[];
-  budgets?: GovernanceBudget[];
-  rate_limit?: GovernanceRateLimit;
-  calendar_aligned?: boolean;
-};
-
-/**
- * Where the composed `provider_configs` came from.
- *
- * Decision 9's whole point is that "inherit" and "absent" mean the same value
- * and different statements, so the composition records which it was. Nothing on
- * the wire reads it; a test does.
- */
-export type ProviderConfigsSource = "override" | "inherit" | "absent";
-
-export type ComposedDesiredState = {
-  /** The complete desired governance for one key, ready for `convergenceBody`. */
-  state: GovernanceDesiredState;
-  providerConfigsSource: ProviderConfigsSource;
-};
-
-/**
- * The desired state for one key: the template merged field by field with that
- * person's override.
- *
- * The merge is `desiredStateFor` from `governance-desired-state.ts`, not a
- * second copy of the rules: step 2 owns the merge and the validation, and the
- * mint (step 5) will call the same function. What this adds is the narrowing to
- * the fields convergence owns, and the `calendar_aligned` default.
- *
- * `calendar_aligned` is asserted rather than inherited. Decision 11 is the
- * fleet's rule, not a per-document one, so a template that forgot the field still
- * converges every key to a calendar-aligned window. An override that says
- * `false` still wins, because the document is the authority for the people it
- * names.
- */
-export const composeDesiredState = (args: {
-  template: GovernanceTemplate;
-  overrides: GovernanceOverrides;
-  email: string;
-}): ComposedDesiredState => {
-  const merged = desiredStateFor(
-    args.template as GovernanceDesiredState,
-    args.overrides,
-    args.email,
-  );
-
-  const state: GovernanceDesiredState = {};
-  for (const field of RECONCILED_FIELDS) {
-    const value = (merged as Record<string, unknown>)[field];
-    if (value === undefined) continue;
-    (state as Record<string, unknown>)[field] = value;
-  }
-
-  // Decision 11. Set on the composed state rather than on the template so no
-  // future document edit can drop it by accident.
-  if (state.calendar_aligned === undefined) state.calendar_aligned = true;
-  // An empty `rate_limit` would mean "remove the key's limit" on the wire,
-  // which is the opposite of a field with no default (decision 12).
-  if (state.rate_limit && Object.keys(state.rate_limit).length === 0) {
-    delete state.rate_limit;
-  }
-
-  const fromOverride = args.overrides[args.email.toLowerCase()]?.provider_configs;
-  const providerConfigsSource: ProviderConfigsSource =
-    fromOverride === undefined
-      ? "absent"
-      : fromOverride === GOVERNANCE_INHERIT
-        ? "inherit"
-        : "override";
-
-  return { state, providerConfigsSource };
-};
-
-/**
- * The complete `PUT` body for one key.
- *
- * Complete is the load-bearing word, and it is what makes the whole approach
- * safe against a replacement set. The body carries the whole composed
- * `provider_configs`, every budget, and the key's own `calendar_aligned`; it
- * carries no budget ids (git holds none, and the update path matches on
- * `reset_duration` when none is given) and never `reset_budget_usage` (clearing
- * usage is opt-in on the wire, and this loop has no reason to opt in).
- *
- * **`budgets` and `provider_configs` are always sent, even when the composed
- * state names none**, because both are replacement sets and the body has to
- * match what the diff compared. The asymmetry with `rate_limit` below is not an
- * inconsistency: `rate_limit` omission genuinely means "leave the key's alone"
- * and the diff skips it for that reason, while an omitted `budgets` or
- * `provider_configs` also means "leave them alone" — so leaving either out
- * would make the diff report a difference the `PUT` cannot fix, and the run
- * would rewrite that key forever with `changed` never reaching zero. An empty
- * array is what actually clears a set the desired state no longer names, which
- * is what makes "rollback is a revert plus one tick" true for a budget an
- * override drops (success criterion 6).
- */
-export const convergenceBody = (
-  state: GovernanceDesiredState,
-): Record<string, unknown> => {
-  const body: Record<string, unknown> = {};
-
-  if (state.calendar_aligned !== undefined) {
-    body.calendar_aligned = state.calendar_aligned;
-  }
-
-  // Always, even empty: see the comment above. `provider_configs` is the field
-  // whose omission deletes the entries' budgets and rate limits, so leaving it
-  // out while the diff compared it is the one shape that never converges.
-  body.provider_configs = (state.provider_configs ?? []).map((config) => {
-    const entry: Record<string, unknown> = { provider: config.provider };
-    if (config.allowed_models !== undefined) {
-      entry.allowed_models = config.allowed_models;
-    }
-    if (config.blacklisted_models !== undefined) {
-      entry.blacklisted_models = config.blacklisted_models;
-    }
-    if (config.weight !== undefined) entry.weight = config.weight;
-    if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
-    return entry;
-  });
-
-  // Always, even empty, for the same reason: an empty list is how the desired
-  // state says "this key has no budgets", and it is the only thing that removes
-  // one an override has dropped.
-  body.budgets = (state.budgets ?? []).map((budget) => ({
-    max_limit: budget.max_limit,
-    reset_duration: budget.reset_duration,
-  }));
-
-  if (state.rate_limit !== undefined) {
-    const limit: Record<string, unknown> = {};
-    for (const field of [
-      "token_max_limit",
-      "token_reset_duration",
-      "request_max_limit",
-      "request_reset_duration",
-    ] as const) {
-      const value = state.rate_limit[field];
-      if (value !== undefined) limit[field] = value;
-    }
-    body.rate_limit = limit;
-  }
-
-  return body;
-};
 
 /** One budget as either side reports it, for the comparison. */
 type BudgetLike = { max_limit?: unknown; reset_duration?: unknown };
@@ -853,7 +709,7 @@ export const reconcileGovernance = async (args: {
       continue;
     }
 
-    const { state } = composeDesiredState({ template, overrides, email: name });
+    const { state } = governanceDesiredState({ template, overrides, email: name });
     const fields = differingFields(state, key);
     if (fields.length === 0) {
       verdicts.push({ kind: "unchanged", name });
@@ -863,7 +719,7 @@ export const reconcileGovernance = async (args: {
       kind: "apply",
       name,
       key,
-      body: convergenceBody(state),
+      body: governanceBody(state),
       fields,
     });
   }

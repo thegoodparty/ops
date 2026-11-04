@@ -73,6 +73,21 @@
  * maximum with no reset duration, or a duration with no maximum), because on
  * the wire an empty one means "remove the limit" and an override should never
  * do that by accident.
+ *
+ * ## The merge, and who calls it
+ *
+ * `desiredStateFor` is the merge. `governanceDesiredState` (below) is the whole
+ * of what a caller needs to write a key: the merge, the narrowing to the fields
+ * governance owns, the `calendar_aligned` default, and the complete-set body.
+ * Two callers use it and neither holds a copy: the reconciler
+ * (`vk-janitor-core.ts`, step 3) converges existing keys to it, and the minter
+ * (`vk-mint-core.ts`, step 5) creates a key from it.
+ *
+ * That the two share the function is the whole of step 5's guarantee. A mint and
+ * a convergence that agreed only because each had its own transcription of the
+ * rules would agree until one of them changed, and the failure mode is a key
+ * that starts drifted and is written on the tick after every mint — with
+ * `changed` counting it as a fight rather than the mint's mistake.
  */
 
 import { isEmailShaped } from "./key-name";
@@ -802,3 +817,216 @@ export const desiredStateFor = (
   email: string,
 ): GovernanceDesiredState =>
   composeGovernanceDesiredState(template, overrides[email.toLowerCase()]);
+
+/* -------------------------------------------------------------------------
+ * What the reconciler and the minter both send
+ *
+ * Steps 3 and 5 of `docs/bifrost-reconciler.md`. This half is here, in step 2's
+ * module, because it is the one place both callers can reach without one of
+ * them importing the other: the reconciler converges an existing key to it and
+ * the minter creates a key from it, and neither may hold a transcription of the
+ * rules. See this module's header for why that is the point of step 5.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * The fields governance owns, as the reconciler's diff compares them.
+ *
+ * `description` and `is_active` are deliberately **not** here even though the
+ * template carries them. The template's `description` is the marker the janitor
+ * matches on, and `is_active` is a decision two other jobs own: the janitor sets
+ * it false with a deletion timer, and the mint sets it true to reactivate. A
+ * convergence loop that re-asserted the template's `is_active: true` every five
+ * minutes would undo a revocation within one tick.
+ *
+ * They are left out of the create body for the mirror-image reason: the mint's
+ * body carries the template's own `description` and `is_active` (which is how a
+ * new key gets the marker and starts active), so a composed state that also
+ * carried them would be a second, divergent spelling of the same two fields in
+ * one request.
+ */
+export const RECONCILED_FIELDS = [
+  "provider_configs",
+  "budgets",
+  "rate_limit",
+  "calendar_aligned",
+] as const;
+
+export type ReconciledField = (typeof RECONCILED_FIELDS)[number];
+
+/**
+ * The template as the desired-state computation reads it: the governance
+ * fields, with no metadata and no per-call fields.
+ *
+ * A structural superset of the mint's `VirtualKeyTemplate` rather than a second
+ * declaration of it: the create path and the converge path read the same SSM
+ * document, so a field the template gains is a field both see.
+ */
+export type GovernanceTemplate = {
+  description?: string;
+  is_active?: boolean;
+  provider_configs?: GovernanceProviderConfig[];
+  budgets?: GovernanceBudget[];
+  rate_limit?: GovernanceRateLimit;
+  calendar_aligned?: boolean;
+};
+
+/**
+ * Where the composed `provider_configs` came from.
+ *
+ * Decision 9's whole point is that "inherit" and "absent" mean the same value
+ * and different statements, so the composition records which it was. Nothing on
+ * the wire reads it; a test does.
+ */
+export type ProviderConfigsSource = "override" | "inherit" | "absent";
+
+export type ComposedDesiredState = {
+  /** The complete desired governance for one key, ready for `governanceBody`. */
+  state: GovernanceDesiredState;
+  providerConfigsSource: ProviderConfigsSource;
+};
+
+/**
+ * The desired state for one key: the template merged field by field with that
+ * person's override, narrowed to the fields governance owns.
+ *
+ * The merge is `desiredStateFor` above, not a second copy of the rules. On top
+ * of it: the narrowing to `RECONCILED_FIELDS`, and the `calendar_aligned`
+ * default.
+ *
+ * `calendar_aligned` is asserted rather than inherited. Decision 11 is the
+ * fleet's rule, not a per-document one, so a template that forgot the field
+ * still converges every key to a calendar-aligned window. An override that says
+ * `false` still wins, because the document is the authority for the people it
+ * names.
+ */
+export const governanceDesiredState = (args: {
+  template: GovernanceTemplate;
+  overrides: GovernanceOverrides;
+  email: string;
+}): ComposedDesiredState => {
+  const merged = desiredStateFor(args.template, args.overrides, args.email);
+
+  const state: GovernanceDesiredState = {};
+  for (const field of RECONCILED_FIELDS) {
+    const value = (merged as Record<string, unknown>)[field];
+    if (value === undefined) continue;
+    (state as Record<string, unknown>)[field] = value;
+  }
+
+  // Decision 11. Set on the composed state rather than on the template so no
+  // future document edit can drop it by accident.
+  if (state.calendar_aligned === undefined) state.calendar_aligned = true;
+  // An empty `rate_limit` would mean "remove the key's limit" on the wire,
+  // which is the opposite of a field with no default (decision 12).
+  if (state.rate_limit && Object.keys(state.rate_limit).length === 0) {
+    delete state.rate_limit;
+  }
+
+  const fromOverride = args.overrides[args.email.toLowerCase()]?.provider_configs;
+  const providerConfigsSource: ProviderConfigsSource =
+    fromOverride === undefined
+      ? "absent"
+      : fromOverride === GOVERNANCE_INHERIT
+        ? "inherit"
+        : "override";
+
+  return { state, providerConfigsSource };
+};
+
+/**
+ * The name the reconciler's callers had before the mint became the second one.
+ *
+ * Kept rather than renamed in the callers: step 3's tests and assertions name
+ * it, and a step about the minter should not churn the convergence loop's diff
+ * for a name. The mint calls the same function under the name that says who it
+ * is for, and there is exactly one implementation behind both.
+ */
+export const composeDesiredState = governanceDesiredState;
+
+/**
+ * The complete governance body for one key, whether it is being created or
+ * converged.
+ *
+ * Complete is the load-bearing word, and it is what makes the whole approach
+ * safe against a replacement set. The body carries the whole composed
+ * `provider_configs`, every budget, and the key's own `calendar_aligned`; it
+ * carries no budget ids (git holds none, and the update path matches on
+ * `reset_duration` when none is given) and never `reset_budget_usage` (clearing
+ * usage is opt-in on the wire, and nothing here has a reason to opt in).
+ *
+ * **`budgets` and `provider_configs` are always sent, even when the composed
+ * state names none**, because both are replacement sets and the body has to
+ * match what a diff compared. The asymmetry with `rate_limit` below is not an
+ * inconsistency: `rate_limit` omission genuinely means "leave the key's alone"
+ * and the reconciler's diff skips it for that reason, while an omitted
+ * `budgets` or `provider_configs` also means "leave them alone" — so leaving
+ * either out would make the diff report a difference the `PUT` cannot fix, and
+ * the run would rewrite that key forever with `changed` never reaching zero. An
+ * empty array is what actually clears a set the desired state no longer names,
+ * which is what makes "rollback is a revert plus one tick" true for a budget an
+ * override drops (success criterion 6).
+ *
+ * On the create path the same two fields mean "this key has these and no
+ * others", which is the shape the desired state has just computed, so the mint
+ * sends this body's contents spread into its create request. It sends them
+ * rather than the composed state itself because the two differ in one place:
+ * the body drops `id`s from budget rows, and a create carries none either.
+ */
+export const governanceBody = (
+  state: GovernanceDesiredState,
+): Record<string, unknown> => {
+  const body: Record<string, unknown> = {};
+
+  if (state.calendar_aligned !== undefined) {
+    body.calendar_aligned = state.calendar_aligned;
+  }
+
+  // Always, even empty: see the comment above. `provider_configs` is the field
+  // whose omission deletes the entries' budgets and rate limits, so leaving it
+  // out while a diff compared it is the one shape that never converges.
+  body.provider_configs = (state.provider_configs ?? []).map((config) => {
+    const entry: Record<string, unknown> = { provider: config.provider };
+    if (config.allowed_models !== undefined) {
+      entry.allowed_models = config.allowed_models;
+    }
+    if (config.blacklisted_models !== undefined) {
+      entry.blacklisted_models = config.blacklisted_models;
+    }
+    if (config.weight !== undefined) entry.weight = config.weight;
+    if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
+    return entry;
+  });
+
+  // Always, even empty, for the same reason: an empty list is how the desired
+  // state says "this key has no budgets", and it is the only thing that removes
+  // one an override has dropped.
+  body.budgets = (state.budgets ?? []).map((budget) => ({
+    max_limit: budget.max_limit,
+    reset_duration: budget.reset_duration,
+  }));
+
+  if (state.rate_limit !== undefined) {
+    const limit: Record<string, unknown> = {};
+    for (const field of [
+      "token_max_limit",
+      "token_reset_duration",
+      "request_max_limit",
+      "request_reset_duration",
+    ] as const) {
+      const value = state.rate_limit[field];
+      if (value !== undefined) limit[field] = value;
+    }
+    body.rate_limit = limit;
+  }
+
+  return body;
+};
+
+/**
+ * The reconciler's name for `governanceBody`: the complete set a `PUT` carries.
+ *
+ * One implementation, two names, on the same reasoning as
+ * `composeDesiredState` above: step 3's diff and tests read `convergenceBody`,
+ * and step 5 adds a second caller rather than a second body.
+ */
+export const convergenceBody = governanceBody;

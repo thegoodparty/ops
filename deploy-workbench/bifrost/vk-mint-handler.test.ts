@@ -9,6 +9,7 @@ import {
   type VirtualKeyGateway,
 } from "./vk-mint-core";
 import { createHandler, type HandlerDeps } from "./vk-mint-handler";
+import type { GovernanceOverrides } from "./governance-desired-state";
 
 /**
  * The handler's wiring: the verified caller, the fail-closed statuses, the
@@ -53,9 +54,12 @@ const deps = (options: {
   member?: boolean;
   directoryError?: Error;
   templateError?: Error;
+  overridesError?: Error;
   tokenError?: Error;
   keys?: VirtualKey[];
   create?: (body: Record<string, unknown>) => Promise<VirtualKey>;
+  /** The per-person document the handler reads beside the template. */
+  overrides?: Record<string, unknown>;
 }) => {
   const logs: Record<string, unknown>[] = [];
   const creates: Record<string, unknown>[] = [];
@@ -78,9 +82,13 @@ const deps = (options: {
   };
 
   const injected: HandlerDeps = {
-    readTemplate: async () => {
+    readGovernance: async () => {
       if (options.templateError) throw options.templateError;
-      return template();
+      if (options.overridesError) throw options.overridesError;
+      return {
+        template: template(),
+        overrides: (options.overrides ?? {}) as GovernanceOverrides,
+      };
     },
     readSetupToken: async () => {
       if (options.tokenError) throw options.tokenError;
@@ -168,7 +176,7 @@ describe("the mint endpoint", () => {
   it("reactivates an inactive key through the handler, returning the new value", async () => {
     let updated = false;
     const handler = createHandler({
-      readTemplate: async () => template(),
+      readGovernance: async () => ({ template: template(), overrides: {} }),
       readSetupToken: async () => SETUP_TOKEN,
       createDirectory: async () => ({
         getUserId: async () => "user-1",
@@ -226,5 +234,58 @@ describe("the mint endpoint", () => {
     assert.equal(response.statusCode, 502);
     assert.ok(!response.body.includes("sk-bf-leak"));
     assert.ok(!JSON.stringify(logs).includes("sk-bf-leak"));
+  });
+});
+
+describe("the create carries the caller's governance (step 5)", () => {
+  it("creates the key from the template and the caller's override, in the composed shape", async () => {
+    const { handler, creates } = deps({
+      overrides: {
+        [EMAIL]: {
+          budgets: [{ max_limit: 250, reset_duration: "1M" }],
+          provider_configs: "inherit",
+        },
+      },
+    });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+
+    assert.equal(creates.length, 1);
+    const body = creates[0];
+    assert.equal(body.name, EMAIL);
+    // The override's budget, in the shape the reconciler's body uses (no id).
+    assert.deepEqual(body.budgets, [{ max_limit: 250, reset_duration: "1M" }]);
+    // `inherit` resolved to the template's list rather than being sent as the
+    // sentinel or as nothing: the field is a replacement set on the wire.
+    assert.deepEqual(body.provider_configs, template().provider_configs);
+    // Decision 11's fleet-wide default, and decision 12's absent rate limit.
+    assert.equal(body.calendar_aligned, true);
+    assert.ok(!("rate_limit" in body));
+    // The template's own fields are untouched.
+    assert.equal(body.description, template().description);
+    assert.equal(body.is_active, true);
+  });
+
+  it("creates from the template alone for a caller with no entry in the overrides document", async () => {
+    const { handler, creates } = deps({ overrides: {} });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(creates[0].budgets, []);
+    assert.equal(creates[0].calendar_aligned, true);
+    assert.deepEqual(creates[0].provider_configs, template().provider_configs);
+  });
+
+  it("refuses rather than creating from half the desired state when the overrides document cannot be read", async () => {
+    // A key created with the template's governance while a person's override
+    // exists is a key they then live with until the next tick rewrites it, and
+    // the tick is a five-minute wait for the thing they just asked for. The read
+    // is one dependency because the two documents are one desired state.
+    const { handler, creates, logs } = deps({
+      overridesError: new Error("AccessDenied on /bifrost/governance-overrides"),
+    });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 500);
+    assert.equal(creates.length, 0);
+    assert.equal(logs[0].reason, "template-unavailable");
   });
 });

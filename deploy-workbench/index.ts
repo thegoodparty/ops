@@ -628,6 +628,11 @@ const vkMint = createBifrostVkMint({
   network,
   discovery,
   templateParameter: governance.template,
+  // Both governance documents, because the mint computes the caller's desired
+  // state from them before it creates the key (step 5 of
+  // `docs/bifrost-reconciler.md`). Two arguments rather than one object keeps the
+  // grant's ARNs bound to the parameters this apply actually creates.
+  overridesParameter: governance.overrides,
 });
 
 /** The IAM-gated endpoint step 4 grants people permission to call. */

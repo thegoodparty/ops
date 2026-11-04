@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import assert from "node:assert/strict";
 
 import { WORKBENCH_ACCOUNT_ID } from "../../utils/accounts";
@@ -20,6 +22,14 @@ import {
   type VirtualKey,
   type VirtualKeyGateway,
 } from "./vk-mint-core";
+import {
+  convergenceBody,
+  governanceDesiredState,
+  type GovernanceOverrides,
+  type GovernanceTemplate,
+} from "./governance-desired-state";
+import { reconcileGovernance, type JanitorGateway } from "./vk-janitor-core";
+import { VK_DESCRIPTION } from "./vk-marker";
 
 /**
  * The mint's rules, without AWS and without HTTP: step 3's idempotency cases
@@ -225,7 +235,19 @@ describe("idempotent minting", () => {
     const result = await mintVirtualKey({ gateway, template, email: "jeff@goodparty.org" });
     assert.equal(result.action, "created");
     assert.equal(result.key, "sk-bf-new");
-    assert.deepEqual(creates, [{ ...template, name: "jeff@goodparty.org" }]);
+    // The template's own fields, the name, and the governance the reconciler
+    // would compute for this person. The governance half (`budgets: []`,
+    // `calendar_aligned: true`) is `governanceBody`'s, so a key created here is
+    // already the shape the first tick compares against (step 5 of
+    // `docs/bifrost-reconciler.md`).
+    assert.deepEqual(creates, [
+      {
+        ...template,
+        calendar_aligned: true,
+        budgets: [],
+        name: "jeff@goodparty.org",
+      },
+    ]);
   });
 
   it("reactivates an inactive key in one PUT that also clears the expiry and the deletion timer", async () => {
@@ -439,5 +461,424 @@ describe("live membership, every call (decision 1)", () => {
       ),
       (error: unknown) => error instanceof MintFailure && error.status === 503,
     );
+  });
+});
+
+/**
+ * Step 5 of `docs/bifrost-reconciler.md`: **a mint for an overridden email
+ * produces a key the reconciler then reports as unchanged.**
+ *
+ * The gate the plan sets for this step, and the reason the two live in one test
+ * file section rather than two: the assertion is not "the create body had the
+ * right fields" but "the reconciler, run over the key this create produced,
+ * finds nothing to write". A test of the first kind passes on a mint that agrees
+ * with the reconciler by coincidence, and the coincidence is exactly what drifts.
+ *
+ * The gateway here is a fake that *keeps* what a create writes, so the key the
+ * reconciler lists is the one the mint actually asked for, hydrated the way
+ * `GET /api/governance/virtual-keys` hydrates it (`applyVKGovernanceFromModelConfigs`
+ * at the pinned tag): `allow_all_keys` and `keys` rather than `key_ids`, budget
+ * rows with the runtime columns, and a rate limit with its counters.
+ */
+describe("a minted key starts converged (step 5)", () => {
+  /**
+   * A gateway that stores the create body it was given and answers the list the
+   * way the real one does. Nothing is derived from the desired-state code: the
+   * key is a translation of the request, so a difference the reconciler finds is
+   * a difference the mint really sent.
+   */
+  const storingGateway = () => {
+    const created: Record<string, unknown>[] = [];
+    let stored: Record<string, unknown> | undefined;
+
+    /** A stored key row, hydrated the way the list route hydrates it. */
+    const asListed = (): VirtualKey =>
+      ({
+        id: "id-created",
+        name: stored?.name,
+        value: "sk-bf-created",
+        is_active: stored?.is_active,
+        expires_at: null,
+        delete_after_expire: null,
+        description: stored?.description,
+        calendar_aligned: stored?.calendar_aligned ?? null,
+        budgets: ((stored?.budgets as Record<string, unknown>[]) ?? []).map(
+          (budget) => ({
+            id: `budget-${String(budget.reset_duration)}`,
+            max_limit: budget.max_limit,
+            reset_duration: budget.reset_duration,
+            // Runtime-owned, written by the accounting, never by git.
+            current_usage: 0,
+            last_reset: "2026-11-01T00:00:00Z",
+            is_calendar_aligned: true,
+          }),
+        ),
+        provider_configs: (
+          (stored?.provider_configs as Record<string, unknown>[]) ?? []
+        ).map((config) => ({
+          id: 1,
+          provider: config.provider,
+          allowed_models: config.allowed_models ?? [],
+          blacklisted_models: config.blacklisted_models ?? [],
+          weight: config.weight ?? null,
+          // The association the other way round, as the route reports it.
+          allow_all_keys: Array.isArray(config.key_ids)
+            ? (config.key_ids as unknown[]).includes("*")
+            : false,
+          keys: [],
+        })),
+        rate_limit:
+          stored?.rate_limit === undefined
+            ? null
+            : {
+                ...(stored.rate_limit as Record<string, unknown>),
+                token_current_usage: 0,
+                request_current_usage: 0,
+              },
+      }) as unknown as VirtualKey;
+
+    const gateway: VirtualKeyGateway & JanitorGateway = {
+      list: async () => ({
+        keys: stored ? [asListed()] : [],
+        totalCount: stored ? 1 : 0,
+      }),
+      create: async (body) => {
+        created.push(body);
+        stored = body;
+        return asListed();
+      },
+      update: async () => asListed(),
+    };
+    return { gateway, created };
+  };
+
+  /**
+   * A template with the committed document's shape: the marker, one provider
+   * entry per model family, and no budgets or rate limit (decisions 11 and 12).
+   */
+  const keyTemplate = (): GovernanceTemplate => ({
+    description: VK_DESCRIPTION,
+    is_active: true,
+    provider_configs: [
+      {
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5", "us.moonshotai.kimi-k3"],
+        key_ids: ["*"],
+      },
+      {
+        provider: "fireworks",
+        allowed_models: ["worker-default"],
+        key_ids: ["*"],
+      },
+    ],
+  });
+
+  const EMAIL = "jeff@goodparty.org";
+
+  /** The directory the reconciler needs; its answers are not this test's subject. */
+  const directory = (): MembershipDirectory => ({
+    getUserId: async () => "user-1",
+    listMemberUserIds: async () => ["user-1"],
+  });
+
+  /** Run the reconciler over whatever the mint's create left in the fake. */
+  const reconcile = async (
+    gateway: JanitorGateway,
+    overrides: GovernanceOverrides,
+  ) =>
+    reconcileGovernance({
+      gateway,
+      directory: directory(),
+      template: keyTemplate(),
+      overrides,
+    });
+
+  it("is unchanged to the reconciler when the email has an override", async () => {
+    const overrides: GovernanceOverrides = {
+      [EMAIL]: {
+        budgets: [{ max_limit: 250, reset_duration: "1M" }],
+        rate_limit: { request_max_limit: 600, request_reset_duration: "5m" },
+      },
+    };
+
+    const { gateway, created } = storingGateway();
+    const minted = await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides,
+      email: EMAIL,
+    });
+    assert.equal(minted.action, "created");
+
+    // What the create asked for, before the reconciler sees it: the override is
+    // in the body, and it is in the composed shape rather than the override's
+    // own spelling.
+    assert.deepEqual(created[0].budgets, [
+      { max_limit: 250, reset_duration: "1M" },
+    ]);
+    assert.deepEqual(created[0].rate_limit, {
+      request_max_limit: 600,
+      request_reset_duration: "5m",
+    });
+    assert.equal(created[0].calendar_aligned, true);
+    // The template's model policy survived a budget-only override: the merge is
+    // field by field (decision 9), not a replacement of the whole document.
+    assert.deepEqual(created[0].provider_configs, keyTemplate().provider_configs);
+
+    // The criterion: the reconciler over that key writes nothing.
+    const result = await reconcile(gateway, overrides);
+    assert.equal(result.outcome, "converged");
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
+    assert.deepEqual(result.applied, []);
+    assert.equal(result.minted, 0);
+  });
+
+  it("is unchanged to the reconciler for somebody with no override", async () => {
+    const { gateway } = storingGateway();
+    const minted = await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides: {},
+      email: EMAIL,
+    });
+    assert.equal(minted.action, "created");
+
+    const result = await reconcile(gateway, {});
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
+    assert.deepEqual(result.applied, []);
+  });
+
+  it("is unchanged when the override narrows the provider list and inherits the rest", async () => {
+    // The case that would break a mint copying the template or the override
+    // instead of the merge: `provider_configs` is a replacement set on the wire
+    // (decision 9), so a narrowed list has to be the list that is created, and
+    // the reconciler has to agree about it.
+    const overrides: GovernanceOverrides = {
+      [EMAIL]: {
+        provider_configs: [
+          { provider: "bedrock", allowed_models: ["us.anthropic.claude-sonnet-5-5"], key_ids: ["*"] },
+        ],
+        calendar_aligned: false,
+      },
+    };
+
+    const { gateway, created } = storingGateway();
+    await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides,
+      email: EMAIL,
+    });
+
+    assert.deepEqual(created[0].provider_configs, [
+      { provider: "bedrock", allowed_models: ["us.anthropic.claude-sonnet-5-5"], key_ids: ["*"] },
+    ]);
+    assert.equal(created[0].calendar_aligned, false);
+
+    const result = await reconcile(gateway, overrides);
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
+  });
+
+  it("never puts a key value in the create body, and the mint hands the gateway's back", async () => {
+    // Decision 7: the reconciler mints nothing and the minter is the only place
+    // a credential exists. The create is where it comes into existence, and the
+    // gateway generates it — so the only `value` in play is the one the gateway
+    // returned, and the desired state has no field for one.
+    const { gateway, created } = storingGateway();
+    const result = await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides: {
+        [EMAIL]: { budgets: [{ max_limit: 250, reset_duration: "1M" }] },
+      },
+      email: EMAIL,
+    });
+
+    assert.ok(!("value" in created[0]), "the create body must not carry a key value");
+    assert.ok(!("key" in created[0]), "the create body must not carry a key value");
+    assert.equal(JSON.stringify(created[0]).includes("sk-bf"), false);
+    // And what comes back is the gateway's own value, not one composed here.
+    assert.equal(result.key, "sk-bf-created");
+
+    // The reconciler's body for the same key has no credential either: it is
+    // built from the desired state, and the desired state has no such field.
+    const body = convergenceBody(
+      governanceDesiredState({
+        template: keyTemplate(),
+        overrides: { [EMAIL]: { budgets: [{ max_limit: 250, reset_duration: "1M" }] } },
+        email: EMAIL,
+      }).state,
+    );
+    assert.ok(!("value" in body));
+    assert.equal(JSON.stringify(body).includes("sk-bf"), false);
+  });
+
+  it("does not converge an existing key, and does not create a second one", async () => {
+    // The other half of the split decision 7 makes: governance on an existing key
+    // is the reconciler's, so a mint that finds a key returns it. The mint's job
+    // is granting, and a mint that also wrote governance would be a second writer
+    // racing the five-minute tick.
+    const { gateway, created } = storingGateway();
+    await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides: {},
+      email: EMAIL,
+    });
+    const createsBefore = created.length;
+
+    const second = await mintVirtualKey({
+      gateway,
+      template: keyTemplate(),
+      overrides: { [EMAIL]: { budgets: [{ max_limit: 250, reset_duration: "1M" }] } },
+      email: EMAIL,
+    });
+    assert.equal(second.action, "existing");
+    assert.equal(created.length, createsBefore, "a second mint must not create");
+
+    // So the reconciler is the one that applies the override, exactly as it
+    // would for a key minted before the override existed.
+    const result = await reconcile(gateway, {
+      [EMAIL]: { budgets: [{ max_limit: 250, reset_duration: "1M" }] },
+    });
+    assert.equal(result.changed, 1);
+    assert.deepEqual(result.applied, [{ name: EMAIL, fields: ["budgets"] }]);
+  });
+});
+
+describe("the committed documents, minted and then reconciled", () => {
+  const TEMPLATE_PATH = path.resolve(__dirname, "vk-mint-template.json");
+  const OVERRIDES_PATH = path.resolve(__dirname, "governance-overrides.json");
+
+  /**
+   * The same two files the Lambdas read out of SSM, and the same shape the
+   * handler hands to `mintVirtualKey`: the template as written, and the
+   * overrides document with its `$comment` metadata still on it (which the
+   * merge ignores and the desired state never carries).
+   */
+  const documents = () => ({
+    template: JSON.parse(
+      fs.readFileSync(TEMPLATE_PATH, "utf8"),
+    ) as GovernanceTemplate,
+    overrides: JSON.parse(
+      fs.readFileSync(OVERRIDES_PATH, "utf8"),
+    ) as GovernanceOverrides,
+  });
+
+  /**
+   * The fake gateway from the acceptance suite, which stores a create and lists
+   * it back hydrated. Repeated here rather than exported from a test file: it is
+   * the smallest thing that can answer "what would the reconciler see".
+   */
+  const storingGateway = () => {
+    let stored: Record<string, unknown> | undefined;
+    const asListed = (): VirtualKey =>
+      ({
+        id: "id-created",
+        name: stored?.name,
+        value: "sk-bf-created",
+        is_active: stored?.is_active,
+        expires_at: null,
+        delete_after_expire: null,
+        description: stored?.description,
+        calendar_aligned: (stored?.calendar_aligned as boolean) ?? null,
+        budgets: ((stored?.budgets as Record<string, unknown>[]) ?? []).map(
+          (budget) => ({
+            max_limit: budget.max_limit,
+            reset_duration: budget.reset_duration,
+            current_usage: 0,
+          }),
+        ),
+        provider_configs: (
+          (stored?.provider_configs as Record<string, unknown>[]) ?? []
+        ).map((config) => ({
+          provider: config.provider,
+          allowed_models: config.allowed_models ?? [],
+          blacklisted_models: config.blacklisted_models ?? [],
+          weight: config.weight ?? null,
+          allow_all_keys: Array.isArray(config.key_ids)
+            ? (config.key_ids as unknown[]).includes("*")
+            : false,
+          keys: [],
+        })),
+        rate_limit:
+          stored?.rate_limit === undefined
+            ? null
+            : (stored.rate_limit as Record<string, unknown>),
+      }) as unknown as VirtualKey;
+
+    const gateway: VirtualKeyGateway & JanitorGateway = {
+      list: async () => ({
+        keys: stored ? [asListed()] : [],
+        totalCount: stored ? 1 : 0,
+      }),
+      create: async (body) => {
+        stored = body;
+        return asListed();
+      },
+      update: async () => asListed(),
+    };
+    return gateway;
+  };
+
+  const EMAIL = "jeff@goodparty.org";
+
+  it("mints a key from the committed template that the reconciler reports unchanged", async () => {
+    const gateway = storingGateway();
+    const { template, overrides } = documents();
+
+    const minted = await mintVirtualKey({ gateway, template, overrides, email: EMAIL });
+    assert.equal(minted.action, "created");
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: {
+        getUserId: async () => "user-1",
+        listMemberUserIds: async () => ["user-1"],
+      },
+      template,
+      overrides,
+    });
+
+    // The criterion, against the files as committed rather than a fixture: a
+    // real mint for a real email is a key the next tick has nothing to do for.
+    assert.equal(result.outcome, "converged");
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
+    assert.deepEqual(result.applied, []);
+    assert.equal(result.minted, 0);
+  });
+
+  it("mints a key that starts unchanged to the reconciler when the committed overrides name the person", async () => {
+    // The same, with an override layered on the committed document the way a
+    // real one would be, so the criterion is proven for the case the step is
+    // about rather than only for the empty document.
+    const gateway = storingGateway();
+    const { template, overrides } = documents();
+    const withOverride: GovernanceOverrides = {
+      ...overrides,
+      [EMAIL]: {
+        budgets: [{ max_limit: 250, reset_duration: "1M" }],
+        rate_limit: { request_max_limit: 600, request_reset_duration: "5m" },
+        calendar_aligned: true,
+      },
+    };
+
+    await mintVirtualKey({ gateway, template, overrides: withOverride, email: EMAIL });
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: {
+        getUserId: async () => "user-1",
+        listMemberUserIds: async () => ["user-1"],
+      },
+      template,
+      overrides: withOverride,
+    });
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
   });
 });

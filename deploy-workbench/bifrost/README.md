@@ -344,10 +344,11 @@ data rather than built in code (step 1 of
 [`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md); step 3's
 mint Lambda and step 5's janitor consume it). The Lambda stores it as an SSM
 `String`, reads it at run time, adds the per-call fields (the caller's lowercase
-email as `name`, and the engineering team once item 14 creates it) and `POST`s
-the result to `/api/governance/virtual-keys`. Widening a model list is therefore
-a reviewed edit here plus an apply, with no Lambda code change — the tier is
-data.
+email as `name`, the caller's governance from
+`governance-overrides.json` below, and the engineering team once item 14 creates
+it) and `POST`s the result to `/api/governance/virtual-keys`. Widening a model
+list is therefore a reviewed edit here plus an apply, with no Lambda code
+change — the tier is data.
 
 What it carries, and why each is a decision (decision 5):
 
@@ -367,10 +368,14 @@ What it carries, and why each is a decision (decision 5):
 - **`key_ids: ["*"]` on each entry**, because a provider config with no keys
   allows none: empty is deny, and `"*"` means "use the provider's keys" — the
   deployment's, not the person's.
-- **No `budgets` and no `rate_limit`.** Skipped for pass one: AWS and Fireworks
-  already impose provider-level limits, and a per-person number chosen before
-  there is usage data can starve a person mid-task as easily as catch a runaway.
-  Coming back is a field in this file.
+- **No `budgets` and no `rate_limit` in this file.** Both are fields of the
+  desired state, and neither belongs in the template. A limit in the template
+  reaches every key on the next reconciler tick, so one line here is a
+  fleet-wide cap nobody asked for; and a number chosen without usage data can
+  starve a person mid-task as easily as it catches a runaway. Per-person budgets
+  came back with usage data behind them (decision 13 of
+  [`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md)) and live in
+  `governance-overrides.json`, below.
 - **No `name`**, which is the caller's email and belongs to the mint, not the
   template: one name in a shared template is one name for everyone, and
   Bifrost's unique index on the key name would hand the first caller's key to
@@ -417,6 +422,25 @@ Durations are Bifrost's own (`1d`, `1w`, `1M` = 30 days, `1Q`, `1Y`, or Go's
 here. `rate_limit` has no default anywhere: an omitted one means "leave the
 key's alone", so a limit is added here for the people it should apply to, never
 in the template, where it would reach every key on the next tick.
+
+### Both documents, and the one computation that reads them
+
+The mint applies the override at create (step 5 of
+[`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md)), so a new key
+starts converged and the first reconciler tick after it has nothing to do. It
+reads both `String` parameters, computes the caller's desired state with
+`governanceDesiredState` in `bifrost/governance-desired-state.ts`, and creates
+the key with the complete governance body — the same function and the same body
+builder the reconciler uses, so there is one implementation of the merge rather
+than two that happen to agree today.
+
+What that means for a document edit: the template's governance fields are
+baseline for everybody, an entry here changes them for the people it names, and
+both reach an existing key on the next tick as well as a new one at create. The
+one field that stays mint-only is `description`'s marker and `is_active`: those
+are the mint's and the janitor's, and the reconciler deliberately does not
+touch them (`RECONCILED_FIELDS` in `bifrost/governance-desired-state.ts` says
+why).
 
 ## The image
 

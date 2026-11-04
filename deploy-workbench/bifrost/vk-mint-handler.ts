@@ -22,15 +22,28 @@
  *                             via Cloud Map, not the ALB (`/api` there is
  *                             behind oauth2-proxy and Google SSO)
  *   TEMPLATE_PARAMETER_NAME   the SSM String parameter holding the template
+ *   OVERRIDES_PARAMETER_NAME  `/bifrost/governance-overrides`, the per-person
+ *                             document step 2 added beside it
  *   SETUP_TOKEN_SECRET_NAME   `bifrost/gateway`, the gateway's own container
  *                             (decision 3)
  *   SETUP_TOKEN_SECRET_JSON_KEY  BIFROST_SETUP_TOKEN
  *   READER_ROLE_ARN           the management-account `bifrost-vk-reader`
  *   READER_SESSION_NAME       `VK_READER_SESSION_NAME`, imported from the role
  *
+ * The two governance documents are read through one dependency
+ * (`readGovernance`), in one call, for the same reason the reconciler reads them
+ * together: a create body composed from the template and a *different* tick's
+ * overrides is a key that starts drifted, and the step's whole point is that a
+ * fresh key does not. A read that fails fails the mint rather than creating a
+ * key with the template's governance only (`template-unavailable`), because a
+ * key with the wrong governance is one a caller has to live with until the next
+ * tick rewrites it, and a refusal costs nothing but the retry.
+ *
  * Nothing here is allowed to grow. Decision 3's requirement is that this
  * function stays small and boring: "it reads a name, a template and the setup
- * token; it makes one or two calls; it returns a key."
+ * token; it makes one or two calls; it returns a key." The second document does
+ * not change that shape: it is the same read, from the same parameter family,
+ * in the same dependency.
  */
 
 import {
@@ -60,6 +73,7 @@ import {
   type VirtualKeyGateway,
   type VirtualKeyTemplate,
 } from "./vk-mint-core";
+import type { GovernanceOverrides } from "./governance-desired-state";
 
 export const SETUP_TOKEN_JSON_KEY = "BIFROST_SETUP_TOKEN";
 
@@ -79,8 +93,15 @@ export type HttpResponse = {
 };
 
 export type HandlerDeps = {
-  /** Reads and parses the SSM template. Throws when it cannot. */
-  readTemplate: () => Promise<VirtualKeyTemplate>;
+  /**
+   * Reads both governance documents out of SSM: the template and the per-person
+   * overrides. Throws when either cannot be read or does not parse, which fails
+   * the mint (there is no partial desired state to create from).
+   */
+  readGovernance: () => Promise<{
+    template: VirtualKeyTemplate;
+    overrides: GovernanceOverrides;
+  }>;
   /** Reads the setup token out of the secret. Throws when it cannot. */
   readSetupToken: () => Promise<string>;
   /** Assumes the reader role and builds the two directory reads. */
@@ -131,13 +152,16 @@ export const createHandler =
       }
       await requireEngineer(directory, caller.email);
 
-      let template: VirtualKeyTemplate;
+      let governance: {
+        template: VirtualKeyTemplate;
+        overrides: GovernanceOverrides;
+      };
       try {
-        template = await deps.readTemplate();
+        governance = await deps.readGovernance();
       } catch {
         throw new MintFailure(
           "template-unavailable",
-          "could not read the key template",
+          "could not read the governance documents",
         );
       }
 
@@ -153,7 +177,8 @@ export const createHandler =
 
       const result = await mintVirtualKey({
         gateway: deps.createGateway(setupToken),
-        template,
+        template: governance.template,
+        overrides: governance.overrides,
         email: caller.email,
       });
 
@@ -390,14 +415,28 @@ export const createBifrostGateway = (args: {
  * not construct one.
  */
 export const handler = createHandler({
-  readTemplate: async () => {
+  readGovernance: async () => {
     const ssm = new SSMClient({ region: AWS_REGION });
-    const response = await ssm.send(
-      new GetParameterCommand({ Name: requireEnv("TEMPLATE_PARAMETER_NAME") }),
-    );
-    const value = response.Parameter?.Value;
-    if (!value) throw new Error("the template parameter has no value");
-    return JSON.parse(value) as VirtualKeyTemplate;
+    const read = async (name: string): Promise<unknown> => {
+      const response = await ssm.send(
+        new GetParameterCommand({ Name: requireEnv(name) }),
+      );
+      const value = response.Parameter?.Value;
+      if (!value) throw new Error(`${name} has no value`);
+      return JSON.parse(value) as unknown;
+    };
+
+    // Both documents, in the shape the reconciler reads them in, so the create
+    // path and the tick that follows it compute from the same pair. The shape
+    // and the contents were validated at apply time (decision 10), so what is
+    // read here is trusted to have been reviewed; a malformed one still fails
+    // the mint rather than creating a key from a guess.
+    return {
+      template: (await read("TEMPLATE_PARAMETER_NAME")) as VirtualKeyTemplate,
+      overrides: (await read(
+        "OVERRIDES_PARAMETER_NAME",
+      )) as GovernanceOverrides,
+    };
   },
 
   readSetupToken: async () => {
