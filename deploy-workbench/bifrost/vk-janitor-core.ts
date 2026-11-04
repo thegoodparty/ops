@@ -22,8 +22,8 @@
  *   mint, which also clears that timer (decision 4), so there is one code path
  *   that grants and one that revokes and neither undoes the other.
  * - **The timer is set once, on the transition.** A key already inactive with
- *   a deletion timer is left alone, or an hourly run would push the window
- *   forward every hour and nothing would ever be deleted.
+ *   a deletion timer is left alone, or a run every five minutes would push the
+ *   window forward every tick and nothing would ever be deleted.
  * - **Every read happens before the first write.** A directory or gateway read
  *   that fails partway through a run leaves the gateway untouched rather than
  *   half-reconciled: the run either classifies every managed key or writes
@@ -94,11 +94,18 @@ export type JanitorGateway = {
  * separate code from `gateway-unavailable` because a deploy that wrote a
  * parameter and a gateway that refused a write are different failures to go and
  * look at, and the three-in-a-row alarm (step 6) counts a run either way.
+ *
+ * Step 4 adds two, for the config half: `config-unavailable` is a read that
+ * failed, and `convergence-failed` is a write the gateway refused. Both fail the
+ * invocation, which is what turns "the file says one thing and the process does
+ * another" into a red deploy rather than a log line nobody opened (decision 5).
  */
 export type JanitorFailureCode =
   | "membership-unavailable"
   | "gateway-unavailable"
-  | "desired-state-unavailable";
+  | "desired-state-unavailable"
+  | "config-unavailable"
+  | "convergence-failed";
 
 export class JanitorFailure extends Error {
   constructor(
@@ -173,7 +180,7 @@ export const deactivationBody = (
 /**
  * Whether a key already carries the janitor's deletion timer. All three parts
  * are required: an inactive key with an expiry but `delete_after_expire` not
- * set is a partial transition, and completing it once is not the hourly clock
+ * set is a partial transition, and completing it once is not the per-tick clock
  * reset this guard exists to prevent (the next run sees all three and skips).
  */
 export const hasDeletionTimer = (key: VirtualKey): boolean =>

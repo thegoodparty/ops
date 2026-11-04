@@ -120,15 +120,20 @@ describe("the function, its schedule and its network", () => {
     assert.doesNotMatch(environment.BIFROST_BASE_URL, /goodparty\.org/);
   });
 
-  it("is scheduled hourly from a named constant (open item 3), with a timeout below the interval", () => {
-    assert.equal(VK_JANITOR_INTERVAL_MINUTES, 60);
-    assert.equal(VK_JANITOR_SCHEDULE_EXPRESSION, "rate(60 minutes)");
+  it("is scheduled every five minutes from a named constant (decision 4), with a timeout below the interval", () => {
+    // Decision 4 of `docs/bifrost-reconciler.md`, down from the hour open item 3
+    // of `bifrost-virtual-keys.md` chose. The number itself is pinned in
+    // `bifrost/vk-janitor-contract.test.ts` beside the guards it has to satisfy;
+    // this asserts the stack actually uses it.
+    assert.equal(VK_JANITOR_INTERVAL_MINUTES, 5);
+    assert.equal(VK_JANITOR_SCHEDULE_EXPRESSION, "rate(5 minutes)");
     // The expression is derived from the constant, so changing the interval
     // cannot leave the rule and the documented number disagreeing.
     assert.match(
       SOURCE,
       /scheduleExpression:\s*VK_JANITOR_SCHEDULE_EXPRESSION/,
     );
+    assert.equal(VK_JANITOR_TIMEOUT_SECONDS, 120);
     assert.ok(VK_JANITOR_TIMEOUT_SECONDS < VK_JANITOR_INTERVAL_MINUTES * 60);
     // A reconcile that reads, classifies and writes must not have two runs
     // interleaved.
@@ -144,6 +149,60 @@ describe("the function, its schedule and its network", () => {
     assert.match(permission[1], /action:\s*"lambda:InvokeFunction"/);
     assert.match(permission[1], /principal:\s*"events\.amazonaws\.com"/);
     assert.match(permission[1], /sourceArn:\s*rule\.arn/);
+  });
+
+  /**
+   * The trap the plan records: a second `aws.lambda.Permission` on one function
+   * must not reuse the first's statement id. Lambda refuses a duplicate id on a
+   * function's resource policy (`AddPermission`'s `ResourceConflictException`, a
+   * `409`) and the apply fails with "The statement id already exists", so the
+   * failure is at apply time and looks like a Pulumi problem.
+   *
+   * Step 4 adds the deploy's invoke, which is a same-account IAM call and needs
+   * no permission resource at all, so there is still exactly one rule and one
+   * permission. No permission here carries a literal `statementId`, which is why
+   * the count is the assertion that matters: Pulumi derives a distinct id per
+   * resource, so the only way to collide is to write one down twice, and the
+   * second half of this test fails on exactly that.
+   */
+  it("declares one rule and one permission, and no duplicate statement id", () => {
+    const rules = [...SOURCE.matchAll(/new aws\.cloudwatch\.EventRule\(/g)].length;
+    const permissions = [...SOURCE.matchAll(/new aws\.lambda\.Permission\(/g)].length;
+    assert.equal(rules, 1, "one rule: revocation and both convergence halves share the five-minute tick");
+    assert.equal(
+      permissions,
+      1,
+      "one permission per rule; the deploy's invoke is a same-account IAM call and needs no resource-based policy",
+    );
+
+    const ids = [...SOURCE.matchAll(/statementId:\s*"([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    assert.equal(
+      new Set(ids).size,
+      ids.length,
+      "two permissions on one function must not share a statementId: Lambda answers a duplicate with a 409 and the apply fails",
+    );
+    // Today there are none, because Pulumi derives a distinct id per resource
+    // and naming one would replace a live permission for no gain. The day a
+    // second rule appears, this is where a copied literal shows up.
+    assert.deepEqual(ids, []);
+  });
+
+  it("passes the trigger label the handler reads, on both callers", () => {
+    // The rule's payload and the deploy's are the contract between the two, and
+    // the handler reads `trigger` and nothing else.
+    assert.match(
+      SOURCE,
+      /input:\s*JSON\.stringify\(\{ action: "reconcile", trigger: "schedule" \}\)/,
+    );
+    assert.match(
+      fs.readFileSync(
+        path.resolve(__dirname, "scripts/verify-convergence.ts"),
+        "utf8",
+      ),
+      /JSON\.stringify\(\{ action: "reconcile", trigger: "deploy" \}\)/,
+    );
   });
 
   it("is a scheduled function, not an endpoint: no Function URL and no IAM-gated URL", () => {
@@ -225,6 +284,7 @@ describe("the shared secret and the grants", () => {
   it("holds the token in the secret, never in the function's environment", () => {
     assert.deepEqual(Object.keys(vkJanitorEnvironment()).sort(), [
       "BIFROST_BASE_URL",
+      "CONFIG_PARAMETER_NAME",
       "OVERRIDES_PARAMETER_NAME",
       "READER_ROLE_ARN",
       "READER_SESSION_NAME",
@@ -338,10 +398,13 @@ describe("the shared secret and the grants", () => {
     );
     assert.match(SOURCE, /TEMPLATE_PARAMETER_NAME:\s*VK_MINT_TEMPLATE_PARAMETER_NAME/);
     assert.match(SOURCE, /OVERRIDES_PARAMETER_NAME:\s*GOVERNANCE_OVERRIDES_PARAMETER_NAME/);
-    // Step 4's half. The parameter is in the grant and not in the environment
-    // because nothing reads it yet, and the plan keeps step 4's trigger out of
-    // this PR.
-    assert.ok(!("CONFIG_PARAMETER_NAME" in vkJanitorEnvironment()));
+    // Step 4's half, and it is a parameter *name* here rather than a value: the
+    // handler reads it under the role, which is what makes it a name and not a
+    // secret. Asserted as one of the three the grant covers, so the environment
+    // and the policy cannot disagree about which parameter it is.
+    assert.equal(vkJanitorEnvironment().CONFIG_PARAMETER_NAME, BIFROST_CONFIG_PARAMETER_NAME);
+    assert.match(SOURCE, /CONFIG_PARAMETER_NAME:\s*BIFROST_CONFIG_PARAMETER_NAME/);
+    assert.ok((RECONCILER_PARAMETERS as readonly string[]).includes(BIFROST_CONFIG_PARAMETER_NAME));
   });
 });
 

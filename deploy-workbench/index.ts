@@ -645,20 +645,25 @@ export const bifrostPrivateHostname = vkMint.bifrostHostname;
 // ---------------------------------------------------------------------------
 // The virtual-key janitor.
 //
-// Step 5 of `docs/bifrost-virtual-keys.md`: the hourly reconcile loop that
-// deactivates a Lambda-managed key whose owner has left `Engineers`. It consumes
-// the network and the same setup-token secret the mint reads, and it assumes the
-// read-only role step 2 created rather than carrying any directory permission of
-// its own. The marker that decides which keys it may touch is the shared
-// constant in `bifrost/vk-marker.ts`; the behaviour is
-// `bifrost/vk-janitor-core.ts`.
+// Step 5 of `docs/bifrost-virtual-keys.md` and steps 3 and 4 of
+// `docs/bifrost-reconciler.md`: the reconcile loop that deactivates a
+// Lambda-managed key whose owner has left `Engineers` and converges both the
+// keys' governance and the gateway's live configuration. It runs every five
+// minutes on one rule, and the deploy workflow invokes it once more after every
+// apply ("Two triggers, for two different bounds" in the reconciler plan). It
+// consumes the network and the same setup-token secret the mint reads, and it
+// assumes the read-only role step 2 created rather than carrying any directory
+// permission of its own. The marker that decides which keys it may touch is the
+// shared constant in `bifrost/vk-marker.ts`; the governance loop is
+// `bifrost/vk-janitor-core.ts` and the config loop is
+// `bifrost/config-convergence-core.ts`.
 //
 // It adds one more 8080 ingress rule on the task group, from its own security
 // group, because it is the second caller of the VPC-internal admin API. That is
 // the same exception the mint's module documents, not a new one.
 const vkJanitor = createBifrostVkJanitor({ provider, network });
 
-/** The function the hourly rule invokes, for a human reading the console. */
+/** The function the five-minute rule invokes, for a human reading the console. */
 export const vkBifrostJanitorFunctionArn = vkJanitor.function.arn;
 
 /** The EventBridge rule's name, so step 5's check does not start with a hunt. */
