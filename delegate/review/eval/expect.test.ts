@@ -163,13 +163,13 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
   }
 });
 
-test("the checked-in manifest holds out a quarter, with block and approve on both sides", () => {
+test("the checked-in manifest holds out a minority, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 15);
+  assert.equal(cases.length, 23);
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
-  assert.equal(holdout.length, 5);
+  assert.equal(holdout.length, 10);
   for (const split of ["tune", "holdout"]) {
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
     assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
