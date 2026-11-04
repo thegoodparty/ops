@@ -113,7 +113,7 @@ cat report.md
 
 ## Expected-result suite
 
-Fifteen cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+Seventeen cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
 
 The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
 
@@ -127,7 +127,7 @@ Every `delegate eval` comment also runs this suite as a parallel job and posts t
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Fifteen cases at three runs costs about $65 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Seventeen cases at three runs costs about $75 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
 
 ### Gate
 
