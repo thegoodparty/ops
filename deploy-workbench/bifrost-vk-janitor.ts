@@ -20,11 +20,30 @@ import {
 import { BIFROST_CONFIG_PARAMETER_NAME, secretArnPattern } from "./ecs";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
 import {
+  VK_JANITOR_INTERVAL_MINUTES,
+  VK_JANITOR_RETRY_WINDOW_SECONDS,
+  VK_JANITOR_SCHEDULE_EXPRESSION,
+  VK_JANITOR_TIMEOUT_SECONDS,
+} from "./bifrost/vk-janitor-contract";
+import {
   BIFROST_PORT,
   REGION,
   VPC_CIDR,
   type createWorkbenchNetwork,
 } from "./network";
+
+/**
+ * The timing budget, re-exported so a caller of this module (and
+ * `bifrost-vk-janitor.test.ts`) keeps finding it here. The numbers and both of
+ * their guards are in `bifrost/vk-janitor-contract.ts`, which the deploy's poll
+ * reads too.
+ */
+export {
+  VK_JANITOR_INTERVAL_MINUTES,
+  VK_JANITOR_SCHEDULE_EXPRESSION,
+  VK_JANITOR_TIMEOUT_SECONDS,
+  VK_JANITOR_RETRY_WINDOW_SECONDS,
+};
 
 /**
  * The Bifrost virtual-key janitor: step 5 of `docs/bifrost-virtual-keys.md`,
@@ -68,15 +87,26 @@ import {
  *   second, from its own group, because it is the second caller of the same
  *   VPC-internal admin API (decision 3 and 6).
  *
- * ## What the two triggers will be, and why they are not here
+ * ## What the two triggers are (step 4, now built)
  *
  * Step 4 of the reconciler plan adds a `rate(5 minutes)` schedule and the deploy
- * workflow's `RequestResponse` invoke with a poll. Neither is built in step 3,
- * and nothing here stands in their way: the schedule is the same `EventRule`
- * this file already creates, moved to a new expression, and the invoke is a
- * same-account IAM call that needs no resource-based policy on the function.
- * The loop itself is one exported function a handler and a schedule can both
- * run.
+ * workflow's `RequestResponse` invoke with a poll. Both are built: the schedule
+ * is the same `EventRule` this file already creates, moved to a new expression
+ * (`bifrost/vk-janitor-contract.ts`), and the invoke is a same-account IAM call
+ * that needs no resource-based policy on the function.
+ *
+ * **One rule, deliberately, and not two.** Splitting revocation's cadence from
+ * convergence's would mean a second `aws.lambda.Permission`, because each one
+ * grants a single `sourceArn`. Two permissions must then have distinct
+ * `statementId`s: Lambda refuses a duplicate id on one function's resource
+ * policy (`AddPermission`'s `ResourceConflictException`, a `409`) and the apply
+ * fails with "The statement id already exists". This file gives no permission a
+ * literal id, so Pulumi derives a distinct one per resource and a copy cannot
+ * collide; `bifrost-vk-janitor.test.ts` pins one rule and one permission, and
+ * fails if two explicit statement ids here ever match. There is no second rule because there is no second cadence to give
+ * it: the reconciler's bound is five minutes (decision 4) and the argument for
+ * an hour was about paging, which the alarm (step 6) answers better than a
+ * slower rule does.
  *
  * ## Why a plain EventBridge rule and not Scheduler
  *
@@ -85,17 +115,19 @@ import {
  * carrying. A schedule group and a DLQ would be more machinery around one
  * `rate()` expression than the job is.
  *
- * ## Why the interval, and why step 3 does not change it
+ * ## Why the interval, and where it is argued with
  *
  * Open item 3 of `bifrost-virtual-keys.md`: hourly is the design's choice, not a
  * measured one, argued from the revocation bound rather than from a measurement.
  * `docs/bifrost-reconciler.md` decision 4 changes it to five minutes, for the
  * reason a convergence loop needs: an override should land without a deploy.
- * That is step 4's change, in the same PR as the trigger that makes the cadence
- * mean something, and deliberately not made here — an interval change without
- * the deploy's invoke would be a revocation sweep running twelve times an hour
- * for no benefit. The constant keeps the number reviewable and gives that step
- * one place to argue with.
+ *
+ * The number and both guards on it (below the interval, and above it for the
+ * deploy's retry window) live in `bifrost/vk-janitor-contract.ts`, which is a
+ * plain module rather than part of this Pulumi program so
+ * `scripts/verify-convergence.ts` can read the timeout it has to outlast. They
+ * are re-exported below, so this module is still the one place a reader of the
+ * stack meets them.
  */
 
 /**
@@ -122,31 +154,17 @@ export const VK_JANITOR_LOG_GROUP_NAME = `/aws/lambda/${VK_JANITOR_FUNCTION_NAME
 export const VK_JANITOR_LOG_RETENTION_DAYS = 90;
 
 /**
- * The hourly interval (open item 3), with decision 6's bounded-delay reasoning
- * above. Kept a constant so the schedule expression below cannot drift from the
- * documented number.
+ * The function's shell, which is not part of the timing budget: memory is a
+ * property of what the loop holds in one request, not of when it runs.
  */
-export const VK_JANITOR_INTERVAL_MINUTES = 60;
-export const VK_JANITOR_SCHEDULE_EXPRESSION = `rate(${VK_JANITOR_INTERVAL_MINUTES} minutes)`;
-
-/**
- * Well below the interval, so two runs do not overlap by design. The work is a
- * group read, a paged key list and at most one `PUT` per managed key; two
- * minutes is far more than that needs, and the ordering is the point.
- */
-export const VK_JANITOR_TIMEOUT_SECONDS = 120;
 export const VK_JANITOR_MEMORY_MB = 256;
 
-if (VK_JANITOR_TIMEOUT_SECONDS >= VK_JANITOR_INTERVAL_MINUTES * 60) {
-  // A run that outlives its interval would overlap the next one, and
-  // `reservedConcurrentExecutions: 1` would then start dropping invocations.
-  // Fail at load, where a test catches it.
-  throw new Error(
-    `janitor timeout ${VK_JANITOR_TIMEOUT_SECONDS}s must be below the interval ${VK_JANITOR_INTERVAL_MINUTES}m`,
-  );
-}
-
-/** The one run at a time the reconcile needs. */
+/**
+ * The one run at a time the reconcile needs. It lives here rather than in the
+ * timing module because it is a property of this function's wiring rather than
+ * a number the deploy's poll reads; the throttle it causes is that module's
+ * subject, which is why the two guards about it are there.
+ */
 export const VK_JANITOR_RESERVED_CONCURRENCY = 1;
 
 /**
@@ -161,12 +179,14 @@ export const vkJanitorEnvironment = (): Record<string, string> => ({
   SETUP_TOKEN_SECRET_JSON_KEY,
   READER_ROLE_ARN: VK_READER_ROLE_ARN,
   READER_SESSION_NAME: VK_READER_SESSION_NAME,
-  // The desired state, from the two parameters step 2 publishes. Names, not
-  // values: a parameter value in an environment variable would be readable by
-  // anything that can call `GetFunctionConfiguration`, which is the same reason
-  // the setup token is not here either.
+  // The governance desired state, from the two parameters step 2 publishes, and
+  // the gateway file step 4's config half converges the live subset of. Names,
+  // not values: a parameter value in an environment variable would be readable
+  // by anything that can call `GetFunctionConfiguration`, which is the same
+  // reason the setup token is not here either.
   TEMPLATE_PARAMETER_NAME: VK_MINT_TEMPLATE_PARAMETER_NAME,
   OVERRIDES_PARAMETER_NAME: GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+  CONFIG_PARAMETER_NAME: BIFROST_CONFIG_PARAMETER_NAME,
 });
 
 /** Lambda's own trust. Nothing else may assume this role. */
@@ -187,11 +207,12 @@ export const vkJanitorTrust = {
  *
  * `/bifrost/config` is here because the plan's step 3 names it: the grant is one
  * policy on three parameters, and issuing it in one place is the point. The
- * loop reads the two governance documents today; `/bifrost/config` is step 4's
- * half, wired in when the deploy's invoke gives it a caller. Granting it now is
- * deliberate rather than decorative — a reconciler that has to grow a permission
- * after the fact is a reconciler whose first real run is an `AccessDenied` — and
- * it is read-only, on three named parameters, with no wildcard.
+ * governance loop reads the two governance documents; `/bifrost/config` is step
+ * 4's half, read by the config loop the deploy's invoke reaches and by every
+ * scheduled tick after it. Granting it in step 3 and exercising it in step 4 is
+ * deliberate: a reconciler that has to grow a permission after the fact is a
+ * reconciler whose first real run is an `AccessDenied`. It is read-only, on
+ * three named parameters, with no wildcard.
  */
 export const RECONCILER_PARAMETERS = [
   BIFROST_CONFIG_PARAMETER_NAME,
@@ -444,7 +465,7 @@ export const createBifrostVkJanitor = (args: {
     {
       name: VK_JANITOR_FUNCTION_NAME,
       description:
-        "Deactivates Bifrost virtual keys whose owner has left the Engineers group, hourly (step 5 of docs/bifrost-virtual-keys.md).",
+        "Deactivates Bifrost virtual keys whose owner has left the Engineers group and converges every managed key's governance and the gateway's live config, every 5 minutes and on every workbench deploy (steps 5 of docs/bifrost-virtual-keys.md and 3-4 of docs/bifrost-reconciler.md).",
       role: role.arn,
       runtime: aws.lambda.Runtime.NodeJS22dX,
       handler: "handler.handler",
@@ -476,11 +497,17 @@ export const createBifrostVkJanitor = (args: {
 
   // The schedule. A plain EventBridge rule rather than EventBridge Scheduler,
   // for the reason in the header.
+  //
+  // One rule, and it is the whole cadence: revocation and both convergence
+  // halves run on the same five-minute tick (decision 4). A second rule would
+  // need its own `aws.lambda.Permission` with a distinct `statementId` — see the
+  // header and `bifrost-vk-janitor.test.ts` — and there is no cadence in this
+  // design that wants one.
   const rule = new aws.cloudwatch.EventRule(
     "bifrostVkJanitorSchedule",
     {
       name: VK_JANITOR_NAME,
-      description: `Reconciles Bifrost virtual keys against the Engineers group every ${VK_JANITOR_INTERVAL_MINUTES} minutes.`,
+      description: `Reconciles Bifrost virtual keys and the gateway's live config against the committed state every ${VK_JANITOR_INTERVAL_MINUTES} minutes.`,
       scheduleExpression: VK_JANITOR_SCHEDULE_EXPRESSION,
       tags,
     },
@@ -492,15 +519,19 @@ export const createBifrostVkJanitor = (args: {
     {
       rule: rule.name,
       arn: fn.arn,
-      // The scheduled shape the handler recognises. The handler does not read a
-      // payload today; the literal is the contract between the rule and the
-      // function, the same way group-sync's is.
-      input: JSON.stringify({ action: "reconcile" }),
+      // The scheduled shape the handler recognises. The handler reads `trigger`
+      // and nothing else (`reconcilerTrigger`), so this literal and the deploy's
+      // `{action, trigger: "deploy"}` are the contract between the two callers.
+      input: JSON.stringify({ action: "reconcile", trigger: "schedule" }),
     },
     { provider },
   );
 
-  // EventBridge needs explicit permission to invoke the function.
+  // EventBridge needs explicit permission to invoke the function. One
+  // permission per rule, and this is the only rule: the deploy's invoke is a
+  // same-account IAM call authorised by the caller's own policy (the
+  // `pulumi-deploy` role, which is AdministratorAccess), so it needs no
+  // resource-based policy here at all. Adding one would be decoration.
   new aws.lambda.Permission(
     "bifrostVkJanitorSchedulePermission",
     {
@@ -508,6 +539,15 @@ export const createBifrostVkJanitor = (args: {
       function: fn.name,
       principal: "events.amazonaws.com",
       sourceArn: rule.arn,
+      // No `statementId` here, deliberately. Pulumi derives one per resource
+      // when it is not given, so two permissions cannot collide by accident; the
+      // trap the plan records is the *literal* one, a second block copied from
+      // this with the same id held over, which Lambda refuses with a 409
+      // (`AddPermission`'s `ResourceConflictException`) and the apply reports as
+      // "The statement id already exists". Naming this one now would replace a
+      // working resource on the next apply for no functional gain, so the guard
+      // is a test: `bifrost-vk-janitor.test.ts` pins one rule and one permission,
+      // and fails if any two explicit statement ids in this file ever match.
     },
     { provider },
   );

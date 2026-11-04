@@ -99,8 +99,14 @@ jobs:
     # hour default that would let a wedged run hold the lock all day. The
     # post-apply health check can wait up to its own 10-minute timeout, and it
     # must still be running when that timeout expires so it can print the
-    # service's events: a job killed at the limit would lose the diagnosis.
-    timeout-minutes: 20
+    # service's events: a job killed at the limit would lose the diagnosis. The
+    # reconcile after it adds its own bounded window (300s of retries, then one
+    # run of up to the function's 120s timeout), so the worst case for the two
+    # checks is 1020s and the budget leaves the apply and the image builds about
+    # thirteen minutes on top of that. `deploy-workflow-order.test.ts` pins the
+    # sum against this number, so a later check that pushes it over fails there
+    # rather than as a killed run that lost its own diagnosis.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -431,6 +437,46 @@ jobs:
         env:
           WORKBENCH_DEPLOY_ROLE_ARN: arn:aws:iam::024901689212:role/pulumi-deploy
         run: npx --no-install tsx scripts/verify-service.ts --timeout-seconds 600 --interval-seconds 10
+
+      # The apply is not the same thing as a converged gateway. Step 1 of
+      # `docs/bifrost-reconciler.md` narrowed `BIFROST_CONFIG_VERSION` to the
+      # boot-only subset, so a live edit (a provider's base URL, a key's models
+      # or aliases, the client's retention or logging) no longer registers a new
+      # task-definition revision and no longer restarts the task. Nothing in the
+      # apply then applies it: this invoke is what does, and its result is what
+      # says whether the file the PR changed is the configuration the process is
+      # running.
+      #
+      # `RequestResponse` and a poll, never fire-and-forget. An `Event` invoke
+      # returns 202 and a request id whether the reconciler converged or threw,
+      # and a workflow that invokes and moves on is green over a config that
+      # never landed -- the `75d30ae` class of bug with a different mechanism.
+      # The script fails the run unless the summary says `converged`.
+      #
+      # A throttled invoke is retried, not failed. The function is capped at
+      # `reservedConcurrentExecutions: 1`, so an invoke that arrives while a
+      # scheduled tick is running returns `TooManyRequestsException` (429) rather
+      # than a result; the script retries with backoff for a window pinned above
+      # the 120s timeout, and only a run that ran and did not converge fails the
+      # run. A window that expires on nothing but throttles is reported as
+      # "never ran", separately and loudly enough to be seen, because a pattern
+      # of them means the cadence and the deploy are fighting and the answer is a
+      # second rule, not a bigger cap.
+      #
+      # No new IAM. It makes the same `pulumi-deploy` hop the service check above
+      # makes (`scripts/aws-role.ts`), and that role is AdministratorAccess, so a
+      # same-account invoke needs no resource-based policy on the function and no
+      # grant on this role. Adding either would be decoration.
+      #
+      # After the service check on purpose: a reconciler invoked against a task
+      # that has not come back up would either fail its HTTP reads or converge
+      # the wrong process, and a broken service is already the earlier, more
+      # specific failure.
+      - name: Converge the running gateway to the committed configuration
+        working-directory: deploy-workbench
+        env:
+          WORKBENCH_DEPLOY_ROLE_ARN: arn:aws:iam::024901689212:role/pulumi-deploy
+        run: npx --no-install tsx scripts/verify-convergence.ts --retry-window-seconds 300
 
       # Bedrock model access is not a Pulumi resource, so it cannot ride in
       # deploy.sh; see the header of the script for why none exists. Without

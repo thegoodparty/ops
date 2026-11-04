@@ -7,6 +7,7 @@ import {
   JanitorFailure,
   type JanitorGateway,
 } from "./vk-janitor-core";
+import type { ConfigGateway } from "./config-convergence-core";
 import { createJanitorHandler, type JanitorDeps } from "./vk-janitor-handler";
 
 /**
@@ -48,11 +49,19 @@ const harness = (options: {
   directoryError?: Error;
   tokenError?: Error;
   governanceError?: Error;
+  configError?: Error;
   template?: Record<string, unknown>;
   overrides?: Record<string, unknown>;
+  /** The committed file's text. Defaults to one the fake gateway already matches. */
+  configText?: string;
+  /** The gateway's own `GET /api/config` view. */
+  observedConfig?: Record<string, unknown>;
+  /** Replaces the whole config gateway, for a test about its writes. */
+  configGateway?: (base: ConfigGateway) => ConfigGateway;
 }) => {
   const logs: Record<string, unknown>[] = [];
   const updates: Array<{ id: string; body: Record<string, unknown> }> = [];
+  const configPuts: Array<Record<string, unknown>> = [];
 
   const directory: MembershipDirectory = {
     getUserId: async (email) => options.userIds?.[email] ?? null,
@@ -64,6 +73,30 @@ const harness = (options: {
       updates.push({ id, body });
       return key({ name: "updated", id });
     },
+  };
+
+  // The gateway's config view and the committed file agree, so a test that is
+  // not about config convergence gets an empty diff and no write. `client`
+  // carries one field the file also carries; `governance` is in the file and
+  // deliberately not converged (`env-reference`), which is what the default
+  // summary's `skipped: 2` counts.
+  const observedConfig = options.observedConfig ?? {
+    client_config: { enable_logging: true },
+    framework_config: {},
+  };
+  const configText =
+    options.configText ??
+    JSON.stringify({ client: { enable_logging: true }, governance: { auth_config: {} } });
+
+  const baseConfigGateway: ConfigGateway = {
+    getConfig: async () => observedConfig,
+    putConfig: async (body) => {
+      configPuts.push(body);
+    },
+    getProvider: async () => null,
+    putProvider: async () => {},
+    listProviderKeys: async () => [],
+    putProviderKey: async () => {},
   };
 
   const deps: JanitorDeps = {
@@ -85,11 +118,19 @@ const harness = (options: {
         overrides: (options.overrides ?? {}) as never,
       };
     },
+    readConfig: async () => {
+      if (options.configError) throw options.configError;
+      return configText;
+    },
     createDirectory: async () => {
       if (options.directoryError) throw options.directoryError;
       return directory;
     },
     createGateway: () => gateway,
+    createConfigGateway: () =>
+      options.configGateway
+        ? options.configGateway(baseConfigGateway)
+        : baseConfigGateway,
     log: (entry) => logs.push(entry),
     now: () => NOW,
   };
@@ -98,6 +139,7 @@ const harness = (options: {
     handler: createJanitorHandler(deps),
     logs,
     updates,
+    configPuts,
   };
 };
 
@@ -109,6 +151,40 @@ describe("the janitor handler", () => {
    * assertion those tests are really making about the second job: the fake
    * gateway's keys are already converged.
    */
+  /**
+   * The run's own summary, emitted last on every successful invocation. Its
+   * shape is the contract the deploy's poll reads (`reconciler-summary.ts`), and
+   * every test below sees it, so it is written here once.
+   *
+   * `config.unchanged: 1` and `config.skipped: 2` are the harness's default file:
+   * one client field that already matches, plus the two sections config
+   * convergence names and refuses ($schema, governance).
+   */
+  const runSummary = (overrides: {
+    revocation?: Record<string, unknown>;
+    governance?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+    outcome?: string;
+    trigger?: string;
+  } = {}) => ({
+    event: "reconciler-run",
+    outcome: overrides.outcome ?? "converged",
+    trigger: overrides.trigger ?? "unknown",
+    revocation:
+      overrides.revocation ??
+      { outcome: "ok", kept: 0, deactivated: 1, skipped: 0 },
+    governance:
+      overrides.governance ??
+      { outcome: "converged", changed: 0, unchanged: 0, skipped: 1 },
+    // The default is the scheduled tick's answer: decision 16 makes the deploy
+    // the trigger that owns config convergence, so a tick reports `not-run`
+    // rather than doing it. Every test that expects a config write passes
+    // `trigger: "deploy"`.
+    config:
+      overrides.config ??
+      { outcome: "not-run", changed: 0, unchanged: 0, skipped: 0 },
+  });
+
   const reconcilerSummary = (managedKeys: number, unchanged: number) => ({
     event: "vk-reconciler",
     outcome: "converged",
@@ -165,6 +241,7 @@ describe("the janitor handler", () => {
         name: "gone@goodparty.org",
         reason: "not-a-member",
       },
+      runSummary(),
     ]);
     // Decision 3's rule, applied to this job too: a key appears in a response
     // body and must not appear in a log line. The setup token is worse.
@@ -194,6 +271,10 @@ describe("the janitor handler", () => {
         skipped: 0,
       },
       reconcilerSummary(1, 1),
+      runSummary({
+        revocation: { outcome: "ok", kept: 1, deactivated: 0, skipped: 0 },
+        governance: { outcome: "converged", changed: 0, unchanged: 1, skipped: 0 },
+      }),
     ]);
   });
 
@@ -245,6 +326,13 @@ describe("the janitor handler", () => {
     assert.deepEqual(updates, []);
     assert.deepEqual(logs, [
       { event: "vk-janitor", outcome: "aborted", reason: "group-empty", members: 0 },
+      // The config half still ran: it reads no group, and an unrelated directory
+      // read must not decide whether a config change landed.
+      runSummary({
+        outcome: "not-converged",
+        revocation: { outcome: "aborted", kept: 0, deactivated: 0, skipped: 0 },
+        governance: { outcome: "aborted", changed: 0, unchanged: 0, skipped: 0 },
+      }),
     ]);
   });
 
@@ -263,6 +351,7 @@ describe("the janitor handler", () => {
         event: "vk-janitor",
         outcome: "failed",
         reason: "membership-unavailable",
+        trigger: "unknown",
       },
     ]);
   });
@@ -276,7 +365,12 @@ describe("the janitor handler", () => {
         error instanceof JanitorFailure && error.code === "gateway-unavailable",
     );
     assert.deepEqual(logs, [
-      { event: "vk-janitor", outcome: "failed", reason: "gateway-unavailable" },
+      {
+        event: "vk-janitor",
+        outcome: "failed",
+        reason: "gateway-unavailable",
+        trigger: "unknown",
+      },
     ]);
   });
 
@@ -324,6 +418,7 @@ describe("the janitor handler", () => {
         event: "vk-janitor",
         outcome: "failed",
         reason: "desired-state-unavailable",
+        trigger: "unknown",
       },
     ]);
   });
@@ -361,6 +456,7 @@ describe("the janitor handler", () => {
         event: "vk-janitor",
         outcome: "failed",
         reason: "desired-state-unavailable",
+        trigger: "unknown",
       },
     ]);
     // The parameter's value is never in a log line, and neither is the error's
@@ -388,13 +484,139 @@ describe("the janitor handler", () => {
     assert.deepEqual(updates[0].body.budgets, [
       { max_limit: 250, reset_duration: "1M" },
     ]);
-    assert.deepEqual(logs.at(-1), {
+    assert.deepEqual(logs.at(-2), {
       event: "vk-reconciler",
       outcome: "converged",
       name: "jeff@goodparty.org",
       fields: ["budgets"],
     });
+    assert.deepEqual(logs.at(-1), runSummary({
+      revocation: { outcome: "ok", kept: 1, deactivated: 0, skipped: 0 },
+      governance: { outcome: "converged", changed: 1, unchanged: 0, skipped: 0 },
+    }));
     // Still no key value anywhere in the log.
     assert.ok(!JSON.stringify(logs).includes(KEY_VALUE));
+  });
+
+  /**
+   * Step 4's half, through the handler rather than the core: the parameter's
+   * text reaches the loop, a change to it is one `PUT`, and a refused write
+   * fails the invocation so the deploy's poll cannot read it as converged.
+   */
+  it("converges the gateway's live config from the parameter, in one write", async () => {
+    const { handler, logs, configPuts } = harness({
+      keys: [],
+      members: ["user-1"],
+      configText: JSON.stringify({ client: { enable_logging: true } }),
+      observedConfig: { client_config: { enable_logging: false } },
+    });
+
+    const result = await handler({ action: "reconcile", trigger: "deploy" });
+
+    assert.equal(result.config.outcome, "converged");
+    assert.equal(result.config.changed, 1);
+    assert.deepEqual(configPuts, [
+      { client_config: { enable_logging: true } },
+    ]);
+    // The per-section line comes before the run's summary, and it names the
+    // field rather than its value.
+    assert.deepEqual(logs.at(-2), {
+      event: "bifrost-config-reconciler",
+      outcome: "converged",
+      section: "client",
+      fields: ["enable_logging"],
+    });
+    assert.deepEqual(logs.at(-1), runSummary({
+      trigger: "deploy",
+      revocation: { outcome: "ok", kept: 0, deactivated: 0, skipped: 0 },
+      governance: { outcome: "converged", changed: 0, unchanged: 0, skipped: 0 },
+      config: { outcome: "converged", changed: 1, unchanged: 0, skipped: 2 },
+    }));
+    assert.equal(result.summary.outcome, "converged");
+    assert.equal(result.summary.trigger, "deploy");
+  });
+
+  it("does not converge config on a scheduled tick, and says so", async () => {
+    // Decision 16 bounds config convergence at a deploy. A tick that converged
+    // it anyway would be a different promise than the plan makes, and it would
+    // erase a dashboard edit within five minutes with no deploy behind it.
+    let configGatewayBuilt = 0;
+    const { handler, configPuts } = harness({
+      keys: [],
+      members: ["user-1"],
+      configText: JSON.stringify({ client: { enable_logging: true } }),
+      observedConfig: { client_config: { enable_logging: false } },
+      configGateway: (base) => {
+        configGatewayBuilt++;
+        return base;
+      },
+    });
+
+    const result = await handler({ action: "reconcile", trigger: "schedule" });
+
+    assert.equal(result.config.outcome, "not-run");
+    assert.equal(result.config.reason, "not-this-trigger");
+    assert.deepEqual(configPuts, []);
+    assert.equal(
+      configGatewayBuilt,
+      0,
+      "the parameter is not even read, let alone written",
+    );
+    // A scheduled tick with nothing else to do is still `converged`: the config
+    // half is not its job, which is exactly why the summary records `not-run`
+    // rather than failing the tick.
+    assert.equal(result.summary.outcome, "converged");
+    assert.equal(result.summary.config.outcome, "not-run");
+  });
+
+  it("fails the invocation when the gateway refuses a config write", async () => {
+    const { handler, logs } = harness({
+      keys: [],
+      members: ["user-1"],
+      configText: JSON.stringify({ client: { enable_logging: true } }),
+      observedConfig: { client_config: { enable_logging: false } },
+      configGateway: (base) => ({
+        ...base,
+        putConfig: async () => {
+          throw new Error("PUT /api/config refused");
+        },
+      }),
+    });
+
+    await assert.rejects(
+      handler({ action: "reconcile", trigger: "deploy" }),
+      (error: unknown) =>
+        error instanceof JanitorFailure && error.code === "convergence-failed",
+    );
+    // No summary was returned, which is what the platform reports as a
+    // FunctionError; the failure line is the record that it was this loop.
+    assert.deepEqual(logs.at(-1), {
+      event: "vk-janitor",
+      outcome: "failed",
+      reason: "convergence-failed",
+      trigger: "deploy",
+    });
+  });
+
+  it("fails the invocation when /bifrost/config cannot be read", async () => {
+    const { handler, logs } = harness({
+      keys: [],
+      members: ["user-1"],
+      configError: new Error("AccessDenied on /bifrost/config"),
+    });
+
+    await assert.rejects(
+      handler({ action: "reconcile", trigger: "deploy" }),
+      (error: unknown) =>
+        error instanceof JanitorFailure &&
+        error.code === "desired-state-unavailable",
+    );
+    assert.deepEqual(logs.at(-1), {
+      event: "vk-janitor",
+      outcome: "failed",
+      reason: "desired-state-unavailable",
+      trigger: "deploy",
+    });
+    assert.doesNotMatch(JSON.stringify(logs), /AccessDenied/);
   });
 });

@@ -444,4 +444,86 @@ describe("deploy-workbench.yml deploy health checks", () => {
       "the check must not replace the job's first-hop session; Bedrock enablement below needs it back",
     );
   });
+
+  /**
+   * Step 4 of `docs/bifrost-reconciler.md`: the post-apply invoke.
+   *
+   * The invariant is the same shape as the health check's and for a sharper
+   * reason. Step 1 narrowed `BIFROST_CONFIG_VERSION` to the boot-only subset, so
+   * a live config edit no longer registers a task-definition revision and no
+   * longer restarts the task: this step is the *only* thing that applies it. A
+   * step that could skip, warn, or continue past a failed convergence would be
+   * green over a config that never landed, which is the `75d30ae` class of bug
+   * with a new mechanism.
+   */
+  it("converges the running gateway after the service check, and fails on anything but converged", () => {
+    const name = "Converge the running gateway to the committed configuration";
+    const convergeAt = stepIndex(name);
+    assert.ok(
+      convergeAt > stepIndex("Deploy"),
+      "the converge step must run after the apply it is confirming",
+    );
+    assert.ok(
+      convergeAt > stepIndex("Verify the service returned to a steady state"),
+      "a reconciler invoked against a task that has not come back up converges the wrong process",
+    );
+    assert.ok(
+      convergeAt < stepIndex("Enable Bedrock models"),
+      "a failed convergence must stop the run before it mutates the account further",
+    );
+
+    const body = stepNamed(name).body;
+    assert.ok(
+      body.includes("scripts/verify-convergence.ts"),
+      "the step must run the reconciler poll",
+    );
+    assert.ok(
+      /--retry-window-seconds\s+\d+/.test(body),
+      "the throttle retry must be bounded by an explicit window",
+    );
+    assert.ok(
+      !body.includes("::warning::"),
+      "a failed convergence must fail the run, not warn",
+    );
+    assert.ok(
+      !body.includes("continue-on-error"),
+      "a failed convergence must fail the run, not continue",
+    );
+    assert.ok(
+      !body.includes("configure-aws-credentials"),
+      "the hop is made inside the script, so the job's first-hop session stays in place",
+    );
+    // Unconditional. An `if:` guard on the invoke is the skip path this step
+    // exists to close, and there is no probe it could sensibly be gated on.
+    assert.ok(!/\n\s+if:/.test(body), "the converge step must not be conditional");
+  });
+
+  it("fits the post-apply checks inside the job's timeout", () => {
+    // Both waits are bounded and both bounds are explicit numbers, so the job's
+    // own `timeout-minutes` has to cover them plus a normal apply, or a slow but
+    // legal run gets killed and loses its diagnosis.
+    const timeoutMatch = /^ {4}timeout-minutes: (\d+)$/m.exec(SOURCE);
+    assert.ok(timeoutMatch, "the deploy job has no timeout-minutes");
+    const jobSeconds = Number(timeoutMatch[1]) * 60;
+
+    const serviceTimeout = Number(
+      /--timeout-seconds\s+(\d+)/.exec(
+        stepNamed("Verify the service returned to a steady state").body,
+      )?.[1] ?? 0,
+    );
+    const convergeWindow = Number(
+      /--retry-window-seconds\s+(\d+)/.exec(
+        stepNamed("Converge the running gateway to the committed configuration").body,
+      )?.[1] ?? 0,
+    );
+    assert.ok(serviceTimeout > 0 && convergeWindow > 0);
+    // The reconcile adds one run of up to the function's timeout on top of its
+    // window, and the apply itself needs minutes. Ten minutes of slack is the
+    // floor the other checks already leave.
+    const functionTimeout = 120;
+    assert.ok(
+      serviceTimeout + convergeWindow + functionTimeout + 600 < jobSeconds,
+      `the two post-apply checks (${serviceTimeout}s + ${convergeWindow}s + ${functionTimeout}s) plus an apply must fit inside ${jobSeconds}s`,
+    );
+  });
 });
