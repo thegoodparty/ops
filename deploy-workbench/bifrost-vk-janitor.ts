@@ -168,6 +168,43 @@ export const VK_JANITOR_MEMORY_MB = 256;
 export const VK_JANITOR_RESERVED_CONCURRENCY = 1;
 
 /**
+ * What the function is, in the words AWS stores on it and the console shows.
+ *
+ * Exported so `bifrost-vk-janitor.test.ts` asserts the *interpolated* string
+ * rather than the source text of it, which is what the apply sends. That check
+ * exists because this one did not: the description below used to be 276
+ * characters, AWS's limit on a Lambda function description is 256, and the
+ * workbench deploy found out (`UpdateFunctionConfiguration`,
+ * `ValidationException`, on the merge of #453) *after* the same apply had
+ * already moved the schedule to `rate(5 minutes)`. A preview cannot see a
+ * length constraint either, so nothing short of the unit suite can.
+ *
+ * Accuracy is the other half of the constraint, and it is why the text is
+ * trimmed to the vocabulary that carries the behaviour rather than to
+ * initials: every job the function does is still named here, with the two
+ * plan steps it comes from, because a description that fits by having stopped
+ * describing something would be the wrong fix.
+ */
+export const VK_JANITOR_FUNCTION_DESCRIPTION = `Deactivates Bifrost virtual keys whose owner has left the Engineers group and converges their governance and gateway live config, every ${VK_JANITOR_INTERVAL_MINUTES} minutes and on every workbench deploy (docs/bifrost-virtual-keys.md step 5, docs/bifrost-reconciler.md steps 3-4).`;
+
+/**
+ * The rule's own description, derived from the same interval so the two cannot
+ * disagree about the cadence. It is a separate string because it describes the
+ * trigger rather than the work, and it is exported for the same reason as the
+ * one above: the length guard has to see the interpolated value.
+ */
+export const VK_JANITOR_RULE_DESCRIPTION = `Reconciles Bifrost virtual keys and the gateway's live config against the committed state every ${VK_JANITOR_INTERVAL_MINUTES} minutes.`;
+
+/**
+ * The execution role's description, which is a separate string from the
+ * function's because it is a separate resource with a separate (much larger)
+ * limit. It is exported only so the length guard sees the value the apply
+ * sends; nothing reads it.
+ */
+export const VK_JANITOR_ROLE_DESCRIPTION =
+  "Bifrost reconcile loop: deactivates virtual keys whose owner has left the Engineers group and converges every managed key to the committed governance (steps 5 of docs/bifrost-virtual-keys.md and 3 of docs/bifrost-reconciler.md).";
+
+/**
  * The non-secret configuration: the gateway's private address, the setup-token
  * container's name and JSON key, and the reader role's ARN and session name.
  * The token itself is not here and never will be, because a Lambda environment
@@ -437,8 +474,7 @@ export const createBifrostVkJanitor = (args: {
     "bifrostVkJanitorRole",
     {
       name: VK_JANITOR_ROLE_NAME,
-      description:
-        "Bifrost reconcile loop: deactivates virtual keys whose owner has left the Engineers group and converges every managed key to the committed governance (steps 5 of docs/bifrost-virtual-keys.md and 3 of docs/bifrost-reconciler.md).",
+      description: VK_JANITOR_ROLE_DESCRIPTION,
       assumeRolePolicy: JSON.stringify(vkJanitorTrust),
       managedPolicyArns: [LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN],
       tags,
@@ -464,8 +500,10 @@ export const createBifrostVkJanitor = (args: {
     "bifrostVkJanitor",
     {
       name: VK_JANITOR_FUNCTION_NAME,
-      description:
-        "Deactivates Bifrost virtual keys whose owner has left the Engineers group and converges every managed key's governance and the gateway's live config, every 5 minutes and on every workbench deploy (steps 5 of docs/bifrost-virtual-keys.md and 3-4 of docs/bifrost-reconciler.md).",
+      // Kept inside AWS's 256-character limit on a function description, and
+      // guarded by length in `bifrost-vk-janitor.test.ts`: see the constant's
+      // own comment for the apply that this limit failed on.
+      description: VK_JANITOR_FUNCTION_DESCRIPTION,
       role: role.arn,
       runtime: aws.lambda.Runtime.NodeJS22dX,
       handler: "handler.handler",
@@ -507,7 +545,7 @@ export const createBifrostVkJanitor = (args: {
     "bifrostVkJanitorSchedule",
     {
       name: VK_JANITOR_NAME,
-      description: `Reconciles Bifrost virtual keys and the gateway's live config against the committed state every ${VK_JANITOR_INTERVAL_MINUTES} minutes.`,
+      description: VK_JANITOR_RULE_DESCRIPTION,
       scheduleExpression: VK_JANITOR_SCHEDULE_EXPRESSION,
       tags,
     },
