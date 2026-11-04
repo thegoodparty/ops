@@ -8,7 +8,12 @@ import {
   bifrostVkReaderTrust,
   VK_READER_SESSION_NAME,
 } from "../deploy/components/bifrost-vk-reader";
-import { GATEWAY_SECRET_NAME, secretArnPattern } from "./ecs";
+import { GATEWAY_SECRET_NAME, secretArnPattern, BIFROST_CONFIG_PARAMETER_NAME } from "./ecs";
+import { REGION } from "./network";
+import {
+  GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+  VK_MINT_TEMPLATE_PARAMETER_NAME,
+} from "./governance-parameters";
 import { BIFROST_PORT } from "./network";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
 import {
@@ -27,6 +32,7 @@ import {
   VK_JANITOR_ROLE_NAME,
   VK_JANITOR_SCHEDULE_EXPRESSION,
   VK_JANITOR_TIMEOUT_SECONDS,
+  RECONCILER_PARAMETERS,
   vkJanitorEnvironment,
   vkJanitorExecutionPolicy,
 } from "./bifrost-vk-janitor";
@@ -59,6 +65,7 @@ const INDEX_SOURCE = fs.readFileSync(path.resolve(__dirname, "index.ts"), "utf8"
 
 const policy = () =>
   vkJanitorExecutionPolicy({
+    region: REGION,
     logGroupArn: `arn:aws:logs:us-west-2:${WORKBENCH_ACCOUNT_ID}:log-group:${VK_JANITOR_LOG_GROUP_NAME}`,
   });
 
@@ -218,30 +225,90 @@ describe("the shared secret and the grants", () => {
   it("holds the token in the secret, never in the function's environment", () => {
     assert.deepEqual(Object.keys(vkJanitorEnvironment()).sort(), [
       "BIFROST_BASE_URL",
+      "OVERRIDES_PARAMETER_NAME",
       "READER_ROLE_ARN",
       "READER_SESSION_NAME",
       "SETUP_TOKEN_SECRET_JSON_KEY",
       "SETUP_TOKEN_SECRET_NAME",
+      "TEMPLATE_PARAMETER_NAME",
     ]);
+    // Names of parameters, never a parameter's value or the token. The SSM
+    // values are read at run time under the role, which is what makes the
+    // difference between a name here and a secret here.
     assert.ok(
       !Object.values(vkJanitorEnvironment()).some((value) =>
         /token-[a-z0-9]/i.test(value),
       ),
     );
+    for (const name of ["TEMPLATE_PARAMETER_NAME", "OVERRIDES_PARAMETER_NAME"] as const) {
+      assert.match(vkJanitorEnvironment()[name], /^\/bifrost\//);
+    }
   });
 
-  it("grants no identitystore action, no SSM, no CreateLogGroup and no KMS", () => {
+  it("grants no identitystore action, no CreateLogGroup and no KMS", () => {
     const actions = policy().Statement.flatMap((s) => s.Action);
     assert.deepEqual(actions.sort(), [
       "logs:CreateLogStream",
       "logs:PutLogEvents",
       "secretsmanager:GetSecretValue",
+      "ssm:GetParameter",
       "sts:AssumeRole",
     ]);
     assert.ok(!actions.some((action) => action.startsWith("identitystore:")));
-    assert.ok(!actions.some((action) => action.startsWith("ssm:")));
     assert.ok(!actions.includes("kms:Decrypt"));
     assert.ok(!actions.includes("logs:CreateLogGroup"));
+  });
+
+  /**
+   * The reversal. Before step 3 this test asserted the opposite, because the
+   * function was a revocation sweep that needed no desired state. It is now a
+   * convergence loop, which cannot converge to a document it may not read, and
+   * the plan names these two tests as the ones that reverse in the same PR as
+   * the grant.
+   */
+  it("reads the three reconciler parameters by name, and nothing wider", () => {
+    const statement = policy().Statement.find(
+      (s) => s.Sid === "ReadReconcilerParameters",
+    );
+    assert.ok(statement, "no ReadReconcilerParameters statement");
+    assert.deepEqual(statement.Action, ["ssm:GetParameter"]);
+
+    // Exactly the three the plan names: the config store, the template and the
+    // per-person overrides. No wildcard on the name, and no `GetParameters` or
+    // `GetParametersByPath` — the plural and the path walk reach more than this
+    // job has any use for.
+    assert.deepEqual(
+      statement.Resource.map((arn) =>
+        arn.replace(/^arn:aws:ssm:[^:]+:[0-9]{12}:parameter/, ""),
+      ),
+      [...RECONCILER_PARAMETERS],
+    );
+    assert.deepEqual([...RECONCILER_PARAMETERS], [
+      BIFROST_CONFIG_PARAMETER_NAME,
+      VK_MINT_TEMPLATE_PARAMETER_NAME,
+      GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+    ]);
+    assert.deepEqual([...RECONCILER_PARAMETERS], [
+      "/bifrost/config",
+      "/bifrost/vk-mint-template",
+      "/bifrost/governance-overrides",
+    ]);
+
+    const actions = policy().Statement.flatMap((s) => s.Action);
+    assert.ok(!actions.includes("ssm:GetParameters"));
+    assert.ok(!actions.includes("ssm:GetParametersByPath"));
+    assert.ok(!actions.some((action) => /^ssm:(Put|Delete)/.test(action)));
+    // The ARNs carry the stack's region, not a literal, so a region move cannot
+    // leave the grant pointing at a partition that does not exist.
+    assert.equal(BIFROST_CONFIG_PARAMETER_NAME, "/bifrost/config");
+    for (const arn of statement.Resource) {
+      assert.match(
+        arn,
+        new RegExp(
+          `^arn:aws:ssm:${REGION}:${WORKBENCH_ACCOUNT_ID}:parameter/bifrost/`,
+        ),
+      );
+    }
   });
 
   it("writes to its own log group, with a retention longer than the key window", () => {
@@ -255,11 +322,26 @@ describe("the shared secret and the grants", () => {
     ]);
   });
 
-  it("reads no SSM template and declares no SSM parameter", () => {
-    // The template is the mint's; a janitor that read it would be a second
-    // consumer of a shape it never needs.
-    assert.doesNotMatch(SOURCE, /aws\.ssm\.Parameter/);
-    assert.doesNotMatch(SOURCE, /TEMPLATE_PARAMETER_NAME/);
+  it("names its parameters rather than declaring them, and passes their names as configuration", () => {
+    // The parameters are step 2's, published by `governance-parameters.ts` and
+    // by `ecs.ts`; a janitor that declared them would be a second writer.
+    assert.doesNotMatch(SOURCE, /aws\.ssm\.Parameter\(/);
+    // The handler reads them by the names this module passes in, so the
+    // environment and the grant cannot disagree about which parameter is which.
+    assert.equal(
+      vkJanitorEnvironment().TEMPLATE_PARAMETER_NAME,
+      VK_MINT_TEMPLATE_PARAMETER_NAME,
+    );
+    assert.equal(
+      vkJanitorEnvironment().OVERRIDES_PARAMETER_NAME,
+      GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+    );
+    assert.match(SOURCE, /TEMPLATE_PARAMETER_NAME:\s*VK_MINT_TEMPLATE_PARAMETER_NAME/);
+    assert.match(SOURCE, /OVERRIDES_PARAMETER_NAME:\s*GOVERNANCE_OVERRIDES_PARAMETER_NAME/);
+    // Step 4's half. The parameter is in the grant and not in the environment
+    // because nothing reads it yet, and the plan keeps step 4's trigger out of
+    // this PR.
+    assert.ok(!("CONFIG_PARAMETER_NAME" in vkJanitorEnvironment()));
   });
 });
 

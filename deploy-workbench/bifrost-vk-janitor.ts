@@ -3,7 +3,13 @@ import * as aws from "@pulumi/aws";
 import * as esbuild from "esbuild";
 import * as path from "node:path";
 
+import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { VK_READER_SESSION_NAME } from "../deploy/components/bifrost-vk-reader";
+import {
+  GOVERNANCE_OVERRIDES_PARAMETER_NAME,
+  RECONCILER_PARAMETER_NAMES,
+  VK_MINT_TEMPLATE_PARAMETER_NAME,
+} from "./governance-parameters";
 import {
   LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN,
   VK_READER_ROLE_ARN,
@@ -11,24 +17,34 @@ import {
   SETUP_TOKEN_SECRET_NAME,
   type PolicyDocument,
 } from "./bifrost-vk-mint";
+import { BIFROST_CONFIG_PARAMETER_NAME, secretArnPattern } from "./ecs";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
-import { secretArnPattern } from "./ecs";
 import {
   BIFROST_PORT,
+  REGION,
   VPC_CIDR,
   type createWorkbenchNetwork,
 } from "./network";
 
 /**
- * The Bifrost virtual-key janitor: step 5 of `docs/bifrost-virtual-keys.md`.
+ * The Bifrost virtual-key janitor: step 5 of `docs/bifrost-virtual-keys.md`,
+ * and since step 3 of `docs/bifrost-reconciler.md` the reconciler's function too.
  *
- * The reconcile loop of decision 6, as infrastructure: one Lambda on an hourly
- * EventBridge rule that makes the set of Lambda-managed keys follow the
- * `Engineers` group. It lists the group, lists the gateway's keys, keeps the
- * ones carrying the description marker, resolves each owner's email to a user
- * id, and deactivates the keys whose owner is no longer a member. The
- * behaviour is `bifrost/vk-janitor-core.ts`; this module owns what it runs as
- * and what it may reach.
+ * Two jobs over one function and one set of reads, which is decision 3 of the
+ * reconciler plan: a second Lambda would have duplicated this VPC attachment,
+ * this setup-token read, this directory hop and these tests.
+ *
+ * 1. **Revocation**, step 5's loop: one Lambda on an EventBridge rule that makes
+ *    the set of Lambda-managed keys follow the `Engineers` group. It lists the
+ *    group, lists the gateway's keys, keeps the ones carrying the description
+ *    marker, resolves each owner's email to a user id, and deactivates the keys
+ *    whose owner is no longer a member.
+ * 2. **Governance convergence**, step 3's loop: the same function reads the two
+ *    governance documents, composes the desired state per key, diffs it against
+ *    what the gateway reports, and `PUT`s only the keys that differ.
+ *
+ * The behaviour is `bifrost/vk-janitor-core.ts`; this module owns what it runs
+ * as and what it may reach.
  *
  * What it deliberately does not own:
  *
@@ -43,10 +59,24 @@ import {
  *   retyped. It is the gateway's own container (decision 3), one name shared by
  *   the task definition, the mint and this function; two readers of one
  *   container, and the same rule about never logging a body.
+ * - **The governance documents themselves.** Both parameters are step 2's
+ *   (`governance-parameters.ts` and `ecs.ts`); this module names them and grants
+ *   itself `ssm:GetParameter` on them. A second writer would be a second source
+ *   of truth.
  * - **The task's 8080 ingress.** `bifrost-vk-mint.ts` adds the first exception
  *   to `network.ts`'s "from the ALB only" invariant; this module adds the
  *   second, from its own group, because it is the second caller of the same
  *   VPC-internal admin API (decision 3 and 6).
+ *
+ * ## What the two triggers will be, and why they are not here
+ *
+ * Step 4 of the reconciler plan adds a `rate(5 minutes)` schedule and the deploy
+ * workflow's `RequestResponse` invoke with a poll. Neither is built in step 3,
+ * and nothing here stands in their way: the schedule is the same `EventRule`
+ * this file already creates, moved to a new expression, and the invoke is a
+ * same-account IAM call that needs no resource-based policy on the function.
+ * The loop itself is one exported function a handler and a schedule can both
+ * run.
  *
  * ## Why a plain EventBridge rule and not Scheduler
  *
@@ -55,17 +85,17 @@ import {
  * carrying. A schedule group and a DLQ would be more machinery around one
  * `rate()` expression than the job is.
  *
- * ## Why the hourly interval is a named constant
+ * ## Why the interval, and why step 3 does not change it
  *
- * Open item 3: hourly is the design's choice, not a measured one. Decision 6
- * puts the revocation bound at "about an hour and a quarter of the person
- * leaving the Workspace group", counting the fifteen-minute Workspace →
- * Identity Center sync, and argues the interval from consequences rather than
- * measurement: an hour because a person who has left is not a five-minute
- * emergency, and a job that runs often enough to page on is a job that pages
- * for a bad reason. The constant keeps the number reviewable and gives a later
- * change one place to argue with; the test pins the expression the rule
- * actually uses to it.
+ * Open item 3 of `bifrost-virtual-keys.md`: hourly is the design's choice, not a
+ * measured one, argued from the revocation bound rather than from a measurement.
+ * `docs/bifrost-reconciler.md` decision 4 changes it to five minutes, for the
+ * reason a convergence loop needs: an override should land without a deploy.
+ * That is step 4's change, in the same PR as the trigger that makes the cadence
+ * mean something, and deliberately not made here — an interval change without
+ * the deploy's invoke would be a revocation sweep running twelve times an hour
+ * for no benefit. The constant keeps the number reviewable and gives that step
+ * one place to argue with.
  */
 
 /**
@@ -131,6 +161,12 @@ export const vkJanitorEnvironment = (): Record<string, string> => ({
   SETUP_TOKEN_SECRET_JSON_KEY,
   READER_ROLE_ARN: VK_READER_ROLE_ARN,
   READER_SESSION_NAME: VK_READER_SESSION_NAME,
+  // The desired state, from the two parameters step 2 publishes. Names, not
+  // values: a parameter value in an environment variable would be readable by
+  // anything that can call `GetFunctionConfiguration`, which is the same reason
+  // the setup token is not here either.
+  TEMPLATE_PARAMETER_NAME: VK_MINT_TEMPLATE_PARAMETER_NAME,
+  OVERRIDES_PARAMETER_NAME: GOVERNANCE_OVERRIDES_PARAMETER_NAME,
 });
 
 /** Lambda's own trust. Nothing else may assume this role. */
@@ -146,15 +182,51 @@ export const vkJanitorTrust = {
 } as const;
 
 /**
+ * The three SSM parameters the reconciler's desired state lives in, in the
+ * account's partition.
+ *
+ * `/bifrost/config` is here because the plan's step 3 names it: the grant is one
+ * policy on three parameters, and issuing it in one place is the point. The
+ * loop reads the two governance documents today; `/bifrost/config` is step 4's
+ * half, wired in when the deploy's invoke gives it a caller. Granting it now is
+ * deliberate rather than decorative — a reconciler that has to grow a permission
+ * after the fact is a reconciler whose first real run is an `AccessDenied` — and
+ * it is read-only, on three named parameters, with no wildcard.
+ */
+export const RECONCILER_PARAMETERS = [
+  BIFROST_CONFIG_PARAMETER_NAME,
+  ...RECONCILER_PARAMETER_NAMES,
+] as const;
+
+/**
+ * The parameter ARNs, quoted by name rather than by the Pulumi resource.
+ *
+ * A name-derived ARN so this policy stays a pure function a test can read, the
+ * same way the secret grant is. `/bifrost/config`'s own resource is created by
+ * `ecs.ts`, and the names are constants shared with the parameters themselves,
+ * so the grant and the resources cannot disagree about which parameter is which.
+ * The account is the workbench one, named and not a wildcard: these three
+ * parameters are this account's.
+ */
+export const reconcilerParameterArns = (args: { region: string }): string[] =>
+  RECONCILER_PARAMETERS.map(
+    (name) =>
+      `arn:aws:ssm:${args.region}:${WORKBENCH_ACCOUNT_ID}:parameter${name}`,
+  );
+
+/**
  * The execution role's whole grant: assume the one reader role, read the one
- * setup-token secret, write its own log streams.
+ * setup-token secret, read the three reconciler parameters, write its own log
+ * streams.
  *
  * Deliberately absent, and asserted by `bifrost-vk-janitor.test.ts`:
  *
  * - every `identitystore:*` action — the directory reads go through
  *   `bifrost-vk-reader`, whose inline policy is the scope;
- * - `ssm:GetParameter` — the janitor reads no template; the shape of a key is
- *   the mint's business;
+ * - `ssm:GetParameters`, `ssm:GetParametersByPath` and every write — the three
+ *   parameters are known by name, so the plural read and the path walk would
+ *   reach more than this job has any use for, and nothing in this repo writes a
+ *   parameter except Pulumi;
  * - `kms:Decrypt` — the secret uses the account's `aws/secretsmanager` key,
  *   whose policy admits the account, the same reasoning the mint's and
  *   group-sync's roles record;
@@ -162,9 +234,17 @@ export const vkJanitorTrust = {
  * - every write to the directory or to anything but its own logs. The only
  *   mutating call the job makes is the gateway `PUT`, which is authorised by
  *   the setup token, not by IAM.
+ *
+ * The `ssm:GetParameter` grant reverses what this file said before step 3 of
+ * `docs/bifrost-reconciler.md`, and the reason is the reason the function
+ * changed: it was a revocation sweep that needed no desired state, and it is now
+ * a convergence loop that has to read the state it is converging to. The plan
+ * names those two tests ("the janitor's IAM changes and two of its tests
+ * reverse") and they are rewritten in the same PR as the grant.
  */
 export const vkJanitorExecutionPolicy = (args: {
   logGroupArn: string;
+  region: string;
 }): PolicyDocument => ({
   Version: "2012-10-17",
   Statement: [
@@ -186,6 +266,14 @@ export const vkJanitorExecutionPolicy = (args: {
       // container (decision 3). Secrets Manager appends six random characters
       // to the ARN, so the name needs a wildcard.
       Resource: [secretArnPattern(SETUP_TOKEN_SECRET_NAME)],
+    },
+    {
+      Sid: "ReadReconcilerParameters",
+      Effect: "Allow",
+      Action: ["ssm:GetParameter"],
+      // Three names, no wildcard on the name itself, so the grant reaches
+      // exactly the parameters the desired state is in.
+      Resource: reconcilerParameterArns({ region: args.region }),
     },
     {
       Sid: "WriteOwnLogs",
@@ -329,7 +417,7 @@ export const createBifrostVkJanitor = (args: {
     {
       name: VK_JANITOR_ROLE_NAME,
       description:
-        "Bifrost vk-janitor Lambda: sts:AssumeRole on the management-account bifrost-vk-reader, read BIFROST_SETUP_TOKEN from bifrost/gateway, write its own logs. No identitystore action, no SSM template, no other secret.",
+        "Bifrost reconcile loop: deactivates virtual keys whose owner has left the Engineers group and converges every managed key to the committed governance (steps 5 of docs/bifrost-virtual-keys.md and 3 of docs/bifrost-reconciler.md).",
       assumeRolePolicy: JSON.stringify(vkJanitorTrust),
       managedPolicyArns: [LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN],
       tags,
@@ -343,7 +431,9 @@ export const createBifrostVkJanitor = (args: {
       name: VK_JANITOR_NAME,
       role: role.name,
       policy: logGroup.arn.apply((logGroupArn) =>
-        JSON.stringify(vkJanitorExecutionPolicy({ logGroupArn })),
+        JSON.stringify(
+          vkJanitorExecutionPolicy({ logGroupArn, region: REGION }),
+        ),
       ),
     },
     { provider },

@@ -75,7 +75,7 @@
  * do that by accident.
  */
 
-import { isEmailShaped } from "./vk-janitor-core";
+import { isEmailShaped } from "./key-name";
 
 /** The sentinel that says "keep the template's value for this field". */
 export const GOVERNANCE_INHERIT = "inherit";

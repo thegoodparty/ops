@@ -29,6 +29,7 @@
  */
 
 import { WORKBENCH_ACCOUNT_ID } from "../../utils/accounts";
+import type { ObservedGovernance } from "./vk-governance-observed";
 
 /**
  * The Identity Center group that decides who may hold a key (decision 1). It
@@ -62,7 +63,7 @@ export type VirtualKey = {
   expires_at?: string | null;
   delete_after_expire?: boolean | null;
   description?: string | null;
-};
+} & ObservedGovernance;
 
 export type KeyPage = {
   keys: VirtualKey[];
