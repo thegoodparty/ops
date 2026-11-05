@@ -1842,10 +1842,11 @@ describe("bifrost ecs", () => {
   });
 
   it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
-    // 4,014 bytes against the standard tier's 4 KiB, measured at step 1 of
-    // `docs/bifrost-reconciler.md`: 82 bytes of headroom, not the couple of
-    // kilobytes a comment in `ecs.ts` and one in `bifrost/README.md` used to
-    // claim. The number is asserted rather than left to a comment, because the
+    // 4,042 bytes against the standard tier's 4 KiB, measured on 2026-11-04
+    // after the Bedrock model list moved to `global.` profiles: 54 bytes of
+    // headroom, not the couple of kilobytes a comment in `ecs.ts` and one in
+    // `bifrost/README.md` used to claim. The number is asserted rather than
+    // left to a comment, because the
     // failure mode of getting it wrong is a rejected `PutParameter` in an
     // apply that has already merged.
     assert.equal(BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES, 4096);
@@ -1858,8 +1859,8 @@ describe("bifrost ecs", () => {
     // the comment block does. If this fails the comment is the stale part.
     assert.equal(
       BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
-      82,
-      "the 82-byte headroom in the ecs.ts comment block must be the measured one",
+      54,
+      "the 54-byte headroom in the ecs.ts comment block must be the measured one",
     );
   });
 

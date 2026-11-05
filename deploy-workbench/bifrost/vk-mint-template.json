@@ -5,13 +5,13 @@
     {
       "provider": "bedrock",
       "allowed_models": [
-        "us.anthropic.claude-sonnet-5-5",
-        "us.anthropic.claude-opus-5-5",
-        "us.moonshotai.kimi-k3",
-        "us.openai.gpt-6.1-sol",
-        "us.anthropic.claude-haiku-5-5",
-        "us.xai.grok-4.7",
-        "us.zai.glm-5.3"
+        "global.anthropic.claude-sonnet-5-5",
+        "global.anthropic.claude-opus-5-5",
+        "global.moonshotai.kimi-k3",
+        "global.openai.gpt-6.1-sol",
+        "global.anthropic.claude-haiku-5-5",
+        "global.xai.grok-4.7",
+        "global.zai.glm-5.3"
       ],
       "key_ids": ["*"]
     },

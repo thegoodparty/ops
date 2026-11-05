@@ -44,8 +44,13 @@ import { BIFROST_UPSTREAM_TAG } from "../bifrost-image";
  *   `network_config.base_url`, per provider, and the Fireworks provider uses
  *   it for every request path (`core/providers/fireworks/fireworks.go`, which
  *   defaults it to the global `https://api.fireworks.ai/inference`). That is
- *   what makes US-only inference a config property rather than a convention:
- *   the gateway has no other endpoint to fall back to.
+ *   what makes US-only Fireworks inference a config property rather than a
+ *   convention: the gateway has no other endpoint to fall back to.
+ *
+ * Bedrock is on a different rule and a different decision: it serves `global.`
+ * cross-region inference profiles, which route by capacity anywhere AWS offers
+ * the model. The Bedrock half of the residency story moved on 2026-11-04; see
+ * `docs/bifrost-gateway.md`, "Inference residency".
  */
 
 const CONFIG_PATH = path.resolve(__dirname, "config.json");
@@ -140,26 +145,34 @@ const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
  * Everything else in this file is derived from the files or from
  * `utils/bedrock-models.ts`, and a derivation cannot notice a class that was
  * deleted from both the config and the template at once: it shrinks with them.
- * This list is the independent statement of what US-only inference actually
- * leaves, so an accidental deletion fails a test instead of quietly reducing
- * what the fleet can reach.
+ * This list is the independent statement of what the gateway actually serves,
+ * so an accidental deletion fails a test instead of quietly reducing what the
+ * fleet can reach.
  *
- * Eight, not gp-pi's nine: DeepSeek V3.2 is gone because Bedrock has no
- * `us.deepseek.v3.2` inference profile (checked with
- * `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-10-29: the only
- * DeepSeek profile is `us.deepseek.r1-v1:0`), and a bare `deepseek.v3.2` id is
- * not a US commitment. See `docs/bifrost-gateway.md`, "Provider
- * configuration".
+ * Two residency rules live in these literals, and they are different rules:
+ * every Bedrock entry is a `global.` cross-region inference profile (the
+ * account moved off the `us.` geo profiles on 2026-11-04, about 10% cheaper;
+ * see `docs/bifrost-gateway.md`, "Inference residency"), and every Fireworks
+ * entry is a US-only router on the US-only endpoint, which is unchanged and
+ * still enforced by contract.
+ *
+ * Seven, down from eight: DeepSeek V3.2 is gone. Bedrock publishes no
+ * `global.deepseek.v3.2` profile and no `us.` one either -- checked with
+ * `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-11-04, where the only
+ * DeepSeek profile is `us.deepseek.r1-v1:0`, and `GetFoundationModel` reports
+ * `inferenceTypesSupported: [ON_DEMAND]` -- so it cannot be served as a
+ * profile at all, global or geographic. Removed on 2026-11-04; see
+ * `docs/bifrost-gateway.md`, "Inference residency".
  */
-const US_MODEL_CLASSES: Record<string, string[]> = {
+const SERVED_MODEL_CLASSES: Record<string, string[]> = {
   bedrock: [
-    "us.anthropic.claude-sonnet-5-5",
-    "us.anthropic.claude-opus-5-5",
-    "us.moonshotai.kimi-k3",
-    "us.openai.gpt-6.1-sol",
-    "us.anthropic.claude-haiku-5-5",
-    "us.xai.grok-4.7",
-    "us.zai.glm-5.3",
+    "global.anthropic.claude-sonnet-5-5",
+    "global.anthropic.claude-opus-5-5",
+    "global.moonshotai.kimi-k3",
+    "global.openai.gpt-6.1-sol",
+    "global.anthropic.claude-haiku-5-5",
+    "global.xai.grok-4.7",
+    "global.zai.glm-5.3",
   ],
   fireworks: [
     // Fireworks' documented US-only ids are
@@ -179,7 +192,8 @@ const US_MODEL_CLASSES: Record<string, string[]> = {
   ],
 };
 
-const US_BEDROCK_PREFIX = "us.";
+/** The profile prefix every Bedrock entry must carry: `global.`, not `us.`. */
+const SERVED_BEDROCK_PREFIX = "global.";
 
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
@@ -420,29 +434,48 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("serves no model from outside the United States", () => {
+  it("serves every model from a global Bedrock profile or a US-only Fireworks router", () => {
     const config = loadConfig();
 
-    // `global.` is worldwide by definition, so it may not appear anywhere in
-    // the file: not in a model list, not in a key, not in a value nobody
-    // thought of as a model. A bare id is only meaningless as a model, so that
-    // half is checked where models are named.
+    // The two providers are on opposite rules, and this test is where the
+    // difference is enforced rather than described.
+    //
+    // Bedrock: every served id is a `global.` cross-region inference profile.
+    // No `us.` profile (the rollover may still carry them in IAM, but the
+    // gateway must not select one) and no bare foundation-model id, which is
+    // not a profile at all and which several of these models cannot be
+    // invoked as. The reason is cost, not residency; it is recorded in
+    // `docs/bifrost-gateway.md`, "Inference residency".
+    const served = provider(config, "bedrock").keys.flatMap((key) => key.models);
+    assert.ok(served.length > 0, "the bedrock key serves no models; empty is deny-by-default");
     for (const value of collectStrings(config)) {
-      assert.ok(
-        !value.includes("global."),
-        `config.json carries "${value}", which names the worldwide profile; the gateway serves US-only inference`,
-      );
+      if (value.startsWith("global.") || value.startsWith("us.")) {
+        assert.ok(
+          served.includes(value) ||
+            WORKBENCH_MODELS.some(
+              (model) =>
+                model.invokeId === value ||
+                (model.transitionalInvokeIds ?? []).includes(value),
+            ),
+          `config.json carries "${value}", which is an inference profile that is neither served here nor named in utils/bedrock-models.ts`,
+        );
+      }
     }
-
     for (const key of provider(config, "bedrock").keys) {
       for (const model of key.models) {
         assert.ok(
-          model.startsWith(US_BEDROCK_PREFIX),
-          `bedrock model ${model} is not a us. inference profile; a bare or global id is not a US commitment`,
+          model.startsWith(SERVED_BEDROCK_PREFIX),
+          `bedrock model ${model} is not a global. inference profile; a us. profile is the rollover, not what the gateway selects`,
+        );
+        assert.ok(
+          !model.startsWith("us."),
+          `bedrock model ${model} is a us. geo profile; the gateway serves the global profile, and us. survives only in transitionalInvokeIds`,
         );
       }
     }
 
+    // Fireworks is unchanged and stays strict: every served name resolves on
+    // the wire to a US-only router id.
     for (const key of provider(config, "fireworks").keys) {
       for (const model of key.models) {
         assert.match(
@@ -480,7 +513,9 @@ describe("bifrost config.json", () => {
     );
 
     // No other provider may carry an endpoint override: one that did would be
-    // a path to a model the US-only lists do not cover.
+    // an endpoint no decision in this repo covers. Bedrock's endpoint is the
+    // region in `bedrock_key_config`, and a global profile is still invoked
+    // from that source region.
     for (const [name, configured] of Object.entries(config.providers ?? {})) {
       if (name === "fireworks") continue;
       assert.ok(
@@ -490,7 +525,7 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("lists exactly the US Bedrock profiles the task role's IAM allows", () => {
+  it("lists exactly the global Bedrock profiles the task role's IAM allows", () => {
     const config = loadConfig();
     const configured = provider(config, "bedrock").keys.flatMap((key) => key.models);
 
@@ -498,21 +533,21 @@ describe("bifrost config.json", () => {
     // built from `utils/bedrock-models.ts`, so anything here without a matching
     // resource is an AccessDenied. The other direction is not equality: the
     // IAM list is the sandbox's grant and is allowed to be wider than what the
-    // gateway serves, which is exactly the state the transitional `global.`
-    // Sonnet profile and the bare foundation-model ids are in. What this list
-    // must be is the `us.`-profile subset of that file, with nothing added.
-    const usProfiles = [
+    // gateway serves, which is exactly the state the transitional `us.`
+    // profiles and the bare foundation-model ids are in. What this list must be
+    // is the `global.`-profile subset of that file, with nothing added.
+    const globalProfiles = [
       ...new Set(
         WORKBENCH_MODELS.filter((model) =>
-          model.invokeId.startsWith(US_BEDROCK_PREFIX),
+          model.invokeId.startsWith(SERVED_BEDROCK_PREFIX),
         ).map((model) => model.invokeId),
       ),
     ].sort();
 
     assert.deepEqual(
       [...configured].sort(),
-      usProfiles,
-      "config.json's Bedrock models drifted from the us. profiles in utils/bedrock-models.ts; a missing one is a class the fleet cannot reach",
+      globalProfiles,
+      "config.json's Bedrock models drifted from the global. profiles in utils/bedrock-models.ts; a missing one is a class the fleet cannot reach",
     );
 
     const resources = bedrockInvokeResources();
@@ -530,7 +565,7 @@ describe("bifrost config.json", () => {
 
   it("serves exactly the agreed model classes, per provider", () => {
     const config = loadConfig();
-    for (const [name, expected] of Object.entries(US_MODEL_CLASSES)) {
+    for (const [name, expected] of Object.entries(SERVED_MODEL_CLASSES)) {
       // Classes are what the names resolve to on the wire, so an alias is the
       // same class as its router and not a ninth one.
       const configured = [
@@ -543,15 +578,15 @@ describe("bifrost config.json", () => {
       assert.deepEqual(
         [...configured].sort(),
         [...expected].sort(),
-        `${name}'s classes drifted from the agreed eight US-only classes; a class added is a data-residency decision and one removed is a class the fleet loses`,
+        `${name}'s classes drifted from the agreed seven; a class added is a residency and cost decision and one removed is a class the fleet loses`,
       );
     }
     // And no provider outside that set: a third provider would be a model class
     // nothing here has decided on.
     assert.deepEqual(
       Object.keys(config.providers ?? {}).sort(),
-      Object.keys(US_MODEL_CLASSES).sort(),
-      "config.json declares a provider the US-only model decision does not cover",
+      Object.keys(SERVED_MODEL_CLASSES).sort(),
+      "config.json declares a provider the model decision does not cover",
     );
   });
 

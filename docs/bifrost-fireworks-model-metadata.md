@@ -92,8 +92,13 @@ through the v2.3.0 `datasheet.Store`:
 The catalog has the model under three neighbouring ids and not under the exact
 router id the gateway serves and the residency test requires. Lookup is an exact
 match on `model|provider|mode` (`datasheet/store.go:182`), so a near miss is a
-miss. That is the whole bug. The seven Bedrock `us.*` profiles each have a row
+miss. That is the whole bug. The seven Bedrock profiles each have a row
 (`bedrock/us.moonshotai.kimi-k3` and the other six), which is why they are rich.
+That was measured while the Bedrock entries were `us.` profiles; they are
+`global.` profiles since 2026-11-04 (`docs/bifrost-gateway.md`, "Inference
+residency"), and the enrichment mechanism is unchanged either way — it is the
+row existing, not the prefix, that made them rich. Nothing in this document's
+conclusion depends on which profile the list names.
 
 The datasheet was re-downloaded on 2026-11-04 and the same gap is there (5 714
 rows): `fireworks_ai/accounts/fireworks/models/deepseek-v4p1-flash-1017-us` is a

@@ -51,8 +51,10 @@ const REGION = "us-west-2";
  *
  * The last two are ours and are load-bearing rather than cautious.
  *
- * `bedrock`, because the `us.`-prefixed model ids are geo inference profiles
- * that route each request across member regions by capacity. AWS states it
+ * `bedrock`, because the inference profiles the account selects route each
+ * request across member regions by capacity rather than staying in
+ * `us-west-2` — a `us.` geo profile among its members, and a `global.` profile
+ * (every entry since 2026-11-04) more widely still. AWS states it
  * directly: "If any destination Region in a cross-Region inference profile is
  * blocked in your SCPs, the request will fail even if other Regions remain
  * allowed." So this is not a hedge against a maybe. Without it every model

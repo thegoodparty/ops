@@ -77,14 +77,19 @@ const loadConfig = (): Config =>
   JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) as Config;
 
 /**
- * US-only inference, from the key's side. `config.json` decides what the
+ * Two residency rules, from the key's side. `config.json` decides what the
  * gateway will route; this file decides what a person's key may ask for, and a
  * key that names a model the gateway does not allow is a 404 or an
- * `AccessDenied` at request time. So the two files carry the same US-only
- * rules and the same classes, and `config.test.ts` pins the class set that the
- * exact-match test below then inherits.
+ * `AccessDenied` at request time. So the two files carry the same rules and the
+ * same classes, and `config.test.ts` pins the class set that the exact-match
+ * test below then inherits.
+ *
+ * Bedrock entries are `global.` cross-region inference profiles, the account's
+ * convention since 2026-11-04 (about 10% cheaper than the `us.` geo profiles;
+ * `docs/bifrost-gateway.md`, "Inference residency"). Fireworks entries are
+ * US-only router ids on the US-only endpoint, unchanged and still enforced.
  */
-const US_BEDROCK_PREFIX = "us.";
+const SERVED_BEDROCK_PREFIX = "global.";
 
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
@@ -132,33 +137,23 @@ describe("bifrost virtual-key template", () => {
     assert.equal(template.is_active, true);
   });
 
-  it("allows nothing outside the United States", () => {
+  it("allows a global Bedrock profile or a US-only Fireworks router, and nothing else", () => {
     const template = loadTemplate();
-
-    // A JSON-parsed template has no comments to check, so every string in it is
-    // a value: `global.` anywhere is the worldwide profile named as a model.
-    const strings: string[] = [];
-    const collect = (value: unknown) => {
-      if (typeof value === "string") strings.push(value);
-      else if (Array.isArray(value)) value.forEach(collect);
-      else if (value && typeof value === "object") {
-        Object.values(value as Record<string, unknown>).forEach(collect);
-      }
-    };
-    collect(template);
-    for (const value of strings) {
-      assert.ok(
-        !value.includes("global."),
-        `the template carries "${value}", which names the worldwide profile; the gateway serves US-only inference`,
-      );
-    }
 
     for (const entry of providerConfigs(template)) {
       for (const model of entry.allowed_models) {
         if (entry.provider === "bedrock") {
+          // The account's Bedrock convention is a `global.` cross-region
+          // inference profile, not a `us.` geo profile and not a bare id. A
+          // bare id would not be a profile at all, and several of these models
+          // have no in-region invocation.
           assert.ok(
-            model.startsWith(US_BEDROCK_PREFIX),
-            `${model} is not a us. inference profile; a bare or global id is not a US commitment`,
+            model.startsWith(SERVED_BEDROCK_PREFIX),
+            `${model} is not a global. inference profile; the gateway serves global profiles, and a us. or bare id is not one`,
+          );
+          assert.ok(
+            !model.startsWith("us."),
+            `${model} is a us. geo profile; those survive only in transitionalInvokeIds while the fleet rolls over`,
           );
         } else if (entry.provider === "fireworks") {
           // A key alias is a name that resolves to a router; what the provider
@@ -176,9 +171,10 @@ describe("bifrost virtual-key template", () => {
       }
     }
 
-    // The endpoint is the other half of the decision and lives in config.json,
-    // because a template cannot override a provider's endpoint; the guard here
-    // is that the template may not add one and quietly point a key elsewhere.
+    // The Fireworks endpoint is still the other half of that provider's
+    // decision and lives in config.json, because a template cannot override a
+    // provider's endpoint; the guard here is that the template may not add one
+    // and quietly point a key elsewhere.
     const config = loadConfig();
     for (const [provider, configured] of Object.entries(config.providers ?? {})) {
       if (provider === "fireworks") continue;
