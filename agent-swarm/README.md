@@ -262,6 +262,41 @@ workflow) so `render-env.sh` and compose are refreshed, then
 restart the agents (`up.sh`). Check from a worker: `gh-app-token >/dev/null`
 prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 
+## Adding scripts, skills, schedules and config
+
+Set these up by asking Delegate in Slack, not with a PR to this repo. The
+swarm stores all four in its own database and the lead has a tool for each,
+so a PR, a deploy, a `bootstrap.sh` run and an agent restart on the host is
+just a slower path to the same place.
+
+- Scripts: ask Delegate to save the script to the global catalog
+  (`script-upsert`). It typechecks on save.
+- Skills: ask Delegate to create the skill and install it on the agent that
+  needs it (`skill-create`, `skill-install`).
+- Schedules: ask Delegate to create, disable or delete the schedule
+  (`create-schedule`, `update-schedule`, `delete-schedule`).
+- Souls and identities: ask Delegate to update its own or another agent's
+  (`update-profile`).
+- Config: ask Delegate to set plain keys (`set-config`). Secrets are the
+  exception: set them yourself in the dashboard as secret config, and never
+  paste a secret into Slack.
+
+A PR is still the way to change anything outside the swarm's database: the
+host (`docker-compose.yml`, `Caddyfile`, `render-env.sh`, the worker image,
+`global-setup-script.sh`), AWS access (`deploy-infrastructure/`), the Slack
+manifest, the login and admin lists and the MCP servers. If a
+new script needs one of those, for example an S3 permission or a Slack scope,
+only that part is a PR.
+
+The panel-wave scripts in `host/scripts/`, the `scale-to-win-panel-wave`
+skill in `host/skills/` and the lead's soul in `host/soul/` came in by PR.
+`bootstrap.sh` still pushes them on every run and overwrites any change made
+from Slack, so change those by PR until they are moved out of the repo. The
+same goes for the global config keys `SETUP_SCRIPT`, `TEVYN_API_CHANNEL_ID`
+and `PANEL_WAVE_AGENT_ID`, which `bootstrap.sh` rewrites on every run.
+`HANDOFF_ENV` and `REPLIES_BUCKET` are only written when missing, so a change
+to those from Slack survives a rerun.
+
 ## Changing agent behaviour
 
 What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
@@ -272,7 +307,7 @@ the grafana and clickup MCP servers, the global catalog scripts from
 skills from `host/skills/<name>/SKILL.md` (created at agent scope on the coder
 and installed on it; a rerun updates a changed skill instead of adding another),
 the lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
-To change one, edit the file, merge, then on the host:
+To change one of those, edit the file, merge, then on the host:
 
 ```sh
 sudo /opt/agent-swarm/bootstrap.sh
@@ -379,8 +414,10 @@ coder, set by a human: `S2W_USERNAME`, `S2W_PASSWORD` and `S2W_TOTP_SEED`
 ### Schedules
 
 Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
-add. To run the dispatcher every 5 minutes, call the MCP bridge from the host as
-the lead. Do not use `POST /api/schedules`: the REST route does not record which
+add. To run the dispatcher every 5 minutes, ask Delegate in Slack to create a
+recurring script schedule for `panel-waves-tick` every 300000 ms. From the
+host, make the same call through the MCP bridge as the lead. Do not use
+`POST /api/schedules`: the REST route does not record which
 agent created the schedule, so the script would run as a placeholder agent that
 does not exist and could not run `tevyn-handoffs-new` or create tasks.
 
@@ -393,8 +430,8 @@ curl -sS --fail-with-body -X POST http://127.0.0.1:3013/api/mcp-bridge \
 ```
 
 The same call as a tool is `create-schedule` with `targetType: "script"`,
-`scriptName: "panel-waves-tick"`, `intervalMs: 300000`. Delegate can also make
-it from Slack. Disable the schedule to pause all panel waves.
+`scriptName: "panel-waves-tick"`, `intervalMs: 300000`. Disable the schedule
+to pause all panel waves.
 
 Anything else goes through the dashboard or the API at
 `https://delegate-swarm.infra.goodparty.org` (`http://127.0.0.1:3013` on the host)
