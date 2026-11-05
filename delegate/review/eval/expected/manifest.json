@@ -402,5 +402,111 @@
     "split": "holdout",
     "source": "refuted",
     "kind": "false-finding"
+  },
+  {
+    "id": "omni-inc101-sync-audience-paging",
+    "bundle": "omni-inc101-sync-audience-paging.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/vendors/peerly/services/p2pPhoneListUpload.service.ts"
+      ]
+    },
+    "tests": "Simulated. Modeled on INC-101, where a filter matching about 82,000 recipients outran the gateway during phone-list resolution. The new preview route drives resolveFilterAudience synchronously on the request path in pages of 1,000 up to the 200,000 cap, but unlike the build path (p2pPhoneListUpload.service.ts:854) and the Serve SMS create path it passes no timeBudgetMs. An audience of about 82,000 or more means 82+ sequential Databricks page reads inside one request, past the ~120 s gateway, so the official gets a gateway timeout instead of a count. docs/scale.md rows: Interactive resolution budget 90 s (gateway gives up at ~120 s); Known traps, per-page work over an audience on the request path.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-3370-match-chunk-param-limit",
+    "bundle": "omni-3370-match-chunk-param-limit.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/peopleDb/databricks/contactUploadMatchSql.util.ts",
+        "packages/gp-api/src/contactUploads/services/contactUploadProcessJob.service.ts"
+      ]
+    },
+    "tests": "Simulated. Modeled on the omni#3370 contact-upload match pipeline. The match input is one bound JSON string parameter, and Databricks caps a single parameter at 1,048,576 characters (stated in the util's comments and contactUploads/AGENTS.md), not at the 16 MiB statement size the diff sizes against. At a typical ~235 characters per row, a 20,000-row chunk is about 4.7M characters, so any upload over roughly 4,400 rows fails its match statement; uploads go up to 100,000 rows. docs/scale.md rows: Contact upload rows 100,000; Known traps, Match SQL input is capped at 800,000 chars (contactUploadMatchSql.util.ts:53).",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-prisma-in-audience-ids",
+    "bundle": "omni-prisma-in-audience-ids.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/contactInteraction/services/contactInteractionText.service.ts",
+        "packages/gp-api/src/outreach/services/outreachTextDelivery.service.ts"
+      ]
+    },
+    "tests": "Simulated. Modeled on the Serve SMS delivery path. findTextedSince passes every resolved person id as a Prisma `personId: { in: [...] }` list, and the resolved audience can hold up to 200,000 ids. Prisma fails above 32,767 bound values, so any Serve send to more than about 32,767 constituents throws in the frequency-cap lookup and the send never writes its CSV. docs/scale.md rows: Audience cap per resolution 200,000; Known traps, ids as bound parameters in Postgres fail above 32,767 values.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-pack-cap-refuse-early",
+    "bundle": "omni-pack-cap-refuse-early.bundle.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Simulated. Modeled on the door-knocking pack path that once held a ~21.5M-row statewide district in memory. The new pre-check is a single COUNT(*) row over the same FROM/WHERE the export uses, so it holds one aggregate regardless of district size, and anything over MAX_PACK_ROWS (3,000,000) is refused before the export starts. Nothing new is paged, held or bound per person, and the existing post-export check stays as a backstop. docs/scale.md rows: Door-knocking pack rows 3,000,000; Known traps, whole district held in memory.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-sms-cap-matches-audience",
+    "bundle": "omni-sms-cap-matches-audience.bundle.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Simulated. Modeled on the recipient caps listed in docs/scale.md (Audience cap per resolution 200,000; Peerly phone list recipients 200,000). The diff swaps a private 200,000 constant for the shared MAX_AUDIENCE_RECIPIENTS of the same value and rewrites two refusal messages. No query, loop, page size or cap value changes, so every path stays bounded exactly as before.",
+    "split": "holdout",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-keyset-paged-resolver",
+    "bundle": "omni-keyset-paged-resolver.bundle.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Simulated. Modeled on the outreach materialization path's OFFSET paging over captured phone-list recipients, which ran inside the launch request. The diff moves the captured-list write onto the existing SQS queue (a new outreachMaterialize message type with a per-outreach dedup id; the request only stamps the filter lock and enqueues) and replaces skip/take with keyset paging on the recipient id in pages of 10,000, stopping at MAX_AUDIENCE_RECIPIENTS (200,000). The largest list is 20 indexed reads and 20 createMany inserts with skipDuplicates, off the request path, so a redelivery is idempotent and nothing holds more than one page. A capture over the cap is logged rather than read. docs/scale.md rows: Outreach materialization page 1,000; Audience cap per resolution 200,000; Known traps, OFFSET paging re-sorts and skips everything before it, and per-page work over an audience on the request path.",
+    "split": "tune",
+    "source": "simulated",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-2977-mrp-per-tract-on-request",
+    "key": "reviews/thegoodparty/omni/2977/6ddbc85430ef0d339bb59e5eba7ca3c30604ab23/573c933f-bb09-424d-b96a-9b78d04ad6a6.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/priorities/util/mrpReadStatus.util.ts",
+        "packages/gp-api/src/priorities/services/priorityResults.service.ts"
+      ]
+    },
+    "tests": "Swaps the priority read to the MRP model with census tract as a dimension, one parameter per tract, fit synchronously inside gp-api's read-status request. The repo's ADR (docs/adr/2026-10-19-civic-panel-mrp-in-gp-api.md) sized it at a few dozen parameters and about 1 ms, and the PR body says speed on very large districts was not measured. Statewide North Carolina has 3,003 tracts; each read took 4 to 9 minutes on Node's one thread and froze the prod fleet on 2026-11-04 (post-mortem \"Statewide read freeze\"). Production approved with no findings. The fix (#3588) caps the model.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "scale"
+  },
+  {
+    "id": "omni-3023-mrp-read-on-home-load",
+    "key": "reviews/thegoodparty/omni/3023/cb0d89a3dca8c3ff3ed9a6362a7fb459601b92d1/e6b3e609-45e4-4f01-89c7-7dfd909b7311.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/dashboardCards/services/dashboardCards.service.ts"
+      ]
+    },
+    "tests": "Adds the priority read (the per-tract MRP fit from #2977) to Home card sync, so every Home load runs it synchronously inside the request, with only a per-server cache. A large district's read takes minutes on Node's one thread, and the least-outstanding-requests balancer spreads repeat loads across servers until the fleet freezes (post-mortem \"Statewide read freeze\", 2026-11-04). The change is a small part of a 54-file PR. Production approved with no findings.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "scale"
   }
 ]
