@@ -226,9 +226,12 @@ denies do not interfere with any of it.
 ### TLS and DNS
 
 - An internet-facing Application Load Balancer, HTTPS listener on 443 with an
-  ACM certificate in `us-west-2`, and an HTTP listener that redirects to
-  HTTPS. Two target groups: Bifrost on 8080 (health check `/health`) and
-  oauth2-proxy on 4180 (health check `/ping`).
+  ACM certificate in `us-west-2`. No HTTP listener and no port 80: the port is
+  closed, because on the inference routes a redirect-to-HTTPS listener turned
+  Bifrost's trailing-slash `301 Location: http://…` into a cleartext round trip
+  that carried the virtual key. `ingress.ts` records the chain. Two target
+  groups: Bifrost on 8080 (health check `/health`) and oauth2-proxy on 4180
+  (health check `/ping`).
 - A Route 53 alias record for `bifrost.workbench.goodparty.org` pointing at
   the ALB.
 - The workbench account owns no zone today, and review settled on giving it

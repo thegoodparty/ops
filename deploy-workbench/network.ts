@@ -89,7 +89,19 @@ export const SUBNETS: SubnetSpec[] = [
 export const BIFROST_PORT = 8080;
 export const OAUTH2_PROXY_PORT = 4180;
 
-/** The ALB listeners (item 6) and the database port (item 7). */
+/**
+ * Port 80, kept as a reference but **not opened and not listened on**.
+ *
+ * `createWorkbenchNetwork` used to admit it to the ALB security group so
+ * `ingress.ts` could run a redirect-to-HTTPS listener. Both are gone: on the
+ * inference routes that redirect was an active downgrade of the virtual key
+ * (see "No port 80" in `ingress.ts`), so the port is closed instead.
+ *
+ * The constant stays because it is the port a reader will look for, and
+ * because `network.test.ts` asserts that no rule in the ALB group admits it. A
+ * future change that means to serve port 80 has to delete that assertion and
+ * this comment, which is the review this is here to force.
+ */
 export const HTTP_PORT = 80;
 export const HTTPS_PORT = 443;
 export const POSTGRES_PORT = 5432;
@@ -347,9 +359,11 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
     { provider },
   );
 
-  // ALB ingress: 443 and 80 from anywhere. 80 exists only to redirect to 443
-  // (item 6); it is opened now so the listener can be added without touching
-  // the group.
+  // ALB ingress: 443 from anywhere, and nothing else. 80 is deliberately not
+  // opened: `ingress.ts` has no HTTP listener, and the port is closed so that a
+  // client following Bifrost's `http://` trailing-slash redirect fails to
+  // connect rather than re-sending its virtual key in cleartext. See "No port
+  // 80" in `ingress.ts` for the whole chain.
   new aws.vpc.SecurityGroupIngressRule(
     "bifrostAlbIngressHttps",
     {
@@ -358,19 +372,6 @@ export const createWorkbenchNetwork = (args: { provider: aws.Provider }) => {
       ipProtocol: "tcp",
       fromPort: HTTPS_PORT,
       toPort: HTTPS_PORT,
-      cidrIpv4: "0.0.0.0/0",
-    },
-    { provider },
-  );
-
-  new aws.vpc.SecurityGroupIngressRule(
-    "bifrostAlbIngressHttp",
-    {
-      securityGroupId: albSecurityGroup.id,
-      description: "http from the internet, redirected to https",
-      ipProtocol: "tcp",
-      fromPort: HTTP_PORT,
-      toPort: HTTP_PORT,
       cidrIpv4: "0.0.0.0/0",
     },
     { provider },
