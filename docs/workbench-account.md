@@ -419,6 +419,7 @@ Facts discovered during implementation go here as they are learned:
   subscribes to them. Every entry selects a `global.` cross-region inference
   profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
   `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
+  `openai.gpt-6.1-terra`,
   `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
   `moonshotai.kimi-k3`. Each entry's outgoing `us.` profile stays permitted
   through `transitionalInvokeIds` until `gp-pi` has shipped the switch. The

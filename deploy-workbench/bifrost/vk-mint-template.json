@@ -9,6 +9,7 @@
         "global.anthropic.claude-opus-5-5",
         "global.moonshotai.kimi-k3",
         "global.openai.gpt-6.1-sol",
+        "global.openai.gpt-6.1-terra",
         "global.anthropic.claude-haiku-5-5",
         "global.xai.grok-4.7",
         "global.zai.glm-5.3"

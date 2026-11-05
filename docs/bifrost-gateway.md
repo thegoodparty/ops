@@ -821,7 +821,7 @@ they diverged rather than averaging them:
 - **Every Bedrock id in the list is a real, active `global.` inference
   profile.** Checked against the account on 2026-11-04 with
   `bedrock:ListInferenceProfiles` and `GetInferenceProfile` in `us-west-2`: all
-  seven are `SYSTEM_DEFINED` and `ACTIVE`. `ListFoundationModels` also reports
+  seven (checked before Terra joined; Terra is unverified until the enabling run) are `SYSTEM_DEFINED` and `ACTIVE`. `ListFoundationModels` also reports
   each of the seven as `inferenceTypesSupported: [INFERENCE_PROFILE]`, so the
   profile is not an option for these models — it is the only way to invoke
   them, which is why a bare id would be a dead entry. The `us.` sibling exists
@@ -1227,7 +1227,7 @@ What genuinely remains open:
   exercised upstream. What remains is not a decision but a test: item 23
   rehearses the restore.
 - **Model allowlist: answered under "Inference residency" in "Provider
-  configuration".** The Bedrock list is seven `global.` profiles and the
+  configuration".** The Bedrock list is eight `global.` profiles and the
   Fireworks list is one US-only router on the US-only host, and the Bedrock
   half is no longer a residency control. What is left of this question is the
   pricing half, and it is sharper rather than smaller: US-only Serverless is 1.5x

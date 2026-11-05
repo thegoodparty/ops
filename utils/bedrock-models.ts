@@ -107,6 +107,13 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "Marketplace product prod-qco655ut2vn54; replaced gpt-5.6-sol and gpt-5.6-terra",
   },
   {
+    id: "openai.gpt-6.1-terra",
+    invokeId: "global.openai.gpt-6.1-terra",
+    crossRegion: true,
+    transitionalInvokeIds: ["us.openai.gpt-6.1-terra"],
+    note: "added alongside gpt-6.1-sol; the Marketplace agreement is created by enable-bedrock-models, so the product id is not recorded here until that run reports it",
+  },
+  {
     id: "anthropic.claude-haiku-5-5",
     invokeId: "global.anthropic.claude-haiku-5-5",
     crossRegion: true,
