@@ -411,8 +411,11 @@ describe("bifrost ecs", () => {
 
   it("scopes the task role to the model list, not to wildcard resources", () => {
     // The plan: "The role is scoped to the model list in
-    // utils/bedrock-models.ts". Composed here from the same function
-    // WorkbenchAccess uses, so adding a model there reaches the gateway too.
+    // utils/bedrock-models.ts". It is now the only invoke grant in the
+    // account — `WorkbenchAccess` holds none — so this statement is the whole
+    // Bedrock allowlist rather than half of it. The exact match between this
+    // list and the profiles the gateway serves is asserted in the module that
+    // owns that drift (`deploy-workbench/bifrost/config.test.ts`).
     const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
       `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-x`,
     ]);
@@ -431,6 +434,16 @@ describe("bifrost ecs", () => {
       );
     }
     assert.ok(ECS_SOURCE.includes("bedrockInvokeResources()"));
+
+    // No `us.` geo profile in the grant. The rollover that permitted each
+    // entry's outgoing `us.` profile alongside its `global.` one is finished,
+    // and this keeps a reintroduction visible in the role rather than only in
+    // the list.
+    assert.equal(
+      resources.some((arn) => arn.includes(":inference-profile/us.")),
+      false,
+      "the task role permits a us. geo inference profile; only each model's global. profile is served",
+    );
   });
 
   it("has no wildcard IAM action or a wildcard resource on either role", () => {

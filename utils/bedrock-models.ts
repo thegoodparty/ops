@@ -22,12 +22,19 @@ import { WORKBENCH_ACCOUNT_ID } from "./accounts";
  * costs, is in `docs/bifrost-gateway.md` under "Inference residency" and in
  * `docs/workbench-account.md` under "Changing a model's inference profile".
  *
- * The `us.` geo profile of each entry is still permitted, through
- * `transitionalInvokeIds`, because a container built before the switch selects
- * it. That is a rollover, not a convention: the follow-up that clears the
- * field returns the policy to one profile per model.
+ * No `us.` geo profile is permitted any more, by any principal. The 2026-11-04
+ * move to `global.` carried each entry's outgoing `us.` profile in
+ * `transitionalInvokeIds` so a `gp-pi` image built before the switch would not
+ * fail mid-session, and that rollover has finished: the field is gone, so the
+ * policy names one profile per model. The half of that switch worth keeping in
+ * mind is who held the grant. `WorkbenchAccess` — every engineer's own
+ * session — used to name these models too; it does not now. Bifrost's task
+ * role is the only principal that may invoke a Bedrock model, and the model
+ * list is what its policy is built from. That is why this file reads as *the*
+ * allowlist rather than as one of several.
  *
- * See `docs/workbench-account.md`, steps 11 and 15.
+ * See `docs/workbench-account.md`, steps 11 and 15, and
+ * `docs/bifrost-gateway.md`, "Direct Bedrock access is gone".
  */
 
 export type BedrockModel = {
@@ -45,30 +52,30 @@ export type BedrockModel = {
   invokeId: string;
   /** True when `invokeId` is a cross-region inference profile. */
   crossRegion: boolean;
-  /**
-   * Extra inference profiles to permit alongside `invokeId`, and only for as
-   * long as a profile change is rolling out.
-   *
-   * A profile change moves `invokeId` from one profile to another on the same
-   * foundation model, so unlike a model replacement there is no new `id` to
-   * add and no agreement to create: only the IAM resource moves. Dropping the
-   * old profile's ARN in the same change that adds the new one would take
-   * access away from every `gp-pi` image still selecting the old profile,
-   * which is the mid-session AccessDenied the three-merge order exists to
-   * avoid. So the old profile stays here until `gp-pi` has shipped the switch,
-   * and is removed in a follow-up. An entry that keeps one is a permanent
-   * second profile, which is a data-residency decision rather than a
-   * transition. See `docs/workbench-account.md`, "Changing a model's
-   * inference profile".
-   *
-   * Every entry below carries the outgoing `us.` geo profile for exactly this
-   * reason: `invokeId` moved from `us.` to `global.` on 2026-11-04, and a
-   * container built before that still selects `us.`. The follow-up clears the
-   * field once nothing does.
-   */
-  transitionalInvokeIds?: string[];
   note?: string;
 };
+
+/**
+ * Where the 2026-11-04 rollover used to live, and why it is gone.
+ *
+ * A profile change moves `invokeId` from one profile to another on the same
+ * foundation model, so unlike a model replacement there is no new `id` to add
+ * and no agreement to create: only the IAM resource moves. Dropping the old
+ * profile's ARN in the same change that added the new one would take access
+ * away from every `gp-pi` image still selecting the old profile, which is the
+ * mid-session AccessDenied the three-merge order exists to avoid. So the
+ * outgoing `us.` profile stayed permitted through a `transitionalInvokeIds`
+ * field on each entry until `gp-pi` shipped the switch, and this is the
+ * follow-up that removes it.
+ *
+ * Restated here rather than deleted, because the shape comes back every time a
+ * profile moves: add the new profile, list the old one somewhere, delete the
+ * old one when nothing selects it. The follow-up is the step that is easy to
+ * forget, and leaving a `transitionalInvokeIds` field in the type is what made
+ * forgetting it silent. It is not coming back as a field: a second profile on
+ * an entry is now a data-residency decision, and this account has made its
+ * peace with `global.` (`docs/bifrost-gateway.md`, "Inference residency").
+ */
 
 export const WORKBENCH_MODELS: BedrockModel[] = [
   {
@@ -78,60 +85,53 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     // moved to the geo profile for residency, keeping `global.` transitional.
     // On 2026-11-04 the account moved every Bedrock model back to its
     // `global.` profile to stop paying the geo premium, so the pair swapped
-    // again: `invokeId` is `global.` and `us.` is the rollover.
+    // again: `invokeId` is `global.`, and the `us.` rollover that kept the
+    // old images working has since been removed.
     id: "anthropic.claude-sonnet-5-5",
     invokeId: "global.anthropic.claude-sonnet-5-5",
     crossRegion: true,
-    transitionalInvokeIds: ["us.anthropic.claude-sonnet-5-5"],
-    note: "moved to the global profile on 2026-11-04, about 10% cheaper than the geo profile; the us. profile was added 2026-10-01 and is now the rollover",
+    note: "moved to the global profile on 2026-11-04, about 10% cheaper than the geo profile; the us. profile was added 2026-10-01 and removed with the rollover",
   },
   {
     id: "anthropic.claude-opus-5-5",
     invokeId: "global.anthropic.claude-opus-5-5",
     crossRegion: true,
-    transitionalInvokeIds: ["us.anthropic.claude-opus-5-5"],
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and a cross-region profile is mandatory",
   },
   {
     id: "moonshotai.kimi-k3",
     invokeId: "global.moonshotai.kimi-k3",
     crossRegion: true,
-    transitionalInvokeIds: ["us.moonshotai.kimi-k3"],
     note: "no in-region support in any region, so a cross-region profile is mandatory",
   },
   {
     id: "openai.gpt-6.1-sol",
     invokeId: "global.openai.gpt-6.1-sol",
     crossRegion: true,
-    transitionalInvokeIds: ["us.openai.gpt-6.1-sol"],
     note: "Marketplace product prod-qco655ut2vn54; replaced gpt-5.6-sol and gpt-5.6-terra",
   },
   {
     id: "openai.gpt-6.1-terra",
     invokeId: "global.openai.gpt-6.1-terra",
     crossRegion: true,
-    transitionalInvokeIds: ["us.openai.gpt-6.1-terra"],
     note: "added alongside gpt-6.1-sol; the Marketplace agreement is created by enable-bedrock-models, so the product id is not recorded here until that run reports it",
   },
   {
     id: "anthropic.claude-haiku-5-5",
     invokeId: "global.anthropic.claude-haiku-5-5",
     crossRegion: true,
-    transitionalInvokeIds: ["us.anthropic.claude-haiku-5-5"],
     note: "Marketplace product prod-6cyn7tgqazjhu",
   },
   {
     id: "xai.grok-4.7",
     invokeId: "global.xai.grok-4.7",
     crossRegion: true,
-    transitionalInvokeIds: ["us.xai.grok-4.7"],
-    note: "not sold through Marketplace, IAM only; replaced grok-4.6",
+    note: "not sold through Marketplace, IAM only; replaced grok-4.6; the us. profile existed and was never used",
   },
   {
     id: "zai.glm-5.3",
     invokeId: "global.zai.glm-5.3",
     crossRegion: true,
-    transitionalInvokeIds: ["us.zai.glm-5.3"],
     note: "global. and us. profiles both exist; access in this account is unverified when granted; replaced glm-5",
   },
 ];
@@ -160,11 +160,6 @@ export const bedrockInvokeResources = (
 ): string[] => [
   ...WORKBENCH_MODELS.filter((m) => m.crossRegion).map(
     (m) => `arn:aws:bedrock:*:${accountId}:inference-profile/${m.invokeId}`
-  ),
-  ...WORKBENCH_MODELS.flatMap((m) =>
-    (m.transitionalInvokeIds ?? []).map(
-      (id) => `arn:aws:bedrock:*:${accountId}:inference-profile/${id}`
-    )
   ),
   ...WORKBENCH_MODELS.map(
     (m) => `arn:aws:bedrock:*::foundation-model/${m.id}`
