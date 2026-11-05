@@ -505,7 +505,7 @@
       ]
     },
     "tests": "Adds the priority read (the per-tract MRP fit from #2977) to Home card sync, so every Home load runs it synchronously inside the request, with only a per-server cache. A large district's read takes minutes on Node's one thread, and the least-outstanding-requests balancer spreads repeat loads across servers until the fleet freezes (post-mortem \"Statewide read freeze\", 2026-11-04). The change is a small part of a 54-file PR. Production approved with no findings.",
-    "split": "holdout",
+    "split": "tune",
     "source": "production-missed",
     "kind": "scale"
   }

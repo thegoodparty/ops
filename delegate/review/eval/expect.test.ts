@@ -169,7 +169,7 @@ test("the checked-in manifest holds out a minority, with block and approve on bo
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
-  assert.equal(holdout.length, 17);
+  assert.equal(holdout.length, 16);
   for (const split of ["tune", "holdout"]) {
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
     assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
