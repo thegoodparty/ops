@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   AVAILABILITY_ZONES,
   BIFROST_PORT,
@@ -104,6 +106,23 @@ describe("workbench network layout", () => {
     assert.equal(POSTGRES_PORT, 5432);
     assert.equal(HTTP_PORT, 80);
     assert.equal(HTTPS_PORT, 443);
+  });
+
+  it("does not open port 80 on any security group it creates", () => {
+    // The ALB group used to admit 80 so `ingress.ts` could redirect to HTTPS.
+    // That redirect was a downgrade of the virtual key on the inference routes
+    // (see "No port 80" in `ingress.ts`), so the port is closed. Read as
+    // source rather than standing up Pulumi: the assertion is about a literal
+    // that is written in the file either way, the same reason
+    // `security-group-descriptions.test.ts` reads these programs as text.
+    //
+    // Matched on the literal `80` as well as on `HTTP_PORT`, so a rule written
+    // with the number rather than the constant does not slip past.
+    const source = fs.readFileSync(path.resolve(__dirname, "network.ts"), "utf8");
+    assert.ok(
+      !/fromPort:\s*(?:HTTP_PORT|80)\b/.test(source),
+      "network.ts opens port 80; port 80 must stay closed",
+    );
   });
 
   it("names the DB subnet group item 7 will reference", () => {
