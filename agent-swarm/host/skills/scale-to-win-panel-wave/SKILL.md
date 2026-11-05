@@ -31,10 +31,12 @@ Before you do anything, read the record:
 - `needs_human`: stop. Do nothing, do not post. A person must clear it.
 - `schedule` and the state is already `built`, `scheduled` or `replies_uploaded`: stop.
 - `export_replies` and the state is already `replies_uploaded`: stop.
-- `export_replies` and the state is not `scheduled`: stop and escalate (step `precheck`).
+- `export_replies` and the state is not `scheduled` or `built`: stop and escalate (step
+  `precheck`).
 - `schedule` and `sendAt` is less than 30 minutes away or past: escalate (step
   `precheck`, cause "send time passed or too close").
-- Otherwise set `state: 'building'` for `schedule` (keep `scheduled` for `export_replies`).
+- Otherwise set `state: 'building'` for `schedule` (keep the state as is for
+  `export_replies`).
 
 ## Helpers
 
