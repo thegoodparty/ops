@@ -149,8 +149,10 @@ provider that project requires:
   that renders the provider's model list — `bedrock:ListFoundationModels`,
   which Bedrock gives no resource type to scope and which the dashboard's
   provider page needs — and the SCP's existing `bedrock` exemption keeps
-  cross-region profile calls working (a `us.` geo profile and a `global.` one
-  alike; see "Inference residency").
+  cross-region profile calls working. That exemption is what makes a `global.`
+  profile usable at all: blocking any one destination region fails the request
+  outright, so the region deny has to leave the whole service alone (see
+  "Inference residency").
 
 Alternatives considered and not chosen: the EC2 + EBS + DLM host pattern in
 `deploy-infrastructure/agent-swarm.ts` (the engineer's direction is Fargate,
@@ -884,8 +886,10 @@ profile the config selects — which is now `global.`.
 in practice and by contract on this deployment, and it is the provider the
 fleet's default model runs on. Bedrock is not: it is globally routed, and the
 only account-level control that would differentiate it from a globally routed
-Fireworks call does not exist, because the SCP exempts `bedrock` wholesale
-(the `us.` profiles needed that too). The line is held by the model list, and
+Fireworks call does not exist, because the SCP exempts `bedrock` wholesale — and
+it has to, since a `global.` profile's destination set is not a region list this
+account controls and blocking any one of them fails the request. The line is held
+by the model list, and
 since 2026-11-04 that list is a decision about models rather than about
 geography. `config.test.ts` asserts both halves, separately, so neither can go
 soft by being rewritten into the other.
