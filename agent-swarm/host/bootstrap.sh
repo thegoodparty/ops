@@ -167,9 +167,17 @@ else
   echo "lead profile: SOUL.md and IDENTITY.md set from soul/"
 fi
 
+# The model is a custom id as far as agent-swarm is concerned: its catalog
+# (models.dev, `fireworks-ai`) lists no US-only router, so the runtime PATCH
+# would 400 on "Unknown model" without `allow_custom_model`. The id is not
+# merely uncatalogued either -- it is deliberate, and models.json in
+# global-setup-script.sh is what makes pi able to run it. The harness family
+# guard is unaffected: only claude/claude-managed/codex/grok are judged by
+# family, so the `pi` harness takes this id as given on the claim path too.
 for pair in "lead:$LEAD:$LEAD_MODEL" "coder:$CODER:$WORKER_MODEL" "reviewer:$REVIEWER:$WORKER_MODEL"; do
   IFS=: read -r name agent model <<<"$pair"
-  jq -n --arg h "$HARNESS" --arg m "$model" '{harness_provider: $h, model: $m}' \
+  jq -n --arg h "$HARNESS" --arg m "$model" \
+    '{harness_provider: $h, model: $m, allow_custom_model: true}' \
     | api PATCH "/api/agents/$agent/runtime" -d @- >/dev/null
   echo "$name runtime: $HARNESS, $model"
 done
