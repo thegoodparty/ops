@@ -152,6 +152,15 @@ fi
 # volume and is already chowned to worker by the entrypoint before this hook
 # runs.
 PI_AGENT_DIR=/workspace/personal/.pi
+# This runs as root, and /workspace/personal is the worker's own volume, which
+# the worker is free to write to. `install -d` on an existing path applies the
+# owner and mode to it, so a symlink planted at .pi could hand root-chowned
+# access to another directory. Refuse anything at that path that is not a
+# plain directory (or absent), before root touches it.
+if [ -L "$PI_AGENT_DIR" ] || { [ -e "$PI_AGENT_DIR" ] && [ ! -d "$PI_AGENT_DIR" ]; }; then
+  echo "setup: $PI_AGENT_DIR is not a plain directory; replacing it" >&2
+  rm -rf "$PI_AGENT_DIR"
+fi
 install -d -o worker -g worker -m 755 "$PI_AGENT_DIR"
 
 # Written every container start, into a temp file and renamed, so a rerun is

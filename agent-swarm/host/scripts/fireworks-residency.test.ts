@@ -206,17 +206,49 @@ describe('agent-swarm inference residency', () => {
     )
     const referenced = (legacy.apiKey ?? '').slice(1)
     // The name must be one nothing provides. If a real key var were used here,
-    // every global Fireworks model would be runnable.
+    // pi would try that many attempts against every global Fireworks model.
     for (const file of [SETUP_SCRIPT, COMPOSE, RENDER_ENV]) {
       assert.ok(
         !new RegExp(`^\\s*${referenced}:`, 'm').test(read(file)),
-        `the built-in fireworks provider's key variable ${referenced} is provided by ${path.basename(file)}, which re-enables every global model`,
+        `the built-in fireworks provider's key variable ${referenced} is provided by ${path.basename(file)}`,
       )
     }
+    assert.ok(
+      !read(COMPOSE).includes(`${referenced}:`),
+      `${referenced} must not be passed into the container either`,
+    )
     assert.equal(
       legacy.baseUrl,
       US_BASE_URL,
       'even the disabled built-in block must not name the global host',
+    )
+  })
+
+  it('has no environment variable that could satisfy the built-in fireworks provider', () => {
+    // The mechanism above is subtle and worth pinning, because the plausible
+    // alternative reading ("an unresolved $VAR falls through to the provider's
+    // own FIREWORKS_API_KEY") is false but easy to believe: pi 1.5.0's
+    // resolveConfigValueOrThrow THROWS when a models.json reference does not
+    // resolve, and composeApiKeyAuth resolves rawKey instead of delegating to
+    // the provider's inherited auth, so the real key is never consulted.
+    //
+    // What this test can state without spawning pi is the property that makes
+    // that true: the only Fireworks key in the container is FIREWORKS_API_KEY,
+    // and the disabled block does not name it. Behaviour was verified out of
+    // band by setting FIREWORKS_API_KEY and running a global id, which fails
+    // with "No API key found for fireworks" and sends no request.
+    const compose = read(COMPOSE)
+    const keyNames = [...compose.matchAll(/^\s+(FIREWORKS[A-Z0-9_]*):/gm)].map((m) => m[1])
+    assert.deepEqual(
+      [...new Set(keyNames)],
+      ['FIREWORKS_API_KEY'],
+      'the container must receive exactly one Fireworks key variable',
+    )
+    const legacyKey = provider(loadModels(), 'fireworks').apiKey
+    assert.notEqual(
+      legacyKey,
+      '$FIREWORKS_API_KEY',
+      'the disabled built-in provider must not reference the real key; that is the whole containment',
     )
   })
 
@@ -284,6 +316,14 @@ describe('agent-swarm inference residency', () => {
       'the setup script must rename models.json into the agent dir',
     )
     assert.match(setup, /^chown worker:worker "\$PI_MODELS_TMP"$/m)
+    // The block runs as root against a path on the worker's own volume, so a
+    // symlink planted there would let root chown/`install -d` an arbitrary
+    // target. It must refuse a non-directory before touching it.
+    assert.match(
+      setup,
+      /if \[ -L "\$PI_AGENT_DIR" \] \|\| \{ \[ -e "\$PI_AGENT_DIR" \] && \[ ! -d "\$PI_AGENT_DIR" \]; \}; then/,
+      'the setup script must refuse a symlink or non-directory at the agent dir before writing there as root',
+    )
   })
 
   it('mentions no Fireworks model id that is not a US-only router', () => {
