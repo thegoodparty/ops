@@ -108,6 +108,105 @@
     "kind": "bug"
   },
   {
+    "id": "omni-3276-self-set-internal-email",
+    "suite": "core",
+    "key": "reviews/thegoodparty/omni/3276/b00ab4d36a17021b2490ce9c3a6304245e5c47d7/d6e1a243-3c19-45fc-be14-c55d3d8cea0b.json",
+    "tests": "Two production runs on this commit disagreed: one approved, one caught that hasInternalOwner skips every free-robocall eligibility rule for an owner whose email ends in @goodparty.org, an email the user can set through PUT /v1/users/me.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "ops-377-config-arn-never-redeploys",
+    "suite": "core",
+    "key": "reviews/thegoodparty/ops/377/3baecb320966f102d6ef8622c80e5c4bad1edc14/09fc0eb4-ea03-47b5-85a8-ddc81c888419.json",
+    "tests": "The task definition reads the gateway config by its SSM parameter ARN, which does not change when the value does, so a config.json edit never reaches a running task. Production caught it; the author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "ops-379-alb-kills-slow-boot",
+    "suite": "core",
+    "key": "reviews/thegoodparty/ops/379/c54f9b8cbc20edebbf492d4b255c77bc35df3df0/09d58fc3-e9f2-46e0-9c50-6b43a58ee786.json",
+    "tests": "A tighter ALB health check fails a migrating boot after about 30s, and the ECS service has no healthCheckGracePeriod, so startPeriod does not cover it. Production caught it; the author fixed it.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "ops-343-rolling-deploy-two-gateways",
+    "suite": "core",
+    "key": "reviews/thegoodparty/ops/343/a44db50839d121a5d3c90447e20732e712c29e36/9dd13228-8bd6-4508-b3e0-47b751180d2b.json",
+    "tests": "With no deploymentConfiguration, a desiredCount 1 service starts a second Bifrost task before stopping the first, breaking the single-node assumption. Production caught it; the author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2824-cancel-without-claim",
+    "suite": "core",
+    "key": "reviews/thegoodparty/omni/2824/649958fecba8459294e2dfbfaec5b644ba6d3dd2/d8a26163-77ce-41e2-83ae-bc92291528ec.json",
+    "tests": "The hold-model cancel reads the send's status, then deletes the Peerly job and releases the hold with no CAS, so an approve landing in between is cancelled under it. Production caught it; the author fixed it.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-3154-reconcile-window-misses-stale",
+    "suite": "core",
+    "key": "reviews/thegoodparty/omni/3154/8c3a8da030cd048ed98c47ee911cc9251d41d9d3/dbc5820d-eeec-4f9c-8522-9014964c23e7.json",
+    "tests": "The funding reconcile picks unpaid sends by updatedAt in the last 24 hours, so an unfunded send nobody touches again is reported once and then never. Production caught it; the author fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "gp-marketing-424-metadata-raw-name",
+    "suite": "core",
+    "key": "reviews/thegoodparty/gp-marketing/424/1171468dce9f9f535e9d6d67afb7e32c34eaeaa0/546c946c-7a57-4b06-938d-dcce80a1290f.json",
+    "tests": "The page body moved to officeDisplayName, but all eight generateMetadata functions still title the page with the raw position name. Production caught it; the author fixed it.",
+    "split": "holdout",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "gp-data-platform-1285-overlapping-age-bands",
+    "suite": "core",
+    "key": "reviews/thegoodparty/gp-data-platform/1285/17fb7fbbf2af4b9df1fcf39d875b36b94afbdb91/6b0f40c0-2ae7-45bb-a29f-a20e1395aa67.json",
+    "tests": "The all-options-ticked rule uses the family's column count, but the age family holds two band sets, so an audience ticking every band of one set reads as filtered. Production caught it; the author confirmed it in the data and fixed it.",
+    "split": "tune",
+    "source": "production-caught",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-2830-cutoff-general-only",
+    "suite": "core",
+    "key": "reviews/thegoodparty/omni/2830/1b2f6b87d6c6d3b5e7a7385da9ba6caa0091ef5c/4fbd321d-b164-4f5c-93b0-be20c19bec9c.json",
+    "tests": "Production flagged the SMS cutoff ignoring primary-only campaigns. The rule counts only the general election date, matching smsComplianceWindow in eligibility.util.ts; the author refuted it. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "gp-data-platform-1184-off-list-is-false",
+    "suite": "core",
+    "key": "reviews/thegoodparty/gp-data-platform/1184/861f92b5120fcf59835b0086985ac4525e63ace9/77886af5-e865-44b2-8cf4-225aa7661559.json",
+    "tests": "Production flagged an ICP flag returning false instead of null for a position missing from the seed. A missing seed row means the position is off the allow list, so false is correct; the author refuted it. Nothing to block.",
+    "split": "holdout",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "omni-2589-draft-backstop-asymmetry",
+    "suite": "core",
+    "key": "reviews/thegoodparty/omni/2589/35fe96a26b1f0cf54024b6a5724d9513ee671836/e08df688-ea90-467e-8316-d977e1b6a21e.json",
+    "tests": "Production flagged the legal-caution backstop running on a draft-step clarify turn. The clarifying question travels in tool arguments and the streamed text is one short lead-in, so the line cannot land on it; the author refuted it. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
     "id": "ops-302-mangled-prior-id",
     "suite": "re-review",
     "key": "reviews/thegoodparty/ops/302/95e56b588aa5164a15bf2bdafc1e9dcdf1525fb7/9e71d934-004e-424e-9dca-4e20607206bd.json",
