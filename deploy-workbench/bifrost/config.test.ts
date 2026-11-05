@@ -156,7 +156,7 @@ const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
  * entry is a US-only router on the US-only endpoint, which is unchanged and
  * still enforced by contract.
  *
- * Seven, down from eight: DeepSeek V3.2 is gone. Bedrock publishes no
+ * Eight: DeepSeek V3.2 is gone, and GPT-6.1 Terra joined Sol. Bedrock publishes no
  * `global.deepseek.v3.2` profile and no `us.` one either -- checked with
  * `bedrock:ListInferenceProfiles` in `us-west-2` on 2026-11-04, where the only
  * DeepSeek profile is `us.deepseek.r1-v1:0`, and `GetFoundationModel` reports
@@ -170,6 +170,7 @@ const SERVED_MODEL_CLASSES: Record<string, string[]> = {
     "global.anthropic.claude-opus-5-5",
     "global.moonshotai.kimi-k3",
     "global.openai.gpt-6.1-sol",
+    "global.openai.gpt-6.1-terra",
     "global.anthropic.claude-haiku-5-5",
     "global.xai.grok-4.7",
     "global.zai.glm-5.3",
@@ -578,7 +579,7 @@ describe("bifrost config.json", () => {
       assert.deepEqual(
         [...configured].sort(),
         [...expected].sort(),
-        `${name}'s classes drifted from the agreed seven; a class added is a residency and cost decision and one removed is a class the fleet loses`,
+        `${name}'s classes drifted from the agreed eight; a class added is a residency and cost decision and one removed is a class the fleet loses`,
       );
     }
     // And no provider outside that set: a third provider would be a model class
