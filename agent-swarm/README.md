@@ -291,7 +291,11 @@ only that part is a PR.
 The panel-wave scripts in `host/scripts/`, the `scale-to-win-panel-wave`
 skill in `host/skills/` and the lead's soul in `host/soul/` came in by PR.
 `bootstrap.sh` still pushes them on every run and overwrites any change made
-from Slack, so change those by PR until they are moved out of the repo.
+from Slack, so change those by PR until they are moved out of the repo. The
+same goes for the global config keys `SETUP_SCRIPT`, `TEVYN_API_CHANNEL_ID`
+and `PANEL_WAVE_AGENT_ID`, which `bootstrap.sh` rewrites on every run.
+`HANDOFF_ENV` and `REPLIES_BUCKET` are only written when missing, so a change
+to those from Slack survives a rerun.
 
 ## Changing agent behaviour
 
