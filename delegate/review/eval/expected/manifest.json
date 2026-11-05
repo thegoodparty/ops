@@ -369,5 +369,53 @@
     "split": "tune",
     "source": "refuted",
     "kind": "false-finding"
+  },
+  {
+    "id": "omni-2594-free-texts-stamp-race",
+    "key": "reviews/thegoodparty/omni/2594/630e62edbc32f47be7b45c44bee9d0bcad8a3b81/c3d850ff-2d90-41a3-a6d3-5fffb5e78f77.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/outreach/services/outreachPurchase.service.ts",
+        "packages/gp-api/src/outreach/services/outreachP2pSmsHold.service.ts"
+      ]
+    },
+    "tests": "The purchase handler stamps freeTextsApplied on the send before redeemFreeTexts runs its one-time CAS on the campaign. Two eligible sends on one campaign both get stamped, the loser's redeem throws, and its stamp stays, so capture discounts a send that never earned the offer. Production approved; fixed in 3dcf7432b by stamping inside the CAS winner's transaction.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
+  },
+  {
+    "id": "gp-data-platform-982-splink-source-dataset",
+    "key": "reviews/thegoodparty/gp-data-platform/982/6778c5fc2763391f3229c681e8bf88f05e43f280/9c8a962e-0cc6-4c46-88ce-151d4d346da7.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked on matcha/tests/test_pipeline.py reading a source_dataset column the PR renamed. The line is in an untouched smoke test on the Splink-native path, and Splink's Linker adds source_dataset itself for multi-table input; the matcha suite passed at this head. Nothing to block.",
+    "split": "holdout",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "omni-2946-hold-free-path-unreachable",
+    "key": "reviews/thegoodparty/omni/2946/58b4da323629ac37983d2cbbb6926928d82166d7/d93f7d4f-3860-49f8-9e6a-54b177d3604b.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked on SmsReviewStep.tsx treating a covered send as free while gp-api returns a real hold. resolveReadyHoldAmount in outreachPurchase.service.ts returns 0 when the offer covers a built list, and isFreeSend in SmsFlow.tsx keeps checkout waiting for the build, so a hold above 0 on a covered send cannot reach the review step. Nothing to block.",
+    "split": "tune",
+    "source": "refuted",
+    "kind": "false-finding"
+  },
+  {
+    "id": "omni-3126-race-floor-from-frame",
+    "key": "reviews/thegoodparty/omni/3126/5b35345d4ab4310075261f613ff21ca9e5ef6308/f4adcc5a-d9f3-441b-bfb8-a270dc864670.json",
+    "expect": {
+      "verdict": "approve"
+    },
+    "tests": "Production blocked on priorityResults.service.ts taking race from the census frame rather than the answers, while its own finding says the read is only held back longer, never released early. The sizing target and the floor are both frameAnswersNeeded of the same frame, so they agree by design. Nothing to block.",
+    "split": "holdout",
+    "source": "refuted",
+    "kind": "false-finding"
   }
 ]
