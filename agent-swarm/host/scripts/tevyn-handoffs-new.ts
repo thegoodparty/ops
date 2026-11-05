@@ -207,11 +207,19 @@ export const run = async (deps: Deps): Promise<Handoff[]> => {
   }
 
   // Claim after every Slack read has succeeded, so a failed fetch cannot
-  // consume ids it never returned. The cursor moves last.
+  // consume ids it never returned. The claim holds everything a later task
+  // needs, so an id that is never returned again can still be handled from KV.
+  // The cursor moves last.
   for (const handoff of fresh) {
     await deps.kv.set(`handoff:${handoff.outreachId}`, {
       state: 'new',
       slackTs: handoff.ts,
+      channel: handoff.channel,
+      sendAt: handoff.sendAt,
+      timeZone: handoff.timeZone,
+      mode: handoff.mode,
+      message: handoff.message,
+      recipientCount: handoff.recipientCount,
     })
   }
   await deps.kv.set(CURSOR_KEY, messages[messages.length - 1].ts)

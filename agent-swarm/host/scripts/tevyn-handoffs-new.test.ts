@@ -120,6 +120,12 @@ describe('run', () => {
     assert.deepEqual(h.kv.data.get('handoff:12345'), {
       state: 'new',
       slackTs: '1762560000.000100',
+      channel: CHANNEL,
+      sendAt: '2026-11-08T16:00:00.000Z',
+      timeZone: 'US/Eastern',
+      mode: 'shadow',
+      message: 'Town hall Saturday',
+      recipientCount: 42,
     })
     assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000100')
 

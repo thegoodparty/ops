@@ -18,8 +18,9 @@ Never put a constituent's phone number or reply text in Slack, KV or logs.
 
 KV key `handoff:<outreachId>` holds `state` (`new`, `building`, `built`, `scheduled`,
 `replies_uploaded`, `needs_human`), `campaignName`, `sendAt`, `repliesDueAt`
-(`sendAt` + 48h), `slackTs`, `attempts`. `tevyn-handoffs-new` wrote `{state:'new',
-slackTs}` and the tick added the hand-off fields. Always read the record, change fields,
+(`sendAt` + 48h), `slackTs`, `attempts` (with `attemptsFor`, the action the tick
+counted them for; leave both alone). `tevyn-handoffs-new` wrote the claim: `{state:'new',
+slackTs, channel, sendAt, timeZone, mode, message, recipientCount}`. Always read the record, change fields,
 and write it back whole. Never drop `slackTs` or any other field.
 
 Write the record after every step, and before every irreversible click, so a rerun

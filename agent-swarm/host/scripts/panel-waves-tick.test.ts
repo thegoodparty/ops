@@ -35,42 +35,46 @@ const memoryKv = (): Kv & {
   }
 }
 
-const newHandoff = (over: Record<string, unknown> = {}) => ({
-  outreachId: '12345',
+const claim = (over: Record<string, unknown> = {}) => ({
+  state: 'new',
+  slackTs: '1762600000.000100',
+  channel: 'C0TEVYN',
   sendAt: SEND_AT,
   timeZone: 'US/Eastern',
   mode: 'auto',
-  env: 'dev',
-  repliesKey: 'agent-replies/12345.csv',
   message: 'Town hall Saturday, {{first_name}}',
   recipientCount: 42,
-  channel: 'C0TEVYN',
-  ts: '1762600000.000100',
   ...over,
 })
 
-const harness = (fresh: unknown[] = []) => {
+const harness = (records: Record<string, unknown> = {}) => {
   const kv = memoryKv()
+  for (const [id, record] of Object.entries(records)) {
+    kv.data.set(`handoff:${id}`, record)
+  }
   const sent: { task: string; tags: string[] }[] = []
+  let triggers = 0
   const deps: Deps = {
     kv,
     now: () => NOW,
-    runNewHandoffs: async () => fresh,
+    runNewHandoffs: async () => {
+      triggers += 1
+    },
     sendTask: async (args) => {
       sent.push(args)
       return `task-${sent.length}`
     },
   }
-  return { deps, kv, sent }
+  return { deps, kv, sent, triggers: () => triggers }
 }
 
 describe('panel-waves-tick', () => {
-  it('stores a new hand-off on its claim record and sends one schedule task', async () => {
-    const { deps, kv, sent } = harness([newHandoff()])
-    kv.data.set('handoff:12345', { state: 'new', slackTs: '1762600000.000100' })
+  it('sends one schedule task from a claim record', async () => {
+    const { deps, kv, sent, triggers } = harness({ '12345': claim() })
 
     const res = await run(deps)
 
+    assert.equal(triggers(), 1)
     assert.deepEqual(res.dispatched, [
       { outreachId: '12345', action: 'schedule', taskId: 'task-1' },
     ])
@@ -89,12 +93,13 @@ describe('panel-waves-tick', () => {
     const record = kv.data.get('handoff:12345') as Record<string, unknown>
     assert.equal(record.state, 'new')
     assert.equal(record.slackTs, '1762600000.000100')
-    assert.equal(record.repliesDueAt, '2026-11-10T16:00:00.000Z')
+    assert.equal(fields.repliesDueAt, '2026-11-10T16:00:00.000Z')
     assert.equal(record.attempts, 1)
+    assert.equal(record.attemptsFor, 'schedule')
   })
 
   it('writes the lease before sending, with a one hour expiry', async () => {
-    const { deps, kv } = harness([newHandoff()])
+    const { deps, kv } = harness({ '12345': claim() })
     let leaseAtSend: unknown = null
     deps.sendTask = async () => {
       leaseAtSend = kv.data.get('lease:12345')
@@ -193,6 +198,7 @@ describe('panel-waves-tick', () => {
       sendAt: SEND_AT,
       slackTs: 's',
       attempts: 5,
+      attemptsFor: 'schedule',
     })
     kv.data.set('handoff:3', 'garbage')
 
@@ -207,7 +213,7 @@ describe('panel-waves-tick', () => {
   })
 
   it('drops the lease when the task cannot be created, so the next tick retries', async () => {
-    const { deps, kv } = harness([newHandoff()])
+    const { deps, kv } = harness({ '12345': claim() })
     deps.sendTask = async () => null
 
     const res = await run(deps)
@@ -221,10 +227,10 @@ describe('panel-waves-tick', () => {
   })
 
   it('handles two waves in one tick with one task each', async () => {
-    const { deps, sent } = harness([
-      newHandoff(),
-      newHandoff({ outreachId: '67890', ts: '1762600001.000100' }),
-    ])
+    const { deps, sent } = harness({
+      '12345': claim(),
+      '67890': claim({ slackTs: '1762600001.000100' }),
+    })
     const res = await run(deps)
     assert.deepEqual(
       res.dispatched.map((d) => d.outreachId),
@@ -233,10 +239,35 @@ describe('panel-waves-tick', () => {
     assert.equal(sent.length, 2)
   })
 
-  it('rejects a malformed hand-off list before writing anything', async () => {
-    const { deps, kv } = harness([{ outreachId: 'abc' }])
-    await assert.rejects(run(deps))
-    assert.equal(kv.data.size, 0)
+  it('still scans KV when the new hand-offs script fails', async () => {
+    const { deps, sent } = harness({ '12345': claim() })
+    deps.runNewHandoffs = async () => {
+      throw new Error('boom')
+    }
+    const res = await run(deps)
+    assert.equal(res.triggerFailed, true)
+    assert.equal(sent.length, 1)
+  })
+
+  it('counts attempts per action, so a wave that used its building attempts still exports', async () => {
+    const { deps, kv, sent } = harness({
+      '12345': claim({
+        state: 'scheduled',
+        attempts: 5,
+        attemptsFor: 'schedule',
+      }),
+    })
+    deps.now = () => Date.parse('2026-11-10T16:00:00Z')
+
+    const res = await run(deps)
+
+    assert.deepEqual(res.dispatched, [
+      { outreachId: '12345', action: 'export_replies', taskId: 'task-1' },
+    ])
+    assert.equal(sent.length, 1)
+    const record = kv.data.get('handoff:12345') as Record<string, unknown>
+    assert.equal(record.attempts, 1)
+    assert.equal(record.attemptsFor, 'export_replies')
   })
 
   it('exposes the helpers the skill relies on', () => {

@@ -17,17 +17,6 @@ const NEW_HANDOFFS_SCRIPT = 'tevyn-handoffs-new'
 
 export const argsSchema = z.object({})
 
-const newHandoffSchema = z.object({
-  outreachId: z.string().regex(/^\d+$/),
-  sendAt: z.string().datetime(),
-  timeZone: z.string().min(1),
-  mode: z.enum(['shadow', 'auto']),
-  message: z.string(),
-  recipientCount: z.number(),
-  channel: z.string().min(1),
-  ts: z.string().min(1),
-})
-
 const scriptRunSchema = z.object({
   data: z.object({
     exitCode: z.number(),
@@ -47,6 +36,7 @@ const recordSchema = z.object({
   message: z.string().optional(),
   recipientCount: z.number().optional(),
   attempts: z.number().optional(),
+  attemptsFor: z.string().optional(),
 })
 
 const leaseSchema = z.object({ expiresAt: z.number() })
@@ -65,7 +55,7 @@ export type Kv = {
 
 export type Deps = {
   kv: Kv
-  runNewHandoffs: () => Promise<unknown>
+  runNewHandoffs: () => Promise<void>
   sendTask: (args: { task: string; tags: string[] }) => Promise<string | null>
   now?: () => number
 }
@@ -74,6 +64,7 @@ export type TickResult = {
   dispatched: { outreachId: string; action: Action; taskId: string }[]
   skipped: { outreachId: string; reason: string }[]
   failed: { outreachId: string; action: Action }[]
+  triggerFailed?: true
 }
 
 export const repliesDueAtOf = (sendAt: string): string =>
@@ -87,6 +78,11 @@ export const taskTextFor = (
   `Handle ${outreachId} (${action}) following the scale-to-win-panel-wave skill.\n\n` +
   `handoff: ${JSON.stringify({ action, outreachId, ...fields })}`
 
+const attemptsFor = (
+  record: z.infer<typeof recordSchema>,
+  action: Action,
+): number => (record.attemptsFor === action ? (record.attempts ?? 0) : 0)
+
 const pickAction = (
   record: z.infer<typeof recordSchema>,
   now: number,
@@ -94,7 +90,9 @@ const pickAction = (
 ): Action | string => {
   if (record.state === 'new' || record.state === 'building') {
     if (record.sendAt === undefined) return 'no hand-off details stored'
-    if ((record.attempts ?? 0) >= MAX_ATTEMPTS) return 'attempts exhausted'
+    if (attemptsFor(record, 'schedule') >= MAX_ATTEMPTS) {
+      return 'attempts exhausted'
+    }
     // A building record without a live lease is a task that died mid-run;
     // the skill resumes from the stored state.
     return leaseLive ? 'lease live' : 'schedule'
@@ -104,7 +102,9 @@ const pickAction = (
       record.repliesDueAt ?? (record.sendAt && repliesDueAtOf(record.sendAt))
     if (due === undefined) return 'no hand-off details stored'
     if (now < Date.parse(due)) return 'replies not due'
-    if ((record.attempts ?? 0) >= MAX_ATTEMPTS) return 'attempts exhausted'
+    if (attemptsFor(record, 'export_replies') >= MAX_ATTEMPTS) {
+      return 'attempts exhausted'
+    }
     return leaseLive ? 'lease live' : 'export_replies'
   }
   return `state ${record.state}`
@@ -114,26 +114,13 @@ export const run = async (deps: Deps): Promise<TickResult> => {
   const now = deps.now?.() ?? Date.now()
   const result: TickResult = { dispatched: [], skipped: [], failed: [] }
 
-  // tevyn-handoffs-new claims each id as {state:'new', slackTs} before it
-  // returns, and never returns it again. Store everything the task needs on
-  // that record first, so a tick that dies before sending can be recovered
-  // from KV on the next run.
-  const fresh = z.array(newHandoffSchema).parse(await deps.runNewHandoffs())
-  for (const h of fresh) {
-    const existing = await deps.kv.get(`${HANDOFF_PREFIX}${h.outreachId}`)
-    await deps.kv.set(`${HANDOFF_PREFIX}${h.outreachId}`, {
-      ...(typeof existing === 'object' && existing !== null ? existing : {}),
-      state: 'new',
-      slackTs: h.ts,
-      channel: h.channel,
-      sendAt: h.sendAt,
-      repliesDueAt: repliesDueAtOf(h.sendAt),
-      timeZone: h.timeZone,
-      mode: h.mode,
-      message: h.message,
-      recipientCount: h.recipientCount,
-      attempts: 0,
-    })
+  // tevyn-handoffs-new writes the full hand-off on each claim record, so the
+  // tick only triggers it. A failure here must not hide records claimed by an
+  // earlier run, so the KV scan below still happens.
+  try {
+    await deps.runNewHandoffs()
+  } catch {
+    result.triggerFailed = true
   }
 
   const entries: { key: string; value: unknown }[] = []
@@ -174,11 +161,14 @@ export const run = async (deps: Deps): Promise<TickResult> => {
     )
     await deps.kv.set(entry.key, {
       ...(entry.value as object),
-      attempts: (record.data.attempts ?? 0) + 1,
+      attempts: attemptsFor(record.data, action) + 1,
+      attemptsFor: action,
     })
     const fields: Record<string, unknown> = {
       sendAt: record.data.sendAt,
-      repliesDueAt: record.data.repliesDueAt,
+      repliesDueAt:
+        record.data.repliesDueAt ??
+        (record.data.sendAt && repliesDueAtOf(record.data.sendAt)),
       timeZone: record.data.timeZone,
       mode: record.data.mode,
       channel: record.data.channel,
@@ -253,7 +243,6 @@ export default async function (
           `${NEW_HANDOFFS_SCRIPT} failed: exit ${res.data.exitCode}${res.data.error ? ` ${res.data.error}` : ''}`,
         )
       }
-      return res.data.result
     },
     sendTask: async ({ task, tags }) => {
       // allowDuplicate: two waves posted close together read as near-copies

@@ -306,8 +306,9 @@ policy grants the other half.
 - `tevyn-handoffs-new` returns the hand-off posts it has not returned before,
   as compact JSON (outreachId, sendAt, timeZone, mode, repliesKey, message,
   recipientCount, channel, ts). It keeps a cursor in KV (`tevyn:cursor`) and
-  claims each outreach id as `handoff:<outreachId>` = `{ state: 'new', slackTs }`,
-  so an id is returned once. Posts without the "Delegate is handling this wave"
+  claims each outreach id as `handoff:<outreachId>` = `{ state: 'new', slackTs,
+  channel, sendAt, timeZone, mode, message, recipientCount }`, so an id is
+  returned once and can still be handled from KV if nobody got its output. Posts without the "Delegate is handling this wave"
   note or with an invalid machine block are skipped.
 - `tevyn-handoff-csv` (`channel`, `ts`) saves the post's recipient CSV under
   `/afs/tevyn-handoffs/` and returns only that path, never the Slack URL.
@@ -328,12 +329,11 @@ policy grants the other half.
   after the first deploy.
 - `panel-waves-tick` is the dispatcher, meant to run on a schedule (below). Each
   run it (1) runs `tevyn-handoffs-new` through `ctx.swarm.script_run`, because
-  catalog scripts cannot import each other, and writes the hand-off fields
-  (`sendAt`, `repliesDueAt`, `timeZone`, `mode`, `channel`, `message`,
-  `recipientCount`) onto each new `handoff:<outreachId>` record before anything
-  else, so a tick that dies before sending can be recovered from KV; (2) lists
+  catalog scripts cannot import each other, only to trigger the claim (the claim
+  record already holds the hand-off, so the output is ignored and a failed run
+  still leaves the KV scan, flagged as `triggerFailed`); (2) lists
   KV by the `handoff:` prefix; (3) for each record it should act on, writes
-  `lease:<outreachId>` with a one hour expiry and bumps `attempts`, then creates
+  `lease:<outreachId>` with a one hour expiry and bumps `attempts` (counted per action, with `attemptsFor`), then creates
   one coder task, "Handle <id> (schedule|export_replies) following the
   scale-to-win-panel-wave skill", `modelTier: regular`, carrying the hand-off
   fields as JSON. A record with a live lease is skipped, so a slow task is not
@@ -341,7 +341,7 @@ policy grants the other half.
   run retries. It acts on `new` records, on `building` records with no live
   lease (a task that died mid-run), and on `scheduled` records past
   `repliesDueAt`. It leaves `built`, `replies_uploaded` and `needs_human` alone,
-  and stops at 5 attempts. Its result lists `dispatched`, `skipped` (records
+  and stops at 5 attempts per action. Its result lists `dispatched`, `skipped` (records
   with no stored details, exhausted attempts, unreadable) and `failed`; look
   there when a wave seems stuck. It sends with `allowDuplicate: true` because two
   waves posted together read as near-copies to the duplicate check.
