@@ -1543,14 +1543,12 @@ out. Written for the 2026-11-04 switch, in the direction it actually ran:
 3. `ops` removes `transitionalInvokeIds`, once nothing offers the `us.` profile
    any more.
 
-**Step 3 ran, and the field is gone.** This section described it as a follow-up
-because it is the step that is easy to forget; it is recorded here as done so
-the next profile change is a plan with three steps rather than one with two.
-With the field removed there is no `transitionalInvokeIds` on any entry, no
-`us.` ARN in `bedrockInvokeResources()`, and `deploy/bedrock-models.test.ts`
-fails if either comes back. An entry that needs a second profile now is a
-permanent residency decision, not a transition, and that is the shape a future
-change would have to argue for explicitly.
+Step 3 is the one that gets forgotten, and the shape it leaves behind is worth
+knowing: once it is done, `transitionalInvokeIds` is not a field of `BedrockModel`
+in `utils/bedrock-models.ts`, so the policy names one `global.` profile per model
+and no `us.` ARN appears in it. `deploy/bedrock-models.test.ts` fails if either
+returns. An entry that needs a second profile is therefore a permanent residency
+decision rather than a transition, and it has to be argued for as one.
 
 ### What a model costs the policy
 
@@ -1579,14 +1577,14 @@ Not 3,881: the virtual-key mint grant and other statements landed after the
 2026-09-28 measurement, so anyone checking has to measure rather than continue
 the old series.
 
-**Re-measured again when the direct invoke grant was removed.** The composed
-`WorkbenchAccess` policy is now **ten statements at 3,482 bytes**, with no model
-ARN in it at all. The arithmetic, so the next reader can check it: the invoke
-statement and its 16 profile ARNs left, and the eight `us.` rollover ARNs went
-with `transitionalInvokeIds`, so no model ARN remains in the set. A single Deny
-replaced the Allow. The account's entire Bedrock resource list is now the
+**Measured with the direct invoke grant gone.** The composed `WorkbenchAccess`
+policy is **ten statements at 3,482 bytes**, with no model ARN in it at all.
+The arithmetic, so the next reader can check it: the invoke statement and its 16
+profile ARNs are gone, and the eight `us.` rollover ARNs went with
+`transitionalInvokeIds`, so no model ARN remains in the set. A single Deny
+stands where the Allow was. The account's entire Bedrock resource list is the
 gateway task role's 16 ARNs — eight `global.` profiles and eight foundation
-models — and the permission set's size stopped being the thing to watch. The
+models — and this permission set's size stopped being the thing to watch. The
 reason it is worth recording as a number at all is the opposite of the original
 note: the limit was never the constraint, and the 412 bytes the rollover cost
 were a hint that the list had two readers when it only needed one.

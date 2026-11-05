@@ -894,8 +894,9 @@ soft by being rewritten into the other.
 
 **Decision: `WorkbenchAccess` holds no Bedrock invoke, and Bifrost's task role
 is the only principal in the workbench account that may invoke a model.** This
-is the item 22 tightening the phased task list below always pointed at, and it
-is the piece phase F was waiting for.
+is the shape the phased task list's tighten item and phase F both described as
+the end state; it is recorded here as a decision rather than as progress, so a
+later change has something to disagree with.
 
 What it replaces. Until this change an engineer's SSO session carried the same
 four invoke actions on the same model list as the gateway's task role, as
@@ -1213,10 +1214,8 @@ long as the direct path is kept.
 - **Phase F — tighten.** Narrow `WorkbenchAccess`'s Bedrock invoke to what the
   gateway's task role needs (or remove it from engineers entirely), which is
   the payoff the workbench document's open question about removing
-  `bedrock:*` from `EngineerAccess` is pointing at. **Done, in the second
-  form:** the invoke came off `WorkbenchAccess` entirely rather than being
-  narrowed, because there is no per-person need for it once the gateway is the
-  path ("Direct Bedrock access is gone" above).
+  `bedrock:*` from `EngineerAccess` is pointing at. This is a follow-up with
+  its own PR.
 
 **Rollback, at each phase:**
 
@@ -1562,11 +1561,6 @@ network or a permission can land before the item that creates it.
     them names that document and its step, not this item.
 22. Tighten `WorkbenchAccess`/`EngineerAccess` Bedrock invoke and remove
     direct provider keys, in a separate PR, after a full cycle on the gateway.
-    **Half done:** `WorkbenchAccess`'s Bedrock invoke is removed and Bifrost's
-    task role is the only principal that may invoke a model ("Direct Bedrock
-    access is gone" above). `EngineerAccess` still grants the Bedrock-family
-    reads and no invoke, which is unchanged and was already true; the direct
-    provider keys are a `gp-pi` change rather than one here.
 23. A restore rehearsal from an RDS snapshot, recorded with its date and the
     evidence.
 24. A digest-upgrade rehearsal, including a migration rollback, recorded the
