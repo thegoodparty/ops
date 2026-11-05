@@ -169,11 +169,51 @@ describe('panel-waves-tick', () => {
     assert.equal((await run(deps)).dispatched.length, 1)
   })
 
-  it('leaves needs_human, built, replies_uploaded and pre-due records alone', async () => {
+  it('sends an export task for a shadow (built) wave once replies are due', async () => {
+    const { deps, kv, sent } = harness()
+    kv.data.set('handoff:12345', {
+      state: 'built',
+      slackTs: '1',
+      channel: 'C0TEVYN',
+      sendAt: SEND_AT,
+      mode: 'shadow',
+    })
+
+    const early = await run(deps)
+    assert.deepEqual(early.dispatched, [])
+    assert.deepEqual(early.skipped, [])
+
+    deps.now = () => Date.parse('2026-11-10T16:00:01Z')
+    const res = await run(deps)
+    assert.deepEqual(res.dispatched, [
+      { outreachId: '12345', action: 'export_replies', taskId: 'task-1' },
+    ])
+    assert.equal(JSON.parse(sent[0].task.split('handoff: ')[1]).mode, 'shadow')
+  })
+
+  it('stops exporting a built wave after its export attempts run out', async () => {
+    const { deps, kv, sent } = harness()
+    kv.data.set('handoff:12345', {
+      state: 'built',
+      slackTs: '1',
+      sendAt: SEND_AT,
+      attempts: 5,
+      attemptsFor: 'export_replies',
+    })
+    deps.now = () => Date.parse('2026-11-10T16:00:01Z')
+
+    const res = await run(deps)
+
+    assert.equal(sent.length, 0)
+    assert.deepEqual(res.skipped, [
+      { outreachId: '12345', reason: 'attempts exhausted' },
+    ])
+  })
+
+  it('leaves needs_human, replies_uploaded and pre-due records alone', async () => {
     const { deps, kv, sent } = harness()
     for (const [id, state] of [
       ['1', 'needs_human'],
-      ['2', 'built'],
       ['3', 'replies_uploaded'],
     ]) {
       kv.data.set(`handoff:${id}`, { state, sendAt: SEND_AT, slackTs: 's' })

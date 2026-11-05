@@ -339,8 +339,9 @@ policy grants the other half.
   fields as JSON. A record with a live lease is skipped, so a slow task is not
   started twice; if the task cannot be created the lease is dropped so the next
   run retries. It acts on `new` records, on `building` records with no live
-  lease (a task that died mid-run), and on `scheduled` records past
-  `repliesDueAt`. It leaves `built`, `replies_uploaded` and `needs_human` alone,
+  lease (a task that died mid-run), and on `scheduled` and `built` records past
+  `repliesDueAt` (a shadow wave is scheduled by a person but exported by the
+  agent). It leaves `replies_uploaded` and `needs_human` alone,
   and stops at 5 attempts per action. Its result lists `dispatched`, `skipped` (records
   with no stored details, exhausted attempts, unreadable) and `failed`; look
   there when a wave seems stuck. It sends with `allowDuplicate: true` because two
@@ -354,7 +355,7 @@ policy grants the other half.
 | --- | --- |
 | `new` | claimed by `tevyn-handoffs-new`, waiting for a schedule task |
 | `building` | a schedule task is working in S2W; a rerun resumes it |
-| `built` | `mode: shadow`, campaign built, a person schedules it |
+| `built` | `mode: shadow`, campaign built, a person schedules it; replies due at `sendAt` + 48h |
 | `scheduled` | `mode: auto`, scheduled and read back; replies due at `repliesDueAt` |
 | `replies_uploaded` | replies export is in S3 |
 | `needs_human` | the skill escalated in the post's thread; nothing touches it until a person clears the record |

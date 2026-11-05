@@ -3,7 +3,9 @@ import * as z from 'zod'
 
 // Run on a schedule. Turns panel hand-offs into one coder task each: a new
 // hand-off becomes a "schedule" task, and a scheduled wave whose replies are
-// due becomes an "export_replies" task. A KV lease per outreach keeps a slow
+// due becomes an "export_replies" task.
+// A shadow wave ("built") is scheduled by a person, so it gets the same export
+// at the same due time. A KV lease per outreach keeps a slow
 // task from being started twice. No Slack token or constituent data is read
 // here; the hand-off fields come from tevyn-handoffs-new, which this script
 // runs through script_run (catalog scripts cannot import each other).
@@ -97,7 +99,7 @@ const pickAction = (
     // the skill resumes from the stored state.
     return leaseLive ? 'lease live' : 'schedule'
   }
-  if (record.state === 'scheduled') {
+  if (record.state === 'scheduled' || record.state === 'built') {
     const due =
       record.repliesDueAt ?? (record.sendAt && repliesDueAtOf(record.sendAt))
     if (due === undefined) return 'no hand-off details stored'
