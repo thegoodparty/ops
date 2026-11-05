@@ -1607,8 +1607,11 @@ console-adjacent step to remember, which is the property the ordering exists to
 preserve.
 
 What removal does is revoke IAM. The entry disappears from
-`bedrockInvokeResources()`, `deploy.yml` applies the narrowed permission set, and
-`bedrock:InvokeModel` on that profile stops being allowed.
+`bedrockInvokeResources()`, `deploy-workbench.yml` applies the narrowed task role,
+and `bedrock:InvokeModel` on that profile stops being allowed. `deploy.yml` still
+runs and still applies `WorkbenchAccess`, but that set names no model: its
+`DenyDirectBedrockInvoke` is a fixed list of actions on `Resource: "*"`, so the
+permission set says the same thing before and after a model leaves.
 
 What removal does **not** do is unsubscribe. `scripts/enable-bedrock-models.ts`
 only ever creates agreements; it has no delete path, and
