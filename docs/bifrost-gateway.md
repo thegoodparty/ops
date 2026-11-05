@@ -954,9 +954,13 @@ PR from the gateway work.** An engineer running a `gp-pi` image built before
 the provider retirement, or any harness still pointed at Bedrock directly, gets
 an AccessDenied on the first model call. That is the intended outcome — the
 access is gone, not degraded — and the fix is to update the image or point the
-harness at the gateway. The Deny's `Sid` and the AccessDenied message both name
-the action, so the error reads as a policy decision rather than as a missing
-model subscription, which is what the old failure looked like.
+harness at the gateway. The AccessDenied names the action and the resource, which
+is the same shape a missing model subscription used to produce, so this is not
+distinguishable from an outage by the message alone. What distinguishes it is
+which action is named: an explicit `Deny` in the session's own inline policy
+reports the action the request was refused on, where a missing agreement reports
+the model. Anyone diagnosing this should read the action first and the model
+second.
 
 ### Prompt caching
 

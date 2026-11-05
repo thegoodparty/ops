@@ -281,15 +281,19 @@ export const productManager: PolicyDocument = {
 //
 // **Why a Deny as well as the absence of an Allow.** Absence is what actually
 // refuses the call: with no statement allowing `bedrock:InvokeModel`, the
-// request is denied by default, and that is sufficient. The Deny is not
-// redundant in two cases a review should weigh. It is what an engineer sees in
-// the error, so the AccessDenied that used to read as a missing model
-// subscription reads as "direct Bedrock is off, use the gateway". And it keeps
-// holding if a later edit adds a broad grant to this document — the
+// request is denied by default, and that is sufficient. It is the durability
+// argument that earns the Deny a place, not the refusal: an explicit Deny keeps
+// holding if a later edit adds a broad grant to this document, and the
 // tag-conditioned `Action: ["*"]` shape in `engineerAccess` is exactly that
-// pattern, and this set is one copy-paste from it. `AdministratorAccess` is
+// pattern — this set is one copy-paste from it. `AdministratorAccess` is
 // deliberately unaffected: break-glass is how a person reaches Bedrock
 // directly now, and it is a separate permission set.
+//
+// What it does *not* buy is a better error message. An AccessDenied from an
+// explicit Deny names the action and the resource, which is the shape a missing
+// model agreement also produces; the two are told apart by which action is
+// named, not by the wording. Worth saying because "the Deny makes the failure
+// legible" is the intuitive claim and it is only half true.
 //
 // The five actions rather than `bedrock:Invoke*`: there is no wildcard verb on
 // the foundation-model service, and enumerating keeps the deny from silently
