@@ -79,8 +79,10 @@ Delete local screenshots and exports when you are done.
    - The rendered message equals the invite with a name filled in.
    - The loaded count is at most `recipientCount` and no more than 15% short of it.
    Otherwise escalate (step `check`, with both counts in the cause).
-6. `mode: shadow`: stop here. Set `state: 'built'`. Reply in the thread: built for a
-   person to schedule, with the campaign name and screenshot of Send Summary.
+6. `mode: shadow`: stop here. Set `state: 'built'`, with `campaignName`. Reply in the
+   thread: built for a person to schedule at the hand-off's send time, with the
+   campaign name and screenshot of Send Summary, and that you will export the replies
+   48 hours after that time.
 7. `mode: auto`: click "Schedule your full list". Fill BOTH Send Date and Send Time, in
    the official's `timeZone`, converted from `sendAt`. Type the values; do not use the
    picker. Never click SCHEDULE SEND while either field is blank. Screenshot first.
@@ -91,8 +93,12 @@ Delete local screenshots and exports when you are done.
 
 ## Action: export_replies
 
-Run only at or after `repliesDueAt`.
-1. Open the campaign (search `#<outreachId>`; use the saved `campaignName`).
+Run only at or after `repliesDueAt`. The record is `scheduled` (auto) or `built`
+(shadow, scheduled by a person). For both, `repliesDueAt` counts from the hand-off's
+`sendAt`, not from the time a person actually picked.
+1. Open the campaign (search `#<outreachId>`; use the saved `campaignName`). If it was
+   never sent, or is still scheduled or sending, do not export; escalate (step `export`,
+   cause "campaign not sent").
 2. Export Campaign Data. On the "Campaign Replies Export" row click Refresh Export.
    Use the Replies export, not "Campaign Results".
 3. Wait for DOWNLOAD to return (a few seconds), then
