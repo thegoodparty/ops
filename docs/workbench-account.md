@@ -1424,20 +1424,24 @@ Written down on 2026-09-23, while adding Claude Opus 5.5, because the moving
 parts are in three places and one of them was silently disconnected.
 
 One edit does it: an entry in `utils/bedrock-models.ts`. Everything else follows
-from that list. Two workflows then have to run, and they are not the same one:
+from that list. Two workflows are involved, and only one of them still carries
+the model list:
 
-- **`deploy.yml`** applies the `WorkbenchAccess` permission set, which no
-  longer holds a Bedrock invoke at all: it carries the catalog reads and a Deny
-  on the invoke family. The model list reaches IAM through
-  `deploy-workbench.yml` instead, because the task role that holds it is in this
-  stack. It has no path filter, so it always runs. Without it the model is
-  subscribed and every invocation is refused by IAM.
-- **`deploy-workbench.yml`** runs `scripts/enable-bedrock-models.ts` with
-  `APPLY=1`, which creates the model agreement. Without it the model is permitted
-  and the first invocation works for up to fifteen minutes before turning into
-  AccessDenied, which is the failure that reads like an outage.
+- **`deploy-workbench.yml`** is the one that matters, and it does both halves.
+  Its apply creates the task role's invoke statement from
+  `bedrockInvokeResources()`, so a model added to the list is permitted only
+  once this runs. It also runs `scripts/enable-bedrock-models.ts` with
+  `APPLY=1`, which creates the model agreement; without that the first
+  invocation works for up to fifteen minutes and then turns into AccessDenied.
+  Its path filter includes `utils/bedrock-models.ts` and
+  `scripts/enable-bedrock-models.ts`, so editing the list is enough to trigger
+  it.
+- **`deploy.yml`** applies the `WorkbenchAccess` permission set, which holds no
+  Bedrock invoke: the catalog reads and a Deny on the invoke family. A model
+  change no longer depends on it running, and the Deny it applies names no
+  model. It has no path filter, so it runs on every merge to `main` anyway.
 
-That second workflow did not fire on a model list change until 2026-09-23. Its
+That workflow's trigger did not fire on a model list change until 2026-09-23. Its
 path filter listed `scripts/enable-bedrock-models.ts` with a comment saying that
 listing the script made editing the model list enough, but the list lives in
 `utils/`, so it was not. Adding Opus 5.5 was the first change to find it, because
