@@ -527,6 +527,15 @@ export const createBifrostIngress = (args: {
   // key in cleartext. An ALB with no listener on a port accepts no connections
   // on it, so removing the listener and the security-group rule is the whole
   // change; there is no bare-listener resource left behind.
+  //
+  // `albSecurityGroup`'s description still says "80 and 443 from the internet"
+  // and is deliberately left alone. It maps to the EC2 `GroupDescription`
+  // attribute, which has no Update API (`@pulumi/aws` documents exactly that on
+  // `SecurityGroupArgs.description`), so correcting the text would replace the
+  // security group and, through the ALB and its listener, most of this ingress.
+  // That is not a change to make in the PR that closes a port; it belongs with
+  // the next deliberate replacement of the group. The stale sentence is a
+  // property of the imported group, not of the rule this change deletes.
 
   /**
    * The alias. Route 53 points the name at the ALB's own name and zone id

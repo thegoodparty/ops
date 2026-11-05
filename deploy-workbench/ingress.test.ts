@@ -67,6 +67,20 @@ const resourceBlock = (logicalName: string): string => {
   return next >= 0 ? rest.slice(0, next) : rest;
 };
 
+/**
+ * A file's source with its comments removed.
+ *
+ * The port-80 assertions have to match code, not prose. The module documents
+ * why the port is closed, and that explanation necessarily contains the
+ * strings the assertions look for (a `"HTTP"` listener, `HTTP_301`), so
+ * matching the raw source would fail on the documentation of the very thing it
+ * is guarding. Stripping comments leaves only what Pulumi would run.
+ */
+const codeOnly = (source: string): string =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|\s)\/\/[^\n]*/g, "$1");
+
 describe("bifrost ingress", () => {
   it("names the gateway under the delegated workbench zone", () => {
     assert.equal(BIFROST_HOSTNAME, "bifrost.workbench.goodparty.org");
@@ -119,28 +133,40 @@ describe("bifrost ingress", () => {
     // listener with no security-group rule is unreachable but will be opened
     // by the next reader who wonders why it is dead, and a rule with no
     // listener is one `aws.lb.Listener` away from being live.
+    //
+    // The checks read the source both for the `HTTP_PORT` constant and for a
+    // literal `80`, because a listener written as `port: 80` is the same
+    // regression and the constant is not the only way to spell it. They are
+    // scoped to the listener resource, not to the whole file: the target
+    // groups legitimately carry `protocol: "HTTP"` (the ALB terminates TLS and
+    // the app is spoken to in the clear over the VPC), so a file-wide match on
+    // the protocol would fail on correct code.
+    const listenerBlock = codeOnly(resourceBlock("bifrostHttpsListener"));
     assert.ok(
-      !/port:\s*HTTP_PORT/.test(INGRESS_SOURCE),
-      "ingress.ts creates a listener on HTTP_PORT; port 80 must stay closed (see 'No port 80' in ingress.ts)",
+      !/port:\s*(?:HTTP_PORT|80)\b/.test(listenerBlock),
+      "the ALB listener serves cleartext on port 80 again; port 80 must stay closed (see 'No port 80' in ingress.ts)",
     );
     assert.ok(
-      !INGRESS_SOURCE.includes("\"bifrostHttpListener\""),
+      !/protocol:\s*"HTTP"/.test(listenerBlock),
+      "the ALB listener is a cleartext HTTP listener again; port 80 must stay closed",
+    );
+    assert.ok(
+      !codeOnly(INGRESS_SOURCE).includes('"bifrostHttpListener"'),
       "ingress.ts has an http listener resource again; port 80 must stay closed",
     );
     assert.ok(
-      !INGRESS_SOURCE.includes("HTTP_301"),
+      !codeOnly(INGRESS_SOURCE).includes("HTTP_301"),
       "ingress.ts redirects to HTTPS again; that is the downgrade this change removed",
     );
 
     // The security-group half lives in network.ts. Read the ALB group's rules
-    // as source and assert none of them names port 80.
-    const NETWORK_SOURCE = fs.readFileSync(
-      path.resolve(__dirname, "network.ts"),
-      "utf8",
+    // as source and assert none of them admits 80.
+    const NETWORK_SOURCE = codeOnly(
+      fs.readFileSync(path.resolve(__dirname, "network.ts"), "utf8"),
     );
     assert.ok(
-      !/fromPort:\s*HTTP_PORT/.test(NETWORK_SOURCE),
-      "network.ts opens HTTP_PORT on a security group; port 80 must stay closed",
+      !/fromPort:\s*(?:HTTP_PORT|80)\b/.test(NETWORK_SOURCE),
+      "network.ts opens port 80 on a security group; port 80 must stay closed",
     );
     assert.ok(
       !NETWORK_SOURCE.includes('"bifrostAlbIngressHttp"'),

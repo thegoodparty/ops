@@ -115,10 +115,13 @@ describe("workbench network layout", () => {
     // source rather than standing up Pulumi: the assertion is about a literal
     // that is written in the file either way, the same reason
     // `security-group-descriptions.test.ts` reads these programs as text.
+    //
+    // Matched on the literal `80` as well as on `HTTP_PORT`, so a rule written
+    // with the number rather than the constant does not slip past.
     const source = fs.readFileSync(path.resolve(__dirname, "network.ts"), "utf8");
     assert.ok(
-      !/fromPort:\s*HTTP_PORT/.test(source),
-      "network.ts opens HTTP_PORT; port 80 must stay closed",
+      !/fromPort:\s*(?:HTTP_PORT|80)\b/.test(source),
+      "network.ts opens port 80; port 80 must stay closed",
     );
   });
 
