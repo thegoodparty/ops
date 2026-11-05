@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds the swarm state that lives only in SQLite: the global SETUP_SCRIPT,
 # the grafana and clickup MCP servers, the catalog scripts in scripts/, the
-# lead's soul, and each agent's harness and model.
+# skills in skills/, the lead's soul, and each agent's harness and model.
 # Run as root on the host once the stack is up. Safe to run again, but a rerun
 # replaces any edits the lead made to its own SOUL.md and IDENTITY.md with the
 # copies in soul/.
@@ -109,6 +109,8 @@ hand_off_config() {
     | api PUT /api/config -d @- >/dev/null
 }
 hand_off_config TEVYN_API_CHANNEL_ID C09JMECMP89
+# The agent panel-waves-tick sends its tasks to.
+hand_off_config PANEL_WAVE_AGENT_ID "$CODER"
 for kv in "HANDOFF_ENV=dev" "REPLIES_BUCKET=tevyn-poll-csvs-develop"; do
   if api GET "/api/config?scope=global&key=${kv%%=*}" | jq -e '.configs | length > 0' >/dev/null; then
     echo "hand-off config: ${kv%%=*} already set, kept"
@@ -128,6 +130,31 @@ for src in scripts/*.ts; do
     '{name: $n, source: $s, scope: "global", intent: "bootstrap.sh from scripts/"}' \
     | api POST /api/scripts/upsert -H "X-Agent-ID: $LEAD" -d @- \
     | jq -r '"script \(.name): v\(.version), unchanged: \(.contentDeduped)"'
+done
+
+# Skills. Creating or editing one needs the lead, same as global scripts. The
+# skill is owned by the coder and installed on it; it is looked up by name
+# first so a rerun updates it instead of failing on the unique name.
+for dir in skills/*/; do
+  src="${dir}SKILL.md"
+  name="$(basename "$dir")"
+  skill="$(api GET "/api/skills?scope=agent&agentId=$CODER" \
+    | jq -r --arg n "$name" '[.skills[] | select(.name == $n)][0].id // ""')"
+  if [[ -z "$skill" ]]; then
+    skill="$(jq -n --rawfile c "$src" --arg a "$CODER" \
+      '{content: $c, type: "personal", scope: "agent", ownerAgentId: $a}' \
+      | api POST /api/skills -H "X-Agent-ID: $LEAD" -d @- | jq -r '.skill.id')"
+    echo "skill $name: created as $skill"
+  elif api GET "/api/skills/$skill" | jq -e --rawfile c "$src" '.content == $c' >/dev/null; then
+    echo "skill $name: unchanged ($skill)"
+  else
+    jq -n --rawfile c "$src" '{content: $c}' \
+      | api PUT "/api/skills/$skill" -H "X-Agent-ID: $LEAD" -d @- >/dev/null
+    echo "skill $name: updated ($skill)"
+  fi
+  jq -n --arg a "$CODER" '{agentId: $a}' \
+    | api POST "/api/skills/$skill/install" -H "X-Agent-ID: $LEAD" -d @- >/dev/null
+  echo "skill $name: installed on coder"
 done
 
 if api GET "/api/agents/$LEAD" | jq -e --rawfile s soul/SOUL.md --rawfile i soul/IDENTITY.md \

@@ -269,7 +269,9 @@ rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
 `host/global-setup-script.sh` (runs as root at every agent container start),
 the grafana and clickup MCP servers, the global catalog scripts from
 `host/scripts/` (each `*.ts` that is not a test, named by its file name), the
-lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
+skills from `host/skills/<name>/SKILL.md` (created at agent scope on the coder
+and installed on it; a rerun updates a changed skill instead of adding another),
+the lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
 To change one, edit the file, merge, then on the host:
 
 ```sh
@@ -289,7 +291,8 @@ NTP before touching the seed.
 The hand-off scripts find work in the `#tevyn-api` posts gp-api writes for an
 agent wave and send replies back through S3. They read these global config
 keys (not secret except the token): `SLACK_BOT_TOKEN` (needs `channels:history`
-and `files:read`), `TEVYN_API_CHANNEL_ID`, `HANDOFF_ENV` (`dev` or `prod`; dev
+and `files:read`), `TEVYN_API_CHANNEL_ID`, `PANEL_WAVE_AGENT_ID` (the coder's id, written by `bootstrap.sh` on every run;
+`panel-waves-tick` sends its tasks to it), `HANDOFF_ENV` (`dev` or `prod`; dev
 and prod share the channel, so only posts whose block `env` matches are taken)
 and `REPLIES_BUCKET` (`tevyn-poll-csvs-develop` for dev, `-master` for prod;
 optional `REPLIES_BUCKET_REGION`, default `us-west-2`). `bootstrap.sh` writes
@@ -314,8 +317,83 @@ policy grants the other half.
   at hop limit 2), returns the key and byte count, then deletes the export from
   agent-fs. A failed PUT keeps the export.
 
+- `tevyn-thread-reply` (`channel`, `ts`, `text`, optional `filePath`) replies in a
+  hand-off post's thread with `chat.postMessage`, or, with a png or jpg under
+  `/afs/`, uploads it into the thread (`files.getUploadURLExternal` and
+  `files.completeUploadExternal`, text as the comment) and deletes it from
+  agent-fs. Worker agents have no Slack tools in agent-swarm (posting and
+  uploading are lead-only), so the coder uses this script. It refuses text that
+  looks like a phone number. The script filesystem is text only, so the image
+  is read through `ctx.sh('base64 ...')`; smoke-test one upload on the host
+  after the first deploy.
+- `panel-waves-tick` is the dispatcher, meant to run on a schedule (below). Each
+  run it (1) runs `tevyn-handoffs-new` through `ctx.swarm.script_run`, because
+  catalog scripts cannot import each other, and writes the hand-off fields
+  (`sendAt`, `repliesDueAt`, `timeZone`, `mode`, `channel`, `message`,
+  `recipientCount`) onto each new `handoff:<outreachId>` record before anything
+  else, so a tick that dies before sending can be recovered from KV; (2) lists
+  KV by the `handoff:` prefix; (3) for each record it should act on, writes
+  `lease:<outreachId>` with a one hour expiry and bumps `attempts`, then creates
+  one coder task, "Handle <id> (schedule|export_replies) following the
+  scale-to-win-panel-wave skill", `modelTier: regular`, carrying the hand-off
+  fields as JSON. A record with a live lease is skipped, so a slow task is not
+  started twice; if the task cannot be created the lease is dropped so the next
+  run retries. It acts on `new` records, on `building` records with no live
+  lease (a task that died mid-run), and on `scheduled` records past
+  `repliesDueAt`. It leaves `built`, `replies_uploaded` and `needs_human` alone,
+  and stops at 5 attempts. Its result lists `dispatched`, `skipped` (records
+  with no stored details, exhausted attempts, unreadable) and `failed`; look
+  there when a wave seems stuck. It sends with `allowDuplicate: true` because two
+  waves posted together read as near-copies to the duplicate check.
+
+### KV states
+
+`handoff:<outreachId>` is shared by the scripts and the skill:
+
+| state | meaning |
+| --- | --- |
+| `new` | claimed by `tevyn-handoffs-new`, waiting for a schedule task |
+| `building` | a schedule task is working in S2W; a rerun resumes it |
+| `built` | `mode: shadow`, campaign built, a person schedules it |
+| `scheduled` | `mode: auto`, scheduled and read back; replies due at `repliesDueAt` |
+| `replies_uploaded` | replies export is in S3 |
+| `needs_human` | the skill escalated in the post's thread; nothing touches it until a person clears the record |
+
+`lease:<outreachId>` is `{ expiresAt }` with a one hour KV expiry. To release a
+stuck item early, delete the `lease:` key; to retry an escalated one, set its
+state back (`new` for a schedule, `scheduled` for an export) and clear
+`needsHumanStep` and `needsHumanCause`.
+
+### Scale to Win skill
+
+`host/skills/scale-to-win-panel-wave/SKILL.md` is the coder's instructions for
+building and scheduling a wave in Scale to Win with `agent-browser` and for
+exporting its replies. `bootstrap.sh` registers it (`POST /api/skills` with the
+lead's `X-Agent-ID`, `PUT /api/skills/{id}` when the text changed, then
+`POST /api/skills/{id}/install`). It needs these agent-scope config keys on the
+coder, set by a human: `S2W_USERNAME`, `S2W_PASSWORD` and `S2W_TOTP_SEED`
+(exported to the environment for the first two). The browser profile lives at
+`/workspace/personal/s2w-browser-profile` on the coder's volume.
+
+### Schedules
+
 Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
-add.
+add. To run the dispatcher every 5 minutes, call the MCP bridge from the host as
+the lead. Do not use `POST /api/schedules`: the REST route does not record which
+agent created the schedule, so the script would run as a placeholder agent that
+does not exist and could not run `tevyn-handoffs-new` or create tasks.
+
+```sh
+cd /opt/agent-swarm
+KEY="$(sed -n 's/^API_KEY=//p' .env)"; LEAD="$(sed -n 's/^LEAD_AGENT_ID=//p' .env)"
+curl -sS --fail-with-body -X POST http://127.0.0.1:3013/api/mcp-bridge \
+  -H "Authorization: Bearer $KEY" -H "X-Agent-ID: $LEAD" -H 'Content-Type: application/json' \
+  -d '{"tool":"create-schedule","args":{"name":"panel-waves-tick","scheduleType":"recurring","targetType":"script","scriptName":"panel-waves-tick","intervalMs":300000}}'
+```
+
+The same call as a tool is `create-schedule` with `targetType: "script"`,
+`scriptName: "panel-waves-tick"`, `intervalMs: 300000`. Delegate can also make
+it from Slack. Disable the schedule to pause all panel waves.
 
 Anything else goes through the dashboard or the API at
 `https://delegate-swarm.infra.goodparty.org` (`http://127.0.0.1:3013` on the host)
@@ -366,6 +444,13 @@ Both are scope swarm, installed on all three agents, and registered by
   (`SLACK_THREAD_FOLLOWUP_REQUIRE_MENTION=true` on the api service). Without
   it, agent-swarm routes every untagged reply in a thread it was ever tagged
   in back to the agent. DMs and the assistant pane do not need a mention.
+- Panel hand-offs: `slack-manifest.json` already lists `chat:write`,
+  `chat:write.public`, `files:read`, `files:write` and `channels:history`, which
+  `tevyn-handoffs-new`, `tevyn-handoff-csv` and `tevyn-thread-reply` need. If the
+  app was installed before those scopes were added, a human must reinstall it
+  (Settings, Install App, Reinstall to GoodParty; the bot token stays the same
+  unless Slack rotates it), and the bot must be a member of `#tevyn-api`
+  (`/invite @delegate`), or uploads into the thread fail with `not_in_channel`.
 - Home channel and alerts channel: `#swarm-testing` (`C0C6RUJ9VMK`). The
   Delegate bot has to be a member to hear messages there.
 
