@@ -442,10 +442,9 @@ describe("bifrost config.json", () => {
     // difference is enforced rather than described.
     //
     // Bedrock: every served id is a `global.` cross-region inference profile.
-    // No `us.` profile (the rollover may still carry them in IAM, but the
-    // gateway must not select one) and no bare foundation-model id, which is
-    // not a profile at all and which several of these models cannot be
-    // invoked as. The reason is cost, not residency; it is recorded in
+    // No `us.` profile and no bare foundation-model id, which is not a profile
+    // at all and which several of these models cannot be invoked as. The
+    // reason is cost, not residency; it is recorded in
     // `docs/bifrost-gateway.md`, "Inference residency".
     const served = provider(config, "bedrock").keys.flatMap((key) => key.models);
     assert.ok(served.length > 0, "the bedrock key serves no models; empty is deny-by-default");
@@ -453,11 +452,7 @@ describe("bifrost config.json", () => {
       if (value.startsWith("global.") || value.startsWith("us.")) {
         assert.ok(
           served.includes(value) ||
-            WORKBENCH_MODELS.some(
-              (model) =>
-                model.invokeId === value ||
-                (model.transitionalInvokeIds ?? []).includes(value),
-            ),
+            WORKBENCH_MODELS.some((model) => model.invokeId === value),
           `config.json carries "${value}", which is an inference profile that is neither served here nor named in utils/bedrock-models.ts`,
         );
       }
@@ -466,11 +461,11 @@ describe("bifrost config.json", () => {
       for (const model of key.models) {
         assert.ok(
           model.startsWith(SERVED_BEDROCK_PREFIX),
-          `bedrock model ${model} is not a global. inference profile; a us. profile is the rollover, not what the gateway selects`,
+          `bedrock model ${model} is not a global. inference profile; the gateway serves global. profiles only`,
         );
         assert.ok(
           !model.startsWith("us."),
-          `bedrock model ${model} is a us. geo profile; the gateway serves the global profile, and us. survives only in transitionalInvokeIds`,
+          `bedrock model ${model} is a us. geo profile; the account permits only global. profiles`,
         );
       }
     }
@@ -526,17 +521,24 @@ describe("bifrost config.json", () => {
     }
   });
 
-  it("lists exactly the global Bedrock profiles the task role's IAM allows", () => {
+  // This is now an exact match in both directions, and that is the change this
+  // PR makes. It used to allow the IAM list to be wider than what the gateway
+  // serves, because `bedrockInvokeResources()` also carried each entry's
+  // outgoing `us.` profile and the bare foundation-model id, and `WorkbenchAccess`
+  // held the same grant as a person's direct path. Neither is true any more:
+  // the resources name exactly the `global.` profiles the gateway serves, and
+  // the subscription script is the only other reader of the list and works from
+  // the foundation-model ids rather than from these ARNs. A model reachable
+  // through IAM that no key can ask for is dead weight at best; a model a key
+  // can ask for that IAM refuses is an outage. Equality is the only shape that
+  // makes both impossible.
+  it("lists exactly the Bedrock profiles the task role's IAM allows", () => {
     const config = loadConfig();
     const configured = provider(config, "bedrock").keys.flatMap((key) => key.models);
 
     // `taskRolePolicyDocument(bedrockInvokeResources())` in the ECS module is
     // built from `utils/bedrock-models.ts`, so anything here without a matching
-    // resource is an AccessDenied. The other direction is not equality: the
-    // IAM list is the sandbox's grant and is allowed to be wider than what the
-    // gateway serves, which is exactly the state the transitional `us.`
-    // profiles and the bare foundation-model ids are in. What this list must be
-    // is the `global.`-profile subset of that file, with nothing added.
+    // resource is an AccessDenied.
     const globalProfiles = [
       ...new Set(
         WORKBENCH_MODELS.filter((model) =>
@@ -551,7 +553,18 @@ describe("bifrost config.json", () => {
       "config.json's Bedrock models drifted from the global. profiles in utils/bedrock-models.ts; a missing one is a class the fleet cannot reach",
     );
 
+    // The policy's inference-profile ARNs, which is the half a key can reach.
+    // Equality, not a subset: the model allowlist is the resource list.
     const resources = bedrockInvokeResources();
+    const permittedProfiles = resources
+      .filter((resource) => resource.includes(":inference-profile/"))
+      .map((resource) => resource.slice(resource.lastIndexOf("/") + 1))
+      .sort();
+    assert.deepEqual(
+      permittedProfiles,
+      [...configured].sort(),
+      "the task role's inference-profile resources drifted from the models the gateway serves; that is the allowlist in both directions",
+    );
     for (const model of configured) {
       assert.ok(
         resources.some(
@@ -562,6 +575,15 @@ describe("bifrost config.json", () => {
         `${model} has no inference-profile IAM resource in bedrockInvokeResources()`,
       );
     }
+    // And no `us.` geo profile survives there at all. The 2026-11-04 rollover
+    // used `transitionalInvokeIds` to permit each entry's outgoing `us.`
+    // profile; that field is gone, and this is where a reintroduction would
+    // show up.
+    assert.equal(
+      resources.some((resource) => resource.includes(":inference-profile/us.")),
+      false,
+      "the task role permits a us. geo inference profile; only the global. profile of each model is served or granted",
+    );
   });
 
   it("serves exactly the agreed model classes, per provider", () => {

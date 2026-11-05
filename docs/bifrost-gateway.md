@@ -6,13 +6,18 @@
 > `goodparty-workbench` account. It records the decisions, the reasoning and
 > the few things that still need a human. It changes no infrastructure.
 
-Today every harness reaches a model provider directly. The container ships
-Fireworks credentials, and the workbench account hands each engineer a
-`WorkbenchAccess` session that invokes Bedrock directly. That means provider
-keys and Bedrock invocations are spread across laptops, containers and
-identity, and there is nowhere to see or cap what the fleet spends. A gateway
-in the middle is one place for routing, credentials, budgets and
-observability.
+> Today every harness reaches a model provider directly. The container ships
+> Fireworks credentials, and the workbench account hands each engineer a
+> `WorkbenchAccess` session that invokes Bedrock directly. That means provider
+> keys and Bedrock invocations are spread across laptops, containers and
+> identity, and there is nowhere to see or cap what the fleet spends. A gateway
+> in the middle is one place for routing, credentials, budgets and
+> observability.
+>
+> *(Written before the gateway existed. The Bedrock half of that paragraph is
+> now history: `WorkbenchAccess` holds no Bedrock invoke and the gateway's task
+> role is the only principal that may call a model. See "Direct Bedrock access
+> is gone" below. The Fireworks key is still in the container.)*
 
 This is the gateway's plan. It is the sibling of
 [`workbench-account.md`](./workbench-account.md), which is the account's plan
@@ -732,7 +737,9 @@ has to a model, so the lists are where the rule can be a property of the
 deployment rather than a convention: a model not in a key's list is refused
 before any provider call, and the virtual-key template that a minted key is
 created from carries the same lists (`bifrost-virtual-keys.md`, decision 5), so
-a person's key cannot ask for what the gateway would not route.
+a person's key cannot ask for what the gateway would not route. "Only path" is
+now an IAM statement rather than a description of the client config; see
+"Direct Bedrock access is gone" below.
 
 The two providers are on different rules on purpose, and it is worth saying why
 they diverged rather than averaging them:
@@ -769,9 +776,11 @@ they diverged rather than averaging them:
 
 - **Bedrock moved to `global.` profiles on 2026-11-04, reversing the earlier
   US-geo convention.** Every entry in the list is a `global.` cross-region
-  inference profile, and the outgoing `us.` geo profile of each is permitted
-  only through `transitionalInvokeIds` while the fleet rolls over
-  (`utils/bedrock-models.ts`). This is a deliberate reversal of the decision
+  inference profile. The outgoing `us.` geo profile of each was permitted
+  through `transitionalInvokeIds` while the fleet rolled over
+  (`utils/bedrock-models.ts`), and that field has since been removed, so nothing
+  is permitted but the `global.` profile of each model. This is a deliberate
+  reversal of the decision
   recorded in `docs/workbench-account.md`, not a drift, and the reasoning is
   below. What it replaced, for the record: until this change every Bedrock
   entry was a `us.` geo profile, chosen for residency, and `global.` was the
@@ -880,6 +889,73 @@ Fireworks call does not exist, because the SCP exempts `bedrock` wholesale
 since 2026-11-04 that list is a decision about models rather than about
 geography. `config.test.ts` asserts both halves, separately, so neither can go
 soft by being rewritten into the other.
+
+### Direct Bedrock access is gone
+
+**Decision: `WorkbenchAccess` holds no Bedrock invoke, and Bifrost's task role
+is the only principal in the workbench account that may invoke a model.** This
+is the item 22 tightening the phased task list below always pointed at, and it
+is the piece phase F was waiting for.
+
+What it replaces. Until this change an engineer's SSO session carried the same
+four invoke actions on the same model list as the gateway's task role, as
+`InvokeSelectedBedrockModels` in `deploy/components/identity-center/policies.ts`.
+That grant existed because `pi` reached Bedrock directly, as the engineer, with
+the engineer's credentials: the inner loop predates the gateway. The gateway's
+whole argument is that a request should reach AWS as one identity, so the
+models it may call are one list and the person is authorised by a virtual key
+rather than by an SSO session (`bifrost-virtual-keys.md`). Keeping the direct
+grant would have made that argument half true: every key scoped to a model list
+would have sat beside a session that could call every model in the list
+without one, and the per-person attribution the key exists to produce would
+have had a hole in it nobody could close from the gateway side.
+
+What made it safe to remove, checked rather than assumed:
+
+- **`gp-pi` retired its built-in Bedrock provider.** `etc/pi/extensions/gp-bifrost.ts`
+  in `thegoodparty/gp-pi` carries `RETIRED_PROVIDERS = ["amazon-bedrock", "fireworks"]`
+  and replaces both providers' model lists with an empty one, so the image the
+  fleet runs has no direct Bedrock route to fall back to. The image served its
+  models through the gateway before this PR, not after it.
+- **Nothing else in this repo invokes Bedrock as an engineer.** The only two
+  readers of the Bedrock APIs are the gateway's own task role (`deploy-workbench/ecs.ts`)
+  and `scripts/enable-bedrock-models.ts`, which creates model agreements rather
+  than invoking models and runs as `pulumi-deploy` — an admin role in the
+  account, not a person's session. There is no boto3, no notebook, no Lambda,
+  and no CI job anywhere in this repository that makes a Bedrock invoke call.
+  `deploy-workbench/scripts/verify-service.ts` and `verify-convergence.ts`
+  touch the gateway's HTTP surface and Lambda, not Bedrock. Recorded because
+  the next such caller has to be a decision rather than an assumption, and
+  `deploy/bedrock-invoke-principals.test.ts` fails if a new file starts naming
+  an invoke action.
+- **There is no assume-the-gateway's-role path.** The task role trusts only
+  `ecs-tasks.amazonaws.com` (`deploy-workbench/ecs.ts`), and `WorkbenchAccess`
+  holds no `sts:AssumeRole` at all. Both halves are asserted in
+  `deploy/identity-center-workbench.test.ts`, because removing the group grant
+  while leaving an assume path would have been cosmetic.
+
+What an engineer keeps:
+
+- the Bedrock catalog reads (`bedrock:Get*`, `bedrock:List*`), so the console,
+  the model list, and "why is my agent slow" still work;
+- the CloudWatch reads the workbench account already granted, which is how a
+  gateway-side failure is diagnosed;
+- the virtual-key mint function URL, which is how a person gets a key.
+
+Break-glass is deliberately unaffected. `AdministratorAccess` in this account
+still invokes anything, and that is the recovery path rather than a gap: the
+Admins assignment is the one identity that does not depend on CI or on the
+gateway being up. What changed is the standing grant every engineer held, not
+the exceptional one.
+
+**The failure mode, stated plainly, because it is the reason this is a separate
+PR from the gateway work.** An engineer running a `gp-pi` image built before
+the provider retirement, or any harness still pointed at Bedrock directly, gets
+an AccessDenied on the first model call. That is the intended outcome — the
+access is gone, not degraded — and the fix is to update the image or point the
+harness at the gateway. The Deny's `Sid` and the AccessDenied message both name
+the action, so the error reads as a policy decision rather than as a missing
+model subscription, which is what the old failure looked like.
 
 ### Prompt caching
 
@@ -1137,8 +1213,10 @@ long as the direct path is kept.
 - **Phase F — tighten.** Narrow `WorkbenchAccess`'s Bedrock invoke to what the
   gateway's task role needs (or remove it from engineers entirely), which is
   the payoff the workbench document's open question about removing
-  `bedrock:*` from `EngineerAccess` is pointing at. This is a follow-up with
-  its own PR.
+  `bedrock:*` from `EngineerAccess` is pointing at. **Done, in the second
+  form:** the invoke came off `WorkbenchAccess` entirely rather than being
+  narrowed, because there is no per-person need for it once the gateway is the
+  path ("Direct Bedrock access is gone" above).
 
 **Rollback, at each phase:**
 
@@ -1484,6 +1562,11 @@ network or a permission can land before the item that creates it.
     them names that document and its step, not this item.
 22. Tighten `WorkbenchAccess`/`EngineerAccess` Bedrock invoke and remove
     direct provider keys, in a separate PR, after a full cycle on the gateway.
+    **Half done:** `WorkbenchAccess`'s Bedrock invoke is removed and Bifrost's
+    task role is the only principal that may invoke a model ("Direct Bedrock
+    access is gone" above). `EngineerAccess` still grants the Bedrock-family
+    reads and no invoke, which is unchanged and was already true; the direct
+    provider keys are a `gp-pi` change rather than one here.
 23. A restore rehearsal from an RDS snapshot, recorded with its date and the
     evidence.
 24. A digest-upgrade rehearsal, including a migration rollback, recorded the

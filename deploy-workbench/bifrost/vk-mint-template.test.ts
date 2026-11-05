@@ -153,7 +153,7 @@ describe("bifrost virtual-key template", () => {
           );
           assert.ok(
             !model.startsWith("us."),
-            `${model} is a us. geo profile; those survive only in transitionalInvokeIds while the fleet rolls over`,
+            `${model} is a us. geo profile; the account permits only global. profiles`,
           );
         } else if (entry.provider === "fireworks") {
           // A key alias is a name that resolves to a router; what the provider

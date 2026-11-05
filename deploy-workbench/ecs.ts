@@ -1215,22 +1215,32 @@ export const TASK_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
 export const EXECUTION_PARAMETER_ACTIONS = ["ssm:GetParameters"] as const;
 
 /**
- * The invoke actions, matching the set `WorkbenchAccess` grants engineers
- * (`deploy/components/identity-center/policies.ts`): the two `InvokeModel`
- * forms and the two `Converse` forms, because which pair the provider uses is
- * a property of Bifrost's Bedrock provider rather than of this policy, and
- * granting only one pair is an AccessDenied that reads like missing model
- * access.
+ * The invoke actions, the whole of what is permitted anywhere in this account.
+ *
+ * Read this with the grants that are no longer beside it. `WorkbenchAccess`
+ * used to hold these four actions on the same resource list, which made the
+ * gateway one of two ways to reach a model. It holds none of them now
+ * (`deploy/components/identity-center/policies.ts`, `DenyDirectBedrockInvoke`),
+ * so this statement is the only invoke grant in the workbench account and the
+ * task role is the only principal that can make a model call. That is the
+ * property the model list in `utils/bedrock-models.ts` is standing in for:
+ * Bifrost authorises *which person* through its virtual keys, and IAM
+ * authorises *which models*, once, for one identity.
+ *
+ * Two `InvokeModel` forms and two `Converse` forms, because which pair the
+ * provider uses is a property of Bifrost's Bedrock provider rather than of
+ * this policy, and granting only one pair is an AccessDenied that reads like
+ * missing model access.
  *
  * Deliberately absent, and worth stating because it is the "nothing wilder"
  * half of the requirement:
  *
- * - `bedrock:Get*` / `bedrock:List*`, which `WorkbenchAccess` holds wide so a
- *   person is never blocked mid-task. The gateway is not a person and invokes
- *   a fixed model list. The one read it turned out to need is named, not
- *   wildcarded: `TASK_BEDROCK_READ_ACTIONS` below, added when bringing the
- *   service up showed the provider enumerating the catalog to render its model
- *   list.
+ * - `bedrock:Get*` / `bedrock:List*`, which `WorkbenchAccess` still holds wide
+ *   so a person can see the catalog and debug a slow call. The gateway is not a
+ *   person and invokes a fixed model list. The one read it turned out to need
+ *   is named, not wildcarded: `TASK_BEDROCK_READ_ACTIONS` below, added when
+ *   bringing the service up showed the provider enumerating the catalog to
+ *   render its model list.
  * - anything `aws-marketplace`, which is what auto-subscribes a model nobody
  *   chose. Subscriptions are out of band, per the plan and step 11.
  */
@@ -1375,9 +1385,20 @@ export const executionRoleConfigParameterPolicyDocument = (
 /**
  * The task role's policy: invoke exactly the models in
  * `utils/bedrock-models.ts`, which is the same list the subscription script
- * walks and the same one `WorkbenchAccess` composes from. One list, so a model
- * added there is reachable by the gateway without a second edit, and a model
- * removed there is not.
+ * walks, the same one `deploy-workbench/bifrost/config.json` serves, and the
+ * same one a minted virtual key is allowed. One list, so a model added there is
+ * reachable by the gateway without a second edit, and a model removed there is
+ * not.
+ *
+ * The resource list is the model allowlist rather than wider than it. It used
+ * to be wider on purpose: each entry also permitted its outgoing `us.` geo
+ * profile while the fleet rolled over to `global.`, so the role named sixteen
+ * inference profiles for eight served models. That rollover is finished and
+ * the field is gone, so the inference-profile ARNs here are exactly the
+ * profiles the gateway serves. `deploy-workbench/bifrost/config.test.ts`
+ * asserts that equality in both directions, because the failure it prevents
+ * is a model reachable through IAM that no key can ask for, or one a key can
+ * ask for that IAM refuses.
  *
  * Plus the catalog read. Without it the gateway can serve inference but cannot
  * show its models: the dashboard's provider page asks Bifrost to list them and

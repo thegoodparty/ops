@@ -15,9 +15,9 @@ files that belong in review:
   deployment actually provides, no credential literal, the per-provider model
   rules (`global.` Bedrock profiles only, Fireworks US router ids and
   the `us.api.fireworks.ai` endpoint, and the agreed class set pinned as
-  literals), and Bedrock's `global.`-profile subset matching
-  `utils/bedrock-models.ts` (the list the task role's IAM is built from,
-  alongside the `bedrock:ListFoundationModels` grant that renders it).
+  literals), and Bedrock's `global.` profiles matching `utils/bedrock-models.ts`
+  exactly (the list the task role's IAM is built from, alongside the
+  `bedrock:ListFoundationModels` grant that renders it).
 - `vk-mint-template.json` — the default per-person virtual key shape, as data
   ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md),
   step 1). See "Virtual-key template" and "Governance overrides" below.
@@ -105,13 +105,14 @@ a later tag. It holds:
   (`accounts/fireworks/routers/<model>-us`) rather than `*`; and `bedrock`,
   whose key carries no credential at all: Bifrost inherits the ECS **task
   role** through the AWS default credential chain, so `bedrock_key_config`
-  sets only the region. The Bedrock model list is the `global.`-profile subset of
-  `utils/bedrock-models.ts`, which is what the task role's IAM policy
-  enumerates; the test fails if the two drift, because a model in one and not
-  the other is a 404 or an `AccessDenied` at runtime. The IAM grant is allowed
-  to be wider than the gateway's list — it is the sandbox's direct path too,
-  and during the 2026-11-04 rollover it still permits each model's outgoing
-  `us.` profile through `transitionalInvokeIds` — and that is why the config
+  sets only the region. The Bedrock model list is exactly the `global.`-profile
+  set in `utils/bedrock-models.ts`, which is what the task role's IAM policy
+  enumerates; the test fails if the two drift in **either** direction, because a
+  model in one and not the other is a 404 or an `AccessDenied` at runtime. That
+  equality is new with the removal of `transitionalInvokeIds` — the IAM list is
+  no longer the wider of the two, since there is no second direct path for it to
+  be wide for. `WorkbenchAccess` holds no Bedrock invoke at all, the gateway's
+  task role is the only principal that may invoke a model, and the config
   carries no bare foundation-model id and no `us.` profile: the gateway selects
   `global.` cross-region inference profiles, which is a cost decision recorded
   in `docs/bifrost-gateway.md`, "Inference residency". Fireworks did not change
@@ -123,10 +124,10 @@ a later tag. It holds:
   `bedrock:ListFoundationModels` (on `*`, since Bedrock defines no resource
   type for it). Without it the provider page shows
   `not authorized to perform: bedrock:ListFoundationModels` instead of the
-  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The `us.`
-  inference profiles in the list need no separate read — they come from the
-  key's own `models` allowlist and are invoked through profile ARNs the invoke
-  statement grants.
+  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The
+  `global.` inference profiles in the list need no separate read — they come
+  from the key's own `models` allowlist and are invoked through profile ARNs the
+  invoke statement grants.
 - **Prompt caching on Bedrock, and not on Fireworks.** `providers.bedrock`
   carries `prompt_cache` with `auto_inject: true` and two injection points, the
   system message and the last message (`{ "location": "message", "role":
