@@ -53,6 +53,7 @@ Lead categories:
 - ai-rules: probable violation of a rule in ai-rules/*.md — cite the suspected file
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
 - thematic: multiple files touching the same risk surface (all timezone code, all new validation paths)
+- scale: a new or changed query, loop, request-path computation or in-memory collection over voters, contacts, people, an audience, districts or tracts, whose cost grows with that size. Lead on it when the diff loads a whole set into memory, binds one parameter per row (an IN list, a bulk insert), does per-row or per-page work inside an HTTP request, or calls an external API once per row. If the repo has docs/scale.md, read it: it lists the sizes and the traps.
 
 Do NOT lead on: fabricated findings, pre-existing code the diff does not touch, theoretical risks requiring unlikely preconditions, or style preferences where the diff already matches surrounding code.
 
@@ -116,6 +117,8 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 
 **thematic:** Read all paths together. Emit one finding per distinct verified sub-issue.
+
+**scale:** Find N, the size of the set this code loads, iterates, binds or computes over, in a written source in the repo: docs/scale.md first, then an ADR, a doc, a code constant or comment, or the PR description. Then name the operation and the limit it breaks at that N: a bind-parameter or statement-size cap, task memory, a request or gateway timeout, a vendor rate limit, or CPU time that blocks the server inside a request. Blocker when the code as written breaks that limit at the written N, or does work that grows with N inside a user-facing request where the repo documents an N large enough to outrun the request. Before emitting, look for the falsification: the code caps the input and refuses early, pages within the limit (keyset or fixed-size chunks), streams, or moves the work to a queue or job. If no written source gives N, drop it: "could be slow at scale" without a number is speculation. The body names N with its source (file:line), the operation, and the limit. Emit scale findings with category bugs.
 
 ## The disprove-it pass — required
 
