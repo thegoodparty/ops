@@ -58,20 +58,13 @@ describe("delegate swarm host files", () => {
     }
   });
 
-  // bootstrap.sh finds a skill by its directory name, so a name in the
-  // frontmatter that differs would create a second skill on every rerun.
-  it("ships each skill under the name its frontmatter declares", () => {
-    const skills = hostFiles().filter((f) =>
-      /^skills\/[^/]+\/SKILL\.md$/.test(f),
-    );
-    assert.ok(skills.includes("skills/scale-to-win-panel-wave/SKILL.md"));
-    for (const file of skills) {
-      const text = fs.readFileSync(path.join(HOST_DIR, file), "utf8");
-      assert.equal(
-        /^---\nname: (.+)\n/.exec(text)?.[1],
-        file.split("/")[1],
-        file,
-      );
+  // Scripts and skills belong to the swarm's own database and are changed
+  // from Slack. Shipping them would put stale copies on the host.
+  it("ships no scripts or skills", () => {
+    const files = hostFiles();
+    assert.ok(files.length > 0);
+    for (const file of files) {
+      assert.ok(!/^(scripts|skills)\//.test(file), file);
     }
   });
 

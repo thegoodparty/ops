@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuilds the swarm state that lives only in SQLite: the global SETUP_SCRIPT,
-# the grafana and clickup MCP servers, the catalog scripts in scripts/, the
-# skills in skills/, the lead's soul, and each agent's harness and model.
+# the grafana and clickup MCP servers, the lead's soul, and each agent's
+# harness and model.
 # Run as root on the host once the stack is up. Safe to run again, but a rerun
 # replaces any edits the lead made to its own SOUL.md and IDENTITY.md with the
 # copies in soul/.
@@ -119,43 +119,6 @@ for kv in "HANDOFF_ENV=dev" "REPLIES_BUCKET=tevyn-poll-csvs-develop"; do
   fi
 done
 echo "hand-off config: channel saved as global config"
-
-# Global catalog scripts. Global writes need the lead, and the upsert
-# typechecks, so a script that does not compile fails the run here. Saving
-# identical source again is a no-op.
-for src in scripts/*.ts; do
-  [[ "$src" == *.test.ts ]] && continue
-  name="$(basename "$src" .ts)"
-  jq -n --arg n "$name" --rawfile s "$src" \
-    '{name: $n, source: $s, scope: "global", intent: "bootstrap.sh from scripts/"}' \
-    | api POST /api/scripts/upsert -H "X-Agent-ID: $LEAD" -d @- \
-    | jq -r '"script \(.name): v\(.version), unchanged: \(.contentDeduped)"'
-done
-
-# Skills. Creating or editing one needs the lead, same as global scripts. The
-# skill is owned by the coder and installed on it; it is looked up by name
-# first so a rerun updates it instead of failing on the unique name.
-for dir in skills/*/; do
-  src="${dir}SKILL.md"
-  name="$(basename "$dir")"
-  skill="$(api GET "/api/skills?scope=agent&agentId=$CODER" \
-    | jq -r --arg n "$name" '[.skills[] | select(.name == $n)][0].id // ""')"
-  if [[ -z "$skill" ]]; then
-    skill="$(jq -n --rawfile c "$src" --arg a "$CODER" \
-      '{content: $c, type: "personal", scope: "agent", ownerAgentId: $a}' \
-      | api POST /api/skills -H "X-Agent-ID: $LEAD" -d @- | jq -r '.skill.id')"
-    echo "skill $name: created as $skill"
-  elif api GET "/api/skills/$skill" | jq -e --rawfile c "$src" '.content == $c' >/dev/null; then
-    echo "skill $name: unchanged ($skill)"
-  else
-    jq -n --rawfile c "$src" '{content: $c}' \
-      | api PUT "/api/skills/$skill" -H "X-Agent-ID: $LEAD" -d @- >/dev/null
-    echo "skill $name: updated ($skill)"
-  fi
-  jq -n --arg a "$CODER" '{agentId: $a}' \
-    | api POST "/api/skills/$skill/install" -H "X-Agent-ID: $LEAD" -d @- >/dev/null
-  echo "skill $name: installed on coder"
-done
 
 if api GET "/api/agents/$LEAD" | jq -e --rawfile s soul/SOUL.md --rawfile i soul/IDENTITY.md \
   '.soulMd == $s and .identityMd == $i' >/dev/null; then

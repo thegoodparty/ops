@@ -13,8 +13,9 @@ The AWS side is Pulumi, in `deploy-infrastructure/` (stack
 `organization/infrastructure/main`, account 394495727159), and ships with
 every merge to `main` through `.github/workflows/deploy-infrastructure.yml`.
 
-Everything in `host/` is the contents of `/opt/agent-swarm/` on the host
-(`host/systemd/` goes to `/etc/systemd/system/`). On deploy, Pulumi uploads
+Everything in `host/` except `scripts/` and `skills/` (see "Adding scripts,
+skills, schedules and config") is the contents of `/opt/agent-swarm/` on the
+host (`host/systemd/` goes to `/etc/systemd/system/`). On deploy, Pulumi uploads
 `host/` to `s3://delegate-swarm-config-394495727159/host/` and an SSM
 association runs `host/install.sh` on the instance whenever any file
 changed. `install.sh` copies the files in place, installs the systemd unit,
@@ -288,11 +289,17 @@ manifest, the login and admin lists and the MCP servers. If a
 new script needs one of those, for example an S3 permission or a Slack scope,
 only that part is a PR.
 
-The panel-wave scripts in `host/scripts/`, the `scale-to-win-panel-wave`
-skill in `host/skills/` and the lead's soul in `host/soul/` came in by PR.
-`bootstrap.sh` still pushes them on every run and overwrites any change made
-from Slack, so change those by PR until they are moved out of the repo. The
-same goes for the global config keys `SETUP_SCRIPT`, `TEVYN_API_CHANNEL_ID`
+The panel-wave scripts in `host/scripts/` and the `scale-to-win-panel-wave`
+skill in `host/skills/` keep their source and tests here, but the deploy does
+not ship them (`hostFiles` in `deploy-infrastructure/agent-swarm.ts` leaves
+both directories out) and `bootstrap.sh` does not push them. The swarm's
+copies are the live ones. To put an edit live, merge it, then ask Delegate to
+save the script to the global catalog, or update the coder's skill, from the
+file on `main`.
+
+The lead's soul in `host/soul/` came in by PR. `bootstrap.sh` still pushes it
+on every run and overwrites any change made from Slack, so change it by PR
+until it is moved out of the repo. The same goes for the global config keys `SETUP_SCRIPT`, `TEVYN_API_CHANNEL_ID`
 and `PANEL_WAVE_AGENT_ID`, which `bootstrap.sh` rewrites on every run.
 `HANDOFF_ENV` and `REPLIES_BUCKET` are only written when missing, so a change
 to those from Slack survives a rerun.
@@ -302,11 +309,7 @@ to those from Slack survives a rerun.
 What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
 rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
 `host/global-setup-script.sh` (runs as root at every agent container start),
-the grafana and clickup MCP servers, the global catalog scripts from
-`host/scripts/` (each `*.ts` that is not a test, named by its file name), the
-skills from `host/skills/<name>/SKILL.md` (created at agent scope on the coder
-and installed on it; a rerun updates a changed skill instead of adding another),
-the lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
+the grafana and clickup MCP servers, the lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
 To change one of those, edit the file, merge, then on the host:
 
 ```sh
@@ -404,9 +407,7 @@ state back (`new` for a schedule, `scheduled` for an export) and clear
 
 `host/skills/scale-to-win-panel-wave/SKILL.md` is the coder's instructions for
 building and scheduling a wave in Scale to Win with `agent-browser` and for
-exporting its replies. `bootstrap.sh` registers it (`POST /api/skills` with the
-lead's `X-Agent-ID`, `PUT /api/skills/{id}` when the text changed, then
-`POST /api/skills/{id}/install`). It needs these agent-scope config keys on the
+exporting its replies. It is installed on the coder. It needs these agent-scope config keys on the
 coder, set by a human: `S2W_USERNAME`, `S2W_PASSWORD` and `S2W_TOTP_SEED`
 (exported to the environment for the first two). The browser profile lives at
 `/workspace/personal/s2w-browser-profile` on the coder's volume.
