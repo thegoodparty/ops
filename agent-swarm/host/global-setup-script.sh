@@ -141,3 +141,117 @@ WRAP
   git config --system user.name "${GITHUB_NAME:-delegate-gp[bot]}"
   git config --system user.email "${GITHUB_EMAIL:-268660869+delegate-gp[bot]@users.noreply.github.com}"
 fi
+
+# --- pi harness: Fireworks, US-only, exactly one model ----------------------
+#
+# This script runs as root before the privilege drop, so writing to /root/.pi
+# would be invisible to the worker. The pi agent dir is therefore a single
+# explicit path, owned by the worker, and PI_CODING_AGENT_DIR in
+# docker-compose.yml names the same value (fireworks-residency.test.ts fails if
+# the two drift apart). /workspace/personal is the agent's own persistent
+# volume and is already chowned to worker by the entrypoint before this hook
+# runs.
+PI_AGENT_DIR=/workspace/personal/.pi
+install -d -o worker -g worker -m 755 "$PI_AGENT_DIR"
+
+# Written every container start, into a temp file and renamed, so a rerun is
+# idempotent and a half-written file is never read. Only models.json is
+# touched: settings.json, sessions/ and the rest of the agent dir are left
+# alone.
+#
+# US-only inference needs BOTH halves (docs/bifrost-gateway.md, "Inference
+# residency"): the endpoint must be the US host, and the model id must be a
+# US-only router. Either alone is wrong.
+#
+# Why a second provider id instead of listing one model under the built-in
+# `fireworks` provider: in pi 1.5.0 a `models` entry on a built-in provider is
+# ADDED to that provider's catalog, not substituted for it, so declaring only
+# the US router under `fireworks` still leaves every global Fireworks model
+# selectable. The containment below is what actually works: `fireworks-us`
+# lists exactly one model, and the built-in `fireworks` provider is left with
+# no usable credential (its apiKey is a variable nothing sets), so no
+# global-id model can be resolved or run. Verified with `pi --list-models` and
+# an explicit `--model` run, which fails with "No API key found for
+# fireworks". That is also why the built-in block below pins the US base URL:
+# if a future change ever does give it a key, it still cannot reach the
+# global endpoint.
+#
+# Cost is the US price, not pi's built-in global price for the same model
+# family: US-only Serverless is 1.5x, $0.45 in / $0.009 cached / $1.80 out per
+# 1M tokens (docs/bifrost-gateway.md "The Fireworks premium"; the same numbers
+# are in deploy-workbench/bifrost/config.json). pi's catalog carries
+# .3/1.2 for the -1017 entries, which under-reports by a third.
+#
+# Deliberately plain JSON, not JSONC: agent-swarm reads this file with
+# JSON.parse in writeSessionModelsJson, so a comment here would make it drop
+# the provider blocks it composes. The rationale lives in this comment instead.
+PI_MODELS_TMP=$(mktemp "$PI_AGENT_DIR/.models.json.XXXXXX")
+cat >"$PI_MODELS_TMP" <<'PI_MODELS_JSON'
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "fireworks": {
+      "baseUrl": "https://us.api.fireworks.ai/inference",
+      "apiKey": "$FIREWORKS_WORKER_DISABLED_UNSET"
+    },
+    "fireworks-us": {
+      "name": "Fireworks (US-only)",
+      "baseUrl": "https://us.api.fireworks.ai/inference",
+      "api": "anthropic-messages",
+      "apiKey": "$FIREWORKS_API_KEY",
+      "models": [
+        {
+          "id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
+          "name": "DeepSeek V4.1 Flash 1017 US",
+          "api": "anthropic-messages",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": "max"
+          },
+          "input": ["text", "image"],
+          "inputLimits": {
+            "images": {
+              "resize": {
+                "maxWidth": 2000,
+                "maxHeight": 2000,
+                "maxBytes": 4718592,
+                "jpegQuality": 80
+              }
+            }
+          },
+          "cost": {
+            "input": 0.45,
+            "output": 1.8,
+            "cacheRead": 0.009,
+            "cacheWrite": 0
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "compat": {
+            "allowEmptySignature": true,
+            "sendSessionAffinityHeaders": true,
+            "supportsEagerToolInputStreaming": false,
+            "supportsCacheControlOnTools": false,
+            "supportsLongCacheRetention": false,
+            "forceAdaptiveThinking": true
+          }
+        }
+      ]
+    }
+  }
+}
+PI_MODELS_JSON
+chown worker:worker "$PI_MODELS_TMP"
+chmod 644 "$PI_MODELS_TMP"
+mv -f "$PI_MODELS_TMP" "$PI_AGENT_DIR/models.json"
+
+# A stale per-session catalog cache would keep the provider list from before
+# this file existed. It is regenerated from pi.dev, so removing it is safe and
+# only costs a refresh.
+rm -f "$PI_AGENT_DIR/models-store.json"

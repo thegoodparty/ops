@@ -37,7 +37,18 @@ x-agent-entrypoint: &agent-entrypoint
 x-worker-env: &worker-env
   ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
+  # Anthropic is kept for the api service and as the fallback path; the agents
+  # themselves run Fireworks US-only (see PI_MODELS_JSON in
+  # global-setup-script.sh and the "Models" section of agent-swarm/README.md).
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # The pi harness's own key for the ONE model it may run. render-env.sh copies
+  # it from the secret; compose has to enumerate it or nothing passes it into
+  # the container.
+  FIREWORKS_API_KEY: ${FIREWORKS_API_KEY}
+  # The agent dir a non-root worker can write, where global-setup-script.sh
+  # (root, before the privilege drop) puts models.json. A single explicit value
+  # shared with that script; fireworks-residency.test.ts keeps the two equal.
+  PI_CODING_AGENT_DIR: ${PI_CODING_AGENT_DIR:-/workspace/personal/.pi}
   API_KEY: ${API_KEY}
   MCP_BASE_URL: http://api:3013
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}

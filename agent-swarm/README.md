@@ -44,9 +44,9 @@ host; the next deploy overwrites them.
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
   with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
-  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
-  `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
-  `OAUTH2_PROXY_*` keys that turn on Google login
+  `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
+  `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
+  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -403,9 +403,9 @@ with `Authorization: Bearer $API_KEY` (the `API_KEY` key in the secret).
 
 | Role | Name | Id | Model |
 | --- | --- | --- | --- |
-| lead | Delegate | `9f8efd62-469d-4067-9dca-24d72b13864b` | anthropic/claude-opus-5-5 |
-| coder | Coder | `458bcd6d-4384-4366-83fa-63072ef55eab` | anthropic/claude-sonnet-5-5 |
-| reviewer | Reviewer | `a0799d09-6816-445a-957d-1339b672d38b` | anthropic/claude-sonnet-5-5 |
+| lead | Delegate | `9f8efd62-469d-4067-9dca-24d72b13864b` | fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us |
+| coder | Coder | `458bcd6d-4384-4366-83fa-63072ef55eab` | fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us |
+| reviewer | Reviewer | `a0799d09-6816-445a-957d-1339b672d38b` | fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us |
 
 Every agent runs the pi harness. `render-env.sh` sets `HARNESS_PROVIDER=pi`
 and the provider-prefixed models as the container defaults; an agent-scope
@@ -419,6 +419,51 @@ claims it before it reconciles the new harness, about 10 seconds. Re-run it.
 
 `AGENT_NAME=delegate` on the lead only names a newly registered lead. The
 existing one is renamed with `PUT /api/agents/{id}/name`.
+
+### Models
+
+The swarm runs **Fireworks US-only**, on exactly one model: the DeepSeek V4.1
+Flash **1017 US** router,
+`accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`. There is no second
+model and no fallback model.
+
+**US-only takes both halves, and either one alone is wrong.** The endpoint must
+be the US host, `https://us.api.fireworks.ai/inference`, and the model id must
+be a US-only router (`accounts/fireworks/routers/<model>-us`). A US router
+addressed at the global endpoint, or a global model id at the US endpoint, is
+a global request that looks configured and logs nothing unusual. The rule and
+the reason are in `docs/bifrost-gateway.md`, "Inference residency";
+`host/scripts/fireworks-residency.test.ts` enforces it for this host.
+
+Where it lives:
+
+- `host/global-setup-script.sh` writes `models.json` into
+  `/workspace/personal/.pi` on every container start, as root, before the
+  privilege drop, and chowns it to the worker. `PI_CODING_AGENT_DIR` in
+  `docker-compose.yml` names the same directory, and the test fails if the two
+  drift. Nothing writes to `/root/.pi`: that would be invisible to the worker.
+- The provider id is `fireworks-us`, not pi's built-in `fireworks`. On pi
+  1.5.0 a `models` entry on a built-in provider is **added** to that
+  provider's catalogue rather than substituted for it, so listing only the US
+  router under `fireworks` still leaves every global Fireworks model
+  selectable. The separate id is what makes the one-model rule real; the
+  built-in `fireworks` block is left with an `apiKey` that resolves to nothing,
+  so pi refuses a global id with "No API key found for fireworks".
+- Cost is the US-only price, $0.45 in / $0.009 cached / $1.80 out per 1M
+  tokens, 1.5x the global endpoint. pi's built-in catalogue carries
+  .3 / .006 / 1.2 for the `-1017` entries, so the file overrides it; without
+  that the dashboard under-reports the bill by a third.
+
+**Adding a model is a reviewed change, not an automatic upgrade.** Adding one
+means minting a new dated US router id with Fireworks and editing
+`host/global-setup-script.sh` and `host/render-env.sh` together, in one PR that
+re-opens the residency and cost decision. Bumping the release (say `1017` to a
+later date) is the same edit; there is no `-latest` US router to track it, which
+is why the dated id is pinned deliberately.
+
+`FIREWORKS_API_KEY` is a key in the `DELEGATE_SWARM` secret (see "Where it
+runs"). `ANTHROPIC_API_KEY` stays in the secret and in the worker env for the
+api service and as a fallback path, but no agent runs an Anthropic model.
 
 ## MCP servers
 

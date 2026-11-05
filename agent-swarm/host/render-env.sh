@@ -16,6 +16,11 @@ REQUIRED_KEYS=(
   ANTHROPIC_API_KEY
   API_KEY
   CLICKUP_API_TOKEN
+  # The pi harness's only model is Fireworks US-only, so a secret without this
+  # renders a .env whose agents cannot infer at all. Required, not optional:
+  # a container that starts and then fails every task is worse than one that
+  # does not start.
+  FIREWORKS_API_KEY
   GRAFANA_SERVICE_ACCOUNT_TOKEN
   SECRETS_ENCRYPTION_KEY
   SLACK_APP_TOKEN
@@ -95,8 +100,13 @@ fi
 AGENT_SWARM_VERSION=2.6.0
 NODE_ENV=production
 HARNESS_PROVIDER=pi
-LEAD_MODEL_OVERRIDE=anthropic/claude-opus-5-5
-WORKER_MODEL_OVERRIDE=anthropic/claude-sonnet-5-5
+# One model, Fireworks US-only. The provider id is `fireworks-us`, not the
+# built-in `fireworks`: pi adds a `models` entry to a built-in provider's
+# catalog instead of replacing it, so only a separate provider id actually
+# removes the global-id models from the picker. models.json, which defines it,
+# is written by global-setup-script.sh into PI_CODING_AGENT_DIR.
+LEAD_MODEL_OVERRIDE=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
+WORKER_MODEL_OVERRIDE=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
 
 LEAD_AGENT_ID=9f8efd62-469d-4067-9dca-24d72b13864b
 CODER_AGENT_ID=458bcd6d-4384-4366-83fa-63072ef55eab
