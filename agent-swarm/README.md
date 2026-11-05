@@ -275,6 +275,8 @@ just a slower path to the same place.
   needs it (`skill-create`, `skill-install`).
 - Schedules: ask Delegate to create, disable or delete the schedule
   (`create-schedule`, `update-schedule`, `delete-schedule`).
+- Souls and identities: ask Delegate to update its own or another agent's
+  (`update-profile`).
 - Config: ask Delegate to set plain keys (`set-config`). Secrets are the
   exception: set them yourself in the dashboard as secret config, and never
   paste a secret into Slack.
@@ -282,14 +284,14 @@ just a slower path to the same place.
 A PR is still the way to change anything outside the swarm's database: the
 host (`docker-compose.yml`, `Caddyfile`, `render-env.sh`, the worker image,
 `global-setup-script.sh`), AWS access (`deploy-infrastructure/`), the Slack
-manifest, the login and admin lists, the MCP servers and the lead's soul. If a
+manifest, the login and admin lists and the MCP servers. If a
 new script needs one of those, for example an S3 permission or a Slack scope,
 only that part is a PR.
 
-The panel-wave scripts in `host/scripts/` and the `scale-to-win-panel-wave`
-skill in `host/skills/` came in by PR. `bootstrap.sh` still pushes them on
-every run and overwrites any change made from Slack, so change those by PR
-until they are moved out of the repo.
+The panel-wave scripts in `host/scripts/`, the `scale-to-win-panel-wave`
+skill in `host/skills/` and the lead's soul in `host/soul/` came in by PR.
+`bootstrap.sh` still pushes them on every run and overwrites any change made
+from Slack, so change those by PR until they are moved out of the repo.
 
 ## Changing agent behaviour
 
