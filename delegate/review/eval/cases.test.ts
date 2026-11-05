@@ -200,14 +200,14 @@ test("loadCases from S3 skips invalid records with a warn", async () => {
   assert.equal(records.length, 0);
 });
 
-test("the checked-in scenario manifest parses and core has 12 cases", () => {
+test("the checked-in scenario manifest parses and core has 23 cases", () => {
   const scenarios = readManifest(join(__dirname, "scenarios.json"));
-  assert.equal(scenarios.filter((s) => s.suite === "core").length, 12);
+  assert.equal(scenarios.filter((s) => s.suite === "core").length, 23);
 });
 
 test("the checked-in scenarios hold out about a third of each suite", () => {
   const scenarios = readManifest(join(__dirname, "scenarios.json"));
-  assert.equal(scenarios.length, 22);
+  assert.equal(scenarios.length, 33);
   for (const suite of ["core", "re-review"]) {
     const inSuite = scenarios.filter((s) => s.suite === suite);
     const holdout = inSuite.filter((s) => s.split === "holdout").length;
