@@ -13,17 +13,18 @@ The AWS side is Pulumi, in `deploy-infrastructure/` (stack
 `organization/infrastructure/main`, account 394495727159), and ships with
 every merge to `main` through `.github/workflows/deploy-infrastructure.yml`.
 
-Everything in `host/` except `scripts/` and `skills/` (see "Adding scripts,
-skills, schedules and config") is the contents of `/opt/agent-swarm/` on the
-host (`host/systemd/` goes to `/etc/systemd/system/`). On deploy, Pulumi uploads
+Everything in `host/` except `scripts/` and `skills/` (see "Panel
+hand-offs") is the contents of `/opt/agent-swarm/` on the host
+(`host/systemd/` goes to `/etc/systemd/system/`). On deploy, Pulumi uploads
 `host/` to `s3://delegate-swarm-config-394495727159/host/` and an SSM
 association runs `host/install.sh` on the instance whenever any file
 changed. `install.sh` copies the files in place, installs the systemd unit,
 and runs `up.sh`, which renders `.env` from the secret, rebuilds the
 dashboard if the version or login mode changed, builds the worker image if
 the version or `host/worker-patch/` changed (see "Upgrade agent-swarm"),
-runs `docker compose up -d` and, with Google login on, syncs the dashboard
-users (below). Compose
+runs `docker compose up -d`, with Google login on syncs the dashboard
+users (below), and last runs `sync-agent-config.sh` (see "Swarm state this
+repo owns"). Compose
 only recreates the containers whose definition changed. `pulumi up` waits
 for the association, so a host that fails to take a change fails the
 deploy. `install.sh` never stops the stack.
@@ -212,8 +213,8 @@ sign in. Roles set by hand in the API are overwritten on the next deploy.
 An admin can do nearly everything the operator key can do, with tasks,
 config and token changes attributed to them. On v2.6.0 a user token cannot create or edit swarm-scope MCP servers (lead only),
 steer a task someone else requested, refresh the model catalog, or read the
-asset key audit. Do those with `API_KEY` from the host (as `bootstrap.sh`
-does).
+asset key audit. Do those with `API_KEY` from the host (as
+`sync-agent-config.sh` does).
 
 ## GitHub App
 
@@ -230,7 +231,7 @@ open PRs as `delegate-gp[bot]` (see "Git identity" below). The webhook path is o
    Pull requests Read and write, and the comment, review, issue and pull
    request events. Install it on all repositories in the org, which is what it
    is today; the ones that matter are `omni`, `ops` and `gp-pi`, the last for
-   the merge exception in `host/soul/SOUL.md`. Download a private key.
+   the merge exception in the lead's soul. Download a private key.
 2. `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh --github-app` from this
    directory. It generates the webhook secret if the secret has none (read it
    from Secrets Manager and paste it into the App), asks for the App id,
@@ -257,68 +258,69 @@ App by user id). The App only
 reaches repos it is installed on, which today is every repo in the org;
 `omni`, `ops` and `gp-pi` are the ones it is used on.
 
-After merging: run `sudo /opt/agent-swarm/install.sh` (or the deploy
-workflow) so `render-env.sh` and compose are refreshed, then
-`sudo /opt/agent-swarm/bootstrap.sh` to push the new `SETUP_SCRIPT`, then
-restart the agents (`up.sh`). Check from a worker: `gh-app-token >/dev/null`
+A merge that changes `global-setup-script.sh` restarts the agents on deploy
+(see "Swarm state this repo owns"). Check from a worker: `gh-app-token >/dev/null`
 prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 
-## Adding scripts, skills, schedules and config
+## What lives in this repo and what lives in the swarm
 
-Set these up by asking Delegate in Slack, not with a PR to this repo. The
-swarm stores all four in its own database and the lead has a tool for each,
-so a PR, a deploy, a `bootstrap.sh` run and an agent restart on the host is
-just a slower path to the same place.
+The swarm keeps scripts, skills, schedules, souls, identities and plain
+config in its own database, and the lead has a tool for each. Set those up by
+asking Delegate in Slack, not with a PR. Nothing in this repo writes them, so
+a change made from Slack or the dashboard survives every deploy.
 
 - Scripts: ask Delegate to save the script to the global catalog
   (`script-upsert`). It typechecks on save.
 - Skills: ask Delegate to create the skill and install it on the agent that
   needs it (`skill-create`, `skill-install`).
 - Schedules: ask Delegate to create, disable or delete the schedule
-  (`create-schedule`, `update-schedule`, `delete-schedule`).
+  (`create-schedule`, `update-schedule`, `delete-schedule`). Do not use
+  `POST /api/schedules`: that route does not record which agent created the
+  schedule, so a script schedule runs as an agent that does not exist.
 - Souls and identities: ask Delegate to update its own or another agent's
   (`update-profile`).
 - Config: ask Delegate to set plain keys (`set-config`). Secrets are the
   exception: set them yourself in the dashboard as secret config, and never
   paste a secret into Slack.
 
-A PR is still the way to change anything outside the swarm's database: the
-host (`docker-compose.yml`, `Caddyfile`, `render-env.sh`, the worker image,
-`global-setup-script.sh`), AWS access (`deploy-infrastructure/`), the Slack
-manifest, the login and admin lists and the MCP servers. If a
-new script needs one of those, for example an S3 permission or a Slack scope,
-only that part is a PR.
+A PR is the way to change anything else: the host (`docker-compose.yml`,
+`Caddyfile`, `render-env.sh`, the worker image), AWS access
+(`deploy-infrastructure/`), the Slack manifest, the login and admin lists,
+and the three pieces of swarm state below. If a new script needs one of
+those, for example an S3 permission or a Slack scope, only that part is a PR.
 
-The panel-wave scripts in `host/scripts/` and the `scale-to-win-panel-wave`
-skill in `host/skills/` keep their source and tests here, but the deploy does
-not ship them (`hostFiles` in `deploy-infrastructure/agent-swarm.ts` leaves
-both directories out) and `bootstrap.sh` does not push them. The swarm's
-copies are the live ones. To put an edit live, merge it, then ask Delegate to
-save the script to the global catalog, or update the coder's skill, from the
-file on `main`.
+### Swarm state this repo owns
 
-The lead's soul in `host/soul/` came in by PR. `bootstrap.sh` still pushes it
-on every run and overwrites any change made from Slack, so change it by PR
-until it is moved out of the repo. The same goes for the global config keys `SETUP_SCRIPT`, `TEVYN_API_CHANNEL_ID`
-and `PANEL_WAVE_AGENT_ID`, which `bootstrap.sh` rewrites on every run.
-`HANDOFF_ENV` and `REPLIES_BUCKET` are only written when missing, so a change
-to those from Slack survives a rerun.
+`host/sync-agent-config.sh` writes three things into the swarm's database.
+`up.sh` runs it on every deploy, after the stack is up, so merging is all a
+change to them needs:
 
-## Changing agent behaviour
+- the global `SETUP_SCRIPT` config, from `host/global-setup-script.sh` (runs
+  as root at every agent container start)
+- the grafana and clickup MCP servers, installed on all three agents
+- each agent's harness and model, from `HARNESS_PROVIDER` and the
+  `*_MODEL_OVERRIDE` values `render-env.sh` writes
 
-What the swarm knows beyond `.env` lives in its SQLite. `host/bootstrap.sh`
-rebuilds the part that is in this repo: the global `SETUP_SCRIPT` from
-`host/global-setup-script.sh` (runs as root at every agent container start),
-the grafana and clickup MCP servers, the lead's soul from `host/soul/`, and each agent's harness and model from `.env`.
-To change one of those, edit the file, merge, then on the host:
+It restarts the lead and both workers only when the setup script changed or
+an MCP server was newly installed, because agents read those at start. A
+model change applies to the next session without a restart. A harness or
+model set by hand in the dashboard is replaced on the next deploy.
+
+To apply them without a deploy, on the host:
 
 ```sh
-sudo /opt/agent-swarm/bootstrap.sh
-cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer
+sudo -u ec2-user /opt/agent-swarm/sync-agent-config.sh
 ```
 
-A rerun replaces any edits the lead made to its own soul. If those matter,
-read them first from `GET /api/agents/{id}` and copy them into `host/soul/`.
+### Panel hand-offs
+
+The panel-wave scripts and the `scale-to-win-panel-wave` skill keep their
+source and tests in `host/scripts/` and `host/skills/`, but the deploy does not
+ship them (`hostFiles` in `deploy-infrastructure/agent-swarm.ts` leaves both
+directories out), and nothing pushes them into the swarm. The swarm's copies
+are the live ones. To put an edit live, merge it, then ask Delegate to save the
+script to the global catalog, or update the coder's skill, from the file on
+`main`.
 
 `s2w-2fa-code` computes the Scale to Win sign-in code from the config key
 `S2W_TOTP_SEED`, which a human sets at agent scope on the coder agent. It
@@ -329,15 +331,14 @@ NTP before touching the seed.
 The hand-off scripts find work in the `#tevyn-api` posts gp-api writes for an
 agent wave and send replies back through S3. They read these global config
 keys (not secret except the token): `SLACK_BOT_TOKEN` (needs `channels:history`
-and `files:read`), `TEVYN_API_CHANNEL_ID`, `PANEL_WAVE_AGENT_ID` (the coder's id, written by `bootstrap.sh` on every run;
+and `files:read`), `TEVYN_API_CHANNEL_ID`, `PANEL_WAVE_AGENT_ID` (the coder's id;
 `panel-waves-tick` sends its tasks to it), `HANDOFF_ENV` (`dev` or `prod`; dev
 and prod share the channel, so only posts whose block `env` matches are taken)
 and `REPLIES_BUCKET` (`tevyn-poll-csvs-develop` for dev, `-master` for prod;
-optional `REPLIES_BUCKET_REGION`, default `us-west-2`). `bootstrap.sh` writes
-the channel id, and `HANDOFF_ENV` and `REPLIES_BUCKET` only when missing, so
-switching to prod is setting both in the dashboard, and a rerun keeps it. The
-token is the existing global `SLACK_BOT_TOKEN` secret (the Delegate bot's
-token); bootstrap leaves it alone. The host role may
+optional `REPLIES_BUCKET_REGION`, default `us-west-2`). They live in the
+swarm, so switching to prod is setting `HANDOFF_ENV` and `REPLIES_BUCKET` in
+the dashboard or asking Delegate. The token is the existing global
+`SLACK_BOT_TOKEN` secret (the Delegate bot's token). The host role may
 only `s3:PutObject` under `agent-replies/` in the two buckets; gp-api's bucket
 policy grants the other half.
 
@@ -414,8 +415,7 @@ coder, set by a human: `S2W_USERNAME`, `S2W_PASSWORD` and `S2W_TOTP_SEED`
 
 ### Schedules
 
-Schedules start empty. `bootstrap.sh` creates none; Swain decides which to
-add. To run the dispatcher every 5 minutes, ask Delegate in Slack to create a
+Nothing in this repo creates schedules; Swain decides which to add. To run the dispatcher every 5 minutes, ask Delegate in Slack to create a
 recurring script schedule for `panel-waves-tick` every 300000 ms. From the
 host, make the same call through the MCP bridge as the lead. Do not use
 `POST /api/schedules`: the REST route does not record which
@@ -447,9 +447,11 @@ with `Authorization: Bearer $API_KEY` (the `API_KEY` key in the secret).
 | reviewer | Reviewer | `a0799d09-6816-445a-957d-1339b672d38b` | fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us |
 
 Every agent runs the pi harness. `render-env.sh` sets `HARNESS_PROVIDER=pi`
-and the provider-prefixed models as the container defaults; an agent-scope
-`HARNESS_PROVIDER` or `MODEL_OVERRIDE` in the swarm's config (dashboard,
-agent settings) wins over them. The api container gets no model setting: it
+and the provider-prefixed models as the container defaults, and
+`sync-agent-config.sh` writes the same values as each agent's runtime on
+every deploy. That runtime is agent-scope config, which wins over the
+container defaults, so a model changed in the dashboard lasts only until the
+next deploy. The api container gets no model setting: it
 reads none (session summaries use their own pinned model, and workflow LLM
 nodes need an OpenRouter or OpenAI key, which this swarm does not have).
 
@@ -507,14 +509,14 @@ api service and as a fallback path, but no agent runs an Anthropic model.
 ## MCP servers
 
 Both are scope swarm, installed on all three agents, and registered by
-`bootstrap.sh`.
+`sync-agent-config.sh`.
 
 - grafana: the `grafana-mcp` sidecar at `http://grafana-mcp:8000/mcp`,
   pinned by digest. It has no caller auth; only the compose network reaches
   it and Caddy does not route to it.
 - clickup: the hosted server at `https://mcp.clickup.com/mcp`, with OAuth.
-  `bootstrap.sh` installs it only once it is connected (Bringing it up,
-  step 6).
+  `sync-agent-config.sh` installs it only once it is connected (Bringing it
+  up, step 6).
 
 ## Slack
 
@@ -530,7 +532,7 @@ Both are scope swarm, installed on all three agents, and registered by
   in back to the agent. DMs and the assistant pane do not need a mention.
 - Panel hand-offs: `slack-manifest.json` already lists `chat:write`,
   `chat:write.public`, `files:read`, `files:write` and `channels:history`, which
-  `tevyn-handoffs-new`, `tevyn-handoff-csv` and `tevyn-thread-reply` need. If the
+  the hand-off scripts need. If the
   app was installed before those scopes were added, a human must reinstall it
   (Settings, Install App, Reinstall to GoodParty; the bot token stays the same
   unless Slack rotates it), and the bot must be a member of `#tevyn-api`
@@ -568,9 +570,10 @@ The swarm starts with fresh state. In order:
    start pulls the images (the worker image is about 5 GB), builds the
    patched worker image and the dashboard. Check `curl -s http://127.0.0.1:3013/health` and
    `cd /opt/agent-swarm && sudo docker compose ps`.
-4. **Bootstrap.** On the host: `sudo /opt/agent-swarm/bootstrap.sh`. It waits
+4. **Agent config.** The start ends with `sync-agent-config.sh`, which waits
    up to 5 minutes for the three agents to register, then prints one line
-   per item. ClickUp shows as not connected; that is step 6.
+   per item (`journalctl -u agent-swarm`). ClickUp shows as not connected;
+   that is step 6.
 5. **DNS.** The first apply creates the `infra.goodparty.org` zone in this
    account and the A record for `delegate-swarm.infra.goodparty.org` in it,
    but nothing resolves until `goodparty.org` delegates the zone. That
@@ -583,9 +586,8 @@ The swarm starts with fresh state. In order:
    certificate; the OAuth callback in step 6 needs it too.
 6. **Connect ClickUp.** In the dashboard, MCP servers, clickup, Connect, and
    sign in to ClickUp as the Delegate service seat. Then on the host run
-   `sudo /opt/agent-swarm/bootstrap.sh` again, which installs it on the
-   three agents, and
-   `cd /opt/agent-swarm && sudo docker compose restart lead worker-coder worker-reviewer`.
+   `sudo -u ec2-user /opt/agent-swarm/sync-agent-config.sh`, which installs
+   it on the three agents and restarts them.
    Connect before install: an agent session that meets the server before it
    is authorized skips it for days.
 7. **Switch Slack.** Saving the manifest moves the Delegate app to Socket
@@ -614,5 +616,6 @@ The data volume outlives the instance. A new instance's user-data waits for
 the volume, mounts it without formatting, and starts docker; the
 association installs `host/`, and since the secret already has a value,
 `up.sh` builds the dashboard and starts the stack with the same state and
-agent ids. Starting from a blank data volume gives an empty swarm; run
-`bootstrap.sh` (above) to rebuild what is in this repo.
+agent ids. Starting from a blank data volume gives an empty swarm with only
+what `sync-agent-config.sh` writes; scripts, skills, schedules, souls and
+config come back only from a snapshot.

@@ -50,21 +50,22 @@ describe("delegate swarm host files", () => {
     assert.ok(hostFiles().includes("install.sh"));
   });
 
-  // bootstrap.sh reads the lead's soul from /opt/agent-swarm/soul on the host.
-  it("ships bootstrap.sh and the soul files it reads", () => {
-    const files = hostFiles();
-    for (const file of ["bootstrap.sh", "soul/SOUL.md", "soul/IDENTITY.md"]) {
-      assert.ok(files.includes(file), file);
-    }
+  // up.sh runs it on every deploy; without it a merge to
+  // global-setup-script.sh or the model never reaches the agents.
+  it("ships the agent config sync up.sh runs", () => {
+    assert.ok(hostFiles().includes("sync-agent-config.sh"));
+    const up = fs.readFileSync(path.join(HOST_DIR, "up.sh"), "utf8");
+    assert.match(up, /^\.\/sync-agent-config\.sh$/m);
   });
 
-  // Scripts and skills belong to the swarm's own database and are changed
-  // from Slack. Shipping them would put stale copies on the host.
-  it("ships no scripts or skills", () => {
+  // Scripts, skills and souls belong to the swarm's own database and are
+  // changed from Slack. Shipping them would let a deploy push over those
+  // changes.
+  it("ships no swarm-owned content", () => {
     const files = hostFiles();
     assert.ok(files.length > 0);
     for (const file of files) {
-      assert.ok(!/^(scripts|skills)\//.test(file), file);
+      assert.ok(!/^(scripts|skills|soul)\//.test(file), file);
     }
   });
 

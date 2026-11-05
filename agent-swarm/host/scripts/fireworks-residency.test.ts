@@ -34,7 +34,7 @@ const HOST_DIR = path.resolve(__dirname, '..')
 const SETUP_SCRIPT = path.join(HOST_DIR, 'global-setup-script.sh')
 const RENDER_ENV = path.join(HOST_DIR, 'render-env.sh')
 const COMPOSE = path.join(HOST_DIR, 'docker-compose.yml')
-const BOOTSTRAP = path.join(HOST_DIR, 'bootstrap.sh')
+const SYNC_AGENT_CONFIG = path.join(HOST_DIR, 'sync-agent-config.sh')
 
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/
@@ -273,23 +273,23 @@ describe('agent-swarm inference residency', () => {
     assert.match(source, /^\s+ANTHROPIC_API_KEY: \$\{ANTHROPIC_API_KEY\}$/m)
   })
 
-  it('marks the model as custom when bootstrap.sh writes it through the API', () => {
+  it('marks the model as custom when sync-agent-config.sh writes it through the API', () => {
     // agent-swarm's model catalog (models.dev's `fireworks-ai` section) lists no
     // US-only router, and its runtime PATCH answers 400 "Unknown model" for an
     // id the catalog does not know unless the caller vouches for it with
-    // `allow_custom_model`. Without this flag bootstrap.sh fails on the last
+    // `allow_custom_model`. Without this flag sync-agent-config.sh fails on the last
     // step and the agents keep whatever MODEL_OVERRIDE they had before, which
     // is the silent half-failure this test is here to prevent.
-    const source = read(BOOTSTRAP)
+    const source = read(SYNC_AGENT_CONFIG)
     assert.match(
       source,
       /PATCH "\/api\/agents\/\$agent\/runtime"/,
-      'bootstrap.sh no longer PATCHes the agent runtime; re-check how the model is set',
+      'sync-agent-config.sh no longer PATCHes the agent runtime; re-check how the model is set',
     )
     assert.match(
       source,
       /allow_custom_model: true/,
-      'bootstrap.sh must send allow_custom_model: true, or the runtime PATCH 400s on the US router id',
+      'sync-agent-config.sh must send allow_custom_model: true, or the runtime PATCH 400s on the US router id',
     )
   })
 
