@@ -53,43 +53,38 @@ export const panelRepliesPutStatement = {
   ],
 };
 
-// Read-only access to the identity-group-sync Lambda's logs and to CloudWatch
-// alarms, so the swarm can triage an `identity-group-sync-*` alarm. The Lambda
-// lives in this account, so this is a same-account grant on the host role and
-// needs no cross-account role. Log reads are scoped to the Lambda's log group
-// prefix; the alarm and metric actions do not support resource scoping, so
-// they stay on "*" and are read-only. No log write, no secrets.
-const GROUP_SYNC_LOG_GROUP_PREFIX = `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/aws/lambda/identity-group-sync`;
+// Read-only access to CloudWatch Logs across this account, plus alarms and
+// metrics, so the swarm can triage infrastructure-account incidents the way it
+// does in the main account. Same-account grant on the host role, so no
+// cross-account role. Log content can be sensitive. No log write, no secrets.
+const ACCOUNT_LOG_GROUPS = `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:*`;
 
-export const groupSyncLogsReadStatements = [
+export const infraLogsReadStatements = [
   {
-    // DescribeLogGroups only authorizes against the account-wide log-group ARN.
-    Sid: "ListLogGroups",
+    // Not resource-scoped in practice: DescribeLogGroups, query ids and
+    // log-record lookups do not authorize against one log group ARN.
+    Sid: "ListLogGroupsAndManageQueries",
     Effect: "Allow",
-    Action: "logs:DescribeLogGroups",
-    Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:*`,
+    Action: [
+      "logs:DescribeLogGroups",
+      "logs:DescribeQueries",
+      "logs:GetQueryResults",
+      "logs:StopQuery",
+      "logs:GetLogRecord",
+    ],
+    Resource: "*",
   },
   {
-    Sid: "ReadGroupSyncLogs",
+    Sid: "ReadAccountLogs",
     Effect: "Allow",
     Action: [
       "logs:DescribeLogStreams",
       "logs:GetLogEvents",
       "logs:FilterLogEvents",
       "logs:StartQuery",
+      "logs:GetLogGroupFields",
     ],
-    Resource: [
-      `${GROUP_SYNC_LOG_GROUP_PREFIX}*`,
-      `${GROUP_SYNC_LOG_GROUP_PREFIX}*:*`,
-    ],
-  },
-  {
-    // Query ids are not resource-scoped; a query can only be started on the
-    // log groups above.
-    Sid: "ManageLogQueries",
-    Effect: "Allow",
-    Action: ["logs:GetQueryResults", "logs:StopQuery"],
-    Resource: "*",
+    Resource: [ACCOUNT_LOG_GROUPS, `${ACCOUNT_LOG_GROUPS}:*`],
   },
   {
     Sid: "ReadAlarmsAndMetrics",
@@ -146,7 +141,7 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
       Resource: `${bucketArn}/ssm-output/*`,
     },
     panelRepliesPutStatement,
-    ...groupSyncLogsReadStatements,
+    ...infraLogsReadStatements,
     {
       Sid: "ReadBucketEncryption",
       Effect: "Allow",
