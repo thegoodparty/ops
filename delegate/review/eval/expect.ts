@@ -149,7 +149,6 @@ const checkoutFor = (synthetic: Set<string>): CheckoutFn => (bundle, repoDir) =>
     git(["fetch", "--depth=50", "origin", bundle.headSha]);
     git(["checkout", bundle.headSha], 60_000);
   }
-  git(["submodule", "update", "--init", "--recursive"]);
 };
 
 const readBody = async (body: unknown): Promise<string> => {

@@ -297,11 +297,6 @@ const defaultCheckout: CheckoutFn = (bundle, repoDir) => {
     stdio: "pipe",
     timeout: 60_000,
   });
-  execFileSync("git", ["submodule", "update", "--init", "--recursive"], {
-    cwd: repoDir,
-    stdio: "pipe",
-    timeout: 120_000,
-  });
 };
 
 const defaultRunAgentImpl: RunAgentImpl = (config, prompt, overrides) =>
