@@ -51,7 +51,13 @@ const main = async () => {
     // by side only ever read the mirror.
     const byRepo = new Map<string, string[]>();
     for (const c of cases) {
-      if (!c.bundle) continue;
+      if (!c.bundle) {
+        // A recorded case's key is reviews/<owner>/<repo>/<pr>/<head sha>/<run>.json.
+        const [, owner, name, , sha] = (c.key ?? "").split("/");
+        const repo = `${owner}/${name}`;
+        byRepo.set(repo, [...(byRepo.get(repo) ?? []), sha]);
+        continue;
+      }
       const b = readBundleFile(manifestPath, c.bundle);
       byRepo.set(b.repo, [...(byRepo.get(b.repo) ?? []), c.source === "simulated" ? b.baseSha : b.headSha]);
     }

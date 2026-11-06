@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -139,8 +139,17 @@ export const mirrorPath = (mirrorDir: string, repo: string): string =>
 export const ensureInMirror = (mirrorDir: string, repo: string, shas: string[]): string => {
   const mirror = mirrorPath(mirrorDir, repo);
   if (!existsSync(mirror)) {
+    // Cloned aside and renamed into place, so a process racing on a fresh
+    // mirror dir never sees a half-cloned repo; the loser's copy is dropped.
     mkdirSync(mirrorDir, { recursive: true });
-    execFileSync("gh", ["repo", "clone", repo, mirror, "--", "--bare"], { stdio: "pipe", timeout: 1_800_000 });
+    const tmp = `${mirror}.tmp-${process.pid}`;
+    rmSync(tmp, { recursive: true, force: true });
+    execFileSync("gh", ["repo", "clone", repo, tmp, "--", "--bare"], { stdio: "pipe", timeout: 1_800_000 });
+    try {
+      renameSync(tmp, mirror);
+    } catch {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   }
   for (const sha of shas) {
     try {
