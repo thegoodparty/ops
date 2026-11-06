@@ -21,6 +21,8 @@ import { createBifrostDiscovery } from "./discovery";
 import { createBifrostGovernanceParameters } from "./governance-parameters";
 import { createBifrostVkMint } from "./bifrost-vk-mint";
 import { createBifrostVkJanitor } from "./bifrost-vk-janitor";
+import { WORKBENCH_ALERT_EMAIL } from "./alert-email";
+import { createBifrostGatewayAlarms } from "./alarms";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -314,8 +316,13 @@ export const invocationLogGroup = invocationLogs.name;
 // region is immaterial here, and `budgets:*` is one of the SCP's region
 // exemptions, added with this step in mind.
 
-/** The step 1 group alias, which has been waiting for exactly this job. */
-const SPEND_ALERT_EMAIL = "aws-workbench@goodparty.org";
+/**
+ * The step 1 group alias, imported rather than restated: the reconciler's
+ * alarm and the gateway-health topic subscribe the same address, and one
+ * constant is what keeps a typo from becoming a page nobody receives. See
+ * `alert-email.ts`.
+ */
+const SPEND_ALERT_EMAIL = WORKBENCH_ALERT_EMAIL;
 
 const spendNotification = (
   notificationType: "ACTUAL" | "FORECASTED",
@@ -681,3 +688,38 @@ export const vkBifrostJanitorScheduleRuleName = vkJanitor.rule.name;
  */
 export const vkBifrostJanitorAlarmName = vkJanitor.janitorAlarm.name;
 export const vkBifrostJanitorAlertTopicArn = vkJanitor.alertTopic.arn;
+
+// ---------------------------------------------------------------------------
+// The gateway's capacity and availability alarms.
+//
+// The gap `ecs.ts` recorded twice ("the Logs Insights / metric-filter alarm
+// that would make it a page ... there is no alerting target in this account
+// yet"), closed. Four alarms on the one signal set that describes whether the
+// gateway is serving: the task's CPU and memory, the load balancer's own 5XX
+// count, and whether a task is running at all. Each is tuned against a
+// fortnight of measured CloudWatch data rather than a round number, and the
+// measuring is in `alarms.ts` beside the constant it justifies.
+//
+// It consumes the ingress object rather than the load balancer's name, because
+// `HTTPCode_ELB_5XX_Count`'s `LoadBalancer` dimension is the ARN suffix
+// (`app/bifrost/<id>`) and a copied literal would break on the ALB's next
+// replacement. Email only, to the same group alias the spend alerts and the
+// reconciler use: `index.ts` records "no Slack for now" as a reviewed decision
+// for this account, and this is not the change that reverses it.
+//
+// The alarms import `TASK_CPU` and `TASK_MEMORY` from `ecs.ts` so their
+// descriptions state the task size they are actually measuring. The thresholds
+// are percentages and survive a resize on their own; the prose would not, and
+// #484's move to 1024/2048 is the case that proves it.
+const alarms = createBifrostGatewayAlarms({ provider, ingress });
+
+/** The one topic every gateway alarm publishes to, for the console and a human. */
+export const bifrostGatewayAlertTopicArn = alarms.alertTopic.arn;
+
+/** The four alarm names, so a reader of `pulumi stack output` can find them. */
+export const bifrostGatewayAlarmNames = [
+  alarms.cpuSaturationAlarm.name,
+  alarms.memoryPressureAlarm.name,
+  alarms.alb5xxAlarm.name,
+  alarms.availabilityAlarm.name,
+];
