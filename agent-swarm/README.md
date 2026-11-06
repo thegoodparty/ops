@@ -278,6 +278,31 @@ A merge that changes `global-setup-script.sh` restarts the agents on deploy
 (see "Swarm state this repo owns"). Check from a worker: `gh-app-token >/dev/null`
 prints no note, and `gh api repos/thegoodparty/ops --jq .full_name` works.
 
+### Hill-climb permissions
+
+The swarm proposes delegate reviewer changes and measures them with
+`delegate-eval-run.yml`; it never merges them. These settings live in GitHub,
+not in this repo, so they are recorded here. Checked 2026-11-06.
+
+- `delegate-gp` has `actions: write` on its installation, which is what
+  `gh workflow run delegate-eval-run.yml --ref main ...` and `gh run download`
+  need. It also lets the App re-run or cancel any ops workflow, and it holds
+  `workflows: write`; both are accepted for now. A workflow it pushes to a
+  branch gets no AWS access, because the eval roles trust only the workflow
+  files on ops `main` (`job_workflow_ref` in `deploy/components/ci-roles/policies.ts`).
+- Merging needs a human. A candidate may change only
+  `delegate/agents/pr-reviewer.ts` and `pr-reviewer-subagents.ts`, and
+  `.github/CODEOWNERS` gives `delegate/` to `@thegoodparty/gp-contrib`. The
+  `main` ruleset requires a code-owner review, and its only bypass actor is
+  an organization admin. An App can't be a code owner, so neither
+  `delegate-gp` nor `delegate-reviewer` can approve one of these PRs in a
+  human's place. Never add either App as a bypass actor or move `delegate/`
+  to the CODEOWNERS opt-out list.
+- The swarm can't run as the eval. `DELEGATE_EVAL_APP_PRIVATE_KEY` is an
+  Actions secret on ops, outside the `DELEGATE_SWARM` keys, and Actions
+  secrets can't be read back through the API. The eval roles trust only
+  GitHub's OIDC provider, so the host role can't assume them.
+
 ## What lives in this repo and what lives in the swarm
 
 The swarm keeps scripts, skills, schedules, souls, identities and plain
