@@ -435,8 +435,8 @@ Each step is a PR unless it says otherwise.
      HTML login page
    - `count(bifrost_input_tokens_total)` and the label names on one sample, to
      prove `virtual_key_name` and `model` are present and non-empty
-   - the total number of series, which is the input to step 3's allowlist and
-     to the Grafana plan decision
+   - the total number of series, which is the input to step 6's allowlist and
+     to the metrics-instance decision
 
    If the endpoint is locked rather than open, stop and amend this plan: the
    design becomes "Alloy holds the setup token", which is a different security
@@ -461,7 +461,8 @@ Each step is a PR unless it says otherwise.
 
 4. **The `bifrost/grafana-alloy` secret, filled out of band.** This is the
    credential plumbing, and it is the whole of what has to be handed to Grafana
-   on the write side. Same shape as `bifrost/gateway` and `bifrost/sheriff`:
+   on the write side. Same shape as `bifrost/gateway` and
+   `bifrost/oauth2-proxy`, the two containers `fill-secrets.sh` already manages:
    Pulumi owns the read grant and a committed script writes the value, so no
    token is in the repo and a `preview` never reads one. Extend
    `deploy-workbench/bifrost/fill-secrets.sh` rather than adding a fourth
