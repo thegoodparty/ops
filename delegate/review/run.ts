@@ -5,6 +5,7 @@ import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
 import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
+import { readPostmortems } from "./postmortems";
 import { promptDiff } from "./prompt-diff";
 import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
@@ -649,7 +650,8 @@ export const runReview = async (args: {
 
   let result: Awaited<ReturnType<typeof runAgent>>;
   try {
-    result = await runAgent(config, buildReviewPrompt(bundle, { diffPath }), {
+    const postmortems = readPostmortems(reviewDir, bundle.baseSha);
+    result = await runAgent(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: reviewDir,
       abortController: args.abortController,
       mcpServers: { git: createGitTool(reviewDir) },
