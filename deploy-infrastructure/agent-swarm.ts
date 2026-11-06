@@ -53,6 +53,58 @@ export const panelRepliesPutStatement = {
   ],
 };
 
+// Read-only access to the identity-group-sync Lambda's logs and to CloudWatch
+// alarms, so the swarm can triage an `identity-group-sync-*` alarm. The Lambda
+// lives in this account, so this is a same-account grant on the host role and
+// needs no cross-account role. Log reads are scoped to the Lambda's log group
+// prefix; the alarm and metric actions do not support resource scoping, so
+// they stay on "*" and are read-only. No log write, no secrets.
+const GROUP_SYNC_LOG_GROUP_PREFIX = `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:/aws/lambda/identity-group-sync`;
+
+export const groupSyncLogsReadStatements = [
+  {
+    // DescribeLogGroups only authorizes against the account-wide log-group ARN.
+    Sid: "ListLogGroups",
+    Effect: "Allow",
+    Action: "logs:DescribeLogGroups",
+    Resource: `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:*`,
+  },
+  {
+    Sid: "ReadGroupSyncLogs",
+    Effect: "Allow",
+    Action: [
+      "logs:DescribeLogStreams",
+      "logs:GetLogEvents",
+      "logs:FilterLogEvents",
+      "logs:StartQuery",
+    ],
+    Resource: [
+      `${GROUP_SYNC_LOG_GROUP_PREFIX}*`,
+      `${GROUP_SYNC_LOG_GROUP_PREFIX}*:*`,
+    ],
+  },
+  {
+    // Query ids are not resource-scoped; a query can only be started on the
+    // log groups above.
+    Sid: "ManageLogQueries",
+    Effect: "Allow",
+    Action: ["logs:GetQueryResults", "logs:StopQuery"],
+    Resource: "*",
+  },
+  {
+    Sid: "ReadAlarmsAndMetrics",
+    Effect: "Allow",
+    Action: [
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:DescribeAlarmHistory",
+      "cloudwatch:GetMetricData",
+      "cloudwatch:GetMetricStatistics",
+      "cloudwatch:ListMetrics",
+    ],
+    Resource: "*",
+  },
+];
+
 // The host role's inline policy, kept pure so a test can read its statements.
 export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
   Version: "2012-10-17",
@@ -94,6 +146,7 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
       Resource: `${bucketArn}/ssm-output/*`,
     },
     panelRepliesPutStatement,
+    ...groupSyncLogsReadStatements,
     {
       Sid: "ReadBucketEncryption",
       Effect: "Allow",

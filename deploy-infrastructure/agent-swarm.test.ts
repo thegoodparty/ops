@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
   hostFiles,
   hostFilesHash,
+  groupSyncLogsReadStatements,
   panelRepliesPutStatement,
   SWARM_HOSTNAME,
   swarmHostPolicy,
@@ -112,5 +113,25 @@ describe("panel replies grant", () => {
   it("is in the host role's policy", () => {
     const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
     assert.ok(Statement.includes(panelRepliesPutStatement));
+  });
+});
+
+describe("identity-group-sync read access", () => {
+  const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+
+  it("is in the host role's policy", () => {
+    for (const statement of groupSyncLogsReadStatements) {
+      assert.ok(Statement.includes(statement), statement.Sid);
+    }
+  });
+
+  it("is read-only and scopes log reads to the Lambda's log group", () => {
+    const actions = groupSyncLogsReadStatements.flatMap((s) => [s.Action].flat());
+    const write = /Put|Create|Delete|Set|Update|Tag|Associate|Disable|Enable/;
+    assert.deepEqual(actions.filter((a) => write.test(a.split(":")[1])), []);
+    const reads = groupSyncLogsReadStatements.find((s) => s.Sid === "ReadGroupSyncLogs");
+    for (const arn of [reads?.Resource].flat()) {
+      assert.match(String(arn), /:log-group:\/aws\/lambda\/identity-group-sync\*/);
+    }
   });
 });
