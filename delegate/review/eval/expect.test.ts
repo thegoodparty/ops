@@ -593,6 +593,14 @@ test("gate: a case main did not pass 3/3 cannot regress, and unfinished main run
   assert.equal(g.pass, true);
 });
 
+test("gate: a case marked flakyOnMain cannot regress even when main passed it 3/3", () => {
+  const { tune } = gateCases();
+  const flaky = { ...tune, flakyOnMain: "main drops the real bug on some runs" };
+  const base = mkBase([mkReport(flaky, runsOf(true, true, true))]);
+  const g = computeGate([mkReport(flaky, runsOf(true, false, false, true, false, false))], base, [], true);
+  assert.deepEqual([g.cases[0].outcome, g.cases[0].flaky, g.regressions, g.pass], ["not-held", true, [], true]);
+});
+
 test("gate: a target below 3/3 fails, and an unknown target id does too", () => {
   const { tune } = gateCases();
   const base = mkBase([mkReport(tune, runsOf(false, false, false))]);
