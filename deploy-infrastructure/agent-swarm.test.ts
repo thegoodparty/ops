@@ -5,7 +5,7 @@ import * as path from "node:path";
 import {
   hostFiles,
   hostFilesHash,
-  groupSyncLogsReadStatements,
+  infraLogsReadStatements,
   panelRepliesPutStatement,
   SWARM_HOSTNAME,
   swarmHostPolicy,
@@ -116,22 +116,22 @@ describe("panel replies grant", () => {
   });
 });
 
-describe("identity-group-sync read access", () => {
+describe("infrastructure account log read access", () => {
   const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
 
   it("is in the host role's policy", () => {
-    for (const statement of groupSyncLogsReadStatements) {
+    for (const statement of infraLogsReadStatements) {
       assert.ok(Statement.includes(statement), statement.Sid);
     }
   });
 
-  it("is read-only and scopes log reads to the Lambda's log group", () => {
-    const actions = groupSyncLogsReadStatements.flatMap((s) => [s.Action].flat());
+  it("is read-only and scopes stream and event reads to this account's log groups", () => {
+    const actions = infraLogsReadStatements.flatMap((s) => [s.Action].flat());
     const write = /Put|Create|Delete|Set|Update|Tag|Associate|Disable|Enable/;
     assert.deepEqual(actions.filter((a) => write.test(a.split(":")[1])), []);
-    const reads = groupSyncLogsReadStatements.find((s) => s.Sid === "ReadGroupSyncLogs");
+    const reads = infraLogsReadStatements.find((s) => s.Sid === "ReadAccountLogs");
     for (const arn of [reads?.Resource].flat()) {
-      assert.match(String(arn), /:log-group:\/aws\/lambda\/identity-group-sync\*/);
+      assert.match(String(arn), /^arn:aws:logs:[a-z0-9-]+:\d{12}:log-group:\*/);
     }
   });
 });
