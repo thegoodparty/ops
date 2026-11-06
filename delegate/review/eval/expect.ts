@@ -78,6 +78,9 @@ const ExpectedCaseSchema = z
     split: SplitSchema,
     source: SourceSchema,
     kind: KindSchema,
+    // Why main's own result on this case is noise, not a bar. Set, the gate
+    // still scores and reports it but never counts it as a regression.
+    flakyOnMain: z.string().min(1).optional(),
   })
   .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
@@ -327,7 +330,7 @@ const avgCost = (reports: CaseReport[]): number | null => {
 
 // A case main passes on every run must not regress. One that drops below
 // 3/3 gets `runs` more runs and has to reach 2*runs-1 of 2*runs, so a single
-// unlucky run is not a regression. A run that errored is a failed run, and
+// unlucky run is not a regression. A case marked `flakyOnMain` cannot regress. A run that errored is a failed run, and
 // with `final` a rerun that never happened is a failed rerun, so infra noise
 // cannot pass as an improvement. Each target must pass every run.
 export const computeGate = (
@@ -346,7 +349,7 @@ export const computeGate = (
     const candPassed = r.scores.filter((s) => s.pass).length;
     const candRuns = r.scores.length;
     let outcome: GateCase["outcome"];
-    if (main.runsPassed !== runs || main.completed !== runs) outcome = "not-held";
+    if (r.c.flakyOnMain || main.runsPassed !== runs || main.completed !== runs) outcome = "not-held";
     else if (candRuns > runs) outcome = candPassed >= 2 * runs - 1 ? "pass" : "regression";
     else if (candPassed >= runs) outcome = "pass";
     else outcome = final ? "regression" : "rerun";
@@ -355,7 +358,7 @@ export const computeGate = (
       split: r.c.split,
       mainPassed: main.runsPassed,
       mainCompleted: main.completed,
-      flaky: main.runsPassed > 0 && main.runsPassed < main.completed,
+      flaky: Boolean(r.c.flakyOnMain) || (main.runsPassed > 0 && main.runsPassed < main.completed),
       candPassed,
       candRuns,
       outcome,
