@@ -249,10 +249,12 @@ const containerDefinitionBlock = (nameConstant: string): string => {
 
 describe("bifrost ecs", () => {
   it("runs one Fargate task at the plan's sizing", () => {
-    // 0.5 vCPU / 1 GB, per "Compute: ECS Fargate" — the smallest valid
-    // Fargate pair, and a one-line change if the load ever needs more.
-    assert.equal(TASK_CPU, "512");
-    assert.equal(TASK_MEMORY, "1024");
+    // 1 vCPU / 2 GB. The plan started at 0.5 vCPU / 1 GB, the smallest valid
+    // Fargate pair; it was raised on measured CPU ceilings (see the comment on
+    // the constants in `ecs.ts`). What this pins is that the task size is this
+    // pair and that the definition uses the constants rather than a literal.
+    assert.equal(TASK_CPU, "1024");
+    assert.equal(TASK_MEMORY, "2048");
 
     const block = resourceBlock("bifrostTaskDefinition");
     assert.ok(block.includes('networkMode: "awsvpc"'), block);
@@ -1143,11 +1145,12 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("fits both containers' reservations inside the task, with no growth", () => {
+  it("fits both containers' reservations inside the task, with no slack", () => {
     // Fargate refuses a task whose container reservations exceed the task's
-    // cpu/memory. The sidecar's share comes out of the single container's
-    // former whole-task reservation rather than raising the task size, which
-    // is item 8's and stays at 0.5 vCPU / 1 GB.
+    // cpu/memory. The task was raised to 1 vCPU / 2 GB for CPU headroom, and
+    // the sidecar's share comes out of that: its 64/128 is unchanged, so
+    // Bifrost gets the rest. The sums still have to equal the task exactly,
+    // which is the invariant, not the numbers in it.
     assert.equal(
       BIFROST_CONTAINER_CPU + OAUTH2_PROXY_CONTAINER_CPU,
       Number(TASK_CPU),
@@ -2043,14 +2046,20 @@ describe("the password command's memory at boot", () => {
    *   2026-10-25, i.e. about 676 MiB.
    *
    * The fix is the entry point's warm below rather than a bigger task: the
-   * measured concurrent figure fits inside the existing reservation, and the
-   * warm keeps the expensive cold part (the interpreter and botocore import
-   * faulting in from the image layer) to one serial pass before Bifrost starts
-   * instead of two racing for 0.44 vCPU.
+   * measured concurrent figure fits inside the reservation, and the warm keeps
+   * the expensive cold part (the interpreter and botocore import faulting in
+   * from the image layer) to one serial pass before Bifrost starts instead of
+   * two racing for a fraction of a vCPU.
    *
-   * 676 + 142 = 818 MiB of the 896 MiB limit, so the margin is 78 MiB. That is
-   * the tripwire: if the gateway's peak passes ~750 MiB the reservation is what
-   * needs to change, and the container will be killed before a deploy notices.
+   * 676 + 142 = 818 MiB of the 1920 MiB limit, so the margin is 1102 MiB. The
+   * limit was 896 MiB when this block was written, with a 78 MiB margin and a
+   * tripwire at about 750 MiB of gateway usage; the task was then raised to
+   * 1 vCPU / 2 GB for CPU headroom (see `ecs.ts`), which moved the limit without
+   * moving any of the measured numbers above. So the tripwire is now far below
+   * it rather than 78 MiB away: passing ~750 MiB of gateway usage would not by
+   * itself mean the reservation has to change, and the constants here stay the
+   * values that were measured rather than being re-derived against the larger
+   * limit.
    */
   const GATEWAY_PEAK_MIB = 676;
   const PASSWORD_COMMAND_PEAK_MIB = 71;
@@ -2068,7 +2077,7 @@ describe("the password command's memory at boot", () => {
     // already asserts; this only says the arithmetic above is not satisfied by
     // a value that is under what was measured.
     assert.ok(BIFROST_CONTAINER_MEMORY > GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB);
-    assert.equal(BIFROST_CONTAINER_MEMORY, 896);
+    assert.equal(BIFROST_CONTAINER_MEMORY, 1920);
   });
 
   it("is not relying on singleflight across the two pools", () => {

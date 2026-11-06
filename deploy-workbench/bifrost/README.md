@@ -264,12 +264,16 @@ starts, bounded by the same timeout and with a failure swallowed (the first
 dial then reports it, where Bifrost retries instead of exiting). That warm does
 not fill Bifrost's cache, which is inside the process it runs before; it fills
 the page cache, so the interpreter and botocore fault in once and alone instead
-of twice at once on a 0.44 vCPU task. The measured worst case, the gateway's
-676 MiB peak plus two concurrent 71 MiB forks, is 818 MiB of the 896 MiB
-reservation, so no task-size change was needed. Past about 750 MiB of gateway
-usage the reservation is what has to move, and a `cache_ttl` expiry after boot
-can still produce two concurrent forks, so that arithmetic rather than the warm
-is what bounds the risk.
+of twice at once on the 0.44 vCPU reservation it then had. The measured worst
+case, the gateway's 676 MiB peak plus two concurrent 71 MiB forks, was 818 MiB
+of the 896 MiB reservation, so no task-size change was needed for memory. Those
+were the numbers when the warm went in; the task has since been raised to
+1 vCPU / 2 GB for CPU headroom (`deploy-workbench/ecs.ts`), so
+the gateway now reserves 960 CPU / 1920 MiB and the same 818 MiB worst case sits
+at 43% of it. Past about 750 MiB of gateway usage the reservation was what had
+to move, and that is no longer 78 MiB away; a `cache_ttl` expiry after boot can
+still produce two concurrent forks, so that arithmetic rather than the warm is
+what bounds the risk.
 
 **How it reaches the container (item 10's second half).**
 `deploy-workbench/ecs.ts` reads this file at deploy time, stores it in the SSM

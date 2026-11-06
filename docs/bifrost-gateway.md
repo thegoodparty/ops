@@ -135,9 +135,12 @@ provider that project requires:
   service yet — the delegate dispatches ephemeral tasks — so this is the one
   genuinely new resource, and it should follow the same role and secret
   patterns.
-- **Sizing:** 0.5 vCPU / 1 GB (512/1024) to start, per the upstream ECS
-  guide. Bifrost adds microseconds of overhead and the load is per-engineer;
-  the task size is a one-line change if it needs to grow.
+- **Sizing:** 1 vCPU / 2 GB (1024/2048), raised from the 0.5 vCPU / 1 GB
+  (512/1024) this started at. Bifrost adds microseconds of overhead and the
+  load is per-engineer, but the task turned out not to be idle: see "Sizing was
+  raised on measured CPU" at the end of this section. Fargate's valid cpu/memory
+  pairs put 1024 CPU at 2048 through 8192 MB, so 1024/2048 is a pair the
+  platform accepts.
 - **Egress:** the task needs NAT (or VPC endpoints for ECR, Secrets Manager,
   CloudWatch and S3) to pull the image, read secrets, write logs and reach
   the provider APIs.
@@ -158,6 +161,36 @@ Alternatives considered and not chosen: the EC2 + EBS + DLM host pattern in
 `deploy-infrastructure/agent-swarm.ts` (the engineer's direction is Fargate,
 and RDS removes the reason that pattern exists), and ECS on EC2. Neither is
 needed.
+
+**Sizing was raised on measured CPU.** The 0.5 vCPU / 1 GB above was the
+starting point, chosen per the upstream ECS guide as the smallest valid Fargate
+pair and as a one-line change if the load needed more. The load did need more.
+CloudWatch over the 14 days to 2026-11-06, with task CPU a percentage of the
+task's 512 units (448 of which Bifrost reserved), showed the median task idle at
+p50 1.3% and p95 21%, but daily maxima landing on the ceiling exactly:
+100.31% on 2026-11-03, 100.25% on 2026-11-05 and 2026-11-06, 99.57% on
+2026-10-24, 100.00% on 2026-10-25, with 3 of 864 five-minute buckets at or above
+90% and 4 at or above 75%. Those moments line up with the load balancer's 5XX
+bursts (54 at 2026-11-03 16:03-16:33, 58 at 2026-11-04 16:38, 44 at 2026-11-06
+08:43-08:48) while target 5XX was zero over the last two days: the application
+never returned an error, the load balancer gave up on a briefly pinned task.
+Traffic grew about 15x across the window (77 requests on 2026-10-28 to 6,791 on
+2026-11-04) without CPU following it up, so this was peak densification rather
+than steady saturation. Memory was the healthy dimension — p50 12%, daily maxima
+28-32% since 2026-11-01, no sawtooth and no upward creep — and is doubled
+anyway, to keep the container reservations a valid Fargate pair and the memory
+tripwire far below the limit rather than a few MiB under it. Doubling CPU puts
+the observed ceiling at roughly 50% of the task, which is the headroom the
+requirement was about: the size has to keep developers from being disrupted, not
+postpone the same bursts. The service deploys stop-before-start
+(`minimumHealthyPercent: 0` / `maximumPercent: 100`, because two OSS Bifrost
+processes against one database is the multi-node configuration upstream does not
+support), so the task-size change lands as a brief restart rather than a rolling
+deploy.
+
+Sizing up is the only vertical lever here. OSS Bifrost keeps provider configs,
+keys, usage and budgets in memory and does not support multi-node, so there is
+no scale-out to reach for and `desiredCount` stays 1.
 
 ### State: RDS Postgres
 
@@ -1403,7 +1436,9 @@ network or a permission can land before the item that creates it.
    Bedrock model list, `secrets` from Secrets Manager, `awslogs`,
    `initProcessEnabled`), and the CloudWatch log group, in
    `deploy-workbench/ecs.ts`. One cluster with container insights; one Fargate
-   task definition at 0.5 vCPU / 1 GB, `awsvpc`, x86_64 because the mirror pulls
+   task definition at 1 vCPU / 2 GB (item 8 shipped it at 0.5 vCPU / 1 GB, the
+   starting size raised on measured CPU ceilings — see "Sizing was raised on
+   measured CPU"), `awsvpc`, x86_64 because the mirror pulls
    `linux/amd64`; one task, `desiredCount: 1`, with
    `minimumHealthyPercent: 0` / `maximumPercent: 100` so a deploy stops the old
    task before starting the new one rather than briefly running two — ECS's
@@ -1470,8 +1505,9 @@ network or a permission can land before the item that creates it.
    `/etc/oauth2-proxy/allowed-emails.txt`, the redirect URL and whitelist
    domain derived from the ingress hostname), `awslogs` into the same log group
    and `initProcessEnabled`. Both containers are essential, and their cpu/memory
-   reservations split the task's unchanged 0.5 vCPU / 1 GB rather than raising
-   it, because Fargate rejects reservations that exceed the task.
+   reservations split the task's 1 vCPU / 2 GB — the sidecar's 64 CPU / 128 MB
+   unchanged, Bifrost taking the rest — rather than growing the task again,
+   because Fargate rejects reservations that exceed the task.
 
    The HTTPS listener gains four rules, none of which re-points the default
    action: `/oauth2/*` to oauth2-proxy (priority 10), `/` and `/api/*` to
