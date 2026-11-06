@@ -742,7 +742,7 @@ describe("bifrost config.json", () => {
       // And the command is the executable the derived image installs, with the
       // TTL that bounds how long a rotated-away password can be reused and the
       // timeout that bounds one resolution. The timeout is 30s, not the pinned
-      // tag's 10s default: a cold `aws-cli` start on a 0.44 vCPU task is not
+      // tag's 10s default: a cold `aws-cli` start on the task's ~1 vCPU is not
       // the same measurement as a warm one on a build machine, and a timeout
       // here fails store init and exits Bifrost. The budget is in the timeout
       // test below, held against the health check's start period.
@@ -1032,7 +1032,8 @@ describe("the password command's timeout budget", () => {
    *
    * - **Long enough for a cold start.** Two `aws-cli` processes can start on
    *   the same boot (the two stores have separate caches, so a miss in each is
-   *   two forks), and the task has 0.44 vCPU. Measured in the build container,
+   *   two forks), and Bifrost reserves 0.96 vCPU of the task's 1 vCPU — 0.44
+   *   when this budget was chosen. Measured in the build container,
    *   one `aws secretsmanager get-secret-value` costs 0.62-0.88 s wall and 71
    *   MiB peak RSS with a warm page cache on four cores; a cold container also
    *   faults in the ~116 MiB of `aws-cli` plus `python3` from the image layer,

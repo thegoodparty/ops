@@ -582,8 +582,8 @@ export const BIFROST_MEASURED_BOOT_SECONDS = 23.1;
  * end of five measured runs in the build container (0.62-0.88 s wall, 71 MiB
  * peak RSS, four cores, aarch64).
  *
- * It is a floor, not a prediction of the task. Bifrost reserved 0.44 vCPU when
- * this was measured, and the task is 0.96 vCPU now (see the task size above); a
+ * It is a floor, not a prediction of the task. Bifrost's reservation was 0.44
+ * vCPU when this was measured and is 0.96 vCPU now (see the task size above); a
  * cold page cache still makes the real cold start several times this, which is
  * why `config.json`'s timeout is many multiples of it rather than a small
  * margin. The number is here so the test can assert that multiple instead of

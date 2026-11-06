@@ -215,7 +215,8 @@ a store has exactly one of them and both stores have to move in one change.
 
 The `timeout` is 30s rather than the pinned tag's 10s default. A timeout here
 fails store init and Bifrost exits, and the call it bounds is a cold Python
-`aws-cli` start on a task with 0.44 vCPU, not a warm one on a build machine;
+`aws-cli` start on a task reserving a fraction of a vCPU (0.44 when the timeout
+was chosen, 0.96 now), not a warm one on a build machine;
 the worst case is two of them at once at boot. 30s is still inside the container
 health check's 90s `startPeriod` even with the slowest measured boot (23.1s of
 store migrations) added to it, which is the constraint that makes it safe
