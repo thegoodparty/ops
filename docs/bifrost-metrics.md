@@ -16,6 +16,21 @@
 > Step: 1
 > ```
 
+**This plan is the enabling infrastructure and stops there.** It gets Bifrost's
+counters into Grafana Cloud, proves they arrived, and leaves a working data
+path. It does **not** define a dashboard: no panel, no chart layout, no
+dashboard JSON. The visualisation is a follow-on change that builds on a
+verified pipeline, and it belongs with the Grafana provisioning that already
+exists rather than being invented here.
+
+> **The Grafana half is not new.** There is a pre-existing Grafana plan and a
+> working implementation in `thegoodparty/omni`: `components/grafana.ts`
+> provisions datasources, folders, dashboards, alert rules and contact points
+> through `@pulumiverse/grafana`, against the `goodparty` stack (id
+> `1532096`). This plan reuses it rather than building a parallel path. See
+> "The existing Grafana provisioning" below for what it gives us, what
+> credentials it needs, and which of its pieces this work has to touch.
+
 Phase 3 of `bifrost-gateway.md` has carried an unwritten item 15 since the
 gateway was designed: *"Wire `/metrics` into CloudWatch (agent scrape) or the
 chosen metrics path."* It also explains why that is not free. `/metrics` has no
@@ -28,9 +43,9 @@ endpoint, so it builds it.
 
 ## Objective and success criteria
 
-Get per-engineer, per-model token and cost usage off the gateway and into a
-dashboard, without giving anything outside the VPC a query path into the
-gateway's Postgres instance.
+Get per-engineer, per-model token and cost usage off the gateway and into the
+Grafana stack the org already runs, without giving anything outside the VPC a
+query path into the gateway's Postgres instance.
 
 Success, in the order it should be proven:
 
@@ -38,7 +53,7 @@ Success, in the order it should be proven:
    `http://bifrost.workbench.local:8080/metrics` from a container in the private
    subnets returns the Prometheus exposition text, with no credential. If it
    does not, this plan is wrong and step 1 stops it before anything is built.
-2. **The series are the chart.** `bifrost_input_tokens_total`,
+2. **The series carry the dimensions.** `bifrost_input_tokens_total`,
    `bifrost_output_tokens_total` and `bifrost_cost_total` arrive in Grafana
    Cloud carrying `virtual_key_name` and `model` labels, so
    `sum by (virtual_key_name, model) (increase(bifrost_input_tokens_total[24h]))`
@@ -54,19 +69,26 @@ Success, in the order it should be proven:
 5. **A restart costs one sample, and it is visible.** `increase()` across a task
    replacement loses at most one scrape interval, and an unmatched counter reset
    is observable rather than silent.
-6. **A dashboard exists that a human can read.** One panel, stacked by model,
-   developers on the x-axis, tokens on the y, in Grafana Cloud, loading without
-   an ad hoc query.
+6. **The data is reachable from the existing Grafana stack.** The counters are
+   queryable in Explore against the `grafanacloud-prom` datasource on the
+   `goodparty` stack, which is where the pre-existing provisioning already
+   reads from, so a follow-on dashboard is a resource in
+   `components/grafana.ts` and not a new integration.
 
-Explicitly out of scope: the Slack delivery. Whether that is a Grafana alert
-rule, a scheduled report, or something in `gp-pi` is a delivery decision this
-plan does not make and does not depend on. The dashboard and a working data
-path come first; a chart nobody can read is not improved by being posted.
+Explicitly out of scope, and both are deliberate:
+
+- **The dashboard.** No panel, no chart, no dashboard JSON. This plan ends at a
+  verified data path; the visualisation is the next change, built on top of it.
+  Success criterion 6 is the seam: it proves the follow-on has somewhere to
+  land.
+- **The Slack delivery.** Whether that is a Grafana alert rule, a scheduled
+  report, or something in `gp-pi` is a delivery decision this plan does not
+  make and does not depend on.
 
 ## Why scrape, and not the two alternatives
 
-The gateway already records everything the chart needs. `logs_store` is on and
-points at the workbench RDS instance
+The gateway already records everything the usage question needs. `logs_store`
+is on and points at the workbench RDS instance
 (`deploy-workbench/bifrost/config.json:24-42`), and the `logs` table has
 `model`, `prompt_tokens`, `completion_tokens`, `cost`, `virtual_key_id` and
 `virtual_key_name` per request (`framework/logstore/tables.go:310-466` at the
@@ -109,6 +131,42 @@ disabled it, and `metricsEnabled` defaults to true
 (`plugins/telemetry/main.go:779`). The counters are being recorded right now;
 nothing reads them.
 
+## The existing Grafana provisioning
+
+The Grafana half of this does not need designing. `thegoodparty/omni` already
+provisions the `goodparty` Grafana Cloud stack declaratively, in
+`packages/gp-api/deploy/components/grafana.ts`, through `@pulumiverse/grafana`
+(`^2.20.0`). What that gives this plan:
+
+| Piece | Where | What this work uses it for |
+| --- | --- | --- |
+| Pulumi Grafana provider | `grafana:url = https://goodparty.grafana.net`, `grafana:stackId = 1532096` (`infra-cli.ts:202-211`) | The same stack, so the metrics instance is already addressable |
+| Auth | `GRAFANA_AUTH`, an SSM parameter `grafana-shared-service-account-token`, fetched per run (`infra-cli.ts:93,169`) | Read-only use for verification; not needed by the scraper |
+| Prometheus datasource | uid `grafanacloud-prom` (`grafana.ts:42`) | Where the counters appear |
+| Folders and dashboards | `grafana.oss.Folder` / `grafana.oss.Dashboard`, e.g. `grafana.ts:377-390` | Where the follow-on dashboard goes |
+| Contact points and alert routing | `grafana.ts`, `components/alerting/` | Where a Slack delivery would go later |
+
+So the config to plumb is smaller than the first draft of this plan assumed, and
+the credentials split cleanly into two sides:
+
+**Write side, in AWS (this plan's step 4).** The scraper needs one thing Grafana
+owner: a Cloud Access Policy token scoped to `metrics:write` on the workbench's
+metrics instance. That is a *push* credential, unrelated to the
+`GRAFANA_AUTH` service-account token above, which is a *read and admin*
+credential for the stack. Keeping them separate matters: the scraper must not
+hold a token that can edit dashboards or read other instances.
+
+**Read side, already in place.** Querying the data, and later adding a
+dashboard, uses the existing `GRAFANA_AUTH` service account from `omni`'s
+deploy path. Nothing new is required, and no dashboard resource should be added
+to `ops` at all: the provisioning lives in `omni`, next to the app whose metrics
+sit beside these.
+
+One thing this plan does *not* change: `omni`'s Grafana provider is scoped to
+the `gp-api` Pulumi stack, and `ops` has no Grafana provider. This plan
+deliberately adds none. The scrape is infrastructure and belongs in `ops`; the
+dashboards belong in the stack that already owns them.
+
 ## What the endpoint carries
 
 The labels are the reason this works, and they are worth stating exactly. At the
@@ -141,11 +199,11 @@ like bugs otherwise:
   the SQL path there is no `canonical_model_name` label to fall back on, so a
   grouping on `model` shows three slices of the same model. Group on `provider`
   for an honest Fireworks-versus-Bedrock split, or collapse the role names with
-  `label_replace` in the query. This is a decision for step 10.
+  `label_replace` in the query. This is a decision for the dashboard change.
 - **`cost` is the gateway's estimate, not the bill.** Item 16 of
   `bifrost-gateway.md` (reconcile against a week of provider billing, add
   pricing overrides) is still open, and the expected first disagreement is the
-  Fireworks US-only premium. The dashboard should say so on the panel.
+  Fireworks US-only premium. The panel should say so, when there is one.
 
 ## Shape
 
@@ -339,7 +397,7 @@ routing-overhead counters.
   yet, so they are the easiest thing to add later.
 - **Everything Bifrost records but does not expose as a metric.** This is the
   omission that matters, and it is why this plan is a data path rather than a
-  dashboard alone. The per-request record in the `logs` table (per-request
+  chart. The per-request record in the `logs` table (per-request
   latency, `stop_reason`, `selected_key_name`, `user_agent`, `app`, session id,
   `cache_debug`) is **not** on `/metrics`; only aggregates are. A question
   needing per-request detail is answered by the admin API or SQL inside the
@@ -384,13 +442,15 @@ Each step is a PR unless it says otherwise.
    design becomes "Alloy holds the setup token", which is a different security
    conversation and not a smaller one.
 
-2. **Decide the Grafana Cloud plan, with the series count in hand.** Free is
-   10,000 active series with 14-day retention and 3 visualization users; Pro is
-   a $19/month platform fee with 13-month retention. Fourteen days cannot span a
-   rollover window, so unless the answer is "we only care about this fortnight",
-   this is Pro, and the reason is retention rather than series. Record the
-   chosen metrics instance's `remote_write` URL and instance ID in the PR that
-   adds the secret, never in a document, and never the token.
+2. **Decide the metrics instance, with the series count in hand.** The org runs
+   the `goodparty` stack; what is being chosen is a metrics instance on it, and
+   the plan tier it sits under. Free is 10,000 active series with 14-day
+   retention and 3 visualization users; Pro is a $19/month platform fee with
+   13-month retention. Fourteen days cannot span a rollover window, so unless
+   the answer is "we only care about this fortnight", this is Pro, and the
+   reason is retention rather than series. Step 1's count turns this from an
+   estimate into an arithmetic check; the Grafana user question is separate and
+   is the one still open.
 
 3. **Seed the allowlist from the measured series count.** The list of
    counters and the per-metric series counts go in this step's PR body, from
@@ -399,19 +459,34 @@ Each step is a PR unless it says otherwise.
    to argue with. It also turns step 2's plan decision from an estimate into a
    number.
 
-4. **The `bifrost/grafana-alloy` secret, filled out of band.** Same shape as
-   `bifrost/gateway` and `bifrost/sheriff`: Pulumi owns the read grant and a
-   committed script writes the value, so no token is in the repo and a
-   `preview` never reads one. Two keys: the metrics instance ID (the basic-auth
-   username) and a Cloud Access Policy token scoped to `metrics:write` for that
-   instance and nothing else. Extend `deploy-workbench/bifrost/fill-secrets.sh`
-   rather than adding a third script, and add the key list to its header, its
-   `--check` output and its `--force` behaviour.
+4. **The `bifrost/grafana-alloy` secret, filled out of band.** This is the
+   credential plumbing, and it is the whole of what has to be handed to Grafana
+   on the write side. Same shape as `bifrost/gateway` and `bifrost/sheriff`:
+   Pulumi owns the read grant and a committed script writes the value, so no
+   token is in the repo and a `preview` never reads one. Extend
+   `deploy-workbench/bifrost/fill-secrets.sh` rather than adding a fourth
+   script, and add the keys to its header, its `--check` output and its
+   `--force` behaviour.
 
-   The token scope is the security boundary here and deserves the same
-   treatment as the Brave secret: a write-only credential that cannot read the
-   stack, cannot read other instances, and can be revoked in Grafana Cloud
-   without touching AWS.
+   Three keys, and it is worth being exact about what each is for:
+
+   - `GRAFANA_PROM_URL`: the metrics instance's `remote_write` endpoint. Not
+     secret, but deployment-specific, and it belongs beside the token so the two
+     cannot drift.
+   - `GRAFANA_PROM_USERNAME`: the metrics instance ID, which is the basic-auth
+     username. Identifies the instance; not secret on its own.
+   - `GRAFANA_PROM_TOKEN`: a Cloud Access Policy token, scope `metrics:write` on
+     that instance only. The actual secret.
+
+   The scope is the security boundary. This token must not be the
+   `grafana-shared-service-account-token` that `omni`'s deploy reads
+   (`infra-cli.ts:169`): that one can administer the stack. A `metrics:write`
+   token cannot read other instances, cannot query, cannot edit a dashboard, and
+   is revoked in Grafana Cloud without an AWS change. It deserves the same
+   treatment as the Brave secret, for the same reason.
+
+   The read side needs nothing new. Verification in step 9 uses the service
+   account that already exists.
 
 ### Phase 2 — scrape
 
@@ -467,10 +542,10 @@ Each step is a PR unless it says otherwise.
    metric-filter alarm is the follow-up that turns a failure into a page; this
    is the first thing in the deployment that would benefit from one.
 
-### Phase 3 — dashboards
+### Phase 3 — prove the data path, and stop
 
-9. **Prove the data before building on it.** In Grafana Explore, three
-   readings, recorded in the PR body:
+9. **Prove the data before anything is built on it.** In Grafana Explore on the
+   `grafanacloud-prom` datasource, three readings, recorded in the PR body:
 
    - `up{job="bifrost"}` is 1
    - `sum by (virtual_key_name) (increase(bifrost_input_tokens_total[1h]))` is
@@ -482,24 +557,19 @@ Each step is a PR unless it says otherwise.
    not stamping identity onto the request, which is a `config.json` or
    `enforce_auth_on_inference` question and not a scraping one.
 
-10. **The dashboard, as a committed JSON model.** Checked into the repo beside
-   the plan (or provisioned, if the stack already has a provisioning path;
-   decide in the PR), with one panel: stacked bars, `virtual_key_name` on the x,
-   `sum by (model) (increase(<tokens>[1d]))` per segment, and a statement on the
-   panel that the cost line is an estimate. Also decide the model-splitting
-   question from "What the endpoint carries": either group on `provider`, or
-   `label_replace` the three Fireworks role names into one.
-
-   The dashboard is deliberately minimal. It is the thing that proves the data
-   path; a prettier one is a later PR on a working foundation.
-
-11. **Reconcile once, against the database.** For one closed day, compare the
-    dashboard's per-key totals with `GET /api/logs/rankings?dimension=virtual_key`
-    for the same window (or the equivalent SQL inside the 90-day retention). The
+10. **Reconcile once, against the database.** For one closed day, compare the
+    per-key totals with `GET /api/logs/rankings?dimension=virtual_key` for the
+    same window (or the equivalent SQL inside the 90-day retention). The
     expected result is agreement within a scrape interval plus whatever the
     matview refresh adds. A disagreement larger than that is a real finding and
     worth stopping for: it would mean the counters and the log store disagree
     about what a request is.
+
+That is the end of this plan. A dashboard is the next change, and it is a
+`grafana.oss.Dashboard` in `omni`'s `components/grafana.ts` rather than anything
+in this repository; the two open questions it will have to answer are recorded
+under "Deferred to the dashboard change" below so the follow-on does not
+rediscover them.
 
 ## Security, stated plainly
 
@@ -519,13 +589,15 @@ Each step is a PR unless it says otherwise.
   new ingress rule is group-referenced, so it admits the scraper's task and
   nothing else; it does not widen 8080 to the VPC CIDR, which would be the
   tempting shortcut and is not acceptable.
-- **Per-developer figures are sensitive.** The plan delivers a dashboard, and a
-  dashboard is more exposed than a Slack post: it is persistent, linkable, and
-  everyone with Grafana access can browse every engineer's usage at any time.
-  Whoever provisions the Grafana users should decide deliberately who that is,
-  and the panel should carry the context that the number measures model choice
-  and task mix as much as effort (a developer who legitimately fans out eight
-  workers shows eight times the tokens). A team aggregate is the smaller
+- **Per-developer figures are sensitive, and this plan makes them queryable.**
+  It ships no dashboard, but it does put per-engineer token counts into the
+  `goodparty` Grafana stack, where anyone with a Grafana user can query them in
+  Explore. That is a real widening of exposure even without a panel: it is
+  persistent, linkable, and browsable by everyone with access. Whoever owns the
+  Grafana users should decide who that is before step 9 runs, and the
+  dashboard change should carry the context that the number measures model
+  choice and task mix as much as effort (a developer who legitimately fans out
+  eight workers shows eight times the tokens). A team aggregate is the smaller
   disclosure and answers the rollover question on its own; per-developer is a
   second decision, not the default.
 
@@ -536,7 +608,7 @@ Each step is a PR unless it says otherwise.
   trustworthy. They are fine for a trend and not for a budget.
 - **That the history is long enough.** Grafana Cloud's retention is the bound
   now, not Bifrost's 90 days, and it starts at the first scrape. Anything before
-  step 6 lands is not in Mimir and cannot be backfilled from it.
+  step 7 lands is not in Mimir and cannot be backfilled from it.
 - **That `/metrics` is open.** Step 1 is the proof and it has not been run. It
   is deliberately the first step and deliberately its own PR.
 - **That `http_*` or the latency histograms should stay unscraped forever.**
@@ -545,18 +617,39 @@ Each step is a PR unless it says otherwise.
   first candidate, at 24 series per label set; that is a line in the allowlist
   with its own cardinality argument, not a change of shape.
 
+## Settled in review
+
+1. **The scraper lives in `deploy-workbench/`.** Decided. It is the gateway's
+   observability and shares its network and its Cloud Map name, so it belongs
+   beside `ecs.ts` and `network.ts` rather than in `deploy-infrastructure/`.
+   The Grafana *stack* being an org-wide service does not make this task one:
+   the task only reads a workbench VPC address and pushes to an external
+   endpoint. Step 7 is unambiguous on this.
+2. **The dashboard is not part of this plan.** Decided. This is the enabling
+   infrastructure only; the visualisation is a follow-on change in `omni`'s
+   `components/grafana.ts`, where the Grafana provisioning already lives. The
+   former "should the JSON be provisioned or applied by hand" question
+   dissolves: it is a `grafana.oss.Dashboard` resource in a stack that exists.
+
 ## Open questions
 
 1. **Who owns the Grafana users?** Free is 3 visualization users. If more than a
    handful of people should look at this, that is a Pro decision with a
    per-user price, and it is the same question as who may see per-developer
-   figures.
-2. **Does the scraper belong in `deploy-workbench/`, or is it infrastructure?**
-   This plan puts it in `deploy-workbench/` because it is the gateway's
-   observability and shares its network and its Cloud Map name. The alternative
-   is `deploy-infrastructure/`, and the argument for it would be that Grafana is
-   an org-wide service rather than a workbench one. Worth settling before step 7.
-3. **Should the dashboard JSON be provisioned or applied by hand?** The repo has
-   no dashboard provisioning today. Committing the JSON and applying it by hand
-   is the cheap answer; provisioning it is the reproducible one. Step 9 decides
-   this, and it is the only step whose shape is still open.
+   figures. This survives review because it is a money and access question, not
+   a technical one.
+
+## Deferred to the dashboard change
+
+Not this plan's decisions, recorded so the follow-on does not rediscover them:
+
+- **How `model` is grouped.** `gp-pi` sends `worker-default` and
+  `coordinator-default` alongside the catalog name and all three resolve to one
+  DeepSeek wire id, so a naive `sum by (model)` shows three slices of one model.
+  Either group on `provider` or `label_replace` the role names together.
+- **Whether the panel says the cost line is an estimate.** It should, since
+  item 16 of `bifrost-gateway.md` is the reconciliation and it is still open.
+- **Whether per-developer figures are shown, or only a team aggregate.** A
+  dashboard is more exposed than a posted chart: persistent, linkable, and
+  browsable by everyone with Grafana access. The team aggregate is the smaller
+  disclosure and answers the rollover question on its own.
