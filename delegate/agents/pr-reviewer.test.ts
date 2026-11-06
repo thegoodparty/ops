@@ -5,6 +5,7 @@ import {
   buildReviewPrompt,
   REVIEW_OUTPUT_JSON_SCHEMA,
 } from "./pr-reviewer";
+import { prReviewerSubagents } from "./pr-reviewer-subagents";
 import {
   BundleSchema,
   FindingSchema,
@@ -518,11 +519,10 @@ describe("buildReviewPrompt with post-mortems", () => {
 });
 
 describe("architect subagent", () => {
-  it("runs on read-only tools and emits architecture findings the schema accepts", async () => {
-    const { prReviewerSubagents } = await import("./pr-reviewer-subagents");
+  it("runs on read-only tools and emits architecture findings the schema accepts", () => {
     const architect = prReviewerSubagents.architect;
     assert.ok(architect);
-    assert.deepEqual(architect.tools?.filter((t) => !t.startsWith("mcp__git__")), ["Read", "Grep", "Glob"]);
+    assert.deepEqual(architect.tools?.filter((t: string) => !t.startsWith("mcp__git__")), ["Read", "Grep", "Glob"]);
     assert.ok(FindingSchema.safeParse({ path: "a.ts", line: 1, body: "b", category: "architecture", confidence: "high" }).success);
   });
 });
