@@ -166,6 +166,28 @@ Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (re
 
 **Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
 
+## Local arms: structural changes side by side
+
+The dispatched hill-climb run only accepts prompt text. A change with new structure (a subagent, context injected into the bundle, a new tool) is measured locally instead: `review:expect` already replays whatever agent code is in the checkout it runs from, so each variant is a worktree on its own branch.
+
+```sh
+# a real PR as a case, from GitHub alone (no S3), as production would have seen it at that sha
+npm run review:from-pr -- --pr 2977 --sha <reviewed sha> --out ./lab/bundles/omni-2977.bundle.json --mirror-dir ./lab/mirrors
+
+# every arm replays the same tune cases with its own code; this checkout scores them all
+npm run review:arms -- \
+  --manifest ./lab/manifest.json \
+  --arms main=.,architect=../ops-arms/architect,pm-all=../ops-arms/pm-all \
+  --runs 3 --concurrency 2 --parallel-arms 3 \
+  --out ./lab/results/round-1 --mirror-dir ./lab/mirrors
+```
+
+- A local manifest has the same shape as `expected/manifest.json`, and its bundles resolve next to it, so new cases can be tried before anyone labels them into the suite. A bundle case whose `source` is `simulated` gets its head commit rebuilt from the diff; any other source is a real PR, and its head is fetched from GitHub.
+- `--mirror-dir` keeps one bare clone per repo. Each replay is a `--shared` clone of it, so a run does not clone the repo from GitHub per case. Every sha the cases need is fetched once before the arms start.
+- Only tune cases run. The table (`<out>/arms.md`) has one column per arm: runs passed per case, block and approve totals, average cost per run and total spend. Each run's findings are listed under it.
+- `--mode score` re-renders the table from results already on disk.
+- Credentials: `ANTHROPIC_API_KEY` if set, otherwise the local Claude Code login. `gh` auth reads the PRs and clones the repos.
+
 ## Mining candidate cases
 
 ```sh
