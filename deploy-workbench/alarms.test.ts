@@ -168,6 +168,9 @@ describe("the topic and its policy", () => {
     assert.match(SOURCE, /new aws\.sns\.TopicPolicy\(/);
     assert.match(SOURCE, /arn: alertTopic\.arn/);
     assert.match(SOURCE, /policy: alertTopic\.arn\.apply\(alertTopicPolicy\)/);
+    // Bound to a name so the alarms can depend on it; the reviewer is right
+    // that a resource the alarms do not wait for is an ordering bug.
+    assert.match(SOURCE, /const topicPolicy = new aws\.sns\.TopicPolicy\(/);
   });
 });
 
@@ -449,7 +452,9 @@ describe("the alarm module's shape", () => {
     // the default, so an omitted provider is an apply failure, not a resource
     // in the wrong account.
     assert.match(SOURCE, /\{ provider \}/);
-    assert.match(SOURCE, /\{ provider, dependsOn: \[alertTopic\] \}/);
+    // The alarms wait for the policy, not only the topic: a policy that lands
+    // after the first alarm costs a page rather than failing the apply.
+    assert.match(SOURCE, /\{ provider, dependsOn: \[alertTopic, topicPolicy\] \}/);
   });
 
   it("tags what it creates as the surrounding resources are tagged", () => {

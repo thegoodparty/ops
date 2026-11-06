@@ -497,7 +497,7 @@ export const createBifrostGatewayAlarms = (args: {
     { provider },
   );
 
-  new aws.sns.TopicPolicy(
+  const topicPolicy = new aws.sns.TopicPolicy(
     "bifrostGatewayHealthTopicPolicy",
     {
       arn: alertTopic.arn,
@@ -530,9 +530,12 @@ export const createBifrostGatewayAlarms = (args: {
         alarmActions: [alertTopic.arn],
         tags: { Name: spec.name },
       },
-      // The topic policy must exist before the first alarm can publish; without
-      // it the alarm changes state and SNS rejects the publish.
-      { provider, dependsOn: [alertTopic] },
+      // The topic and, more importantly, its policy must exist before an alarm
+      // can publish: an alarm whose policy is not yet in place changes state and
+      // SNS rejects the publish, which is a page lost rather than an apply
+      // failure. `alertTopic` alone would leave that ordering implicit, so the
+      // policy is named too.
+      { provider, dependsOn: [alertTopic, topicPolicy] },
     ),
   );
 
