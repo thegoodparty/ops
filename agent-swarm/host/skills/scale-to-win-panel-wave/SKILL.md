@@ -58,7 +58,7 @@ to `/tevyn-handoffs/<outreachId>-<step>.png` and pass
 `/afs/tevyn-handoffs/<outreachId>-<step>.png` to `tevyn-thread-reply`. Only
 screenshot views that show counts, the message, dates and statuses. Never leave a
 contact preview, a replies view or any phone number in a screenshot; navigate away first.
-Delete local screenshots and exports when you are done.
+Delete local screenshots, recipient CSVs and exports when you are done.
 
 ## Login (every action)
 
@@ -81,7 +81,7 @@ Delete local screenshots and exports when you are done.
    toll-free. Save `campaignName`.
 3. Get the CSV path from `tevyn-handoff-csv`, then download it from agent-fs with the CLI
    (drop the `/afs` prefix) to a local file. Upload that file, choose "assume cell phone", and
-   check that all four columns auto-mapped. Skip suppressions and tags. Delete the CSV from agent-fs afterwards.
+   check that all four columns auto-mapped. Skip suppressions and tags. Delete the CSV from agent-fs and the local copy afterwards.
 4. Paste `message` exactly as given, character for character. Map `{{first_name}}` to the
    first name field.
 5. Check on Send Summary:
