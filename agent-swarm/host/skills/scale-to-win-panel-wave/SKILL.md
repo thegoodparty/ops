@@ -48,8 +48,12 @@ Run catalog scripts with `script-run` (by name):
   post's thread; `filePath` is a png under `/afs/`, uploaded and deleted. It refuses text
   that contains a phone number.
 
-Screenshots: `agent-browser screenshot <path>`, then save the file into agent-fs under
-`/afs/tevyn-handoffs/<outreachId>-<step>.png` so `tevyn-thread-reply` can read it. Only
+Path rule: your own shell writes to agent-fs with drive-relative paths (no `/afs` prefix,
+the CLI adds the drive). `/afs` only exists inside script runs, where the scripts read the same file.
+
+Screenshots: `agent-browser screenshot <path>`, then save the file into agent-fs at
+`/tevyn-handoffs/<outreachId>-<step>.png` so `tevyn-thread-reply` can read it at
+`/afs/tevyn-handoffs/<outreachId>-<step>.png`. Only
 screenshot views that show counts, the message, dates and statuses. Never leave a
 contact preview, a replies view or any phone number in a screenshot; navigate away first.
 Delete local screenshots and exports when you are done.
@@ -105,8 +109,8 @@ Run only at or after `repliesDueAt`. The record is `scheduled` (auto) or `built`
    Use the Replies export, not "Campaign Results".
 3. Wait for DOWNLOAD to return (a few seconds), then
    `agent-browser download <selector> <path>`. Rename the file to `<outreachId>.csv`.
-4. Save it to agent-fs at `/afs/tevyn-handoffs/<outreachId>.csv`, then run
-   `s2w-replies-upload` with `outreachId` and that path.
+4. Save it to agent-fs at `/tevyn-handoffs/<outreachId>.csv`, then run
+   `s2w-replies-upload` with `outreachId` and `exportPath` `/afs/tevyn-handoffs/<outreachId>.csv`.
 5. Set `state: 'replies_uploaded'`. Reply in the thread: replies exported and uploaded
    (no counts of people, no content). Delete every local copy of the file.
 
