@@ -199,7 +199,16 @@ EOF
   fi
 fi
 
-if ((${#WRITE_KEYS[@]} == 0)); then
+# The swarm holds no Anthropic key: the agents run the Fireworks US router, and
+# without the key a task that pins an Anthropic model fails at start instead of
+# quietly billing ~9x. A key an older fill wrote is deleted below, which is a
+# write on its own even when this run changes nothing else.
+prune_anthropic=0
+if jq -e 'has("ANTHROPIC_API_KEY")' <<<"$current" >/dev/null; then
+  prune_anthropic=1
+fi
+
+if ((${#WRITE_KEYS[@]} == 0 && prune_anthropic == 0)); then
   echo "Nothing to write."
   exit 0
 fi
@@ -208,10 +217,7 @@ bold "Writing to Secrets Manager ($SECRET_ID in $ACCOUNT_ID)"
 jq 'reduce $ARGS.positional[] as $k (.; .[$k] = env[$k])' --args "${WRITE_KEYS[@]}" \
   <<<"$current" > "$TMP"
 unset current
-# The swarm holds no Anthropic key: the agents run the Fireworks US router, and
-# without the key a task that pins an Anthropic model fails at start instead of
-# quietly billing ~9x. Drop one an older fill wrote.
-if jq -e 'has("ANTHROPIC_API_KEY")' "$TMP" >/dev/null; then
+if ((prune_anthropic)); then
   jq 'del(.ANTHROPIC_API_KEY)' "$TMP" > "$TMP.pruned"
   mv -f "$TMP.pruned" "$TMP"
   echo "  Dropped ANTHROPIC_API_KEY from the secret."
