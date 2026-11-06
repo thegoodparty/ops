@@ -233,6 +233,45 @@ describe("all four alarms are wired to the topic", () => {
     assert.match(ALB_5XX_ALARM_DESCRIPTION, /5XX/);
     assert.match(AVAILABILITY_ALARM_DESCRIPTION, /no running task/);
   });
+
+  it("does not restate a number in prose that it also interpolates", () => {
+    // A description that interpolates a constant and then spells the same
+    // figure out by hand goes stale on the next tuning change, and the first
+    // draft of two of these did exactly that ("above 24" beside a threshold of
+    // 30, "Twenty minutes" beside an interpolated window). Every figure that is
+    // a constant in this module must arrive by interpolation; anything else
+    // numeric and spelled out is a copy.
+    const interpolated = new Set([
+      String(ALB_5XX_THRESHOLD_COUNT),
+      String(CPU_SATURATION_THRESHOLD_PERCENT),
+      String(MEMORY_PRESSURE_THRESHOLD_PERCENT),
+      String(CPU_SATURATION_BREACH_MINUTES),
+      String(CPU_SATURATION_WINDOW_MINUTES),
+      String(MEMORY_PRESSURE_WINDOW_MINUTES),
+      String(AVAILABILITY_WINDOW_MINUTES),
+    ]);
+    for (const spec of alarmSpecs()) {
+      // Strip what is allowed to be there: the interpolated constants, the
+      // task-derived figures (which come from TASK_CPU/TASK_MEMORY through
+      // helpers, so they follow a resize rather than going stale), and a lookup
+      // span an operator is told to graph (`24 hours`), which is advice about
+      // the console and not a value this module tunes.
+      const prose = spec.description
+        .replace(new RegExp(`\\b(${[...interpolated].join("|")})\\b`, "g"), "<value>")
+        .replace(/\d+(\.\d+)? vCPU/g, "<vcpu>")
+        .replace(/\d+ MiB/g, "<mib>")
+        .replace(/\b\d+ (minutes|hours)\b/g, "<span>")
+        // HTTP status codes are the vocabulary of the failure, not a tuned
+        // value: 503 and 5XX describe what a caller saw.
+        .replace(/\b[45]\d\d\b/g, "<status>");
+      const stray = prose.match(/\b\d{2,}\b/g) ?? [];
+      assert.deepEqual(
+        stray,
+        [],
+        `${spec.name}'s description spells out ${stray.join(", ")}; interpolate the constant instead so it cannot go stale`,
+      );
+    }
+  });
 });
 
 describe("the CPU saturation alarm", () => {
