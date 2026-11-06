@@ -217,7 +217,7 @@ endpoint. Nothing reads the database and nothing is exposed to the internet.
   +----------------+        :8080        +--------------------+
   | bifrost task   | <------------------ | alloy task         |
   | /metrics       |   Cloud Map DNS     | prometheus.scrape  |
-  +----------------+                     | relabel (allowlist)|
+  +----------------+                     | prometheus.relabel |
                                          | remote_write (WAL) |
                                          +---------+----------+
                                                    | 443 out via NAT
@@ -314,9 +314,11 @@ and destroy the ability to use it.
 **A gap is different from a reset, and is the case to alarm on.** If the
 scraper is down, or Grafana Cloud refuses writes, `increase()` cannot invent
 the missing window. That is a hole rather than a rounding error. Two rules
-cover it: `up{job="bifrost"} == 0` for more than a few minutes, and an
-unexplained change in the counter reset count (which is also how an unexpected
-gateway restart becomes visible).
+cover it, both Grafana alert rules rather than CloudWatch ones because they
+read Prometheus series that only exist in Mimir: `up{job="bifrost"} == 0` for
+more than a few minutes, and an unexplained change in the counter reset count
+(which is also how an unexpected gateway restart becomes visible). Step 8 makes
+the first of those real.
 
 **What this means for the number.** Mimir is a sampled aggregate with a bounded
 error; the `logs` table is an exact per-request ledger with a 90-day life. For
@@ -357,10 +359,12 @@ which includes `virtual_key_name` and `model`:
 | `bifrost_overhead_component_microseconds`, `bifrost_a2a_client_operation_duration_seconds`, `bifrost_mcp_client_operation_duration_seconds`, `bifrost_relay_operation_duration_seconds` | multi | 20+ each |
 
 At a plausible 100 label sets on this fleet (10 keys x 9 models, times the
-`provider` / `status_code` splits), the four latency histograms alone are around
-2,800 series, against about 400 for the 17 counters. A blanket `bifrost_*` rule
-fits inside the free tier and then quietly triples the bill on Pro, and it does
-so for metrics this plan does not chart.
+`provider` / `status_code` splits), the four latency histograms alone are **at
+least 8,400 series** (84 or more per label set), against about 1,700 for the 17
+counters. Together that is roughly 10,000 series, which is exactly the free
+tier's limit, so a blanket `bifrost_*` rule is not the "fits inside the free
+tier" story it looks like: it would sit at or past the ceiling and multiply the
+bill on Pro, for metrics this plan does not chart.
 
 So the allowlist is the counters, named one by one, and it is written out.
 Anything a later use case wants is an added line with its own cardinality
@@ -507,13 +511,24 @@ Each step is a PR unless it says otherwise.
    - `prometheus.scrape "bifrost"` with `targets` of
      `bifrost.workbench.local:8080` (the Cloud Map name,
      `deploy-workbench/discovery.ts:56-66`), `metrics_path = "/metrics"`,
-     `scrape_interval = "15s"`, and a `job` label of `bifrost`
-   - `discovery.relabel` with an **explicit allowlist** of the 17 counters,
-     not a `bifrost_*` glob, for the cardinality reason under "Card" above.
-     `http_*` is absent from the list and so is every histogram. Seed step 3
-     writes the list; step 1's series count confirms it.
+     `scrape_interval = "15s"`, a `job` label of `bifrost`, and its `forward_to`
+     pointing at the relabel component below rather than straight at
+     `remote_write`
+   - `prometheus.relabel` with an **explicit keep allowlist on `__name__`** of
+     the 17 counters plus `up`, not a `bifrost_*` glob, for the cardinality
+     reason under "Card" above. This must be `prometheus.relabel`, not
+     `discovery.relabel`: the latter rewrites target label sets before the
+     scrape and so has no `__name__` to match on, which would give no filtering
+     at all. `http_*` is absent from the list and so is every histogram. Seed
+     step 3 writes the list; step 1's series count confirms it.
+   - `up` is listed explicitly and that is not a detail. The keep rule can drop
+     the synthetic `up` series, and step 8's alarm and step 9's first reading
+     both depend on `up{job="bifrost"}`. Without it the plan would be alarming
+     on a series it had just filtered out.
    - `prometheus.remote_write "cloud"` to the endpoint from step 4, reading the
-     instance ID and token from the environment
+     instance ID and token from the environment. The chain is therefore
+     `prometheus.scrape` -> `prometheus.relabel` -> `prometheus.remote_write`,
+     which is the only shape in which a metric-name allowlist works.
    - `logging { level = "warn" }`, so a busy scrape loop does not fill a log
      group
 
@@ -536,12 +551,32 @@ Each step is a PR unless it says otherwise.
    the check: `BIFROST_CONTAINER_MEMORY` and the sum tests in `ecs.test.ts` are
    unchanged in the diff.
 
-8. **Alarms, in the same PR as the service.** A metric-filter alarm on
-   `up{job="bifrost"} == 0`, or an ECS service alarm on running-versus-desired,
-   so a dead scraper is a page and not a quiet week. `bifrost-gateway.md` already
-   notes that this account has no alerting target yet and that a
-   metric-filter alarm is the follow-up that turns a failure into a page; this
-   is the first thing in the deployment that would benefit from one.
+8. **Alarms, in the same PR as the service.** Two of them, because they catch
+different failures and neither covers the other.
+
+   - **A dead scraper: an ECS service alarm** on running-versus-desired, which
+     is a CloudWatch alarm over the service's own metrics. This catches the
+     task being stopped, failing to start, or crash-looping.
+   - **A scraper that runs but cannot deliver: a Grafana alert rule** on
+     `up{job="bifrost"} == 0` and on remote-write failures. This is the case
+     the ECS alarm cannot see, and it is the case that matters: the task stays
+     healthy while Grafana Cloud rejects every write, which looks exactly like a
+     quiet week. The alert belongs in Grafana rather than in CloudWatch because
+     `up` is a Prometheus series that only exists in Mimir; there is no log line
+     carrying it, so no CloudWatch metric filter can evaluate it.
+
+   The second one has to live somewhere. `omni` already provisions Grafana
+   alert rules and contact points (`components/grafana.ts`,
+   `components/alerting/`), so the rule and its routing are a resource in that
+   stack, not a new mechanism here.
+
+   A note on what this account has today: `deploy-workbench/bifrost/README.md`
+   records that the bootstrap container's failures surface only as a stopped
+   reason and that "a metric-filter alarm on that stream is the follow-up that
+   turns it into a page; this account has no alerting target yet". That note is
+   about a *different* log stream and a *different* failure (the first-admin
+   claim), and it is the reason this account has no paging story at all. This
+   step is where the first one arrives, and it arrives in Grafana.
 
 ### Phase 3 — prove the data path, and stop
 
