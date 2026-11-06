@@ -93,7 +93,8 @@ services:
       MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - agent_fs_minio:/data
-    mem_limit: 1g
+    mem_limit: 512m
+    memswap_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
       interval: 10s
@@ -143,7 +144,9 @@ services:
       - DO_NOT_TRACK=1
     volumes:
       - agent_fs_data:/data
-    mem_limit: 2g
+    # The local embedding model cannot be turned off and needs most of this.
+    mem_limit: 1536m
+    memswap_limit: 1536m
     healthcheck:
       # The image has node but no curl or wget. First boot downloads the
       # local embedding model before it listens.
@@ -297,8 +300,10 @@ services:
       AGENT_ROLE: worker
       TEMPLATE_ID: official/reviewer
       MODEL_OVERRIDE: ${WORKER_MODEL_OVERRIDE}
-    mem_limit: 6g
-    memswap_limit: 6g
+    # 6g before agent-fs. It mostly reads diffs; the 2g went to agent-fs and
+    # MinIO so the API, tei and the kernel keep about 6g.
+    mem_limit: 4g
+    memswap_limit: 4g
     volumes:
       - ./aws-config:/etc/delegate-swarm/aws-config:ro
       - swarm_logs:/logs
