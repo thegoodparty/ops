@@ -165,7 +165,7 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
 
 test("the checked-in manifest holds out a minority, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 37);
+  assert.equal(cases.length, 38);
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
