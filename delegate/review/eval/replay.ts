@@ -12,6 +12,7 @@ import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
 import { GIT_TOOL_NAMES, createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
+import { readPostmortems } from "../postmortems";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
@@ -392,7 +393,7 @@ export const replayCase = async (
 
   let agentResult: AgentResult;
   try {
-    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath }), {
+    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath, postmortems: readPostmortems(repoDir, bundle.baseSha) }), {
       cwd: repoDir,
       mcpServers: { git: createGitTool(repoDir) },
       env: agentEnv(),
