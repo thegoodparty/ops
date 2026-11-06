@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
-import { pullCache, pushCache, replayKey } from "./cache";
+import { pullCache, pullHistory, pushCache, replayKey, sameReviewerAs } from "./cache";
 import type { CacheLayout } from "./cache";
 import { SplitSchema, readManifest as readExpectedManifest, selectCases } from "./expect";
 import { CANDIDATE_FILES, codeOutsideLiterals, disallowedChanges, parseIds, publishRun, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
@@ -45,6 +45,7 @@ const usage = () => {
       "  review:eval results from-cases --cases <dir|s3> --out <dir>",
       "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--replays 1] [--force] [--split tune|holdout --manifest <scenarios.json>]",
       "  review:eval cache key | cache pull|push --suite <name> --key <replay-key> --out <dir> [--layout flat|runs]",
+      "  review:eval cache history --key <replay-key> --suite-prefix <prefix> --out <dir>",
       "  review:eval ledger check --run-id <id> --mode dry-run|inner|tune|gate --budget <usd> --manifest <expected/manifest.json> [--cases <ids>]",
       "  review:eval ledger sum --results <dir>[,<dir>] --out <cost.json>",
       "  review:eval ledger add --run-id <id> --mode <m> --budget <usd> --branch-sha <sha> --cost-file <cost.json> --estimate-usd <usd> --gh-run-id <n> --gh-run-attempt <n>",
@@ -124,6 +125,16 @@ const main = async () => {
     const subcommand = argv[1];
     if (subcommand === "key") {
       console.log(replayKey(process.cwd()));
+      return;
+    }
+    if (subcommand === "history") {
+      const flags = parseFlags(argv.slice(2));
+      const key = flag(flags, "key");
+      const suitePrefix = flag(flags, "suite-prefix");
+      const dir = flag(flags, "out");
+      if (!key || !suitePrefix || !dir) { console.error("--key, --suite-prefix and --out are required"); process.exit(1); }
+      const kept = await pullHistory({ key, suitePrefix, dir, sameReviewer: sameReviewerAs(process.cwd()) });
+      console.error(`Pulled ${kept} earlier main run(s) of this reviewer from other replay keys`);
       return;
     }
     if (subcommand !== "pull" && subcommand !== "push") usage();

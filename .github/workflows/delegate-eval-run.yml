@@ -201,10 +201,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      # Full history, so the history step can tell which main commit each
+      # earlier cached run came from.
       - name: Checkout main
         uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
@@ -242,6 +245,27 @@ jobs:
             --key "$replay_key" \
             --layout runs \
             --out ./baseline
+
+      # Main's earlier runs of this same reviewer, from cache keys that eval
+      # code changes left behind, so the gate can tell a case main always
+      # passes from three lucky runs. Kept out of ./baseline, which the cache
+      # push uploads.
+      - name: Pull main's earlier runs of this reviewer
+        env:
+          REVIEW_BUCKET: delegate-reviews
+          REPLAY_KEY: ${{ steps.cache.outputs.replay_key }}
+        run: |
+          npm run -s review:eval -- cache history \
+            --key "$REPLAY_KEY" \
+            --suite-prefix expected- \
+            --out ./history
+
+      - name: Upload main's earlier runs
+        uses: actions/upload-artifact@v4
+        with:
+          name: main-history-${{ github.run_attempt }}
+          path: ./history/
+          if-no-files-found: ignore
 
       - name: Replay main
         env:
@@ -430,6 +454,15 @@ jobs:
           name: cand-results-${{ github.run_attempt }}
           path: ./cand
 
+      # Missing when the cache holds no earlier run of this reviewer; the gate
+      # then judges main on this check's runs alone, the stricter reading.
+      - name: Download main's earlier runs
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: main-history-${{ github.run_attempt }}
+          path: ./history
+
       # The targets come from the dispatch, validated against main's manifest,
       # never from a file on the branch.
       - name: Gate, first pass
@@ -439,8 +472,9 @@ jobs:
           TARGETS: ${{ inputs.targets }}
         run: |
           split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+          history=(); if [ -d ./history ]; then history=(--history ./history); fi
           npm run -s review:expect -- \
-            --mode gate --runs 3 "${split[@]}" \
+            --mode gate --runs 3 "${split[@]}" "${history[@]}" \
             --base ./baseline --targets "$TARGETS" \
             --out ./cand > /dev/null 2>&1
           # The ids go in a file, not a step output: in gate mode they can name
@@ -662,6 +696,14 @@ jobs:
           path: ./baseline
           merge-multiple: true
 
+      - name: Download main's earlier runs
+        if: inputs.mode != 'inner'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: main-history-${{ github.run_attempt }}
+          path: ./history
+
       - name: Score
         id: score
         continue-on-error: true
@@ -675,9 +717,10 @@ jobs:
             npm run -s review:expect -- --mode score --runs 1 --case "$CASES" --variant "cand-${SHA7}" --out ./cand
           else
             split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+            history=(); if [ -d ./history ]; then history=(--history ./history); fi
             # Not printed: the gate report names holdout counts and the log is readable.
             npm run -s review:expect -- \
-              --mode gate --final true --runs 3 "${split[@]}" \
+              --mode gate --final true --runs 3 "${split[@]}" "${history[@]}" \
               --variant "cand-${SHA7}" --baseline-variant "main-${GITHUB_SHA:0:7}" \
               --base ./baseline --targets "$TARGETS" \
               --out ./cand > /dev/null 2>&1
