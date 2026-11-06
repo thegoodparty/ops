@@ -29,6 +29,10 @@ while IFS= read -r -d '' f; do
   if [[ "$f" == *.sh ]]; then chmod 755 "$DEST/$f"; else chmod 644 "$DEST/$f"; fi
 done < <(find . -path ./systemd -prune -o -type f -print0)
 
+# scripts/ and skills/ stopped shipping to the host; copies from earlier
+# deploys would otherwise stay here forever.
+rm -rf "$DEST/scripts" "$DEST/skills"
+
 install -m 644 "$STAGE"/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable agent-swarm.service
