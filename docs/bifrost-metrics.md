@@ -141,7 +141,7 @@ like bugs otherwise:
   the SQL path there is no `canonical_model_name` label to fall back on, so a
   grouping on `model` shows three slices of the same model. Group on `provider`
   for an honest Fireworks-versus-Bedrock split, or collapse the role names with
-  `label_replace` in the query. This is a decision for step 6.
+  `label_replace` in the query. This is a decision for step 10.
 - **`cost` is the gateway's estimate, not the bill.** Item 16 of
   `bifrost-gateway.md` (reconcile against a week of provider billing, add
   pricing overrides) is still open, and the expected first disagreement is the
@@ -232,7 +232,7 @@ interval, per restart, and it does not accumulate.**
 At a 15-second interval that is 5,760 scrapes a day, so two deploys a day loses
 two of them. If the fleet burns 50M tokens a day, one deploy is about 8,700
 tokens, roughly 0.017%, and it is invisible on a chart whose y-axis is millions.
-This is why step 3 sets `scrape_interval = "15s"` rather than leaving the
+This is why step 6 sets `scrape_interval = "15s"` rather than leaving the
 60-second default: it is a free factor-of-four on the one error the design
 cannot remove.
 
@@ -279,15 +279,77 @@ task cheap.
 | Memory | 512 MiB | WAL and the scrape buffer; the WAL is bounded by `truncate_frequency` |
 | Task definition | 256 / 512 | Fargate's smallest pair at that CPU |
 | Scrape interval | 15s | The undercount argument above |
-| Retention (Grafana) | 14 days free, 13 months on Pro | See step 5 |
+| Retention (Grafana) | 14 days free, 13 months on Pro | See step 2 |
 
-The rule that matters for cost is the relabel allowlist. Scraping everything on
-`/metrics` pulls in `http_request_duration_seconds`, which is labelled by
-`path` and is the one genuinely high-cardinality series on the endpoint
-(`plugins/telemetry/main.go:401`). It is useless for this chart and it would
-dominate both the series count and the bill. Step 3 keeps `bifrost_*` and drops
-the `http_*` family, and step 2 measures the real series count before the
-allowlist is fixed.
+The rule that matters for cost is the allowlist, and it is a **named list, not a
+`bifrost_*` glob** (seed step 3). The endpoint carries 32 metrics, 28 `bifrost_*`
+and 4 `http_*`, and the ones dangerous to cardinality are not the `http_*`
+family the first draft of this plan singled out. They are the **histograms**,
+because a histogram's series count is its label sets multiplied by its buckets,
+and six of the eight Bifrost histograms carry the full `bifrostLabels()` set,
+which includes `virtual_key_name` and `model`:
+
+| Metric | Buckets | Series per label set |
+| --- | --- | --- |
+| `bifrost_upstream_latency_seconds` | 22 (`telemetry/main.go:266-269`) | 24 (22 + `_sum` + `_count`) |
+| `bifrost_overhead_latency_microseconds` | 18 (`:277-280`) | 20 |
+| `bifrost_stream_first_token_latency_seconds` | multi | 20+ |
+| `bifrost_stream_inter_token_latency_seconds` | multi | 20+ |
+| `http_request_duration_seconds`, `http_request_size_bytes`, `http_response_size_bytes` | 8 each | 10 each, labelled by `path` |
+| `bifrost_overhead_component_microseconds`, `bifrost_a2a_client_operation_duration_seconds`, `bifrost_mcp_client_operation_duration_seconds`, `bifrost_relay_operation_duration_seconds` | multi | 20+ each |
+
+At a plausible 100 label sets on this fleet (10 keys x 9 models, times the
+`provider` / `status_code` splits), the four latency histograms alone are around
+2,800 series, against about 400 for the 17 counters. A blanket `bifrost_*` rule
+fits inside the free tier and then quietly triples the bill on Pro, and it does
+so for metrics this plan does not chart.
+
+So the allowlist is the counters, named one by one, and it is written out.
+Anything a later use case wants is an added line with its own cardinality
+argument.
+
+### What is not forwarded
+
+Stated as a list, because "does this ship all the telemetry" has an answer that
+is easy to get wrong in either direction.
+
+**Forwarded**: all seventeen `bifrost_*` counters, with `virtual_key_name`,
+`model`, `provider` and the rest of the bounded label set. A counter costs one
+series per label set, so the whole family is the cheap half of the endpoint.
+Between them they carry input and output tokens, cost, cache reads and writes,
+upstream and success request counts, error counts, retries, and the
+routing-overhead counters.
+
+**Not forwarded**, and each for a reason:
+
+- **Every histogram.** `bifrost_upstream_latency_seconds`,
+  `bifrost_overhead_latency_microseconds`,
+  `bifrost_overhead_component_microseconds`,
+  `bifrost_stream_first_token_latency_seconds`,
+  `bifrost_stream_inter_token_latency_seconds`,
+  `bifrost_a2a_client_operation_duration_seconds`,
+  `bifrost_mcp_client_operation_duration_seconds`,
+  `bifrost_relay_operation_duration_seconds`. Cardinality, per the table above.
+  These are for latency work rather than the usage chart, and adding one later
+  is a line in the allowlist with its own argument.
+- **The whole `http_*` family.** Labelled by `path`, the one label here that is
+  unbounded in principle, and useless for this chart.
+- **Gauges**: `bifrost_active_requests`, `bifrost_provider_key_up`, and
+  `bifrost_request_retries` where it is a gauge. Cheap, but nothing charts them
+  yet, so they are the easiest thing to add later.
+- **Everything Bifrost records but does not expose as a metric.** This is the
+  omission that matters, and it is why this plan is a data path rather than a
+  dashboard alone. The per-request record in the `logs` table (per-request
+  latency, `stop_reason`, `selected_key_name`, `user_agent`, `app`, session id,
+  `cache_debug`) is **not** on `/metrics`; only aggregates are. A question
+  needing per-request detail is answered by the admin API or SQL inside the
+  90-day retention, not by this pipeline.
+- **Prompts, completions or any request content.** Not a policy on top of the
+  endpoint: the endpoint does not carry them. That is the whole argument for
+  scraping over PDC.
+
+Two of these are decisions a reviewer could reasonably reverse, and the list is
+written out so that is visible rather than presented as inevitable.
 
 ## Steps
 
@@ -330,7 +392,14 @@ Each step is a PR unless it says otherwise.
    chosen metrics instance's `remote_write` URL and instance ID in the PR that
    adds the secret, never in a document, and never the token.
 
-3. **The `bifrost/grafana-alloy` secret, filled out of band.** Same shape as
+3. **Seed the allowlist from the measured series count.** The list of
+   counters and the per-metric series counts go in this step's PR body, from
+   step 1's capture. This is the cheap review that decides the bill: a reviewer
+   sees the arithmetic and can disagree with it before there is an Alloy config
+   to argue with. It also turns step 2's plan decision from an estimate into a
+   number.
+
+4. **The `bifrost/grafana-alloy` secret, filled out of band.** Same shape as
    `bifrost/gateway` and `bifrost/sheriff`: Pulumi owns the read grant and a
    committed script writes the value, so no token is in the repo and a
    `preview` never reads one. Two keys: the metrics instance ID (the basic-auth
@@ -346,7 +415,7 @@ Each step is a PR unless it says otherwise.
 
 ### Phase 2 — scrape
 
-4. **The Alloy image, pinned by digest.** A derived image is not needed if a
+5. **The Alloy image, pinned by digest.** A derived image is not needed if a
    committed config can be mounted, but it is the house pattern for exactly
    this problem and it gives a content-addressed tag:
    `deploy-workbench/alloy-image.ts` next to `bifrost-image.ts`,
@@ -356,16 +425,18 @@ Each step is a PR unless it says otherwise.
    fails if any of them disagree). At the time of writing the upstream release
    is `v1.21.3`; pin the digest, not the tag, in the same PR that adds it.
 
-5. **The committed Alloy config**, `deploy-workbench/alloy/config.alloy`, as
+6. **The committed Alloy config**, `deploy-workbench/alloy/config.alloy`, as
    data rather than a string in a task definition so it can be reviewed:
 
    - `prometheus.scrape "bifrost"` with `targets` of
      `bifrost.workbench.local:8080` (the Cloud Map name,
      `deploy-workbench/discovery.ts:56-66`), `metrics_path = "/metrics"`,
      `scrape_interval = "15s"`, and a `job` label of `bifrost`
-   - a `discovery.relabel` step keeping `bifrost_*` and dropping `http_*`, with
-     the allowlist fixed by step 1's series count
-   - `prometheus.remote_write "cloud"` to the endpoint from step 3, reading the
+   - `discovery.relabel` with an **explicit allowlist** of the 17 counters,
+     not a `bifrost_*` glob, for the cardinality reason under "Card" above.
+     `http_*` is absent from the list and so is every histogram. Seed step 3
+     writes the list; step 1's series count confirms it.
+   - `prometheus.remote_write "cloud"` to the endpoint from step 4, reading the
      instance ID and token from the environment
    - `logging { level = "warn" }`, so a busy scrape loop does not fill a log
      group
@@ -374,7 +445,7 @@ Each step is a PR unless it says otherwise.
    it rather than inline it, the same way `ecs.ts` reads `config.json` and
    injects it as `BIFROST_CONFIG`.
 
-6. **The service.** An ECS service, its own task definition, a security group
+7. **The service.** An ECS service, its own task definition, a security group
    with egress 8080 to the task and 443 out through the NAT, and a new ingress
    rule on `bifrost-task` whose source is the scraper's group. That rule is the
    third exception to the ALB-only invariant: it must name the rule's reason in
@@ -389,7 +460,7 @@ Each step is a PR unless it says otherwise.
    the check: `BIFROST_CONTAINER_MEMORY` and the sum tests in `ecs.test.ts` are
    unchanged in the diff.
 
-7. **Alarms, in the same PR as the service.** A metric-filter alarm on
+8. **Alarms, in the same PR as the service.** A metric-filter alarm on
    `up{job="bifrost"} == 0`, or an ECS service alarm on running-versus-desired,
    so a dead scraper is a page and not a quiet week. `bifrost-gateway.md` already
    notes that this account has no alerting target yet and that a
@@ -398,7 +469,7 @@ Each step is a PR unless it says otherwise.
 
 ### Phase 3 — dashboards
 
-8. **Prove the data before building on it.** In Grafana Explore, three
+9. **Prove the data before building on it.** In Grafana Explore, three
    readings, recorded in the PR body:
 
    - `up{job="bifrost"}` is 1
@@ -411,7 +482,7 @@ Each step is a PR unless it says otherwise.
    not stamping identity onto the request, which is a `config.json` or
    `enforce_auth_on_inference` question and not a scraping one.
 
-9. **The dashboard, as a committed JSON model.** Checked into the repo beside
+10. **The dashboard, as a committed JSON model.** Checked into the repo beside
    the plan (or provisioned, if the stack already has a provisioning path;
    decide in the PR), with one panel: stacked bars, `virtual_key_name` on the x,
    `sum by (model) (increase(<tokens>[1d]))` per segment, and a statement on the
@@ -422,7 +493,7 @@ Each step is a PR unless it says otherwise.
    The dashboard is deliberately minimal. It is the thing that proves the data
    path; a prettier one is a later PR on a working foundation.
 
-10. **Reconcile once, against the database.** For one closed day, compare the
+11. **Reconcile once, against the database.** For one closed day, compare the
     dashboard's per-key totals with `GET /api/logs/rankings?dimension=virtual_key`
     for the same window (or the equivalent SQL inside the 90-day retention). The
     expected result is agreement within a scrape interval plus whatever the
@@ -465,12 +536,14 @@ Each step is a PR unless it says otherwise.
   trustworthy. They are fine for a trend and not for a budget.
 - **That the history is long enough.** Grafana Cloud's retention is the bound
   now, not Bifrost's 90 days, and it starts at the first scrape. Anything before
-  step 5 lands is not in Mimir and cannot be backfilled from it.
+  step 6 lands is not in Mimir and cannot be backfilled from it.
 - **That `/metrics` is open.** Step 1 is the proof and it has not been run. It
   is deliberately the first step and deliberately its own PR.
-- **That `http_*` series should stay unscraped forever.** Dropping them is a
-  cost decision for this use case. If gateway latency becomes interesting, that
-  is a separate allowlist entry with its own cardinality argument.
+- **That `http_*` or the latency histograms should stay unscraped forever.**
+  Dropping them is a cost decision for this use case, and it is the decision
+  most likely to be revisited. `bifrost_upstream_latency_seconds` is the obvious
+  first candidate, at 24 series per label set; that is a line in the allowlist
+  with its own cardinality argument, not a change of shape.
 
 ## Open questions
 
@@ -482,7 +555,7 @@ Each step is a PR unless it says otherwise.
    This plan puts it in `deploy-workbench/` because it is the gateway's
    observability and shares its network and its Cloud Map name. The alternative
    is `deploy-infrastructure/`, and the argument for it would be that Grafana is
-   an org-wide service rather than a workbench one. Worth settling before step 6.
+   an org-wide service rather than a workbench one. Worth settling before step 7.
 3. **Should the dashboard JSON be provisioned or applied by hand?** The repo has
    no dashboard provisioning today. Committing the JSON and applying it by hand
    is the cheap answer; provisioning it is the reproducible one. Step 9 decides
