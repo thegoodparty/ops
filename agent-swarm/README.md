@@ -80,6 +80,20 @@ or in the EC2 console of the infrastructure account (us-west-2).
 AWS_PROFILE=gp-infrastructure aws ssm start-session --region us-west-2 --target <instance id>
 ```
 
+## Shared files (agent-fs)
+
+Agents and catalog scripts share files at `/afs`, served by
+[agent-fs](https://github.com/desplega-ai/agent-fs) with a local MinIO behind
+it, both in the compose file. Nothing is published outside the compose
+network and nothing is stored in AWS. On boot the API registers with agent-fs
+and writes the shared org, drive and each agent's key into swarm config
+(`AGENT_FS_DEFAULT_ORG_ID`, `AGENT_FS_DEFAULT_DRIVE_ID`, `API_AGENT_FS_API_KEY`);
+only `AGENT_FS_API_URL` is set in compose. The panel-wave scripts pass the
+recipient CSV, screenshots and the replies export through it. Bucket
+versioning is off on purpose, so a delete is a delete. When you bump
+agent-swarm, take the agent-fs image tag from the new
+`docker-compose.example.yml`.
+
 ## Upgrade agent-swarm
 
 The lead and both workers do not run the upstream worker image directly.
@@ -118,7 +132,9 @@ forward-only, so the way back is the latest snapshot.
 ## Backups and restore
 
 The state that matters is the `agent-swarm_swarm_api_data` volume (SQLite,
-WAL) on the data volume, plus the agents' workspaces next to it. Snapshots
+WAL) on the data volume, plus the agents' workspaces next to it. The
+agent-fs volumes (`agent_fs_data`, `agent_fs_minio`) hold only working files
+that scripts delete after use; nothing needs restoring from them. Snapshots
 of the data volume are the backup; their schedule and retention are defined
 with the host in `deploy-infrastructure/`. A snapshot is crash-consistent,
 which SQLite recovers from like a power cut.
