@@ -24,7 +24,7 @@ Fields:
 - endLine: (optional) last line if the finding spans multiple lines
 - body: markdown comment. MUST end with a parenthetical: "(Falsification check: <what would disprove this and whether it is present in the code>.)"
 - suggestion: (optional) literal replacement text for line..endLine, no code fences. Only include when you are confident it will pass CI verbatim. Match the file's existing style (quotes, semicolons, indentation).
-- category: one of bugs | security | tests | conventions | ai-rules | cross-file | thematic
+- category: one of bugs | security | tests | conventions | ai-rules | cross-file | thematic | scale
 - confidence: "high" | "medium"
 
 Emit a finding only if you would block merge on it alone. Drop everything else silently.
@@ -125,7 +125,7 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 4. Take that largest N as reachable unless code on this path restricts it. A belief that real inputs are smaller is not a falsification, and neither is a code comment, doc or ADR that assumes a small input ("a few dozen parameters", "about 1 ms"): that assumption is what this lens checks.
 5. Name the limit it breaks at that N: a bind-parameter or statement-size cap, task memory, a request or gateway timeout, a vendor rate limit, or CPU time inside a request. For CPU work, estimate the time at N: count the operations (a dense P by P Cholesky is about P^3/3, times the iterations) and assume JavaScript does about 10^8 to 10^9 simple operations a second. More than a few seconds inside a request breaks the limit: Node serves every request on one thread, so the whole server stops answering. A hard failure is not required; a stalled server is the failure. When the lead names a query or a frame, follow its output to the code that consumes it, a fit included.
 6. Look for the falsification: the code caps the input and refuses early, pages within the limit (keyset or fixed-size chunks), streams, or moves the work to a queue or job.
-Blocker when the code as written breaks the limit at N and step 6 finds nothing. Drop it only when step 2 found no size at all: "could be slow at scale" without a number is speculation. The body names N with its source (file:line), the operation, and the limit. Emit scale findings with category bugs.
+Blocker when the code as written breaks the limit at N and step 6 finds nothing. Drop it only when step 2 found no size at all: "could be slow at scale" without a number is speculation. The body names N with its source (file:line), the operation, and the limit. Emit scale findings with category scale.
 
 ## The disprove-it pass — required
 
