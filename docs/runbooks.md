@@ -203,9 +203,9 @@ and worth saying so in the incident.
 
 Twenty minutes with no task, or no `RunningTaskCount` datapoint at all. Both
 mean the same thing: nothing is registered behind the load balancer and every
-caller is getting a 503. The window is far longer than any deploy's
-stop-before-start gap (measured worst case about ten minutes), so a normal merge
-cannot have caused it.
+caller is getting a 503. The window is more than twice the longest deploy gap
+measured over 47 deploys — one or two five-minute buckets, 8 minutes continuous
+at one-minute resolution — so a normal merge cannot have caused it.
 
 ```sh
 aws ecs describe-services --cluster bifrost --services bifrost --region us-west-2 \
