@@ -84,7 +84,9 @@ AWS_PROFILE=gp-infrastructure aws ssm start-session --region us-west-2 --target 
 
 ## Shared files (agent-fs)
 
-Agents and catalog scripts share files at `/afs`, served by
+Agents and catalog scripts share files through agent-fs. Scripts see it at
+`/afs`; agents use the agent-fs CLI with drive paths, which are the same path
+without `/afs`. It is served by
 [agent-fs](https://github.com/desplega-ai/agent-fs) with a local MinIO behind
 it, both in the compose file. Nothing is published outside the compose
 network and nothing is stored in AWS. On boot the API registers with agent-fs

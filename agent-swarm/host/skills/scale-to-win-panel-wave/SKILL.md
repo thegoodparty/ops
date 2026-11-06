@@ -48,11 +48,17 @@ Run catalog scripts with `script-run` (by name):
   post's thread; `filePath` is a png under `/afs/`, uploaded and deleted. It refuses text
   that contains a phone number.
 
-Screenshots: `agent-browser screenshot <path>`, then save the file into agent-fs under
-`/afs/tevyn-handoffs/<outreachId>-<step>.png` so `tevyn-thread-reply` can read it. Only
+Paths: scripts see agent-fs at `/afs/...`. Your container has no `/afs`; the agent-fs
+CLI uses drive paths, which are the same path without `/afs`. So the CLI's
+`/tevyn-handoffs/x.png` is the script's `/afs/tevyn-handoffs/x.png`. Write with the drive
+path and pass the `/afs/` path to scripts. Never write a CLI path that starts with `/afs`.
+
+Screenshots: `agent-browser screenshot <path>`, then upload the file with the agent-fs CLI
+to `/tevyn-handoffs/<outreachId>-<step>.png` and pass
+`/afs/tevyn-handoffs/<outreachId>-<step>.png` to `tevyn-thread-reply`. Only
 screenshot views that show counts, the message, dates and statuses. Never leave a
 contact preview, a replies view or any phone number in a screenshot; navigate away first.
-Delete local screenshots and exports when you are done.
+Delete local screenshots, recipient CSVs and exports when you are done.
 
 ## Login (every action)
 
@@ -73,8 +79,9 @@ Delete local screenshots and exports when you are done.
    `Panel wave #<outreachId>`) so step 1 finds it. Texting hours in the official's
    `timeZone`. Sender number: the state's Bandwidth 10DLC number if one exists, else
    toll-free. Save `campaignName`.
-3. Get the CSV path from `tevyn-handoff-csv`. Upload it, choose "assume cell phone", and
-   check that all four columns auto-mapped. Skip suppressions and tags. Delete the CSV from agent-fs afterwards.
+3. Get the CSV path from `tevyn-handoff-csv`, then download it from agent-fs with the CLI
+   (drop the `/afs` prefix) to a local file. Upload that file, choose "assume cell phone", and
+   check that all four columns auto-mapped. Skip suppressions and tags. Delete the CSV from agent-fs and the local copy afterwards.
 4. Paste `message` exactly as given, character for character. Map `{{first_name}}` to the
    first name field.
 5. Check on Send Summary:
@@ -105,8 +112,8 @@ Run only at or after `repliesDueAt`. The record is `scheduled` (auto) or `built`
    Use the Replies export, not "Campaign Results".
 3. Wait for DOWNLOAD to return (a few seconds), then
    `agent-browser download <selector> <path>`. Rename the file to `<outreachId>.csv`.
-4. Save it to agent-fs at `/afs/tevyn-handoffs/<outreachId>.csv`, then run
-   `s2w-replies-upload` with `outreachId` and that path.
+4. Upload it with the agent-fs CLI to `/tevyn-handoffs/<outreachId>.csv`, then run
+   `s2w-replies-upload` with `outreachId` and `/afs/tevyn-handoffs/<outreachId>.csv`.
 5. Set `state: 'replies_uploaded'`. Reply in the thread: replies exported and uploaded
    (no counts of people, no content). Delete every local copy of the file.
 
