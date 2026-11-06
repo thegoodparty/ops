@@ -15,6 +15,12 @@
 > Plan: docs/bifrost-metrics.md
 > Step: 1
 > ```
+>
+> One exception to "changes no infrastructure": step 1's probe is a temporary
+> debug container in the gateway's task definition, reverted within that step.
+> The regulation is that nothing this plan adds outlives its step without its
+> own reviewed change; a probe that has to read the endpoint from inside the
+> network is the only thing that cannot be done from this repository alone.
 
 **This plan is the enabling infrastructure and stops there.** It gets Bifrost's
 counters into Grafana Cloud, proves they arrived, and leaves a working data
@@ -313,12 +319,14 @@ and destroy the ability to use it.
 
 **A gap is different from a reset, and is the case to alarm on.** If the
 scraper is down, or Grafana Cloud refuses writes, `increase()` cannot invent
-the missing window. That is a hole rather than a rounding error. Two rules
-cover it, both Grafana alert rules rather than CloudWatch ones because they
-read Prometheus series that only exist in Mimir: `up{job="bifrost"} == 0` for
-more than a few minutes, and an unexplained change in the counter reset count
-(which is also how an unexpected gateway restart becomes visible). Step 8 makes
-the first of those real.
+the missing window. That is a hole rather than a rounding error, and the
+obvious alert for it does not work: `up` is shipped over the same
+`remote_write` that would be failing, so when writes are rejected no `up`
+sample arrives at all and `up == 0` matches nothing. Detecting a gap means
+alerting on **absence** (`absent_over_time(up{job="bifrost"}[10m])`) or on a
+no-data state, plus a signal that does not travel the write path at all. Step 8
+lays out which detector covers which blind spot, and why that divides across
+both stacks.
 
 **What this means for the number.** Mimir is a sampled aggregate with a bounded
 error; the `logs` table is an exact per-request ledger with a 90-day life. For
@@ -430,10 +438,34 @@ Each step is a PR unless it says otherwise.
    under `/api/`. That is a reading of the source and not an execution of it,
    and the distinction is the whole reason this step is separate.
 
-   The account has no bastion and no ECS Exec, so the read has to happen from
-   inside: a one-off ECS task, or the bootstrap container's shell, or a
-   temporary debug container in the gateway's task definition. What to capture
-   in the PR body, as text and not a screenshot:
+   The account has no bastion and no ECS Exec, and this is the step that has to
+   pick one mechanism rather than list three. Of the obvious candidates, two do
+   not work as written:
+
+   - **A one-off ECS task in the private subnets gets a timeout.** The gateway's
+     security group admits 8080 only from the ALB's group
+     (`deploy-workbench/network.ts:389`) and the vk-mint Lambda's
+     (`bifrost-vk-mint.ts:345`). The scraper's rule does not arrive until step 7,
+     so a probe task is refused at the group. Treating that timeout as "this plan
+     is wrong" would abandon the plan on a false negative, so this is the trap to
+     avoid in this step.
+   - **The bootstrap container has no shell to use.** It is a run-once `sh` claim
+     script (`bifrost/bootstrap.sh`), not an interactive container.
+
+   **The mechanism: a temporary debug container in the gateway's own task
+   definition**, reading `127.0.0.1:8080/metrics` over loopback. It needs no
+   security-group change, so it cannot produce a false negative, and loopback is
+   the one path the task group always permits.
+
+   This is a temporary, reverted change to the gateway's task definition, and
+   saying so explicitly is the point: it is the one thing in this plan that
+   touches `ecs.ts`, it exists for one deploy, and the reverting PR is part of
+   the step rather than a follow-up. "It changes no infrastructure" in the header
+   describes the plan's resting state, not this probe. The alternative, a
+   temporary 8080 ingress rule for a probe task, is a security-group change to
+   the gateway's own group and is the worse of the two to leave half-reverted.
+
+   What to capture in the PR body, as text and not a screenshot:
 
    - the first lines of the response, to show it is exposition text and not an
      HTML login page
@@ -551,24 +583,41 @@ Each step is a PR unless it says otherwise.
    the check: `BIFROST_CONTAINER_MEMORY` and the sum tests in `ecs.test.ts` are
    unchanged in the diff.
 
-8. **Alarms, in the same PR as the service.** Two of them, because they catch
-different failures and neither covers the other.
+8. **Alarms, in the same PR as the service.** Three signals, and the reason
+there are three is that each blind spot is somebody else's detector. The
+ordering below matters: the obvious alert does not work.
 
-   - **A dead scraper: an ECS service alarm** on running-versus-desired, which
-     is a CloudWatch alarm over the service's own metrics. This catches the
-     task being stopped, failing to start, or crash-looping.
-   - **A scraper that runs but cannot deliver: a Grafana alert rule** on
-     `up{job="bifrost"} == 0` and on remote-write failures. This is the case
-     the ECS alarm cannot see, and it is the case that matters: the task stays
-     healthy while Grafana Cloud rejects every write, which looks exactly like a
-     quiet week. The alert belongs in Grafana rather than in CloudWatch because
-     `up` is a Prometheus series that only exists in Mimir; there is no log line
-     carrying it, so no CloudWatch metric filter can evaluate it.
+   - **A dead scraper: an ECS service alarm** on running-versus-desired. A
+     CloudWatch alarm over the service's own metrics; catches the task stopped,
+     failing to start, or crash-looping.
+   - **Missing data: a Grafana alert rule on absence**, i.e.
+     `absent_over_time(up{job="bifrost"}[10m])`, or a no-data state set to
+     Alerting. Not `up == 0`, which is the trap here: `up` is generated by
+     Alloy and shipped over the same `remote_write` that would be failing, so
+     when writes are rejected **no `up` sample ever arrives and `up == 0`
+     matches nothing**. It fires only when the scrape fails while the write
+     still works. "Absent" is the only form that covers the case step 8 exists
+     for.
+   - **Write failures: a CloudWatch metric filter on the Alloy log group**, at
+     warn level, matching the remote-write error lines. This is deliberately
+     *not* a Grafana rule. Alloy's own `prometheus_remote_storage_*` series
+     would be the natural source, but they travel over the failing path and
+     step 6's allowlist does not forward them anyway, so a rule on them would
+     be silent in exactly the outage it is meant to catch. A log line is
+     written by the process that owns the failing socket, and CloudWatch reads
+     it without depending on the write path.
 
-   The second one has to live somewhere. `omni` already provisions Grafana
-   alert rules and contact points (`components/grafana.ts`,
-   `components/alerting/`), so the rule and its routing are a resource in that
-   stack, not a new mechanism here.
+   So the split is honest about what each can see: ECS catches a task that is
+   gone, `absent_over_time` catches a pipeline that has gone quiet, and the
+   CloudWatch filter catches the case where everything looks healthy and
+   nothing is being delivered. That last one is the gap lines 313-320 name, and
+   it is the one that would otherwise be invisible.
+
+   The Grafana rule and its routing are resources in `omni`'s stack, which
+   already provisions alert rules and contact points
+   (`components/grafana.ts`, `components/alerting/`). The two CloudWatch alarms
+   are `ops` resources. That split is by where the signal lives, not by
+   convenience.
 
    A note on what this account has today: `deploy-workbench/bifrost/README.md`
    records that the bootstrap container's failures surface only as a stopped
@@ -576,7 +625,7 @@ different failures and neither covers the other.
    turns it into a page; this account has no alerting target yet". That note is
    about a *different* log stream and a *different* failure (the first-admin
    claim), and it is the reason this account has no paging story at all. This
-   step is where the first one arrives, and it arrives in Grafana.
+   step is where the first one arrives.
 
 ### Phase 3 — prove the data path, and stop
 
