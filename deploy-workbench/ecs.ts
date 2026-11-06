@@ -1728,9 +1728,10 @@ export const createBifrostEcs = (args: {
    *   healthy; see `BIFROST_BOOTSTRAP_CONTAINER_NAME` above.
    * - No review bucket, no `AGENT_VERSION`, no metric filters: those are the
    *   delegate's concerns, not the gateway's.
-   * - `cpu`/`memory` are 512/1024 rather than 1024/4096, per the plan's
-   *   sizing, and the containers' own reservations split that total rather
-   *   than each repeating it; see the constants above.
+   * - `cpu`/`memory` are the task size in the constants above (1024/2048,
+   *   raised from the 512/1024 the plan started at) rather than the delegate's
+   *   1024/4096, and the containers' own reservations split that total rather
+   *   than each repeating it.
    * - The `secrets` block is not a list of keys read from a secret. It is the
    *   declared lists above, plus `BIFROST_CONFIG` from the SSM parameter; see
    *   the module header for why nothing here reads Secrets Manager. Bifrost gets
