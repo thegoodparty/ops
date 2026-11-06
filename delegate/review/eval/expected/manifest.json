@@ -508,5 +508,19 @@
     "split": "tune",
     "source": "production-missed",
     "kind": "scale"
+  },
+  {
+    "id": "omni-2852-priority-page-waits-on-read",
+    "bundle": "omni-2852-priority-page-waits-on-read.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-webapp/app/dashboard/priorities/[priorityId]/page.tsx"
+      ]
+    },
+    "tests": "Adds the priority read-status call to the priority page's server render, so the page shows nothing until gp-api answers, and a failure or slow read takes the whole page with it. gp-webapp is a single-page app; this data should load client-side. On 2026-11-04 this is the path that sent seven read-status requests to six servers in 30 seconds (post-mortem \"Statewide read freeze\"). Production approved.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "architecture"
   }
 ]
