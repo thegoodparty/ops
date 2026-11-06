@@ -47,4 +47,6 @@ for attempt in 1 2 3 4 5; do
   sleep 3
 done
 
+./sync-agent-config.sh
+
 docker compose "${profiles[@]}" ps

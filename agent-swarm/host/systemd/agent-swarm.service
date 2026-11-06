@@ -12,7 +12,7 @@ WorkingDirectory=/opt/agent-swarm
 Environment=AWS_REGION=us-west-2
 ExecStart=/opt/agent-swarm/up.sh
 ExecStop=/usr/bin/docker compose --profile "*" down
-TimeoutStartSec=900
+TimeoutStartSec=1200
 TimeoutStopSec=180
 
 [Install]

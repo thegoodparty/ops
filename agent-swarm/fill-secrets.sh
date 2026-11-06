@@ -250,7 +250,7 @@ elif [[ $MODE == sso ]]; then
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
 else
   echo "Done. Every required key is present. On the host, if the stack is not running yet:"
-  echo "  sudo systemctl start agent-swarm && sudo /opt/agent-swarm/bootstrap.sh"
+  echo "  sudo systemctl start agent-swarm"
   echo "If it is running, re-render .env and apply:"
   echo "  sudo -u ec2-user AWS_REGION=us-west-2 /opt/agent-swarm/up.sh"
 fi
