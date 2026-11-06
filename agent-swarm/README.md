@@ -290,9 +290,11 @@ not in this repo, so they are recorded here. Checked 2026-11-06.
   `workflows: write`; both are accepted for now. A workflow it pushes to a
   branch gets no AWS access, because the eval roles trust only the workflow
   files on ops `main` (`job_workflow_ref` in `deploy/components/ci-roles/policies.ts`).
-- Merging needs a human. A candidate may change only
-  `delegate/agents/pr-reviewer.ts` and `pr-reviewer-subagents.ts`, and
-  `.github/CODEOWNERS` gives `delegate/` to `@thegoodparty/gp-contrib`. The
+- Merging needs a human. The eval reads only
+  `delegate/agents/pr-reviewer.ts` and `pr-reviewer-subagents.ts` from a
+  candidate branch, but nothing stops a PR from touching more. What guards it
+  is `.github/CODEOWNERS`: its `*` default gives every path, `delegate/`
+  included, to `@thegoodparty/gp-contrib`. The
   `main` ruleset requires a code-owner review, and its only bypass actor is
   an organization admin. An App can't be a code owner, so neither
   `delegate-gp` nor `delegate-reviewer` can approve one of these PRs in a
