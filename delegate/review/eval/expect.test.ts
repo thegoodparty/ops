@@ -8,6 +8,7 @@ import {
   commitSyntheticHead,
   computeGate,
   scoreDir,
+  scoreHistory,
   readBundleFile,
   readManifest,
   renderExpectJson,
@@ -601,6 +602,21 @@ test("gate: a case marked flakyOnMain cannot regress even when main passed it 3/
   assert.deepEqual([g.cases[0].outcome, g.cases[0].flaky, g.regressions, g.pass], ["not-held", true, [], true]);
 });
 
+test("gate: earlier main runs of the same reviewer that failed make a 3/3 case not held", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true))]);
+  const cand = mkReport(tune, runsOf(true, false, false, true, false, false));
+  const lucky = computeGate([cand], base, [], true, [mkReport(tune, runsOf(true, false, true))]);
+  assert.deepEqual(
+    [lucky.cases[0].outcome, lucky.cases[0].flaky, lucky.cases[0].earlierPassed, lucky.cases[0].earlierCompleted, lucky.pass],
+    ["not-held", true, 2, 3, true],
+  );
+  const stable = computeGate([cand], base, [], true, [mkReport(tune, runsOf(true, true, true))]);
+  assert.deepEqual([stable.cases[0].outcome, stable.cases[0].flaky, stable.regressions], ["regression", false, [tune.id]]);
+  const errored = computeGate([cand], base, [], true, [mkReport(tune, [{ pass: false, outcome: "no review", errored: true }])]);
+  assert.deepEqual([errored.cases[0].outcome, errored.cases[0].earlierCompleted], ["regression", 0]);
+});
+
 test("gate: a target below 3/3 fails, and an unknown target id does too", () => {
   const { tune } = gateCases();
   const base = mkBase([mkReport(tune, runsOf(false, false, false))]);
@@ -653,4 +669,39 @@ test("selectCases takes a comma-separated list of ids", () => {
   const all = readManifest(MANIFEST);
   const ids = [all[0].id, all[2].id];
   assert.deepEqual(selectCases(all, { case: ids.join(",") }).map((c) => c.id), ids);
+});
+
+test("history keeps only earlier runs of the same case head as the baseline", () => {
+  const { tune } = gateCases();
+  const root = mkdtempSync(join(tmpdir(), "eval-history-"));
+  const put = (dir: string, n: number, headSha: string) => {
+    mkdirSync(join(root, dir, tune.id), { recursive: true });
+    writeFileSync(
+      join(root, dir, tune.id, `run-${n}.json`),
+      JSON.stringify({ caseId: tune.id, headSha, variant: "main-1111111", output: null, error: "x", costUsd: null }),
+    );
+  };
+  put("base", 1, "head-now");
+  put("history", 1, "head-now");
+  put("history", 2, "head-old");
+  put("history", 3, "head-now");
+  const [r] = scoreHistory([tune], join(root, "history"), join(root, "base"));
+  assert.equal(r.scores.length, 2);
+});
+
+test("history drops runs cached before the harness recorded a gating verdict", () => {
+  const { tune } = gateCases();
+  const root = mkdtempSync(join(tmpdir(), "eval-history-"));
+  const put = (dir: string, n: number, gating?: { verdict: string; gates: string[] }) => {
+    mkdirSync(join(root, dir, tune.id), { recursive: true });
+    writeFileSync(
+      join(root, dir, tune.id, `run-${n}.json`),
+      JSON.stringify({ caseId: tune.id, headSha: "h", variant: "main-1111111", output: null, error: "x", costUsd: null, gating }),
+    );
+  };
+  put("base", 1, { verdict: "approve", gates: [] });
+  put("history", 1);
+  put("history", 2, { verdict: "approve", gates: [] });
+  const [r] = scoreHistory([tune], join(root, "history"), join(root, "base"));
+  assert.equal(r.scores.length, 1);
 });

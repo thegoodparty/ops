@@ -67,7 +67,7 @@ test("ids must exist, and a holdout case cannot be named where tune is required"
 });
 
 const gateCase = (id: string, split: "tune" | "holdout", outcome: Gate["cases"][number]["outcome"], candPassed: number) => ({
-  id, split, mainPassed: 3, mainCompleted: 3, flaky: false, candPassed, candRuns: 3, outcome,
+  id, split, mainPassed: 3, mainCompleted: 3, earlierPassed: 0, earlierCompleted: 0, flaky: false, candPassed, candRuns: 3, outcome,
 });
 
 test("the redacted gate carries holdout as counts only", () => {
