@@ -525,7 +525,9 @@ export const scoreDir = (cases: ExpectedCase[], out: string): CaseReport[] =>
 
 // Main's earlier runs of the same reviewer, kept only for the PR head the
 // baseline replayed: the history spans every version of the case list, and an
-// earlier answer to an edited case says nothing about this one.
+// earlier answer to an edited case says nothing about this one. A run cached
+// before the harness recorded a gating verdict would score as a miss, so it is
+// dropped wherever the baseline has one.
 export const scoreHistory = (cases: ExpectedCase[], dir: string, base: string): CaseReport[] => {
   const runsIn = (d: string): Result[] =>
     existsSync(d)
@@ -534,8 +536,10 @@ export const scoreHistory = (cases: ExpectedCase[], dir: string, base: string): 
           .map((f) => JSON.parse(readFileSync(join(d, f), "utf-8")) as Result)
       : [];
   return cases.map((c) => {
-    const heads = new Set(runsIn(join(base, c.id)).map((r) => r.headSha));
-    const rs = runsIn(join(dir, c.id)).filter((r) => heads.has(r.headSha));
+    const baseRuns = runsIn(join(base, c.id));
+    const heads = new Set(baseRuns.map((r) => r.headSha));
+    const gated = baseRuns.some((r) => r.gating !== undefined);
+    const rs = runsIn(join(dir, c.id)).filter((r) => heads.has(r.headSha) && (!gated || r.gating !== undefined));
     return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
   });
 };

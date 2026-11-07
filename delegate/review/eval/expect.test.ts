@@ -688,3 +688,20 @@ test("history keeps only earlier runs of the same case head as the baseline", ()
   const [r] = scoreHistory([tune], join(root, "history"), join(root, "base"));
   assert.equal(r.scores.length, 2);
 });
+
+test("history drops runs cached before the harness recorded a gating verdict", () => {
+  const { tune } = gateCases();
+  const root = mkdtempSync(join(tmpdir(), "eval-history-"));
+  const put = (dir: string, n: number, gating?: { verdict: string; gates: string[] }) => {
+    mkdirSync(join(root, dir, tune.id), { recursive: true });
+    writeFileSync(
+      join(root, dir, tune.id, `run-${n}.json`),
+      JSON.stringify({ caseId: tune.id, headSha: "h", variant: "main-1111111", output: null, error: "x", costUsd: null, gating }),
+    );
+  };
+  put("base", 1, { verdict: "approve", gates: [] });
+  put("history", 1);
+  put("history", 2, { verdict: "approve", gates: [] });
+  const [r] = scoreHistory([tune], join(root, "history"), join(root, "base"));
+  assert.equal(r.scores.length, 1);
+});
