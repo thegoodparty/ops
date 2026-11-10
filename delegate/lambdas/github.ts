@@ -3,8 +3,6 @@ import { getReviewerInstallationToken } from "./github-auth";
 import { getSecrets } from "./secrets";
 import { verifyGithubWebhook } from "./verify";
 
-// Distinct from delegate/framework/repos.ts:WRITE_REPOS (bot-write scope).
-// Update both lists when adding a repo.
 const REVIEW_REPOS = new Set([
   "omni",
   "gp-api",
@@ -23,9 +21,8 @@ const REVIEW_REPOS = new Set([
   "candidate-sites",
   "gp-marketing",
   "gp-pi",
-  // ops: review scope only (not in WRITE_REPOS). Whether an approval here can
-  // merge is decided by .github/CODEOWNERS alone: a PR touching only paths
-  // that file leaves unowned satisfies the code-owner requirement vacuously,
+  // ops: whether an approval here can merge is decided by .github/CODEOWNERS
+  // alone: a PR touching only paths that file leaves unowned satisfies the code-owner requirement vacuously,
   // so the bot's approval is the one approval the ruleset asks for. Four
   // Pulumi trees are unowned -- `deploy/`, `deploy-org/`, `deploy-workbench/`
   // and `deploy-infrastructure/`, de-owned in step 6 of
