@@ -72,12 +72,12 @@
             "worker-default": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
               "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-              "description": "gp-pi worker default. Lists without metadata by itself; gp-pi copies it from the entry sharing this alias target."
+              "description": "gp-pi worker default. Lists without metadata; gp-pi copies it from the entry sharing this alias target."
             },
             "coordinator-default": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
               "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-              "description": "gp-pi coordinator default. Lists without metadata by itself; gp-pi copies it from the entry sharing this alias target."
+              "description": "gp-pi coordinator default. Lists without metadata; gp-pi copies it from the entry sharing this alias target."
             }
           },
           "weight": 1
@@ -92,11 +92,11 @@
           "models": [
             "global.anthropic.claude-sonnet-5-5",
             "global.anthropic.claude-opus-5-5",
-            "global.moonshotai.kimi-k3",
+            "global.moonshotai.kimi-k3.1",
             "global.openai.gpt-6.1-sol",
             "global.openai.gpt-6.1-terra",
             "global.anthropic.claude-haiku-5-5",
-            "global.xai.grok-4.7",
+            "global.anthropic.claude-fable-5-2",
             "global.zai.glm-5.3"
           ],
           "weight": 1,

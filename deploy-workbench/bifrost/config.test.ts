@@ -163,16 +163,21 @@ const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
  * `inferenceTypesSupported: [ON_DEMAND]` -- so it cannot be served as a
  * profile at all, global or geographic. Removed on 2026-11-04; see
  * `docs/bifrost-gateway.md`, "Inference residency".
+ *
+ * Still eight after 2026-11-10: Kimi K3.1 replaced Kimi K3 as its vendor's
+ * successor, and Claude Fable 5.2 took Grok 4.7's slot, which the review that
+ * opened the set to Fable measured as dominated. The two swaps, not two adds,
+ * are what keeps this list and the size constraint in the same edit.
  */
 const SERVED_MODEL_CLASSES: Record<string, string[]> = {
   bedrock: [
     "global.anthropic.claude-sonnet-5-5",
     "global.anthropic.claude-opus-5-5",
-    "global.moonshotai.kimi-k3",
+    "global.moonshotai.kimi-k3.1",
     "global.openai.gpt-6.1-sol",
     "global.openai.gpt-6.1-terra",
     "global.anthropic.claude-haiku-5-5",
-    "global.xai.grok-4.7",
+    "global.anthropic.claude-fable-5-2",
     "global.zai.glm-5.3",
   ],
   fireworks: [

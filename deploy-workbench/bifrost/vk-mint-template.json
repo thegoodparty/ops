@@ -7,11 +7,11 @@
       "allowed_models": [
         "global.anthropic.claude-sonnet-5-5",
         "global.anthropic.claude-opus-5-5",
-        "global.moonshotai.kimi-k3",
+        "global.moonshotai.kimi-k3.1",
         "global.openai.gpt-6.1-sol",
         "global.openai.gpt-6.1-terra",
         "global.anthropic.claude-haiku-5-5",
-        "global.xai.grok-4.7",
+        "global.anthropic.claude-fable-5-2",
         "global.zai.glm-5.3"
       ],
       "key_ids": ["*"]

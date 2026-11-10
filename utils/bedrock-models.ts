@@ -99,10 +99,17 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and a cross-region profile is mandatory",
   },
   {
-    id: "moonshotai.kimi-k3",
-    invokeId: "global.moonshotai.kimi-k3",
+    // Moonshot's successor to Kimi K3, swapped in on 2026-11-10. The model id
+    // is `k3.1` with a dot, which is Moonshot's spelling and not a version of
+    // ours to normalise. The model card names `global.moonshotai.kimi-k3.1` as
+    // the Global inference ID, alongside `us.` and `in.` geo profiles, and
+    // quotes $4.00 / $20.00 per 1M tokens on the global one. It lists no
+    // Marketplace product id, so `enable-bedrock-models` reports no agreement
+    // to create for it, which is the same shape as `kimi-k3` had.
+    id: "moonshotai.kimi-k3.1",
+    invokeId: "global.moonshotai.kimi-k3.1",
     crossRegion: true,
-    note: "no in-region support in any region, so a cross-region profile is mandatory",
+    note: "replaced kimi-k3 on 2026-11-10; open weight; the model card documents US, India and Global cross-region profiles, and this account selects the global one as it does for every entry",
   },
   {
     id: "openai.gpt-6.1-sol",
@@ -123,10 +130,23 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "Marketplace product prod-6cyn7tgqazjhu",
   },
   {
-    id: "xai.grok-4.7",
-    invokeId: "global.xai.grok-4.7",
+    // Anthropic's frontier technical model, and the one tier this set did not
+    // have: above Opus 5.5 and priced at twice it. It is not a successor to
+    // Opus, so an earlier reading of this file would have called it an add; it
+    // took Grok 4.7's slot instead, because Grok 4.7 was measurably dominated
+    // by Haiku 5.5 on both intelligence and price per task and the set is
+    // meant to stay eight models.
+    //
+    // It is a Marketplace product (prod-m733do2vrmi3o), so unlike the Grok
+    // entry it needs an agreement, which the `enable-bedrock-models` step in
+    // deploy-workbench.yml creates with APPLY=1. Thinking is always on and
+    // cannot be disabled (effort is configurable), so every request pays
+    // reasoning tokens; cache reads are $0.20, which is what makes the price
+    // workable in a long session.
+    id: "anthropic.claude-fable-5-2",
+    invokeId: "global.anthropic.claude-fable-5-2",
     crossRegion: true,
-    note: "not sold through Marketplace, IAM only; replaced grok-4.6; the us. profile existed and was never used",
+    note: "added 2026-11-10 in Grok 4.7's slot; Marketplace product prod-m733do2vrmi3o; no in-region invocation, so a cross-region profile is mandatory; adaptive thinking always on, effort low through max",
   },
   {
     id: "zai.glm-5.3",
