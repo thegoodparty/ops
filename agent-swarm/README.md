@@ -85,7 +85,9 @@ answering Slack and tasks cannot be cancelled, while `/health` stays 200.
 deletes `node_modules` from any checkout where nothing else has changed for
 48 hours, or 6 hours once the volume is past 80%. Source trees, `.git` and
 uncommitted work are never touched; the next task in that checkout reinstalls.
-It also prunes unused images and build cache, then reports
+It also prunes unused images and build cache, except while `up.sh` holds
+`/opt/agent-swarm/.deploy.lock`: a worker image it just built has no container
+yet and cannot be pulled back. Then it reports
 `DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent` to the CloudWatch
 namespace `DelegateSwarm`.
 

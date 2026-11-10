@@ -131,6 +131,17 @@ describe("data volume cleanup", () => {
     assert.match(install, /^systemctl enable --now agent-swarm-disk-cleanup\.timer$/m);
   });
 
+  // A worker image built by up.sh has no container until compose starts it,
+  // and pull_policy: never means a pruned one cannot come back.
+  it("never prunes images while up.sh holds the deploy lock", () => {
+    const up = fs.readFileSync(path.join(HOST_DIR, "up.sh"), "utf8");
+    const script = fs.readFileSync(path.join(HOST_DIR, "disk-cleanup.sh"), "utf8");
+    const lock = up.indexOf("flock 9");
+    assert.ok(lock > 0 && lock < up.indexOf("docker build"));
+    assert.ok(script.indexOf("flock -n 9") < script.indexOf("docker image prune"));
+    assert.match(script, /exec 9>>\/opt\/agent-swarm\/\.deploy\.lock/);
+  });
+
   it("lets the host put metrics only in its own namespace", () => {
     const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
     assert.ok(Statement.includes(diskMetricsPutStatement));

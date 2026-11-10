@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/agent-swarm
+# disk-cleanup.sh skips its image and build cache prune while this is held: a
+# just-built worker image has no container yet and cannot be pulled back.
+exec 9>>.deploy.lock
+flock 9
 ./render-env.sh
 
 version="$(sed -n 's/^AGENT_SWARM_VERSION=//p' .env)"

@@ -44,9 +44,16 @@ if (($(used_percent) >= TIGHT_PERCENT || $(inodes_percent) >= TIGHT_PERCENT)); t
   clean "$TIGHT_IDLE_MINUTES"
 fi
 
-# Containers keep their own image, so this only drops superseded versions.
-docker image prune -af >/dev/null
-docker builder prune -af >/dev/null
+# Outside a deploy every wanted image has a container, so this only drops
+# superseded versions. During one, up.sh holds the lock and this is skipped.
+exec 9>>/opt/agent-swarm/.deploy.lock
+if flock -n 9; then
+  docker image prune -af >/dev/null
+  docker builder prune -af >/dev/null
+else
+  echo "disk-cleanup: deploy in progress, skipping image prune"
+fi
+exec 9>&-
 
 used="$(used_percent)"
 inodes="$(inodes_percent)"
