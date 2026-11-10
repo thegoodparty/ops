@@ -33,9 +33,10 @@ done < <(find . -path ./systemd -prune -o -type f -print0)
 # otherwise stay here forever.
 rm -rf "$DEST/scripts" "$DEST/skills" "$DEST/soul" "$DEST/bootstrap.sh"
 
-install -m 644 "$STAGE"/systemd/*.service /etc/systemd/system/
+install -m 644 "$STAGE"/systemd/*.service "$STAGE"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable agent-swarm.service
+systemctl enable --now agent-swarm-disk-cleanup.timer
 
 # A new host is installed before anyone has filled the secret. Leave the
 # stack down until they have, but still fail on any other error.

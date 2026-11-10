@@ -72,6 +72,34 @@ assume `OrganizationAccountAccessRole` from a management admin session; the
 top of `fill-secrets.sh` has the `~/.aws/config` profile
 (`gp-infrastructure`) every command below uses.
 
+## Disk
+
+The 150 GB data volume fills from the agents' own clones and worktrees:
+each gets its own `npm ci`, about 5 GB and 300k files for omni, and agents
+never delete them. When the volume runs out of space or inodes, SQLite
+rejects every write (`SQLITE_FULL` in the api stream), Delegate stops
+answering Slack and tasks cannot be cancelled, while `/health` stays 200.
+
+`disk-cleanup.sh` runs every 15 minutes as root from
+`agent-swarm-disk-cleanup.timer`. In the coder, reviewer and lead volumes it
+deletes `node_modules` from any checkout where nothing else has changed for
+48 hours, or 6 hours once the volume is past 80%. Source trees, `.git` and
+uncommitted work are never touched; the next task in that checkout reinstalls.
+It also prunes unused images and build cache, then reports
+`DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent` to the CloudWatch
+namespace `DelegateSwarm`.
+
+The alarms `delegate-swarm-data-volume-space` and
+`delegate-swarm-data-volume-inodes` fire at 85%, or when the metric stops
+arriving, and email `aws-infrastructure@goodparty.org` through the SNS topic
+`delegate-swarm-alerts`. To see what is using space:
+
+```sh
+sudo du -xsh /var/lib/docker/volumes/* | sort -h
+sudo df -h /var/lib/docker; sudo df -i /var/lib/docker
+sudo systemctl start agent-swarm-disk-cleanup; journalctl -u agent-swarm-disk-cleanup -n 5
+```
+
 ## Connect
 
 The instance id is the stack output `delegateSwarmInstanceId`

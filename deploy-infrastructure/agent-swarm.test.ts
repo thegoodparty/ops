@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  DISK_METRICS_NAMESPACE,
+  diskMetricsPutStatement,
   hostFiles,
   hostFilesHash,
   infraLogsReadStatements,
@@ -114,6 +116,29 @@ describe("panel replies grant", () => {
   it("is in the host role's policy", () => {
     const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
     assert.ok(Statement.includes(panelRepliesPutStatement));
+  });
+});
+
+describe("data volume cleanup", () => {
+  // Without it the agents' node_modules fill the volume and SQLite stops
+  // taking writes, as on 2026-11-06.
+  it("ships the cleanup script and a timer install.sh enables", () => {
+    assert.ok(hostFiles().includes("disk-cleanup.sh"));
+    assert.ok(hostFiles().includes("systemd/agent-swarm-disk-cleanup.service"));
+    assert.ok(hostFiles().includes("systemd/agent-swarm-disk-cleanup.timer"));
+    const install = fs.readFileSync(path.join(HOST_DIR, "install.sh"), "utf8");
+    assert.match(install, /systemd\/\*\.timer/);
+    assert.match(install, /^systemctl enable --now agent-swarm-disk-cleanup\.timer$/m);
+  });
+
+  it("lets the host put metrics only in its own namespace", () => {
+    const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+    assert.ok(Statement.includes(diskMetricsPutStatement));
+    assert.deepEqual(diskMetricsPutStatement.Condition, {
+      StringEquals: { "cloudwatch:namespace": DISK_METRICS_NAMESPACE },
+    });
+    const script = fs.readFileSync(path.join(HOST_DIR, "disk-cleanup.sh"), "utf8");
+    assert.ok(script.includes(`--namespace ${DISK_METRICS_NAMESPACE}`));
   });
 });
 
