@@ -100,6 +100,20 @@ export const infraLogsReadStatements = [
   },
 ];
 
+// disk-cleanup.sh reports data volume usage here; the alarms below read it.
+export const DISK_METRICS_NAMESPACE = "DelegateSwarm";
+export const diskMetricsPutStatement = {
+  Sid: "PutDiskMetrics",
+  Effect: "Allow",
+  Action: "cloudwatch:PutMetricData",
+  Resource: "*",
+  Condition: {
+    StringEquals: { "cloudwatch:namespace": DISK_METRICS_NAMESPACE },
+  },
+};
+
+const SWARM_ALERT_EMAIL = "aws-infrastructure@goodparty.org";
+
 // The host role's inline policy, kept pure so a test can read its statements.
 export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
   Version: "2012-10-17",
@@ -142,6 +156,7 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
     },
     panelRepliesPutStatement,
     ...infraLogsReadStatements,
+    diskMetricsPutStatement,
     {
       Sid: "ReadBucketEncryption",
       Effect: "Allow",
@@ -354,7 +369,7 @@ export const createAgentSwarm = (args: {
     "delegateSwarmDataVolume",
     {
       availabilityZone: AVAILABILITY_ZONE,
-      size: 150,
+      size: 500,
       type: "gp3",
       encrypted: true,
       tags: { ...TAGS, Name: DATA_VOLUME_NAME },
@@ -533,6 +548,80 @@ export const createAgentSwarm = (args: {
     },
     { provider },
   );
+
+  const alertTopic = new aws.sns.Topic(
+    "delegateSwarmAlerts",
+    { name: `${NAME}-alerts`, tags: TAGS },
+    { provider },
+  );
+
+  // Stays unconfirmed until someone accepts the AWS email.
+  new aws.sns.TopicSubscription(
+    "delegateSwarmAlertsEmail",
+    {
+      topic: alertTopic.arn,
+      protocol: "email",
+      endpoint: SWARM_ALERT_EMAIL,
+    },
+    { provider },
+  );
+
+  // CloudWatch publishes alarm actions as its service principal, which the
+  // default topic policy does not admit.
+  new aws.sns.TopicPolicy(
+    "delegateSwarmAlertsPolicy",
+    {
+      arn: alertTopic.arn,
+      policy: alertTopic.arn.apply((topicArn) =>
+        JSON.stringify({
+          Version: "2012-10-17",
+          Statement: [
+            {
+              Sid: "CloudWatchAlarms",
+              Effect: "Allow",
+              Principal: { Service: "cloudwatch.amazonaws.com" },
+              Action: "SNS:Publish",
+              Resource: topicArn,
+              Condition: {
+                StringEquals: {
+                  "aws:SourceAccount": INFRASTRUCTURE_ACCOUNT_ID,
+                },
+              },
+            },
+          ],
+        }),
+      ),
+    },
+    { provider },
+  );
+
+  // A full data volume stops every SQLite write while /health stays 200, so
+  // nothing else notices. Missing data breaches too: the metric stops when
+  // the host, docker or the cleanup timer is down.
+  for (const [id, metricName, what] of [
+    ["delegateSwarmDiskSpaceAlarm", "DataVolumeUsedPercent", "space"],
+    ["delegateSwarmDiskInodesAlarm", "DataVolumeInodesUsedPercent", "inodes"],
+  ] as const) {
+    new aws.cloudwatch.MetricAlarm(
+      id,
+      {
+        name: `${NAME}-data-volume-${what}`,
+        alarmDescription: `The swarm data volume is over 85% ${what}, or disk-cleanup.sh stopped reporting. At 100% SQLite rejects writes and Delegate stops answering Slack. See agent-swarm/README.md, "Disk".`,
+        namespace: DISK_METRICS_NAMESPACE,
+        metricName,
+        statistic: "Maximum",
+        period: 1800,
+        evaluationPeriods: 1,
+        threshold: 85,
+        comparisonOperator: "GreaterThanOrEqualToThreshold",
+        treatMissingData: "breaching",
+        alarmActions: [alertTopic.arn],
+        okActions: [alertTopic.arn],
+        tags: TAGS,
+      },
+      { provider },
+    );
+  }
 
   return { instance, eip };
 };
