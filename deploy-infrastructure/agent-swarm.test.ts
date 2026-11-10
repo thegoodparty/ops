@@ -166,6 +166,23 @@ describe("data volume cleanup", () => {
     assert.match(script, /exec 9>>\/opt\/agent-swarm\/\.deploy\.lock/);
   });
 
+  // A deploy holds the lock for its whole run, and the api it swaps in spends
+  // that time applying migrations. Walking every checkout and pruning images
+  // at the same time competes for the same volume (ENG-11612). The metrics
+  // still go out: the alarms breach on missing data.
+  it("skips the sweep too while a deploy runs, but still reports", () => {
+    const script = fs.readFileSync(path.join(HOST_DIR, "disk-cleanup.sh"), "utf8");
+    const gate = script.indexOf("if ((deploy_in_progress == 0)); then");
+    assert.ok(gate > 0, "the sweep is behind the deploy lock");
+    assert.ok(gate < script.indexOf('clean "$IDLE_MINUTES"'));
+    assert.ok(gate < script.indexOf("docker image prune"));
+    // Col 0 means outside the gate's block, which is indented by two spaces.
+    assert.match(script, /^used="\$\(used_percent\)"$/m);
+    assert.match(script, /^aws cloudwatch put-metric-data/m);
+    // A deploy waits on the lock in up.sh, so a hung metric call must not hold it.
+    assert.ok(script.indexOf("exec 9>&-") < script.indexOf("put-metric-data"));
+  });
+
   it("lets the host put metrics only in its own namespace", () => {
     const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
     assert.ok(Statement.includes(diskMetricsPutStatement));

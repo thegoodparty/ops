@@ -88,16 +88,23 @@ uncommitted work are never touched; the next task in that checkout reinstalls.
 Each run first grows the filesystem to the volume's size (`xfs_growfs`), so
 resizing the volume is only a change to `size` in
 `deploy-infrastructure/agent-swarm.ts`.
-It also prunes unused images and build cache, except while `up.sh` holds
-`/opt/agent-swarm/.deploy.lock`: a worker image it just built has no container
-yet and cannot be pulled back. Then it reports
-`DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent` to the CloudWatch
-namespace `DelegateSwarm`.
+It also prunes unused images and build cache. While `up.sh` holds
+`/opt/agent-swarm/.deploy.lock`, which it does for a whole deploy, the run
+reports its metrics and does nothing else: the sweep and the prunes compete
+with the container swap and with the migrations the new api applies before it
+serves, and a prune can drop an image the deploy pulled but has no container
+for yet. It reports `DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent`
+to the CloudWatch namespace `DelegateSwarm` either way. The lock is mutual, so
+a deploy that starts while a sweep is running waits for that sweep to finish
+before it touches a container.
 
 The alarms `delegate-swarm-data-volume-space` and
 `delegate-swarm-data-volume-inodes` fire at 85%, or when the metric stops
 arriving, and email `aws-infrastructure@goodparty.org` through the SNS topic
-`delegate-swarm-alerts`. To see what is using space:
+`delegate-swarm-alerts`. A full volume is not the only way this host stalls:
+on 2026-11-10 a 3 minute outage was the deploy replacing the api, with the EBS
+queue length under 2.5 and no OOM line anywhere (see "Upgrade agent-swarm").
+To see what is using space:
 
 ```sh
 sudo du -xsh /var/lib/docker/volumes/* | sort -h
@@ -164,10 +171,18 @@ Node and is used as is.
    `render-env.sh`.
 3. Merge. `up.sh` sees the dashboard marker
    (`ui-dist/.agent-swarm-version`) is stale and rebuilds the UI from the new
-   tag, builds the worker image, then compose pulls the new API image and
-   recreates every agent-swarm container. The API drains for up to 30
-   seconds; a task still running is superseded into a resume task on the
-   same agent.
+   tag, builds the worker image, then recreates every agent-swarm container.
+
+   A recreate is an outage, not a restart: the api leaves the compose network
+   and is gone until its replacement is listening. That window is the drain
+   (up to 30 seconds), the container swap, and the boot of the new process,
+   which applies the release's schema migrations before it serves. Measured on
+   2026-11-10, a 15-release bump spent 2m15s with no api container at all and
+   then 33 seconds booting, 28 of them applying 40 migrations (one took 21
+   seconds), so `/health` answered 502 through Caddy for about 3 minutes; both
+   synthetic probes failed and the swarm-unreachable alert paged (ENG-11612).
+   Budget minutes, not seconds, for a version bump. A task still running is
+   superseded into a resume task on the same agent.
 4. Check: `/health` is 200, the three agents show idle in the dashboard, and
    Delegate answers a mention in `#swarm-testing`.
 
