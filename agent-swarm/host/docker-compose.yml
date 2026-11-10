@@ -1,4 +1,4 @@
-# agent-swarm 2.6.0 on delegate-swarm.infra.goodparty.org
+# agent-swarm 2.10.0 on delegate-swarm.infra.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
@@ -55,7 +55,6 @@ x-worker-env: &worker-env
   # key in swarm config on boot, so only the URL is set here.
   AGENT_FS_API_URL: http://agent-fs:7433
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
-  YOLO: "true"
   # Git and gh authenticate as the GitHub App (delegate-gp[bot]) through the
   # gh-app-token helper that global-setup-script.sh installs.
   GITHUB_APP_ID: ${GITHUB_APP_ID:-}
@@ -78,7 +77,7 @@ x-worker-env: &worker-env
 # tag changes with the version or the patch, which is what makes compose
 # recreate the agents; an unchanged tag is not rebuilt.
 x-worker-base: &worker-base
-  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.6.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
+  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.10.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
   pull_policy: never
   entrypoint: *agent-entrypoint
   platform: linux/amd64
@@ -91,7 +90,7 @@ x-worker-base: &worker-base
 
 services:
   # agent-fs: the swarm's shared file store, mounted as /afs in agents and
-  # catalog scripts. Taken from docker-compose.example.yml at 2.6.0. Files live
+  # catalog scripts. Taken from docker-compose.example.yml at 2.10.0. Files live
   # in a local MinIO on the data volume, not in AWS. No ports are published:
   # only the API and the agents reach it, over the compose network. The MinIO
   # root login is upstream's default for the same reason; anything that can
@@ -131,7 +130,7 @@ services:
     logging: *logging
 
   agent-fs:
-    image: ghcr.io/desplega-ai/agent-fs:0.18.5
+    image: ghcr.io/desplega-ai/agent-fs:0.18.24
     platform: linux/amd64
     depends_on:
       minio-init:
@@ -190,7 +189,7 @@ services:
     logging: *logging
 
   api:
-    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.6.0}"
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.10.0}"
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
@@ -206,6 +205,11 @@ services:
       - NODE_ENV=${NODE_ENV:-production}
       - API_KEY=${API_KEY}
       - AGENT_FS_API_URL=http://agent-fs:7433
+      # 2.10.0 serves agent-fs at /agentfs, /share and /site (and turns on the
+      # dashboard's Files page and Comb) whenever AGENT_FS_API_URL is set. That
+      # publishes agent-fs outside the compose network, which this host does
+      # not do yet, so pin it off. Caddy already routes the three prefixes.
+      - AGENT_FS_PROXY=${AGENT_FS_PROXY:-false}
       # agent-swarm sends usage events to desplega by default, tagged with the
       # org name and the admin's email domain.
       - ANONYMIZED_TELEMETRY=false

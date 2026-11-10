@@ -3,7 +3,7 @@
 ## What this is
 
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
-v2.6.0 that shows up in Slack as **Delegate** and serves its dashboard at
+v2.10.0 that shows up in Slack as **Delegate** and serves its dashboard at
 https://delegate-swarm.infra.goodparty.org. One EC2 host in the infrastructure
 account runs the whole stack in Docker Compose. This file is how to operate it.
 
@@ -130,6 +130,14 @@ recipient CSV, screenshots and the replies export through it. Bucket
 versioning is off on purpose, so a delete is a delete. When you bump
 agent-swarm, take the agent-fs image tag from the new
 `docker-compose.example.yml`.
+
+agent-fs is not reachable from a browser: the api service pins
+`AGENT_FS_PROXY` off, so `/agentfs`, `/share` and `/site` return 404. Turning
+it on publishes agent-fs at those three prefixes behind the same Caddy auth,
+and enables the dashboard's Files page and Comb. Set it in the
+`DELEGATE_SWARM` secret rather than in `.env`: `render-env.sh` rewrites `.env`
+on every boot and only carries the keys that are in the secret. `/share` and
+`/site` are public share pages gated by their own token.
 
 ## Upgrade agent-swarm
 
@@ -262,7 +270,7 @@ that file; an address there also needs to be in `allowed-emails.txt` to
 sign in. Roles set by hand in the API are overwritten on the next deploy.
 
 An admin can do nearly everything the operator key can do, with tasks,
-config and token changes attributed to them. On v2.6.0 a user token cannot create or edit swarm-scope MCP servers (lead only),
+config and token changes attributed to them. A user token cannot create or edit swarm-scope MCP servers (lead only),
 steer a task someone else requested, refresh the model catalog, or read the
 asset key audit. Do those with `API_KEY` from the host (as
 `sync-agent-config.sh` does).
