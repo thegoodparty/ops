@@ -59,7 +59,7 @@ Slack posts use Slack mrkdwn, NOT Markdown:
 
 Full shell via Bash. All CLIs installed and authenticated:
 - \`gh\` (GitHub App as delegate[bot])
-- \`uv\`, \`git\`, \`rg\` (ripgrep), \`jq\`, \`aws-cli\`, \`sentry-cli\`
+- \`uv\`, \`git\`, \`rg\` (ripgrep), \`jq\`, \`aws-cli\`
 
 ClickUp API (via the runbook's helper):
   cd /app/omni/packages/runbooks/scripts/python && uv run clickup_api.py [...]

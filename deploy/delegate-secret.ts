@@ -36,7 +36,6 @@ export const DELEGATE_SECRET_KEYS = [
   "DATABRICKS_TOKEN",
   "GRAFANA_SERVICE_ACCOUNT_TOKEN",
   "GRAFANA_WEBHOOK_SECRET",
-  "SENTRY_AUTH_TOKEN",
 
   // Not referenced in this repo. Supplied by the live secret, so it stays to
   // keep the task definition unchanged.

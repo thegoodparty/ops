@@ -115,7 +115,7 @@ const main = async () => {
   // slack-responder: full shallow checkout of omni@main so the bot can read
   // and grep the whole codebase immediately. main is omni's default branch,
   // so a depth-1 clone is "latest main" for free. Best-effort — a clone
-  // failure still lets the bot answer non-code (Grafana/Sentry/Vercel)
+  // failure still lets the bot answer non-code (Grafana/Vercel)
   // questions, so we log and continue rather than aborting the task.
   if (job.agent === "slack-responder") {
     const omniDir = process.env.OMNI_DIR ?? "/app/omni";
