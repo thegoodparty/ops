@@ -45,10 +45,14 @@ host; the next deploy overwrites them.
   before docker starts and formats it only if it is blank, so a replacement
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
-  with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
-  `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
-  `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
-  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login
+  with keys `API_KEY`, `CLICKUP_API_TOKEN`, `FIREWORKS_API_KEY`,
+  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
+  `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
+  `OAUTH2_PROXY_*` keys that turn on Google login. There is deliberately no
+  `ANTHROPIC_API_KEY`: the agents run the Fireworks US router and nothing
+  else, so a task that pins an Anthropic model fails before its first turn
+  instead of quietly billing ~9x (the rule is `docs/bifrost-gateway.md`,
+  "Inference residency").
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -589,8 +593,11 @@ later date) is the same edit; there is no `-latest` US router to track it, which
 is why the dated id is pinned deliberately.
 
 `FIREWORKS_API_KEY` is a key in the `DELEGATE_SWARM` secret (see "Where it
-runs"). `ANTHROPIC_API_KEY` stays in the secret and in the worker env for the
-api service and as a fallback path, but no agent runs an Anthropic model.
+runs"). The secret holds no `ANTHROPIC_API_KEY`: pi has no cross-provider
+fallback, so the missing key turns a stray Anthropic pin into a failure before
+the first turn rather than a task billed at ~9x the Fireworks price. The old
+`delegate/` stack in the serve account is a separate deployment that runs the
+Claude Agent SDK and still needs the key in its own `DELEGATES` secret.
 
 ## MCP servers
 
@@ -648,10 +655,11 @@ The swarm starts with fresh state. In order:
    started.`
 2. **Fill the secret.** From this directory on a laptop:
    `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh`. It asks for the Slack,
-   Anthropic, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
+   Fireworks, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
    `SECRETS_ENCRYPTION_KEY` when the secret lacks them, and never prints
    either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
-   stores. It ends by listing any required key still missing.
+   stores. It ends by listing any required key still missing, and drops an
+   `ANTHROPIC_API_KEY` an older fill left behind.
 3. **Start.** On the host: `sudo systemctl start agent-swarm`. The first
    start pulls the images (the worker image is about 5 GB), builds the
    patched worker image and the dashboard. Check `curl -s http://127.0.0.1:3013/health` and

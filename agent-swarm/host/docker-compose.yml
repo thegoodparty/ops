@@ -37,10 +37,10 @@ x-agent-entrypoint: &agent-entrypoint
 x-worker-env: &worker-env
   ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
-  # Anthropic is kept for the api service and as the fallback path; the agents
-  # themselves run Fireworks US-only (see PI_MODELS_JSON in
-  # global-setup-script.sh and the "Models" section of agent-swarm/README.md).
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # No ANTHROPIC_API_KEY on purpose. The agents run Fireworks US-only (see
+  # PI_MODELS_JSON in global-setup-script.sh and the "Models" section of
+  # agent-swarm/README.md), and a task that pins an Anthropic model must fail
+  # before its first turn rather than quietly bill ~9x the Fireworks price.
   # The pi harness's own key for the ONE model it may run. render-env.sh copies
   # it from the secret; compose has to enumerate it or nothing passes it into
   # the container.
@@ -220,7 +220,6 @@ services:
       - APP_URL=${APP_URL:-https://delegate-swarm.infra.goodparty.org}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - API_DRAIN_MAX_MS=${API_DRAIN_MAX_MS:-30000}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - EMBEDDING_API_BASE_URL=${EMBEDDING_API_BASE_URL:-http://tei:80/v1}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-local}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text-v1.5}
