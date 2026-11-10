@@ -336,13 +336,15 @@ those, for example an S3 permission or a Slack scope, only that part is a PR.
 
 ### Swarm state this repo owns
 
-`host/sync-agent-config.sh` writes three things into the swarm's database.
+`host/sync-agent-config.sh` writes four things into the swarm's database.
 `up.sh` runs it on every deploy, after the stack is up, so merging is all a
 change to them needs:
 
 - the global `SETUP_SCRIPT` config, from `host/global-setup-script.sh` (runs
   as root at every agent container start)
 - the grafana and clickup MCP servers, installed on all three agents
+- the model-catalogue overlay row that teaches the dashboard about the one
+  model the agents run (see "Models")
 - each agent's harness and model, from `HARNESS_PROVIDER` and the
   `*_MODEL_OVERRIDE` values `render-env.sh` writes
 
@@ -539,6 +541,49 @@ Where it lives:
   tokens, 1.5x the global endpoint. pi's built-in catalogue carries
   .3 / .006 / 1.2 for the `-1017` entries, so the file overrides it; without
   that the dashboard under-reports the bill by a third.
+
+**The swarm's own model catalogue does not list this model, so
+`sync-agent-config.sh` adds it.** agent-swarm reads a models.dev projection whose
+`fireworks-ai` section has no row for a dated `-us` router and no `fireworks-us`
+provider at all. Before the overlay row existed, the dashboard's agent runtime
+page said *"No reasoning effort applies to this model: the catalog does not list
+it, or it does not reason"*, the reasoning-effort picker offered no level to
+pick, a `reasoning_effort` PATCH was rejected as unsupported, and the context
+window fell back to 200k instead of 1M. **The agents were never the problem**:
+pi sends no `thinkingLevel` here, so it falls back to its own default, this
+model's `thinkingLevelMap` maps that away and pi's clamp walks forward to
+`high`, which goes out as adaptive thinking at high effort. What was missing was
+the console's view of the model.
+
+So `host/sync-agent-config.sh` upserts one model-catalogue overlay row
+(`PUT /api/models-catalog/overlay`, lead-or-operator, an upsert keyed on
+provider and model id) on every deploy, from the same `models.json` heredoc the
+worker loads:
+
+- `reasoning_options` is the `thinkingLevelMap`'s non-null values, i.e. the
+  provider's own effort tokens (`none`/`low`/`high`/`max`). Nothing restates
+  them in the script, so editing the map moves the console with it;
+  `host/scripts/model-catalog-overlay.test.ts` fails if a second copy appears or
+  if the two disagree. A literal `off` would be wrong here: agent-swarm's effort
+  map normalizes `none` to its own `off` and drops anything else without a word.
+- `contextWindow` and `maxOutput` come from the model's `contextWindow` and
+  `maxTokens`.
+- `expiresWhenUpstreamMatches: false`. Overlay rows normally delete themselves
+  once models.dev catches up, but models.dev has no `fireworks-us` section, so
+  that can never happen and the row is permanent by design.
+- **No price.** Overlay prices reach agent-swarm's pricing table through its
+  models.dev seed projection, which knows a fixed set of provider sections and
+  has no `fireworks-us` case, so a price in this row would never be read. Pi's
+  own dollar figure still comes from the `cost` block in `models.json`, which
+  is where the price above is kept; it is the session's cost *source* that stays
+  `unpriced` instead of `pricing-table`, so cost-based reporting treats these
+  sessions as unmeasured. Adding the price properly means a `fireworks-us`
+  section upstream, not a field here.
+
+A failed overlay write is printed to the journal and the sync carries on
+(`model catalogue overlay: the upsert failed ...`), because the setup script,
+the MCP servers and the runtime model are what make the agents run. The write is
+an upsert, so re-running the script is the retry.
 
 **Adding a model is a reviewed change, not an automatic upgrade.** Adding one
 means minting a new dated US router id with Fireworks and editing
