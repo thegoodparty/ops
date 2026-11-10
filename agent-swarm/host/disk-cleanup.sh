@@ -22,8 +22,7 @@ xfs_growfs "$DATA" >/dev/null
 # the container swap and with the migrations the new api applies before it
 # serves, and a prune can drop an image the deploy pulled but has no container
 # for yet. The metrics below are still published, so the alarms keep seeing
-# data. A deploy longer than a period is visible as a hung deploy, not as a
-# full volume.
+# data through a deploy.
 exec 9>>/opt/agent-swarm/.deploy.lock
 deploy_in_progress=1
 if flock -n 9; then
