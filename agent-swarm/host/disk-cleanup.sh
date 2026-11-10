@@ -13,6 +13,10 @@ IDLE_MINUTES=2880
 TIGHT_IDLE_MINUTES=360
 TIGHT_PERCENT=80
 
+# Pulumi resizes the EBS volume in place; XFS sits on the whole device, so
+# growing the filesystem is all that is left. A no-op at full size.
+xfs_growfs "$DATA" >/dev/null
+
 used_percent() { df --output=pcent "$DATA" | tail -1 | tr -dc 0-9; }
 inodes_percent() { df --output=ipcent "$DATA" | tail -1 | tr -dc 0-9; }
 

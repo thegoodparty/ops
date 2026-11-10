@@ -369,7 +369,7 @@ export const createAgentSwarm = (args: {
     "delegateSwarmDataVolume",
     {
       availabilityZone: AVAILABILITY_ZONE,
-      size: 150,
+      size: 500,
       type: "gp3",
       encrypted: true,
       tags: { ...TAGS, Name: DATA_VOLUME_NAME },

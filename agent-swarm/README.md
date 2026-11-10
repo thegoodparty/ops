@@ -74,7 +74,7 @@ top of `fill-secrets.sh` has the `~/.aws/config` profile
 
 ## Disk
 
-The 150 GB data volume fills from the agents' own clones and worktrees:
+The 500 GB data volume fills from the agents' own clones and worktrees:
 each gets its own `npm ci`, about 5 GB and 300k files for omni, and agents
 never delete them. When the volume runs out of space or inodes, SQLite
 rejects every write (`SQLITE_FULL` in the api stream), Delegate stops
@@ -85,6 +85,9 @@ answering Slack and tasks cannot be cancelled, while `/health` stays 200.
 deletes `node_modules` from any checkout where nothing else has changed for
 48 hours, or 6 hours once the volume is past 80%. Source trees, `.git` and
 uncommitted work are never touched; the next task in that checkout reinstalls.
+Each run first grows the filesystem to the volume's size (`xfs_growfs`), so
+resizing the volume is only a change to `size` in
+`deploy-infrastructure/agent-swarm.ts`.
 It also prunes unused images and build cache, except while `up.sh` holds
 `/opt/agent-swarm/.deploy.lock`: a worker image it just built has no container
 yet and cannot be pulled back. Then it reports
