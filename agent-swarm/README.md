@@ -13,8 +13,7 @@ The AWS side is Pulumi, in `deploy-infrastructure/` (stack
 `organization/infrastructure/main`, account 394495727159), and ships with
 every merge to `main` through `.github/workflows/deploy-infrastructure.yml`.
 
-Everything in `host/` except `scripts/` and `skills/` (see "Panel
-hand-offs") is the contents of `/opt/agent-swarm/` on the host
+Everything in `host/` is the contents of `/opt/agent-swarm/` on the host
 (`host/systemd/` goes to `/etc/systemd/system/`). On deploy, Pulumi uploads
 `host/` to `s3://delegate-swarm-config-394495727159/host/` and an SSM
 association runs `host/install.sh` on the instance whenever any file
@@ -404,134 +403,17 @@ sudo -u ec2-user /opt/agent-swarm/sync-agent-config.sh
 
 ### Panel hand-offs
 
-The panel-wave scripts and the `scale-to-win-panel-wave` skill keep their
-source and tests in `host/scripts/` and `host/skills/`, but the deploy does not
-ship them (`hostFiles` in `deploy-infrastructure/agent-swarm.ts` leaves both
-directories out), and nothing pushes them into the swarm. The swarm's copies
-are the live ones. To put an edit live, merge it, then ask Delegate to save the
-script to the global catalog, or update the coder's skill, from the file on
-`main`.
+The panel-wave scripts (`panel-waves-tick`, `tevyn-handoffs-new`,
+`tevyn-handoff-csv`, `tevyn-thread-reply`, `s2w-replies-upload`,
+`s2w-2fa-code`) and the coder's `scale-to-win-panel-wave` skill live only in
+the swarm, as do their config keys, their KV records and the `panel-waves-tick`
+schedule. Change them by asking Delegate, like any other script or skill.
 
-`s2w-2fa-code` computes the Scale to Win sign-in code from the config key
-`S2W_TOTP_SEED`, which a human sets at agent scope on the coder agent. It
-returns only the 6-digit code, and waits for the next 30-second step when under
-5 seconds remain. A rejected code usually means worker clock drift, so check
-NTP before touching the seed.
-
-The hand-off scripts find work in the `#tevyn-api` posts gp-api writes for an
-agent wave and send replies back through S3. They read these global config
-keys (not secret except the token): `SLACK_BOT_TOKEN` (needs `channels:history`
-and `files:read`), `TEVYN_API_CHANNEL_ID`, `PANEL_WAVE_AGENT_ID` (the coder's id;
-`panel-waves-tick` sends its tasks to it), `HANDOFF_ENV` (`dev` or `prod`; dev
-and prod share the channel, so only posts whose block `env` matches are taken)
-and `REPLIES_BUCKET` (`tevyn-poll-csvs-develop` for dev, `-master` for prod;
-optional `REPLIES_BUCKET_REGION`, default `us-west-2`). They live in the
-swarm, so switching to prod is setting `HANDOFF_ENV` and `REPLIES_BUCKET` in
-the dashboard or asking Delegate. The token is the existing global
-`SLACK_BOT_TOKEN` secret (the Delegate bot's token). The host role may
-only `s3:PutObject` under `agent-replies/` in the two buckets; gp-api's bucket
-policy grants the other half.
-
-- `tevyn-handoffs-new` returns `{handoffs, unreadable}`: the hand-off posts it
-  has not returned before, as compact JSON (outreachId, sendAt, timeZone, mode,
-  repliesKey, message, recipientCount, channel, ts), and the posts it could not
-  read. It keeps a cursor in KV (`tevyn:cursor`) and claims each outreach id as
-  `handoff:<outreachId>` = `{ state: 'new', slackTs, channel, sendAt, timeZone,
-  mode, message, recipientCount }`, so an id is returned once and can still be
-  handled from KV if nobody got its output. A post without the "Delegate is
-  handling this wave" note is not ours and is skipped. A post that carries the
-  note but cannot be read (no machine block, invalid fields, replies key
-  mismatch) is never claimed: it is reported in `unreadable` with its reason and
-  gets one warning reply in its own thread, deduped by `unparsed:<ts>`, and the
-  cursor stops just before the oldest unreleased one so history still covers it
-  next run. After 48h from first sight it stops holding the cursor and is
-  reported with `released: true`.
-- `tevyn-handoff-csv` (`channel`, `ts`) saves the post's recipient CSV under
-  `/afs/tevyn-handoffs/` and returns only that path, never the Slack URL.
-- `s2w-replies-upload` (`outreachId`, `exportPath`) PUTs the export to
-  `agent-replies/<outreachId>.csv` in `REPLIES_BUCKET`, signed with SigV4 from
-  the instance role's IMDS credentials (the swarm API container reaches IMDS
-  at hop limit 2), returns the key and byte count, then deletes the export from
-  agent-fs. A failed PUT keeps the export.
-
-- `tevyn-thread-reply` (`channel`, `ts`, `text`, optional `filePath`) replies in a
-  hand-off post's thread with `chat.postMessage`, or, with a png or jpg under
-  `/afs/`, uploads it into the thread (`files.getUploadURLExternal` and
-  `files.completeUploadExternal`, text as the comment) and deletes it from
-  agent-fs. Worker agents have no Slack tools in agent-swarm (posting and
-  uploading are lead-only), so the coder uses this script. It refuses text that
-  looks like a phone number. The script filesystem is text only, so the image
-  is read through `ctx.sh('base64 ...')`; smoke-test one upload on the host
-  after the first deploy.
-- `panel-waves-tick` is the dispatcher, meant to run on a schedule (below). Each
-  run it (1) runs `tevyn-handoffs-new` through `ctx.swarm.script_run`, because
-  catalog scripts cannot import each other, only to trigger the claim (the claim
-  record already holds the hand-off, so only its `unreadable` list is carried
-  into this result, and a failed run still leaves the KV scan, flagged as
-  `triggerFailed`); (2) lists
-  KV by the `handoff:` prefix; (3) for each record it should act on, writes
-  `lease:<outreachId>` with a one hour expiry and bumps `attempts` (counted per action, with `attemptsFor`), then creates
-  one coder task, "Handle <id> (schedule|export_replies) following the
-  scale-to-win-panel-wave skill", `modelTier: regular`, carrying the hand-off
-  fields as JSON. A record with a live lease is skipped, so a slow task is not
-  started twice; if the task cannot be created the lease is dropped so the next
-  run retries. It acts on `new` records, on `building` records with no live
-  lease (a task that died mid-run), and on `scheduled` and `built` records past
-  `repliesDueAt` (a shadow wave is scheduled by a person but exported by the
-  agent). It leaves `replies_uploaded` and `needs_human` alone,
-  and stops at 5 attempts per action. Its result lists `dispatched`, `skipped` (records
-  with no stored details, exhausted attempts, unreadable record), `failed` and
-  `unreadable` (hand-off posts the scan could not read); look there when a wave
-  seems stuck. It sends with `allowDuplicate: true` because two
-  waves posted together read as near-copies to the duplicate check.
-
-### KV states
-
-`handoff:<outreachId>` is shared by the scripts and the skill:
-
-| state | meaning |
-| --- | --- |
-| `new` | claimed by `tevyn-handoffs-new`, waiting for a schedule task |
-| `building` | a schedule task is working in S2W; a rerun resumes it |
-| `built` | `mode: shadow`, campaign built, a person schedules it; replies due at `sendAt` + 48h |
-| `scheduled` | `mode: auto`, scheduled and read back; replies due at `repliesDueAt` |
-| `replies_uploaded` | replies export is in S3 |
-| `needs_human` | the skill escalated in the post's thread; nothing touches it until a person clears the record |
-
-`lease:<outreachId>` is `{ expiresAt }` with a one hour KV expiry. To release a
-stuck item early, delete the `lease:` key; to retry an escalated one, set its
-state back (`new` for a schedule, `scheduled` for an export) and clear
-`needsHumanStep` and `needsHumanCause`.
-
-### Scale to Win skill
-
-`host/skills/scale-to-win-panel-wave/SKILL.md` is the coder's instructions for
-building and scheduling a wave in Scale to Win with `agent-browser` and for
-exporting its replies. It is installed on the coder. It needs these agent-scope config keys on the
-coder, set by a human: `S2W_USERNAME`, `S2W_PASSWORD` and `S2W_TOTP_SEED`
-(exported to the environment for the first two). The browser profile lives at
-`/workspace/personal/s2w-browser-profile` on the coder's volume.
-
-### Schedules
-
-Nothing in this repo creates schedules; Swain decides which to add. To run the dispatcher every 5 minutes, ask Delegate in Slack to create a
-recurring script schedule for `panel-waves-tick` every 300000 ms. From the
-host, make the same call through the MCP bridge as the lead. Do not use
-`POST /api/schedules`: the REST route does not record which
-agent created the schedule, so the script would run as a placeholder agent that
-does not exist and could not run `tevyn-handoffs-new` or create tasks.
-
-```sh
-cd /opt/agent-swarm
-KEY="$(sed -n 's/^API_KEY=//p' .env)"; LEAD="$(sed -n 's/^LEAD_AGENT_ID=//p' .env)"
-curl -sS --fail-with-body -X POST http://127.0.0.1:3013/api/mcp-bridge \
-  -H "Authorization: Bearer $KEY" -H "X-Agent-ID: $LEAD" -H 'Content-Type: application/json' \
-  -d '{"tool":"create-schedule","args":{"name":"panel-waves-tick","scheduleType":"recurring","targetType":"script","scriptName":"panel-waves-tick","intervalMs":300000}}'
-```
-
-The same call as a tool is `create-schedule` with `targetType: "script"`,
-`scriptName: "panel-waves-tick"`, `intervalMs: 300000`. Disable the schedule
-to pause all panel waves.
+Two things they depend on are in this repo: the host role's `s3:PutObject`
+under `agent-replies/` in `tevyn-poll-csvs-develop` and `tevyn-poll-csvs-master`
+(`panelRepliesPutStatement` in `deploy-infrastructure/agent-swarm.ts`; gp-api's
+bucket policy grants the other half), and the Slack scopes in
+`slack-manifest.json` (see "Slack").
 
 Anything else goes through the dashboard or the API at
 `https://delegate-swarm.infra.goodparty.org` (`http://127.0.0.1:3013` on the host)
@@ -573,7 +455,8 @@ be a US-only router (`accounts/fireworks/routers/<model>-us`). A US router
 addressed at the global endpoint, or a global model id at the US endpoint, is
 a global request that looks configured and logs nothing unusual. The rule and
 the reason are in `docs/bifrost-gateway.md`, "Inference residency";
-`host/scripts/fireworks-residency.test.ts` enforces it for this host.
+`deploy-infrastructure/agent-swarm-fireworks-residency.test.ts` enforces it for
+this host.
 
 Where it lives:
 

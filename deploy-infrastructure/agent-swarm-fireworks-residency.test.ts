@@ -30,7 +30,7 @@ import * as path from 'node:path'
  * two halves for the gateway. It reads local files only and needs no network.
  */
 
-const HOST_DIR = path.resolve(__dirname, '..')
+const HOST_DIR = path.resolve(__dirname, '../agent-swarm/host')
 const SETUP_SCRIPT = path.join(HOST_DIR, 'global-setup-script.sh')
 const RENDER_ENV = path.join(HOST_DIR, 'render-env.sh')
 const COMPOSE = path.join(HOST_DIR, 'docker-compose.yml')

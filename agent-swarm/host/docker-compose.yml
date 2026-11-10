@@ -47,7 +47,7 @@ x-worker-env: &worker-env
   FIREWORKS_API_KEY: ${FIREWORKS_API_KEY}
   # The agent dir a non-root worker can write, where global-setup-script.sh
   # (root, before the privilege drop) puts models.json. A single explicit value
-  # shared with that script; fireworks-residency.test.ts keeps the two equal.
+  # shared with that script; agent-swarm-fireworks-residency.test.ts keeps the two equal.
   PI_CODING_AGENT_DIR: ${PI_CODING_AGENT_DIR:-/workspace/personal/.pi}
   API_KEY: ${API_KEY}
   MCP_BASE_URL: http://api:3013

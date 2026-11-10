@@ -147,7 +147,7 @@ fi
 # This script runs as root before the privilege drop, so writing to /root/.pi
 # would be invisible to the worker. The pi agent dir is therefore a single
 # explicit path, owned by the worker, and PI_CODING_AGENT_DIR in
-# docker-compose.yml names the same value (fireworks-residency.test.ts fails if
+# docker-compose.yml names the same value (agent-swarm-fireworks-residency.test.ts fails if
 # the two drift apart). /workspace/personal is the agent's own persistent
 # volume and is already chowned to worker by the entrypoint before this hook
 # runs.

@@ -175,13 +175,8 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
   ],
 });
 
-// scripts/ and skills/ are the source for swarm-owned scripts and skills,
-// which reach the swarm through Delegate, not the host. Leaving them out of
-// the upload also keeps an edit to them from triggering a host deploy.
 export const hostFiles = () =>
-  listFiles(HOST_DIR)
-    .map((file) => path.relative(HOST_DIR, file))
-    .filter((file) => !/^(scripts|skills)\//.test(file));
+  listFiles(HOST_DIR).map((file) => path.relative(HOST_DIR, file));
 
 // Folded into the association's command so that any change to any host file
 // changes the association, which is what makes SSM run it again.
