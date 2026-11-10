@@ -15,11 +15,19 @@ const HANDLING_NOTE_MARKER = 'Delegate is handling this wave'
 
 export const argsSchema = z.object({})
 
+// A rich text element carries its text as a string, but an action button
+// carries a plain_text object. Both shapes appear in a hand-off post (the
+// "Upload results CSV" button), so accept either.
+const elementTextSchema = z.union([
+  z.string(),
+  z.object({ text: z.string().optional() }),
+])
+
 const richElementSchema = z.object({
   type: z.string(),
-  text: z.string().optional(),
+  text: elementTextSchema.optional(),
   elements: z
-    .array(z.object({ type: z.string(), text: z.string().optional() }))
+    .array(z.object({ type: z.string(), text: elementTextSchema.optional() }))
     .optional(),
 })
 
@@ -110,12 +118,17 @@ const parseMachineBlock = (texts: string[]): Record<string, string> | null => {
   return fields
 }
 
+const textOf = (text: unknown): string =>
+  typeof text === 'string'
+    ? text
+    : ((text as { text?: string } | undefined)?.text ?? '')
+
 const quotedMessage = (blocks: Block[]): string =>
   blocks
     .flatMap((b) => b.elements ?? [])
     .filter((e) => e.type === 'rich_text_quote')
     .flatMap((e) => e.elements ?? [])
-    .map((e) => e.text ?? '')
+    .map((e) => textOf(e.text))
     .join('')
 
 export const parseHandoff = (

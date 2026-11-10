@@ -94,6 +94,31 @@ describe('parseHandoff', () => {
     })
   })
 
+  it('reads a post that carries the Upload results CSV button', () => {
+    const withButton = (ts: string) => {
+      const base = post(ts)
+      return {
+        ...base,
+        blocks: [
+          ...base.blocks,
+          {
+            type: 'actions',
+            elements: [
+              {
+                type: 'button',
+                text: { type: 'plain_text', text: 'Upload results CSV', emoji: true },
+                action_id: 'upload_csv',
+              },
+            ],
+          },
+        ],
+      }
+    }
+    const parsed = parseHandoff(withButton('1762560000.000100'), CHANNEL)
+    assert.equal(parsed?.outreachId, '12345')
+    assert.equal(parsed?.recipientCount, 42)
+  })
+
   it('skips a post without the handling note', () => {
     assert.equal(parseHandoff(post('1.1', { note: false }), CHANNEL), null)
   })
