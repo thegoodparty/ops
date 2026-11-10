@@ -63,6 +63,7 @@ const memoryKv = (): Kv & { data: Map<string, unknown> } => {
 const harness = (messages: unknown[]) => {
   const urls: string[] = []
   const kv = memoryKv()
+  const replies: { channel: string; ts: string; text: string }[] = []
   const deps: Deps = {
     kv,
     token: TOKEN,
@@ -73,9 +74,17 @@ const harness = (messages: unknown[]) => {
       urls.push(url)
       return new Response(JSON.stringify({ ok: true, messages }))
     },
+    reply: async (args) => {
+      replies.push(args)
+    },
   }
-  return { deps, kv, urls }
+  return { deps, kv, urls, replies }
 }
+
+const UNREADABLE_TEXT =
+  'Automated panel-wave dispatcher could not read this hand-off post, so ' +
+  'nothing was scheduled from it. A person needs to check this post and ' +
+  'handle the wave by hand.'
 
 describe('parseHandoff', () => {
   it('reads the machine block, message and recipient count', () => {
@@ -140,8 +149,9 @@ describe('run', () => {
   it('returns a post once and not on the next run', async () => {
     const h = harness([post('1762560000.000100')])
     const first = await run(h.deps)
-    assert.equal(first.length, 1)
-    assert.equal(first[0].outreachId, '12345')
+    assert.equal(first.handoffs.length, 1)
+    assert.equal(first.handoffs[0].outreachId, '12345')
+    assert.deepEqual(first.unreadable, [])
     assert.deepEqual(h.kv.data.get('handoff:12345'), {
       state: 'new',
       slackTs: '1762560000.000100',
@@ -155,7 +165,7 @@ describe('run', () => {
     assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000100')
 
     const second = await run(h.deps)
-    assert.deepEqual(second, [])
+    assert.deepEqual(second, { handoffs: [], unreadable: [] })
   })
 
   it('asks Slack only for messages after the stored cursor', async () => {
@@ -167,14 +177,15 @@ describe('run', () => {
     assert.equal(url.searchParams.get('channel'), CHANNEL)
   })
 
-  it('skips other environments and leaves their ids unclaimed', async () => {
+  it('skips other environments, reports nothing unreadable and leaves their ids unclaimed', async () => {
     const h = harness([
       post('1762560000.000100', {
         block: machine({ env: 'prod', outreachId: '7', repliesKey: 'agent-replies/7.csv' }),
       }),
     ])
-    assert.deepEqual(await run(h.deps), [])
+    assert.deepEqual(await run(h.deps), { handoffs: [], unreadable: [] })
     assert.equal(h.kv.data.has('handoff:7'), false)
+    assert.equal(h.replies.length, 0)
   })
 
   it('skips an id already in KV and returns oldest first', async () => {
@@ -186,7 +197,7 @@ describe('run', () => {
     h.kv.data.set('handoff:8', { state: 'done' })
     const out = await run(h.deps)
     assert.deepEqual(
-      out.map((o) => o.outreachId),
+      out.handoffs.map((o) => o.outreachId),
       ['12345'],
     )
   })
@@ -227,5 +238,196 @@ describe('run', () => {
       assert.equal(e.message, 'Slack history request failed')
       return true
     })
+  })
+
+  it('reports an unreadable post, claims nothing, and warns once across two runs', async () => {
+    const ts = '1762560000.000100'
+    const h = harness([post(ts, { block: 'no block here' })])
+
+    const first = await run(h.deps)
+
+    assert.deepEqual(first.handoffs, [])
+    assert.deepEqual(first.unreadable, [
+      { ts, reason: 'no machine block', posted: true },
+    ])
+    assert.equal(h.kv.data.has('handoff:12345'), false)
+    assert.equal(h.replies.length, 1)
+    assert.deepEqual(h.replies[0], {
+      channel: CHANNEL,
+      ts,
+      text: UNREADABLE_TEXT,
+    })
+    assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
+      reason: 'no machine block',
+      postedAt: '2026-11-03T00:00:00.000Z',
+    })
+    // The post is the first message in the window, so there is nothing older
+    // to point the cursor at and the stored one stays untouched.
+    assert.equal(h.kv.data.has('tevyn:cursor'), false)
+
+    h.deps.now = () => Date.parse('2026-11-03T01:00:00Z')
+    const second = await run(h.deps)
+    assert.deepEqual(second.unreadable, [
+      { ts, reason: 'no machine block', posted: true },
+    ])
+    // A landed warning is never posted twice, and first sight keeps counting
+    // from the first run, so it is not pushed forward by a later one.
+    assert.equal(h.replies.length, 1)
+    assert.equal(
+      (h.kv.data.get(`unparsed:${ts}`) as { firstSeenAt: string }).firstSeenAt,
+      '2026-11-03T00:00:00.000Z',
+    )
+  })
+
+  it('reports why a post could not be read', async () => {
+    const h = harness([
+      post('1762560000.000100', { block: 'no block here' }),
+      post('1762560000.000200', { block: machine({ mode: 'manual' }) }),
+      post('1762560000.000300', {
+        block: machine({ repliesKey: 'agent-replies/999.csv' }),
+      }),
+    ])
+
+    const res = await run(h.deps)
+
+    assert.deepEqual(
+      res.unreadable.map((u) => [u.ts, u.reason]),
+      [
+        ['1762560000.000100', 'no machine block'],
+        ['1762560000.000200', 'invalid fields'],
+        ['1762560000.000300', 'replies key mismatch'],
+      ],
+    )
+    assert.equal(h.replies.length, 3)
+    // The second post carries outreach id 12345, and an unreadable post is
+    // never claimed.
+    assert.equal(h.kv.data.has('handoff:12345'), false)
+  })
+
+  it('stops the cursor just before an unreadable post', async () => {
+    const blocked = '1762560000.000200'
+    const h = harness([
+      post('1762560000.000100'),
+      post(blocked, { block: 'no block here' }),
+      post('1762560000.000300', {
+        block: machine({ outreachId: '9', repliesKey: 'agent-replies/9.csv' }),
+      }),
+    ])
+
+    const first = await run(h.deps)
+
+    assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000100')
+    // A post after the unreadable one is still claimed: the hold is on the
+    // cursor, not on discovery.
+    assert.deepEqual(
+      first.handoffs.map((o) => o.outreachId),
+      ['12345', '9'],
+    )
+
+    await run(h.deps)
+
+    const asked = new URL(h.urls[1])
+    assert.equal(asked.searchParams.get('oldest'), '1762560000.000100')
+  })
+
+  it('keeps the cursor before a post whose warning is under 48h old', async () => {
+    const blocked = '1762560000.000200'
+    const h = harness([
+      post('1762560000.000100'),
+      post(blocked, { block: 'no block here' }),
+    ])
+    h.kv.data.set('tevyn:cursor', '1762560000.000050')
+    h.kv.data.set(`unparsed:${blocked}`, {
+      firstSeenAt: '2026-11-01T01:00:00.000Z',
+      reason: 'no machine block',
+      postedAt: '2026-11-01T01:00:00.000Z',
+    })
+
+    const res = await run(h.deps)
+
+    assert.equal(res.unreadable[0].released, undefined)
+    assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000100')
+    assert.equal(h.replies.length, 0)
+  })
+
+  it('releases a post after 48h: the cursor advances and it is still reported', async () => {
+    const blocked = '1762560000.000200'
+    const h = harness([post(blocked, { block: 'no block here' })])
+    h.kv.data.set('tevyn:cursor', '1762560000.000100')
+    h.kv.data.set(`unparsed:${blocked}`, {
+      firstSeenAt: '2026-10-31T23:00:00.000Z',
+      reason: 'no machine block',
+      postedAt: '2026-10-31T23:00:00.000Z',
+    })
+
+    const res = await run(h.deps)
+
+    assert.deepEqual(res.unreadable, [
+      { ts: blocked, reason: 'no machine block', posted: true, released: true },
+    ])
+    assert.equal(h.kv.data.get('tevyn:cursor'), blocked)
+    assert.equal(h.replies.length, 0)
+  })
+
+  it('does not throw when the warning cannot be posted, and retries it next run', async () => {
+    const ts = '1762560000.000100'
+    const h = harness([post(ts, { block: 'no block here' })])
+    h.deps.reply = async () => {
+      throw new Error('Slack chat.postMessage failed: not_in_channel')
+    }
+
+    const first = await run(h.deps)
+
+    assert.deepEqual(first.unreadable, [
+      { ts, reason: 'no machine block', posted: false },
+    ])
+    // First sight is recorded before the reply, so the release valve does not
+    // wait on Slack.
+    assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
+      reason: 'no machine block',
+    })
+
+    h.deps.reply = async (args) => {
+      h.replies.push(args)
+    }
+    const second = await run(h.deps)
+
+    assert.deepEqual(second.unreadable, [
+      { ts, reason: 'no machine block', posted: true },
+    ])
+    assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
+      reason: 'no machine block',
+      postedAt: '2026-11-03T00:00:00.000Z',
+    })
+  })
+
+  it('releases the cursor after 48h even when the warning never posted', async () => {
+    const blocked = '1762560000.000200'
+    const h = harness([
+      post('1762560000.000100'),
+      post(blocked, { block: 'no block here' }),
+      post('1762560000.000300', {
+        block: machine({ outreachId: '9', repliesKey: 'agent-replies/9.csv' }),
+      }),
+    ])
+    h.deps.reply = async () => {
+      throw new Error('Slack chat.postMessage failed: thread_not_found')
+    }
+    h.kv.data.set(`unparsed:${blocked}`, {
+      firstSeenAt: '2026-10-31T23:00:00.000Z',
+      reason: 'no machine block',
+    })
+
+    const res = await run(h.deps)
+
+    assert.deepEqual(res.unreadable, [
+      { ts: blocked, reason: 'no machine block', posted: false, released: true },
+    ])
+    // Released, so the cursor is free to move past it: a warning Slack keeps
+    // refusing cannot stall discovery.
+    assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000300')
   })
 })

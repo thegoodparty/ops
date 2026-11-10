@@ -432,13 +432,20 @@ the dashboard or asking Delegate. The token is the existing global
 only `s3:PutObject` under `agent-replies/` in the two buckets; gp-api's bucket
 policy grants the other half.
 
-- `tevyn-handoffs-new` returns the hand-off posts it has not returned before,
-  as compact JSON (outreachId, sendAt, timeZone, mode, repliesKey, message,
-  recipientCount, channel, ts). It keeps a cursor in KV (`tevyn:cursor`) and
-  claims each outreach id as `handoff:<outreachId>` = `{ state: 'new', slackTs,
-  channel, sendAt, timeZone, mode, message, recipientCount }`, so an id is
-  returned once and can still be handled from KV if nobody got its output. Posts without the "Delegate is handling this wave"
-  note or with an invalid machine block are skipped.
+- `tevyn-handoffs-new` returns `{handoffs, unreadable}`: the hand-off posts it
+  has not returned before, as compact JSON (outreachId, sendAt, timeZone, mode,
+  repliesKey, message, recipientCount, channel, ts), and the posts it could not
+  read. It keeps a cursor in KV (`tevyn:cursor`) and claims each outreach id as
+  `handoff:<outreachId>` = `{ state: 'new', slackTs, channel, sendAt, timeZone,
+  mode, message, recipientCount }`, so an id is returned once and can still be
+  handled from KV if nobody got its output. A post without the "Delegate is
+  handling this wave" note is not ours and is skipped. A post that carries the
+  note but cannot be read (no machine block, invalid fields, replies key
+  mismatch) is never claimed: it is reported in `unreadable` with its reason and
+  gets one warning reply in its own thread, deduped by `unparsed:<ts>`, and the
+  cursor stops just before the oldest unreleased one so history still covers it
+  next run. After 48h from first sight it stops holding the cursor and is
+  reported with `released: true`.
 - `tevyn-handoff-csv` (`channel`, `ts`) saves the post's recipient CSV under
   `/afs/tevyn-handoffs/` and returns only that path, never the Slack URL.
 - `s2w-replies-upload` (`outreachId`, `exportPath`) PUTs the export to
@@ -459,8 +466,9 @@ policy grants the other half.
 - `panel-waves-tick` is the dispatcher, meant to run on a schedule (below). Each
   run it (1) runs `tevyn-handoffs-new` through `ctx.swarm.script_run`, because
   catalog scripts cannot import each other, only to trigger the claim (the claim
-  record already holds the hand-off, so the output is ignored and a failed run
-  still leaves the KV scan, flagged as `triggerFailed`); (2) lists
+  record already holds the hand-off, so only its `unreadable` list is carried
+  into this result, and a failed run still leaves the KV scan, flagged as
+  `triggerFailed`); (2) lists
   KV by the `handoff:` prefix; (3) for each record it should act on, writes
   `lease:<outreachId>` with a one hour expiry and bumps `attempts` (counted per action, with `attemptsFor`), then creates
   one coder task, "Handle <id> (schedule|export_replies) following the
@@ -472,8 +480,9 @@ policy grants the other half.
   `repliesDueAt` (a shadow wave is scheduled by a person but exported by the
   agent). It leaves `replies_uploaded` and `needs_human` alone,
   and stops at 5 attempts per action. Its result lists `dispatched`, `skipped` (records
-  with no stored details, exhausted attempts, unreadable) and `failed`; look
-  there when a wave seems stuck. It sends with `allowDuplicate: true` because two
+  with no stored details, exhausted attempts, unreadable record), `failed` and
+  `unreadable` (hand-off posts the scan could not read); look there when a wave
+  seems stuck. It sends with `allowDuplicate: true` because two
   waves posted together read as near-copies to the duplicate check.
 
 ### KV states

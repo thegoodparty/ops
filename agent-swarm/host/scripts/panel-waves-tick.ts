@@ -6,7 +6,9 @@ import * as z from 'zod'
 // due becomes an "export_replies" task.
 // A shadow wave ("built") is scheduled by a person, so it gets the same export
 // at the same due time. A KV lease per outreach keeps a slow
-// task from being started twice. No Slack token or constituent data is read
+// task from being started twice. A hand-off post the scan could not read is
+// carried into the result as `unreadable`, so a stuck wave shows up in this
+// schedule's output. No Slack token or constituent data is read
 // here; the hand-off fields come from tevyn-handoffs-new, which this script
 // runs through script_run (catalog scripts cannot import each other).
 
@@ -57,16 +59,47 @@ export type Kv = {
 
 export type Deps = {
   kv: Kv
-  runNewHandoffs: () => Promise<void>
+  runNewHandoffs: () => Promise<UnreadablePost[]>
   sendTask: (args: { task: string; tags: string[] }) => Promise<string | null>
   now?: () => number
+}
+
+// A hand-off post the nested script could not read. It is carried through so a
+// stuck post shows up in this schedule's output instead of vanishing into the
+// other script's run.
+export type UnreadablePost = {
+  ts: string
+  reason: string
+  posted?: boolean
+  released?: boolean
 }
 
 export type TickResult = {
   dispatched: { outreachId: string; action: Action; taskId: string }[]
   skipped: { outreachId: string; reason: string }[]
   failed: { outreachId: string; action: Action }[]
+  unreadable: UnreadablePost[]
   triggerFailed?: true
+}
+
+const nestedResultSchema = z.object({
+  unreadable: z
+    .array(
+      z.object({
+        ts: z.string(),
+        reason: z.string(),
+        posted: z.boolean().optional(),
+        released: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+})
+
+// The nested script's own shape is not this file's to trust: an older catalog
+// copy without `unreadable` reads as an empty list rather than failing the run.
+export const unreadableOf = (result: unknown): UnreadablePost[] => {
+  const parsed = nestedResultSchema.safeParse(result)
+  return parsed.success ? (parsed.data.unreadable ?? []) : []
 }
 
 export const repliesDueAtOf = (sendAt: string): string =>
@@ -114,13 +147,18 @@ const pickAction = (
 
 export const run = async (deps: Deps): Promise<TickResult> => {
   const now = deps.now?.() ?? Date.now()
-  const result: TickResult = { dispatched: [], skipped: [], failed: [] }
+  const result: TickResult = {
+    dispatched: [],
+    skipped: [],
+    failed: [],
+    unreadable: [],
+  }
 
   // tevyn-handoffs-new writes the full hand-off on each claim record, so the
   // tick only triggers it. A failure here must not hide records claimed by an
   // earlier run, so the KV scan below still happens.
   try {
-    await deps.runNewHandoffs()
+    result.unreadable = await deps.runNewHandoffs()
   } catch {
     result.triggerFailed = true
   }
@@ -245,6 +283,7 @@ export default async function (
           `${NEW_HANDOFFS_SCRIPT} failed: exit ${res.data.exitCode}${res.data.error ? ` ${res.data.error}` : ''}`,
         )
       }
+      return unreadableOf(res.data.result)
     },
     sendTask: async ({ task, tags }) => {
       // allowDuplicate: two waves posted close together read as near-copies
