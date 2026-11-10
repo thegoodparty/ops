@@ -783,3 +783,64 @@ test("replayCase does not treat an area as unique once earlier leads claimed its
     ],
   );
 });
+
+const traced = async (leads: object[], prompts: string[]) => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "diff", result: JSON.stringify({ leads, summary: "s" }) },
+    ...prompts.map((prompt, i) => ({
+      subagent: "deep-reviewer",
+      prompt,
+      result: JSON.stringify({ findings: i === 0 ? [finding("src/a.ts", 5)] : [] }),
+    })),
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  return result.leads?.map((l) => [l.area, l.outcome]);
+};
+
+test("a reworded lead is traced by the file and category its deep-reviewer prompt cites", async () => {
+  assert.deepEqual(
+    await traced(
+      [{ area: "Unbounded IN list", paths: ["packages/api/src/text.service.ts"], category: "scale", hypothesis: "findTextedSince binds one parameter per person in the resolved audience" }],
+      ["Verify a scout lead. File: text.service.ts lines 66-85. Category: scale. Check whether the personId list can exceed the bind limit."],
+    ),
+    [["Unbounded IN list", "reported"]],
+  );
+});
+
+test("a lead whose words fit another call better still gets its own call", async () => {
+  assert.deepEqual(
+    await traced(
+      [
+        { area: "Retry loop", paths: ["src/retry.ts"], category: "bugs", hypothesis: "the retry swallows errors from the cache client" },
+        { area: "Cache expiry", paths: ["src/cache.ts"], category: "bugs", hypothesis: "entries never expire" },
+      ],
+      [
+        "Lead in src/retry.ts, category bugs: errors thrown inside the loop are caught and ignored.",
+        'Lead: area "Cache expiry"; the cache client keeps entries forever, and the retry reads errors from it.',
+      ],
+    ),
+    [
+      ["Retry loop", "reported"],
+      ["Cache expiry", "dropped"],
+    ],
+  );
+});
+
+test("two leads on one file with different categories map to different calls", async () => {
+  assert.deepEqual(
+    await traced(
+      [
+        { area: "Missing await", paths: ["src/job.ts"], category: "bugs", hypothesis: "the handler returns before the write finishes" },
+        { area: "No test for the job", paths: ["src/job.ts"], category: "tests", hypothesis: "nothing covers the failure branch" },
+      ],
+      [
+        "Paths: src/job.ts. Category: tests. Hypothesis: no test covers the failure branch of the job.",
+        "Paths: src/job.ts. Category: bugs. Hypothesis: the handler returns before the write to the table finishes.",
+      ],
+    ),
+    [
+      ["Missing await", "dropped"],
+      ["No test for the job", "reported"],
+    ],
+  );
+});
