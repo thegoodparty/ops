@@ -488,7 +488,8 @@
       "verdict": "block",
       "paths": [
         "packages/gp-api/src/priorities/util/mrpReadStatus.util.ts",
-        "packages/gp-api/src/priorities/services/priorityResults.service.ts"
+        "packages/gp-api/src/priorities/services/priorityResults.service.ts",
+        "packages/gp-api/src/priorities/services/censusComposition.ts"
       ]
     },
     "tests": "Swaps the priority read to the MRP model with census tract as a dimension, one parameter per tract, fit synchronously inside gp-api's read-status request. The repo's ADR (docs/adr/2026-10-19-civic-panel-mrp-in-gp-api.md) sized it at a few dozen parameters and about 1 ms, and the PR body says speed on very large districts was not measured. Statewide North Carolina has 3,003 tracts; each read took 4 to 9 minutes on Node's one thread and froze the prod fleet on 2026-11-04 (post-mortem \"Statewide read freeze\"). Production approved with no findings. The fix (#3588) caps the model.",
