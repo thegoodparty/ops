@@ -100,10 +100,11 @@ agent-swarm, take the agent-fs image tag from the new
 
 agent-fs is not reachable from a browser: the api service pins
 `AGENT_FS_PROXY` off, so `/agentfs`, `/share` and `/site` return 404. Turning
-it on (`AGENT_FS_PROXY=true` in `.env`) publishes agent-fs at those three
-prefixes behind the same Caddy auth, and enables the dashboard's Files page
-and Comb. `/share` and `/site` are public share pages gated by their own
-token.
+it on publishes agent-fs at those three prefixes behind the same Caddy auth,
+and enables the dashboard's Files page and Comb. Set it in the
+`DELEGATE_SWARM` secret rather than in `.env`: `render-env.sh` rewrites `.env`
+on every boot and only carries the keys that are in the secret. `/share` and
+`/site` are public share pages gated by their own token.
 
 ## Upgrade agent-swarm
 
