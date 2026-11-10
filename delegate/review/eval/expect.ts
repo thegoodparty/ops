@@ -302,6 +302,9 @@ export interface GateCase {
   split: Split;
   mainPassed: number;
   mainCompleted: number;
+  // Main's runs of the same reviewer from earlier checks.
+  earlierPassed: number;
+  earlierCompleted: number;
   // Passed on some main runs and failed on others: main's own flake.
   flaky: boolean;
   candPassed: number;
@@ -329,7 +332,9 @@ const avgCost = (reports: CaseReport[]): number | null => {
 
 // A case main passes on every run must not regress. One that drops below
 // 3/3 gets `runs` more runs and has to reach 2*runs-1 of 2*runs, so a single
-// unlucky run is not a regression. A case marked `flakyOnMain` cannot regress. A run that errored is a failed run, and
+// unlucky run is not a regression. A case marked `flakyOnMain` cannot regress,
+// and neither can one that `history`, main's earlier runs of the same
+// reviewer, shows failing: three lucky runs are not a bar. A run that errored is a failed run, and
 // with `final` a rerun that never happened is a failed rerun, so infra noise
 // cannot pass as an improvement. Each target must pass every run.
 export const computeGate = (
@@ -337,6 +342,7 @@ export const computeGate = (
   baseline: Baseline,
   targets: string[],
   final: boolean,
+  history: CaseReport[] = [],
 ): Gate => {
   const runs = baseline.runs;
   const counts = reports.map((r) => baselineCounts(baseline, baseline.reports.find((b) => b.c.id === r.c.id)));
@@ -345,10 +351,16 @@ export const computeGate = (
   }
   const cases = reports.map((r, i): GateCase => {
     const main = counts[i];
+    const earlier = (history.find((h) => h.c.id === r.c.id)?.scores ?? []).filter((s) => !s.errored);
+    const earlierPassed = earlier.filter((s) => s.pass).length;
+    const passed = main.runsPassed + earlierPassed;
+    const completed = main.completed + earlier.length;
     const candPassed = r.scores.filter((s) => s.pass).length;
     const candRuns = r.scores.length;
     let outcome: GateCase["outcome"];
-    if (r.c.flakyOnMain || main.runsPassed !== runs || main.completed !== runs) outcome = "not-held";
+    if (r.c.flakyOnMain || main.runsPassed !== runs || main.completed !== runs || earlierPassed !== earlier.length) {
+      outcome = "not-held";
+    }
     else if (candRuns > runs) outcome = candPassed >= 2 * runs - 1 ? "pass" : "regression";
     else if (candPassed >= runs) outcome = "pass";
     else outcome = final ? "regression" : "rerun";
@@ -357,7 +369,9 @@ export const computeGate = (
       split: r.c.split,
       mainPassed: main.runsPassed,
       mainCompleted: main.completed,
-      flaky: Boolean(r.c.flakyOnMain) || (main.runsPassed > 0 && main.runsPassed < main.completed),
+      earlierPassed,
+      earlierCompleted: earlier.length,
+      flaky: Boolean(r.c.flakyOnMain) || (passed > 0 && passed < completed),
       candPassed,
       candRuns,
       outcome,
@@ -410,7 +424,7 @@ const OUTCOME_TEXT: Record<GateCase["outcome"], string> = {
   pass: "pass",
   rerun: "needs 3 more runs",
   regression: "regression",
-  "not-held": "main does not pass this 3/3",
+  "not-held": "main does not pass this every run",
 };
 
 // With a gate, holdout cases appear only as an aggregate: no ids, expectations
@@ -430,7 +444,7 @@ export const renderExpectReport = (
   const holdout = gate?.cases.filter((c) => c.split === "holdout") ?? [];
   const gateLines = gate
     ? [
-        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes 3/3 may regress; one that drops gets 3 more runs and needs 5 of 6.`,
+        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes on every run, here and in earlier runs of the same reviewer, may regress; one that drops gets 3 more runs and needs 5 of 6.`,
         "",
         `Holdout: passed ${holdout.filter((c) => c.candRuns > 0 && c.candPassed === c.candRuns).length} of ${holdout.length}, regressions: ${holdout.filter((c) => c.outcome === "regression").length}.`,
         "",
@@ -449,7 +463,8 @@ export const renderExpectReport = (
         "| --- | --- | --- | --- | --- | --- |",
         ...reports.map((r) => {
           const g = gate.cases.find((c) => c.id === r.c.id)!;
-          const main = describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id));
+          const now = describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id));
+          const main = g.earlierCompleted > 0 ? `${now}, earlier ${g.earlierPassed}/${g.earlierCompleted}` : now;
           return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${g.candPassed}/${g.candRuns} | ${main}${g.flaky ? " (flaky)" : ""} | ${OUTCOME_TEXT[g.outcome]} | ${money(r.costs)} |`;
         }),
       ]
@@ -507,6 +522,27 @@ export const scoreDir = (cases: ExpectedCase[], out: string): CaseReport[] =>
     return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
   });
 
+// Main's earlier runs of the same reviewer, kept only for the PR head the
+// baseline replayed: the history spans every version of the case list, and an
+// earlier answer to an edited case says nothing about this one. A run cached
+// before the harness recorded a gating verdict would score as a miss, so it is
+// dropped wherever the baseline has one.
+export const scoreHistory = (cases: ExpectedCase[], dir: string, base: string): CaseReport[] => {
+  const runsIn = (d: string): Result[] =>
+    existsSync(d)
+      ? readdirSync(d)
+          .filter((f) => /^run-\d+\.json$/.test(f))
+          .map((f) => JSON.parse(readFileSync(join(d, f), "utf-8")) as Result)
+      : [];
+  return cases.map((c) => {
+    const baseRuns = runsIn(join(base, c.id));
+    const heads = new Set(baseRuns.map((r) => r.headSha));
+    const gated = baseRuns.some((r) => r.gating !== undefined);
+    const rs = runsIn(join(dir, c.id)).filter((r) => heads.has(r.headSha) && (!gated || r.gating !== undefined));
+    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
+  });
+};
+
 // --mode replay runs the agent and writes results; --mode score reads them
 // and writes the report. CI runs replay from the PR head and score from main,
 // so a PR cannot change the cases or the scoring it is graded on.
@@ -535,7 +571,8 @@ const main = async () => {
     const reports = scoreDir(cases, out);
     const final = flags.final === "true";
     const targets = flags.targets ? flags.targets.split(",") : [];
-    const gate = computeGate(reports, baseline, targets, final);
+    const history = flags.history ? scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const gate = computeGate(reports, baseline, targets, final, history);
     writeFileSync(join(out, "gate.json"), JSON.stringify(gate, null, 2));
     const report = renderExpectReport(reports, variant ?? "unknown", baseline, gate);
     writeFileSync(join(out, "report.md"), report);
