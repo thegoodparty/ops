@@ -12,10 +12,8 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
   --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text)"
 
-# No ANTHROPIC_API_KEY: the agents run the Fireworks US router and nothing else.
-# Without the key a task that pins an Anthropic model fails before its first
-# turn instead of quietly billing ~9x the Fireworks price.
 REQUIRED_KEYS=(
+  ANTHROPIC_API_KEY
   API_KEY
   CLICKUP_API_TOKEN
   # The pi harness's only model is Fireworks US-only, so a secret without this

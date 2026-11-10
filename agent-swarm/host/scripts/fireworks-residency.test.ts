@@ -269,22 +269,8 @@ describe('agent-swarm inference residency', () => {
     const source = read(COMPOSE)
     assert.match(source, /^\s+FIREWORKS_API_KEY: \$\{FIREWORKS_API_KEY\}$/m)
     assert.match(source, /^\s+PI_CODING_AGENT_DIR: \$\{PI_CODING_AGENT_DIR:-\/workspace\/personal\/\.pi\}$/m)
-  })
-
-  it('keeps an Anthropic key out of the swarm, so a stray pin fails instead of billing', () => {
-    // No agent runs an Anthropic model, and the pi harness is the only thing in
-    // a worker that would read the key. Withholding it turns a task that pins
-    // an Anthropic model into a failure before its first turn instead of work
-    // billed at ~9x the Fireworks price. The old `delegate/` stack owns its own
-    // DELEGATES secret and still needs the key there; this is about the swarm.
-    const source = read(COMPOSE)
-    assert.doesNotMatch(source, /^\s*(-\s*)?ANTHROPIC_API_KEY[:=]/m)
-    // render-env.sh requires every key it names, so a stale entry here would
-    // stop the host from rendering .env once the secret no longer holds one.
-    const renderEnv = read(RENDER_ENV)
-    const required = renderEnv.match(/^REQUIRED_KEYS=\(([\s\S]*?)^\)/m)
-    assert.ok(required, 'render-env.sh no longer declares REQUIRED_KEYS')
-    assert.doesNotMatch(required[1], /ANTHROPIC_API_KEY/)
+    // Anthropic stays for the api service and the fallback path.
+    assert.match(source, /^\s+ANTHROPIC_API_KEY: \$\{ANTHROPIC_API_KEY\}$/m)
   })
 
   it('marks the model as custom when sync-agent-config.sh writes it through the API', () => {

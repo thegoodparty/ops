@@ -123,7 +123,7 @@ WRITE_KEYS+=(GITHUB_BOT_ALIASES)
 
 else
 
-bold "1/4  Delegate Slack app tokens"
+bold "1/5  Delegate Slack app tokens"
 cat <<'EOF'
   Neither step changes how the Delegate app behaves today. The switch to the
   swarm (manifest, Socket Mode, reinstall) comes later: README, "Bringing it
@@ -137,7 +137,7 @@ EOF
 ask SLACK_APP_TOKEN xapp-
 ask SLACK_BOT_TOKEN xoxb-
 
-bold "2/4  Fireworks key (the agents' only model)"
+bold "2/5  Fireworks key (the agents' only model)"
 cat <<'EOF'
   https://app.fireworks.ai -> Settings -> API keys -> Create API key, name
   "delegate-swarm", copy the fw_ key. It is shown once.
@@ -148,14 +148,24 @@ cat <<'EOF'
 EOF
 ask FIREWORKS_API_KEY fw_
 
-bold "3/4  ClickUp personal API token (service seat)"
+bold "3/5  Anthropic key (api service and fallback only)"
+cat <<'EOF'
+  https://console.anthropic.com -> Settings -> API keys. Pick the existing
+  "agent-swarm" workspace (it carries the spend limit), Create Key, name
+  "delegate-swarm", Add. Copy the sk-ant- key; it is shown once.
+  The agents no longer run Anthropic models; this key stays for the api
+  service and as a fallback path.
+EOF
+ask ANTHROPIC_API_KEY sk-ant-
+
+bold "4/5  ClickUp personal API token (service seat)"
 cat <<'EOF'
   Signed in to ClickUp as the Delegate service seat: avatar (top right) ->
   Settings -> Apps -> API Token -> Generate (or Regenerate). Copy the pk_ token.
 EOF
 ask CLICKUP_API_TOKEN pk_
 
-bold "4/4  Grafana read-only service account"
+bold "5/5  Grafana read-only service account"
 cat <<'EOF'
   https://goodparty.grafana.net/org/serviceaccounts -> Add service account.
   Display name "delegate", role Viewer, Create. Then Add service account token,
@@ -199,16 +209,7 @@ EOF
   fi
 fi
 
-# The swarm holds no Anthropic key: the agents run the Fireworks US router, and
-# without the key a task that pins an Anthropic model fails at start instead of
-# quietly billing ~9x. A key an older fill wrote is deleted below, which is a
-# write on its own even when this run changes nothing else.
-prune_anthropic=0
-if jq -e 'has("ANTHROPIC_API_KEY")' <<<"$current" >/dev/null; then
-  prune_anthropic=1
-fi
-
-if ((${#WRITE_KEYS[@]} == 0 && prune_anthropic == 0)); then
+if ((${#WRITE_KEYS[@]} == 0)); then
   echo "Nothing to write."
   exit 0
 fi
@@ -217,11 +218,6 @@ bold "Writing to Secrets Manager ($SECRET_ID in $ACCOUNT_ID)"
 jq 'reduce $ARGS.positional[] as $k (.; .[$k] = env[$k])' --args "${WRITE_KEYS[@]}" \
   <<<"$current" > "$TMP"
 unset current
-if ((prune_anthropic)); then
-  jq 'del(.ANTHROPIC_API_KEY)' "$TMP" > "$TMP.pruned"
-  mv -f "$TMP.pruned" "$TMP"
-  echo "  Dropped ANTHROPIC_API_KEY from the secret."
-fi
 sso_count=$(jq '[has("OAUTH2_PROXY_CLIENT_ID", "OAUTH2_PROXY_CLIENT_SECRET", "OAUTH2_PROXY_COOKIE_SECRET") | select(.)] | length' "$TMP")
 if [[ "$sso_count" != 0 && "$sso_count" != 3 ]]; then
   echo "Not writing: SSO needs all three of client id, client secret and cookie secret."
@@ -242,7 +238,7 @@ aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" 
 | jq -r 'to_entries[] | "  \(.key): \(.value | length)\(if .value == "TODO" then "  <- still TODO" else "" end)"'
 missing=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text \
-| jq -r '["API_KEY","CLICKUP_API_TOKEN","FIREWORKS_API_KEY","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
+| jq -r '["ANTHROPIC_API_KEY","API_KEY","CLICKUP_API_TOKEN","FIREWORKS_API_KEY","GRAFANA_SERVICE_ACCOUNT_TOKEN","SECRETS_ENCRYPTION_KEY","SLACK_APP_TOKEN","SLACK_BOT_TOKEN"] - keys | join(" ")')
 echo
 if [[ -n "$missing" ]]; then
   echo "Still missing before the stack can start: $missing"
