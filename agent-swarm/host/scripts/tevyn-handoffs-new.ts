@@ -242,11 +242,23 @@ const fetchHistory = async (
 
 const unparsedKey = (ts: string): string => `${UNPARSED_PREFIX}${ts}`
 
-const postedAtOf = (record: unknown): number | null => {
-  const parsed = z.object({ postedAt: z.string() }).safeParse(record)
-  if (!parsed.success) return null
-  const at = Date.parse(parsed.data.postedAt)
-  return Number.isNaN(at) ? null : at
+type UnparsedRecord = {
+  firstSeenAt: string
+  reason?: string
+  postedAt?: string
+}
+
+// `firstSeenAt` is written before the warning is attempted, so the release
+// valve never depends on Slack accepting the reply.
+const unparsedSchema = z.object({
+  firstSeenAt: z.string().datetime(),
+  reason: z.string().optional(),
+  postedAt: z.string().optional(),
+})
+
+const unparsedOf = (record: unknown): UnparsedRecord | null => {
+  const parsed = unparsedSchema.safeParse(record)
+  return parsed.success ? parsed.data : null
 }
 
 export type Unreadable = {
@@ -255,8 +267,9 @@ export type Unreadable = {
   // True when the warning reply is in the thread, whether this run posted it or
   // an earlier one did.
   posted: boolean
-  // Set once the post stops holding the cursor: after 48h a person has had the
-  // warning, and a post that cannot be read must not stall discovery forever.
+  // Set once the post stops holding the cursor: 48h after first sight, whether
+  // or not the warning ever posted. A post that cannot be read must not stall
+  // discovery forever.
   released?: true
 }
 
@@ -317,9 +330,16 @@ export const run = async (deps: Deps): Promise<RunResult> => {
   }
 
   for (const entry of unreadable) {
-    const postedAt = postedAtOf(await deps.kv.get(unparsedKey(entry.ts)))
-    if (postedAt !== null && now - postedAt > RELEASE_MS) entry.released = true
-    if (postedAt !== null) {
+    const key = unparsedKey(entry.ts)
+    let record = unparsedOf(await deps.kv.get(key))
+    if (record === null) {
+      record = { firstSeenAt: new Date(now).toISOString(), reason: entry.reason }
+      await deps.kv.set(key, record)
+    }
+    // The valve reads first sight, never the reply: a warning Slack refuses for
+    // 48h must not hold the cursor until the window outgrows the page cap.
+    if (now - Date.parse(record.firstSeenAt) > RELEASE_MS) entry.released = true
+    if (record.postedAt !== undefined) {
       entry.posted = true
       continue
     }
@@ -331,15 +351,12 @@ export const run = async (deps: Deps): Promise<RunResult> => {
       })
     } catch {
       // A warning that cannot be posted must not fail the run: the post stays
-      // in the result with posted: false and the cursor holds for a retry.
+      // in the result with posted: false and the next run tries again.
       continue
     }
-    // Written only after the reply lands, so a failed reply is retried and a
-    // second run never posts a second warning.
-    await deps.kv.set(unparsedKey(entry.ts), {
-      postedAt: new Date(now).toISOString(),
-      reason: entry.reason,
-    })
+    // Merged after the reply lands, so a landed warning is never repeated and
+    // firstSeenAt keeps counting from the first sighting.
+    await deps.kv.set(key, { ...record, postedAt: new Date(now).toISOString() })
     entry.posted = true
   }
 

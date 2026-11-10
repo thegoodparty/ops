@@ -258,18 +258,26 @@ describe('run', () => {
       text: UNREADABLE_TEXT,
     })
     assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
-      postedAt: '2026-11-03T00:00:00.000Z',
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
       reason: 'no machine block',
+      postedAt: '2026-11-03T00:00:00.000Z',
     })
     // The post is the first message in the window, so there is nothing older
     // to point the cursor at and the stored one stays untouched.
     assert.equal(h.kv.data.has('tevyn:cursor'), false)
 
+    h.deps.now = () => Date.parse('2026-11-03T01:00:00Z')
     const second = await run(h.deps)
     assert.deepEqual(second.unreadable, [
       { ts, reason: 'no machine block', posted: true },
     ])
+    // A landed warning is never posted twice, and first sight keeps counting
+    // from the first run, so it is not pushed forward by a later one.
     assert.equal(h.replies.length, 1)
+    assert.equal(
+      (h.kv.data.get(`unparsed:${ts}`) as { firstSeenAt: string }).firstSeenAt,
+      '2026-11-03T00:00:00.000Z',
+    )
   })
 
   it('reports why a post could not be read', async () => {
@@ -331,8 +339,9 @@ describe('run', () => {
     ])
     h.kv.data.set('tevyn:cursor', '1762560000.000050')
     h.kv.data.set(`unparsed:${blocked}`, {
-      postedAt: '2026-11-01T01:00:00.000Z',
+      firstSeenAt: '2026-11-01T01:00:00.000Z',
       reason: 'no machine block',
+      postedAt: '2026-11-01T01:00:00.000Z',
     })
 
     const res = await run(h.deps)
@@ -347,8 +356,9 @@ describe('run', () => {
     const h = harness([post(blocked, { block: 'no block here' })])
     h.kv.data.set('tevyn:cursor', '1762560000.000100')
     h.kv.data.set(`unparsed:${blocked}`, {
-      postedAt: '2026-10-31T23:00:00.000Z',
+      firstSeenAt: '2026-10-31T23:00:00.000Z',
       reason: 'no machine block',
+      postedAt: '2026-10-31T23:00:00.000Z',
     })
 
     const res = await run(h.deps)
@@ -372,7 +382,12 @@ describe('run', () => {
     assert.deepEqual(first.unreadable, [
       { ts, reason: 'no machine block', posted: false },
     ])
-    assert.equal(h.kv.data.has(`unparsed:${ts}`), false)
+    // First sight is recorded before the reply, so the release valve does not
+    // wait on Slack.
+    assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
+      reason: 'no machine block',
+    })
 
     h.deps.reply = async (args) => {
       h.replies.push(args)
@@ -382,6 +397,37 @@ describe('run', () => {
     assert.deepEqual(second.unreadable, [
       { ts, reason: 'no machine block', posted: true },
     ])
-    assert.equal(h.kv.data.has(`unparsed:${ts}`), true)
+    assert.deepEqual(h.kv.data.get(`unparsed:${ts}`), {
+      firstSeenAt: '2026-11-03T00:00:00.000Z',
+      reason: 'no machine block',
+      postedAt: '2026-11-03T00:00:00.000Z',
+    })
+  })
+
+  it('releases the cursor after 48h even when the warning never posted', async () => {
+    const blocked = '1762560000.000200'
+    const h = harness([
+      post('1762560000.000100'),
+      post(blocked, { block: 'no block here' }),
+      post('1762560000.000300', {
+        block: machine({ outreachId: '9', repliesKey: 'agent-replies/9.csv' }),
+      }),
+    ])
+    h.deps.reply = async () => {
+      throw new Error('Slack chat.postMessage failed: thread_not_found')
+    }
+    h.kv.data.set(`unparsed:${blocked}`, {
+      firstSeenAt: '2026-10-31T23:00:00.000Z',
+      reason: 'no machine block',
+    })
+
+    const res = await run(h.deps)
+
+    assert.deepEqual(res.unreadable, [
+      { ts: blocked, reason: 'no machine block', posted: false, released: true },
+    ])
+    // Released, so the cursor is free to move past it: a warning Slack keeps
+    // refusing cannot stall discovery.
+    assert.equal(h.kv.data.get('tevyn:cursor'), '1762560000.000300')
   })
 })
