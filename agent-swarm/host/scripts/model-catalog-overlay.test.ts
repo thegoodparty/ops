@@ -342,13 +342,62 @@ describe('agent-swarm model catalogue overlay', () => {
     )
   })
 
-  it('sends no price, because no pricing path would read it', { skip }, () => {
-    // Overlay prices reach the pricing table through agent-swarm's models.dev
-    // seed projection, which enumerates a fixed set of provider sections and
-    // has no `fireworks-us` case. A price here would be stored, shown in the
-    // overlay table, and never used to price a session.
+  it('carries the US-only price, derived from the heredoc`s cost block', { skip }, () => {
+    // agent-swarm reads an overlay row's `pricing` in `toCatalogModel`, which
+    // copies it into the served catalogue's `cost`, so the runtime page and the
+    // model picker print the real per-1M rates for the one model the swarm runs.
+    // Deriving them from the heredoc keeps them at the US 1.5x rate
+    // (docs/bifrost-gateway.md, "The Fireworks premium") instead of a second
+    // hand-kept copy that could drift back to the global price.
     const run = runOverlay()
-    assert.equal(run.body?.pricing, undefined)
+    assert.equal(run.status, SETUP_SCRIPT_EXIT, run.stderr)
+    const source = JSON.parse(modelsJsonSource()) as {
+      providers: Record<string, { models: { cost?: Record<string, number> }[] }>
+    }
+    const heredocCost = source.providers[PROVIDER_ID]?.models[0]?.cost
+    assert.ok(heredocCost, 'models.json must keep a cost block; this row derives from it')
+    assert.deepEqual(run.body?.pricing, {
+      input: heredocCost.input,
+      output: heredocCost.output,
+      cache_read: heredocCost.cacheRead,
+      cache_write: heredocCost.cacheWrite,
+    })
+    // pi's `cacheRead`/`cacheWrite` are camelCase; models.dev's overlay field is
+    // snake_case. A camelCase key here would pass validation as an unknown field
+    // and silently leave the console with no cache rate.
+    const pricing = run.body?.pricing as Record<string, number>
+    for (const key of Object.keys(pricing)) {
+      assert.ok(
+        ['input', 'output', 'cache_read', 'cache_write'].includes(key),
+        `${key} is not an overlay pricing field`,
+      )
+    }
+    assert.equal(pricing.input, 0.45)
+    assert.equal(pricing.output, 1.8)
+  })
+
+  it('records, beside the price, that it cannot change accounting', () => {
+    // The honest half, and the reason the README calls the price display-only.
+    // `applyOverlayPricingRows` feeds overlay prices to `buildModelsDevSeedRows`,
+    // which enumerates a fixed set of provider sections and has no
+    // `fireworks-us` case, so this row contributes no `pricing` table rows and a
+    // pi session of this model still lands at `costSource: 'unpriced'`. That is
+    // an upstream property this repo cannot test; what it CAN pin is that the
+    // script keeps saying so next to the field, naming the code path that drops
+    // it, so nobody reads `pricing: {...}` as "the swarm now prices this".
+    const source = read(SYNC_AGENT_CONFIG)
+    assert.ok(source.includes("pricing:"), 'the overlay row must keep its price')
+    assert.match(
+      source,
+      /buildModelsDevSeedRows/,
+      'the script must name the projection that drops a fireworks-us price',
+    )
+    assert.match(
+      source,
+      /costSource: 'unpriced'|costSource: "unpriced"/,
+      'the script must say a session stays unpriced',
+    )
+    assert.match(source, /display only/i)
   })
 
   it('is an upsert that can be repeated unchanged', { skip }, () => {

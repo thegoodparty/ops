@@ -143,13 +143,30 @@ fi
 # such entry), so the condition can never be met; `true` would mark a permanent
 # row as temporary.
 #
-# No `pricing` field. Overlay prices reach the pricing table through the
-# models.dev seed projection, which enumerates a fixed set of sections
-# (anthropic, openai, google, fireworks-ai, xai, deepseek, openrouter and the
-# OpenAI-compatible registry) and has no `fireworks-us` case, so a price here
-# would be stored and never used. Sessions stay `costSource: 'unpriced'`; pi's
-# own dollar figure from the models.json cost block is what the dashboard shows.
-# See README, "Models".
+# `pricing` IS sent, and is display only. It is read by two paths in
+# agent-swarm v2.6.0:
+#
+#   1. `toCatalogModel` (src/be/model-catalog-store.ts) copies it into the
+#      served catalogue's `cost`, so the agent runtime page and the model picker
+#      print the US-only rates (agent-runtime-settings.tsx). Without it the one
+#      model the swarm runs is the only one shown with no price.
+#   2. `applyOverlayPricingRows` (same file) turns overlay prices into `pricing`
+#      table rows, but it gets there through `buildModelsDevSeedRows`
+#      (src/be/seed-pricing.ts), which enumerates a FIXED set of provider
+#      sections: anthropic/openai/google/fireworks-ai (for amp), openai (codex,
+#      pi), deepseek (dsh), openrouter (opencode, pi, dsh, grok), xai, and the
+#      OpenAI-compatible registry. `fireworks-us` is in none of them, so it
+#      contributes zero rows and the field cannot change what a session is
+#      charged or how it is tagged.
+#
+# So: a session of this model still lands at `costSource: 'unpriced'` and the
+# dashboard still shows it with a "NO RATE" badge -- but with the correct US
+# dollars beside it (pi reports its own cost from the heredoc's `cost` block,
+# which is the US 1.5x rate, and the API stores that verbatim when it cannot
+# recompute). `unpriced` here means "provenance unknown", not "free": the USD
+# is right, and swarm reports that average per-task spend exclude unpriced rows.
+# Making the price book itself carry `fireworks-us` needs an upstream section in
+# `buildModelsDevSeedRows`; README, "Models" has the operator's view.
 
 # Prints the overlay body for the model in $1/$2, read from the models.json
 # text in $3. A function of its own so model-catalog-overlay.test.ts can run the
@@ -175,6 +192,14 @@ model_catalog_overlay_body() {
         + (if $m.name then {name: $m.name} else {} end)
         + (if ($m.contextWindow | type) == "number" then {contextWindow: $m.contextWindow} else {} end)
         + (if ($m.maxTokens | type) == "number" then {maxOutput: $m.maxTokens} else {} end)
+        + (if ($m.cost | type) == "object" then
+            {pricing: {
+              input: $m.cost.input,
+              output: $m.cost.output,
+              cache_read: $m.cost.cacheRead,
+              cache_write: $m.cost.cacheWrite
+            } | with_entries(select(.value != null))}
+           else {} end)
       end'
 }
 

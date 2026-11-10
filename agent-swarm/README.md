@@ -344,7 +344,9 @@ change to them needs:
   as root at every agent container start)
 - the grafana and clickup MCP servers, installed on all three agents
 - the model-catalogue overlay row that teaches the dashboard about the one
-  model the agents run (see "Models")
+  model the agents run: its reasoning levels, context window, output limit and
+  (display-only) US rates. It never touches the swarm's price book, so it does
+  not change what a session is charged (see "Models")
 - each agent's harness and model, from `HARNESS_PROVIDER` and the
   `*_MODEL_OVERRIDE` values `render-env.sh` writes
 
@@ -540,7 +542,11 @@ Where it lives:
 - Cost is the US-only price, $0.45 in / $0.009 cached / $1.80 out per 1M
   tokens, 1.5x the global endpoint. pi's built-in catalogue carries
   .3 / .006 / 1.2 for the `-1017` entries, so the file overrides it; without
-  that the dashboard under-reports the bill by a third.
+  that pi would under-report the bill by a third.
+
+pi's price is what the ledger stores (see "Cost accounting" below). What the
+swarm's own price book cannot do is *recognise* it, so these sessions are tagged
+`unpriced`; the dollars are right, the provenance is not.
 
 **The swarm's own model catalogue does not list this model, so
 `sync-agent-config.sh` adds it.** agent-swarm reads a models.dev projection whose
@@ -568,22 +574,67 @@ worker loads:
   map normalizes `none` to its own `off` and drops anything else without a word.
 - `contextWindow` and `maxOutput` come from the model's `contextWindow` and
   `maxTokens`.
+- `pricing` is the heredoc's `cost` block, renamed to the overlay's snake_case
+  fields. It is **display only**: agent-swarm's `toCatalogModel` copies it into
+  the served catalogue, so the runtime page and the model picker print the real
+  US rates ($0.45 in / $0.009 cached / $1.80 out per 1M) instead of no price at
+  all. It does **not** price a session — see "Cost accounting" below.
 - `expiresWhenUpstreamMatches: false`. Overlay rows normally delete themselves
   once models.dev catches up, but models.dev has no `fireworks-us` section, so
-  that can never happen and the row is permanent by design.
-- **No price.** Overlay prices reach agent-swarm's pricing table through its
-  models.dev seed projection, which knows a fixed set of provider sections and
-  has no `fireworks-us` case, so a price in this row would never be read. Pi's
-  own dollar figure still comes from the `cost` block in `models.json`, which
-  is where the price above is kept; it is the session's cost *source* that stays
-  `unpriced` instead of `pricing-table`, so cost-based reporting treats these
-  sessions as unmeasured. Adding the price properly means a `fireworks-us`
-  section upstream, not a field here.
+  that can never happen and that row is permanent by design.
 
 A failed overlay write is printed to the journal and the sync carries on
 (`model catalogue overlay: the upsert failed ...`), because the setup script,
 the MCP servers and the runtime model are what make the agents run. The write is
 an upsert, so re-running the script is the retry.
+
+#### Cost accounting
+
+A session of this model records the **right dollars** and the **wrong
+provenance**, and both halves matter to a reader of the dashboard.
+
+The dollars are right because pi reports its own cost: the worker sends
+`totalCostUsd = stats.cost`, computed from the `cost` block in `models.json`,
+which is the US 1.5x rate. When the API cannot recompute the row it stores that
+figure verbatim (`recomputeSessionCost` → `unpricedResult`,
+`src/http/session-cost-recompute.ts`). The provenance is wrong because
+the swarm keeps its own price book, `pricing`, keyed by (provider, model,
+token class) where *provider is the harness* — `pi`, not `fireworks-us`. For a
+`pi` row, the lookup is `pi` + `fireworks-us/accounts/fireworks/routers/…`, and
+nothing seeds that row.
+
+The overlay's `pricing` cannot seed it, and that is upstream: overlay prices
+become price-book rows through `applyOverlayPricingRows`, which builds a
+models.dev-shaped cache and hands it to `buildModelsDevSeedRows`
+(`src/be/seed-pricing.ts`). That projection enumerates a fixed set of provider
+sections — `anthropic`/`openai`/`google`/`fireworks-ai` (as `amp`), `openai`,
+`deepseek`, `openrouter`, `xai`, and the OpenAI-compatible registry — and
+`fireworks-us` is in none of them, so the row contributes zero price-book rows.
+There is also no generic way in: `POST /api/pricing/{provider}/{model}/{tokenClass}`
+(`src/http/pricing.ts`) is the only generic writer and takes the model id as a
+**path segment**, while the id the recompute looks up contains slashes and
+nothing URL-decodes before route matching, so the row cannot even be addressed.
+
+What an operator sees today, precisely:
+
+- the task's Cost figure is the correct US-only amount;
+- beside it, the yellow **NO RATE** badge (`cost-source-badge.tsx`), whose
+tooltip reads "No pricing row matched this provider/model; USD is the
+worker-reported value";
+- the runtime page and the model picker show the right per-1M rates, from this
+overlay row;
+- `costSource` is `unpriced`, so `compound-insights` counts these sessions in
+`unpricedRows`/`unpricedSpendUsd` and leaves them out of `avgCostPerTaskUsd`,
+`trustedSpendUsd` and its "trusted" coverage percentage, and the OTel
+cost counter carries `cost_source: unpriced`.
+
+**That is not the same as "free" or "unmeasured" in dollars** — the money is
+right and the attribution is not. Budget admission sums `totalCostUsd` and so is
+unaffected. Making these sessions `pricing-table` needs an upstream change: a
+`fireworks-us` section in `buildModelsDevSeedRows`, or a model id the pricing
+route can carry in one segment. Until then the honest label is the one the
+dashboard gives it, and the figures to read are `totalSpendUsd` (which does
+include them) rather than `avgCostPerTaskUsd` (which does not).
 
 **Adding a model is a reviewed change, not an automatic upgrade.** Adding one
 means minting a new dated US router id with Fireworks and editing
