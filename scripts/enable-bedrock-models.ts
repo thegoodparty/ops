@@ -82,11 +82,14 @@ const DEPLOY_ROLE_ARN = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy
 /**
  * Every region a `us.` geo profile can route to, per the model cards.
  *
- * The `us.` profiles are the outgoing side of the 2026-11-04 rollover now: every
- * entry in `utils/bedrock-models.ts` selects a `global.` profile, and `us.` is
- * permitted only through `transitionalInvokeIds` while `gp-pi` ships the same
- * switch. The walk is unchanged, and it has to be: the agreement is on the
- * foundation model, which is the same one either profile routes to.
+ * Every entry in `utils/bedrock-models.ts` selects a `global.` profile, and the
+ * `transitionalInvokeIds` rollover that kept each entry's outgoing `us.`
+ * profile permitted has been removed, so nothing selects a `us.` profile any
+ * more. The walk is unchanged and still correct: the agreement is on the
+ * foundation model, which is the same one either profile routes to, so
+ * subscribing is per model and not per profile. The region list is kept because
+ * the rollover was the last reason to walk it and removing the walk would make
+ * the next profile change a code change rather than a list edit.
  *
  * `ca-central-1` is the open question and is left out on purpose. Kimi K3's
  * card lists it as geo-supported while its prose says the `us.` profile

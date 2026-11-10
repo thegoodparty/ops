@@ -229,32 +229,74 @@ export const ECS_EXECUTION_MANAGED_POLICY_ARN =
   "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy";
 
 /**
- * The task size: 0.5 vCPU / 1 GB, per "Sizing" in the plan. Fargate's valid
- * cpu/memory pairs put 512 CPU at 1024 through 4096 MB; this is the smallest
- * pair, which is what "start small, one-line change" means here — raising it
- * is this constant and the containers' own reservations below.
+ * The task size: 1 vCPU / 2 GB. It started at 0.5 vCPU / 1 GB (512/1024), the
+ * smallest valid Fargate pair, because that was the right guess for "start
+ * small" — but the size is no longer a guess. It is set by measured CPU
+ * saturation and by the requirement that the gateway keep enough headroom that
+ * developers are not disrupted, and raising it is these constants and the
+ * containers' own reservations below.
+ *
+ * The evidence, from CloudWatch over the 14 days to 2026-11-06 (task CPU is a
+ * percentage of the task's units, 448 of which Bifrost reserved):
+ *
+ * - p50 1.3%, p95 21% of 512 units. The median is idle; the peak is not a slow
+ *   climb, it is a spike.
+ * - Daily maxima hit the ceiling exactly: 100.31% on 2026-11-03, 100.25% on
+ *   2026-11-05, 100.25% on 2026-11-06, 99.57% on 2026-10-24, 100.00% on
+ *   2026-10-25. In 5-minute buckets, 3 of 864 (0.35%) were at or above 90% and
+ *   4 at or above 75%.
+ * - Those moments line up with the load balancer's 5XX bursts — 54 at 2026-11-03
+ *   16:03-16:33, 58 at 2026-11-04 16:38, 44 at 2026-11-06 08:43-08:48 — while
+ *   target 5XX was zero over the last two days. The application never returns
+ *   an error; the load balancer gives up on a task that is briefly pinned.
+ * - Traffic grew about 15x across the window (77 requests on 2026-10-28 to
+ *   6,791 on 2026-11-04) without CPU following it up, so this is peak
+ *   densification on a burst, not steady saturation.
+ *
+ * Doubling CPU puts the observed 100% ceiling at roughly 50% of the new task,
+ * which is the headroom the requirement is about: a bump that merely moved the
+ * ceiling a little would postpone the same 5XX bursts rather than end them.
+ *
+ * Memory is doubled with it to 2048 MB, for the other half of the same reason.
+ * Memory was the healthy dimension — p50 12%, daily maxima 28-32% since
+ * 2026-11-01, no sawtooth and no upward creep — so nothing measured argues for
+ * it. It is doubled because the reservations below have to sum to a valid
+ * Fargate cpu/memory pair, and because 1024 MB would leave the gateway the same
+ * 896 MiB it had, putting the measured 818 MiB worst case
+ * (`deploy-workbench/bifrost/README.md`) at 91% of it: the dimension that is not
+ * the problem would be the one nearest its limit. At 2048 the same worst case is
+ * 43% of the 1920 MiB reservation, so the tripwire stays far below the limit
+ * instead of a few MiB under it.
+ *
+ * Fargate's valid cpu/memory pairs put 1024 CPU at 2048 through 8192 MB, so
+ * 1024/2048 is a pair the platform accepts.
  *
  * Fargate requires the container-level reservations to fit inside the task, so
  * item 9's sidecar takes its share out of the task rather than out of thin air:
- * the two containers together reserve exactly the task's 512 CPU / 1024 MB,
- * which is unchanged from item 8's single container. Bifrost keeps almost all
- * of it; oauth2-proxy is a small Go reverse proxy with a static allowlist and
- * needs a fraction. The split is spelled as constants with a test that their
- * sums equal the task, because a reservation that exceeds the task is an apply
- * failure (`The sum of the container memory and CPU reservations exceeds the
- * task reservation`) and a container with no reservation at all would silently
+ * the two containers together reserve exactly the task's 1024 CPU / 2048 MB.
+ * Bifrost keeps almost all of it; oauth2-proxy is a small Go reverse proxy with
+ * a static allowlist, nothing has changed about it, and it stays at its 64 CPU /
+ * 128 MB. The split is spelled as constants with a test that their sums equal
+ * the task, because a reservation that exceeds the task is an apply failure
+ * (`The sum of the container memory and CPU reservations exceeds the task
+ * reservation`) and a container with no reservation at all would silently
  * compete with Bifrost for the whole task.
+ *
+ * This is the only vertical lever. OSS Bifrost keeps provider configs, keys,
+ * usage and budgets in memory and does not support multi-node, so there is no
+ * scale-out to reach for: `desiredCount` stays 1 and the deploy stays
+ * stop-before-start. Sizing up is what that leaves, and it is intended.
  *
  * The bootstrap container below deliberately takes no reservation at all: the
  * two above already sum to the task, and it is a curl+jq one-shot that lives
  * for seconds. Fargate allows an unreserved container; it draws from whatever
  * is not reserved at the time.
  */
-export const TASK_CPU = "512";
-export const TASK_MEMORY = "1024";
+export const TASK_CPU = "1024";
+export const TASK_MEMORY = "2048";
 
-export const BIFROST_CONTAINER_CPU = 448;
-export const BIFROST_CONTAINER_MEMORY = 896;
+export const BIFROST_CONTAINER_CPU = 960;
+export const BIFROST_CONTAINER_MEMORY = 1920;
 export const OAUTH2_PROXY_CONTAINER_CPU = 64;
 export const OAUTH2_PROXY_CONTAINER_MEMORY = 128;
 
@@ -540,11 +582,12 @@ export const BIFROST_MEASURED_BOOT_SECONDS = 23.1;
  * end of five measured runs in the build container (0.62-0.88 s wall, 71 MiB
  * peak RSS, four cores, aarch64).
  *
- * It is a floor, not a prediction of the task. The task has 0.44 vCPU and a
- * cold page cache, so the real cold start is several times this, which is why
- * `config.json`'s timeout is many multiples of it rather than a small margin.
- * The number is here so the test can assert that multiple instead of restating
- * the timeout as a taste.
+ * It is a floor, not a prediction of the task. Bifrost's reservation was 0.44
+ * vCPU when this was measured and is 0.96 vCPU now (see the task size above); a
+ * cold page cache still makes the real cold start several times this, which is
+ * why `config.json`'s timeout is many multiples of it rather than a small
+ * margin. The number is here so the test can assert that multiple instead of
+ * restating the timeout as a taste.
  */
 export const BIFROST_MEASURED_CLI_SECONDS = 0.88;
 
@@ -596,7 +639,7 @@ export const PG_SECRET_ARN_ENV_NAME = "PG_SECRET_ARN";
  *
  * 30 rather than the pinned tag's 10s default, for the reason
  * `bifrost/config.test.ts`'s timeout budget records: two cold `aws-cli` starts
- * on a 0.44 vCPU task are not the warm measurement, and 30s still leaves the
+ * on a contended task are not the warm measurement, and 30s still leaves the
  * whole slow boot inside the health check's 90s start period.
  */
 export const BIFROST_PG_PASSWORD_TIMEOUT_SECONDS = 30;
@@ -672,7 +715,7 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * `BIFROST_CONFIG`.
  *
  * Why a parameter rather than an `environment` entry with the JSON inlined in
- * the task definition: the file is 4,042 bytes today (`wc -c`, measured on
+ * the task definition: the file is 4,085 bytes today (`wc -c`, measured on
  * `deploy-workbench/bifrost/config.json`) and grows when item 14 adds teams and
  * virtual keys, and task-definition environment entries are the wrong place for
  * a document that changes on its own schedule. Why SSM rather
@@ -690,8 +733,8 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
  * see what the gateway is actually running with.
  *
- * Standard tier, which holds 4 KiB. The file is 4,042 bytes today, so there are
- * **54 bytes** of headroom, not the couple of kilobytes an earlier version of
+ * Standard tier, which holds 4 KiB. The file is 4,085 bytes today, so there are
+ * **11 bytes** of headroom, not the couple of kilobytes an earlier version of
  * this comment claimed; every addition from here is a deliberate byte budget
  * rather than free space. Past 4 KiB this needs `tier: "Advanced"` explicitly
  * (8 KiB, and AWS charges for it), because the provider would otherwise fail
@@ -714,7 +757,7 @@ export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
  * The standard tier's content limit for an SSM `String` parameter, in bytes.
  *
  * Named rather than written into a comment because `bifrost/config.json` is
- * 4,042 bytes today, which leaves 54 bytes of headroom: the margin is small
+ * 4,085 bytes today, which leaves 11 bytes of headroom: the margin is small
  * enough that the suite should fail when it is crossed, not a reviewer. An
  * over-limit value is rejected by `PutParameter` rather than truncated, so the
  * apply fails loudly, but only after a merge. Past this the parameter needs
@@ -1080,7 +1123,8 @@ export const readBifrostConfig = (): string =>
  * (`postgresconn.go`, "One cache per pool"), so `singleflight` collapses a
  * burst inside one pool and not across the two: the connections each store
  * makes while `initStores` runs can be two concurrent forks of a Python
- * `aws-cli` (71 MiB RSS each, measured) on a task with 0.44 vCPU.
+ * `aws-cli` (71 MiB RSS each, measured) on a task that has to start both of them
+ * at once.
  *
  * What the warm does and does not do, stated precisely because the difference
  * matters: it does not populate Bifrost's cache, which lives inside the process
@@ -1215,22 +1259,32 @@ export const TASK_SECRET_ACTIONS = ["secretsmanager:GetSecretValue"] as const;
 export const EXECUTION_PARAMETER_ACTIONS = ["ssm:GetParameters"] as const;
 
 /**
- * The invoke actions, matching the set `WorkbenchAccess` grants engineers
- * (`deploy/components/identity-center/policies.ts`): the two `InvokeModel`
- * forms and the two `Converse` forms, because which pair the provider uses is
- * a property of Bifrost's Bedrock provider rather than of this policy, and
- * granting only one pair is an AccessDenied that reads like missing model
- * access.
+ * The invoke actions, the whole of what is permitted anywhere in this account.
+ *
+ * Read this with the grants that are no longer beside it. `WorkbenchAccess`
+ * used to hold these four actions on the same resource list, which made the
+ * gateway one of two ways to reach a model. It holds none of them now
+ * (`deploy/components/identity-center/policies.ts`, `DenyDirectBedrockInvoke`),
+ * so this statement is the only invoke grant in the workbench account and the
+ * task role is the only principal that can make a model call. That is the
+ * property the model list in `utils/bedrock-models.ts` is standing in for:
+ * Bifrost authorises *which person* through its virtual keys, and IAM
+ * authorises *which models*, once, for one identity.
+ *
+ * Two `InvokeModel` forms and two `Converse` forms, because which pair the
+ * provider uses is a property of Bifrost's Bedrock provider rather than of
+ * this policy, and granting only one pair is an AccessDenied that reads like
+ * missing model access.
  *
  * Deliberately absent, and worth stating because it is the "nothing wilder"
  * half of the requirement:
  *
- * - `bedrock:Get*` / `bedrock:List*`, which `WorkbenchAccess` holds wide so a
- *   person is never blocked mid-task. The gateway is not a person and invokes
- *   a fixed model list. The one read it turned out to need is named, not
- *   wildcarded: `TASK_BEDROCK_READ_ACTIONS` below, added when bringing the
- *   service up showed the provider enumerating the catalog to render its model
- *   list.
+ * - `bedrock:Get*` / `bedrock:List*`, which `WorkbenchAccess` still holds wide
+ *   so a person can see the catalog and debug a slow call. The gateway is not a
+ *   person and invokes a fixed model list. The one read it turned out to need
+ *   is named, not wildcarded: `TASK_BEDROCK_READ_ACTIONS` below, added when
+ *   bringing the service up showed the provider enumerating the catalog to
+ *   render its model list.
  * - anything `aws-marketplace`, which is what auto-subscribes a model nobody
  *   chose. Subscriptions are out of band, per the plan and step 11.
  */
@@ -1375,9 +1429,20 @@ export const executionRoleConfigParameterPolicyDocument = (
 /**
  * The task role's policy: invoke exactly the models in
  * `utils/bedrock-models.ts`, which is the same list the subscription script
- * walks and the same one `WorkbenchAccess` composes from. One list, so a model
- * added there is reachable by the gateway without a second edit, and a model
- * removed there is not.
+ * walks, the same one `deploy-workbench/bifrost/config.json` serves, and the
+ * same one a minted virtual key is allowed. One list, so a model added there is
+ * reachable by the gateway without a second edit, and a model removed there is
+ * not.
+ *
+ * The resource list is the model allowlist rather than wider than it. It used
+ * to be wider on purpose: each entry also permitted its outgoing `us.` geo
+ * profile while the fleet rolled over to `global.`, so the role named sixteen
+ * inference profiles for eight served models. That rollover is finished and
+ * the field is gone, so the inference-profile ARNs here are exactly the
+ * profiles the gateway serves. `deploy-workbench/bifrost/config.test.ts`
+ * asserts that equality in both directions, because the failure it prevents
+ * is a model reachable through IAM that no key can ask for, or one a key can
+ * ask for that IAM refuses.
  *
  * Plus the catalog read. Without it the gateway can serve inference but cannot
  * show its models: the dashboard's provider page asks Bifrost to list them and
@@ -1663,9 +1728,10 @@ export const createBifrostEcs = (args: {
    *   healthy; see `BIFROST_BOOTSTRAP_CONTAINER_NAME` above.
    * - No review bucket, no `AGENT_VERSION`, no metric filters: those are the
    *   delegate's concerns, not the gateway's.
-   * - `cpu`/`memory` are 512/1024 rather than 1024/4096, per the plan's
-   *   sizing, and the containers' own reservations split that total rather
-   *   than each repeating it; see the constants above.
+   * - `cpu`/`memory` are the task size in the constants above (1024/2048,
+   *   raised from the 512/1024 the plan started at) rather than the delegate's
+   *   1024/4096, and the containers' own reservations split that total rather
+   *   than each repeating it.
    * - The `secrets` block is not a list of keys read from a secret. It is the
    *   declared lists above, plus `BIFROST_CONFIG` from the SSM parameter; see
    *   the module header for why nothing here reads Secrets Manager. Bifrost gets
@@ -1868,7 +1934,7 @@ export const createBifrostEcs = (args: {
           name: BIFROST_BOOTSTRAP_CONTAINER_NAME,
           image: resolvedBootstrapImage,
           // No cpu/memory reservation: the two containers above already sum to
-          // the task's 512/1024, and this one lives for seconds. Fargate lets
+          // the task's 1024/2048, and this one lives for seconds. Fargate lets
           // an unreserved container draw on what is not reserved.
           //
           // Non-essential, so a claim that cannot run (a password upstream's

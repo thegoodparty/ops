@@ -340,7 +340,10 @@ shared one working tree, which the one-worktree-per-task rule now prevents.
       (2026-10-01, pi-brave). `gp-pi` gained an always-on `web_search` tool,
       and its key goes here because the container already holds a
       `WorkbenchAccess` SSO session and can read the secret with the same
-      credentials it invokes Bedrock with. The secret is `gp-pi/brave-search`,
+      credentials it mints its gateway key with. (It used to be the same
+      credentials it invoked Bedrock with; `WorkbenchAccess` holds no Bedrock
+      invoke any more, which changes nothing about this grant.) The secret is
+      `gp-pi/brave-search`,
       one JSON key `BRAVE_API_KEY`, created out of band by jeff on 2026-10-01.
       The grant is a single statement in `workbenchAccess`, on that secret's
       ARN and nothing else, held there by
@@ -390,8 +393,11 @@ Facts discovered during implementation go here as they are learned:
   background on first invocation, provided the invoking role holds
   `aws-marketplace:Subscribe`. AWS's guidance is that blocking a model means a
   Deny or a scoped Allow on `bedrock:InvokeModel`, not withholding a
-  subscription. That is why `WorkbenchAccess` names its models as resource
-  ARNs: that statement is the allowlist, and it is the only one.
+  subscription. That is why the gateway's task role names its models as
+  resource ARNs: that statement is the allowlist, and it is the only one. It
+  was `WorkbenchAccess`'s statement too until the sandbox's direct path was
+  removed; see "Direct Bedrock access is gone" in
+  [`bifrost-gateway.md`](./bifrost-gateway.md).
 - **"Worked a few times, then AccessDenied" is the documented shape of a
   failed background subscription**, not necessarily a routing problem. AWS:
   during the setup period, up to fifteen minutes, calls may succeed while the
@@ -415,13 +421,15 @@ Facts discovered during implementation go here as they are learned:
   set is not the caller's region, which is why the IAM resources wildcard the
   region and enumerate the model rather than the reverse.
 - **Models the coding sandbox uses** live in `utils/bedrock-models.ts`, one
-  list imported by both the IAM policy that permits them and the script that
-  subscribes to them. Every entry selects a `global.` cross-region inference
-  profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
+  list imported by the IAM policy that permits them, the script that subscribes
+  to them, and Bifrost's own config tests. Every entry selects a `global.`
+  cross-region inference profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
   `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
+  `openai.gpt-6.1-terra`,
   `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
-  `moonshotai.kimi-k3`. Each entry's outgoing `us.` profile stays permitted
-  through `transitionalInvokeIds` until `gp-pi` has shipped the switch. The
+  `moonshotai.kimi-k3`. The outgoing `us.` profile that each entry permitted
+  through `transitionalInvokeIds` while the fleet rolled over is now gone, so
+  the policy names one profile per model and no `us.` ARN appears anywhere. The
   account was on `us.` geo profiles for residency before that; Sonnet 5.5 was
   briefly the reverse exception, launched on `global.` alone on 2026-09-28 and
   moved to `us.` when AWS added it on 2026-10-01 — both of those dates are
@@ -429,6 +437,11 @@ Facts discovered during implementation go here as they are learned:
   "Changing a model's inference profile" under "Adding a Bedrock model
   later". `deepseek.v3.2` was removed in the same change: it has no `global.`
   profile and no `us.` one, so there was nothing left for it to select.
+  **The list now has one reader that grants anything.** `WorkbenchAccess` held
+  the same resource list as a person's direct path until it was removed (see
+  "Direct Bedrock access is gone" in `bifrost-gateway.md`); the gateway's task
+  role is the only principal left, so this list is the account's Bedrock
+  allowlist rather than one of two.
 - **The Anthropic first-time-use form is assumed already submitted.** It is
   required once per account or once at the organization's management account,
   and a submission at the root is inherited by every account in the
@@ -1411,18 +1424,24 @@ Written down on 2026-09-23, while adding Claude Opus 5.5, because the moving
 parts are in three places and one of them was silently disconnected.
 
 One edit does it: an entry in `utils/bedrock-models.ts`. Everything else follows
-from that list. Two workflows then have to run, and they are not the same one:
+from that list. Two workflows are involved, and only one of them still carries
+the model list:
 
-- **`deploy.yml`** applies the `WorkbenchAccess` permission set, whose invoke
-  statement is `bedrockInvokeResources()` over that list. It has no path filter,
-  so it always runs. Without it the model is subscribed and every invocation is
-  refused by IAM.
-- **`deploy-workbench.yml`** runs `scripts/enable-bedrock-models.ts` with
-  `APPLY=1`, which creates the model agreement. Without it the model is permitted
-  and the first invocation works for up to fifteen minutes before turning into
-  AccessDenied, which is the failure that reads like an outage.
+- **`deploy-workbench.yml`** is the one that matters, and it does both halves.
+  Its apply creates the task role's invoke statement from
+  `bedrockInvokeResources()`, so a model added to the list is permitted only
+  once this runs. It also runs `scripts/enable-bedrock-models.ts` with
+  `APPLY=1`, which creates the model agreement; without that the first
+  invocation works for up to fifteen minutes and then turns into AccessDenied.
+  Its path filter includes `utils/bedrock-models.ts` and
+  `scripts/enable-bedrock-models.ts`, so editing the list is enough to trigger
+  it.
+- **`deploy.yml`** applies the `WorkbenchAccess` permission set, which holds no
+  Bedrock invoke: the catalog reads and a Deny on the invoke family. A model
+  change no longer depends on it running, and the Deny it applies names no
+  model. It has no path filter, so it runs on every merge to `main` anyway.
 
-That second workflow did not fire on a model list change until 2026-09-23. Its
+That workflow's trigger did not fire on a model list change until 2026-09-23. Its
 path filter listed `scripts/enable-bedrock-models.ts` with a comment saying that
 listing the script made editing the model list enough, but the list lives in
 `utils/`, so it was not. Adding Opus 5.5 was the first change to find it, because
@@ -1528,9 +1547,12 @@ out. Written for the 2026-11-04 switch, in the direction it actually ran:
 3. `ops` removes `transitionalInvokeIds`, once nothing offers the `us.` profile
    any more.
 
-An entry that keeps a `transitionalInvokeIds` is a permanent second profile,
-which is a residency decision rather than a transition; empty it in the
-follow-up.
+Step 3 is the one that gets forgotten, and the shape it leaves behind is worth
+knowing: once it is done, `transitionalInvokeIds` is not a field of `BedrockModel`
+in `utils/bedrock-models.ts`, so the policy names one `global.` profile per model
+and no `us.` ARN appears in it. `deploy/bedrock-models.test.ts` fails if either
+returns. An entry that needs a second profile is therefore a permanent residency
+decision rather than a transition, and it has to be argued for as one.
 
 ### What a model costs the policy
 
@@ -1557,10 +1579,19 @@ seven transitional `us.` profiles arrived, so the policy grew by five ARNs and
 412 bytes over the 16 ARNs at 4,555 bytes on `main` just before this change.
 Not 3,881: the virtual-key mint grant and other statements landed after the
 2026-09-28 measurement, so anyone checking has to measure rather than continue
-the old series. The follow-up that clears `transitionalInvokeIds` takes it back
-to 14 ARNs at 4,445 bytes. At about 150 bytes a model there is room for roughly
-thirty-five more before the limit is the thing to think about, which is worth
-knowing mainly so nobody trims the list to save space.
+the old series.
+
+**Measured with the direct invoke grant gone.** The composed `WorkbenchAccess`
+policy is **ten statements at 3,482 bytes**, with no model ARN in it at all.
+The arithmetic, so the next reader can check it: the invoke statement and its 16
+profile ARNs are gone, and the eight `us.` rollover ARNs went with
+`transitionalInvokeIds`, so no model ARN remains in the set. A single Deny
+stands where the Allow was. The account's entire Bedrock resource list is the
+gateway task role's 16 ARNs — eight `global.` profiles and eight foundation
+models — and this permission set's size stopped being the thing to watch. The
+reason it is worth recording as a number at all is the opposite of the original
+note: the limit was never the constraint, and the 412 bytes the rollover cost
+were a hint that the list had two readers when it only needed one.
 
 ### Removing a model, and what removal does not do
 
@@ -1576,8 +1607,11 @@ console-adjacent step to remember, which is the property the ordering exists to
 preserve.
 
 What removal does is revoke IAM. The entry disappears from
-`bedrockInvokeResources()`, `deploy.yml` applies the narrowed permission set, and
-`bedrock:InvokeModel` on that profile stops being allowed.
+`bedrockInvokeResources()`, `deploy-workbench.yml` applies the narrowed task role,
+and `bedrock:InvokeModel` on that profile stops being allowed. `deploy.yml` still
+runs and still applies `WorkbenchAccess`, but that set names no model: its
+`DenyDirectBedrockInvoke` is a fixed list of actions on `Resource: "*"`, so the
+permission set says the same thing before and after a model leaves.
 
 What removal does **not** do is unsubscribe. `scripts/enable-bedrock-models.ts`
 only ever creates agreements; it has no delete path, and

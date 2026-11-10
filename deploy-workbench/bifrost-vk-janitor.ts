@@ -18,6 +18,7 @@ import {
   type PolicyDocument,
 } from "./bifrost-vk-mint";
 import { BIFROST_CONFIG_PARAMETER_NAME, secretArnPattern } from "./ecs";
+import { WORKBENCH_ALERT_EMAIL } from "./alert-email";
 import { BIFROST_DISCOVERY_DNS_NAME } from "./discovery";
 import {
   VK_JANITOR_INTERVAL_MINUTES,
@@ -208,9 +209,11 @@ export const VK_JANITOR_ROLE_DESCRIPTION =
  * The address the failure alarm emails. The same group alias the spend alerts
  * use (`index.ts`, `SPEND_ALERT_EMAIL`), because it is the same operator
  * question — "something in the workbench account is wrong" — and a second alias
- * would split the answer in two.
+ * would split the answer in two. It is imported rather than restated so that
+ * this, the spend alerts and the gateway-health topic (`alarms.ts`) cannot
+ * drift into three copies; `alert-email.ts` is the one place it is written.
  */
-export const VK_JANITOR_ALERT_EMAIL = "aws-workbench@goodparty.org";
+export const VK_JANITOR_ALERT_EMAIL = WORKBENCH_ALERT_EMAIL;
 
 /**
  * How many consecutive failing runs mean "stuck". Three, per the plan's step 6

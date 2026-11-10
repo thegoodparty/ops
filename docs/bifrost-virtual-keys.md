@@ -52,6 +52,14 @@ changes. This document does not touch the Bedrock IAM either: that grant is
 merged (#396, `bifrost-bedrock-iam`), and this design neither depends on it nor
 modifies it.
 
+The one thing that has changed since this was written: `WorkbenchAccess` no
+longer holds a Bedrock invoke at all (`docs/bifrost-gateway.md`, "Direct
+Bedrock access is gone"). That grant used to sit beside the gateway's, which
+made the sentence above slightly generous — a person *could* reach a model
+without a key, as themselves. They cannot now, and the task role is the only
+principal in the account that may. Nothing in this design depends on that
+change; it removes one caveat from it.
+
 ## Goals
 
 1. **Attribution per person.** A request is attributable to a person because
@@ -314,11 +322,14 @@ uniform and a mistake is uniform:
   US-only with its provider pointed at the US-only endpoint in `config.json`;
   `bifrost-gateway.md`, "Inference residency" under "Provider
   configuration"). A key may therefore never name a model the gateway would
-  refuse, and `utils/bedrock-models.ts` is deliberately *not* the template's
-  source: it is the sandbox's direct `WorkbenchAccess` grant, which is wider
-  than the gateway's list — during the rollover it still permits each model's
-  outgoing `us.` profile — and a key scoped to it would ask for an entry the
-  gateway no longer routes.
+  refuse. `utils/bedrock-models.ts` is deliberately *not* the template's
+  source, even now that the two lists happen to agree: the file is the IAM
+  allowlist, the template is what a key may ask for, and they are read by
+  different halves of the system. Since the removal of the sandbox's direct
+  `WorkbenchAccess` invoke they no longer *differ* — the gateway's task role is
+  the only principal that may invoke a model, so the IAM list is the gateway's
+  list — but keeping the template's copy means a future IAM widening does not
+  silently widen what a person's key can ask for.
   Each provider entry also carries `key_ids: ["*"]`, because a provider config
   with no keys allows none: empty is deny, `"*"` is "use the provider's keys",
   and the gateway's keys are the deployment's, not the person's.
@@ -710,8 +721,11 @@ adding one later is adding a field here.
 ## What this is not
 
 - **Not a security boundary against the person it issues to.** See caveat 1.
-- **Not a replacement for `WorkbenchAccess`.** The gateway's Bedrock IAM stays
-  the task role's; this only decides which models a person's key may reach.
+- **Not a replacement for the gateway's own IAM.** The gateway's Bedrock IAM
+  stays the task role's; it is now the *only* Bedrock invoke grant in the
+  account, since the sandbox's direct `WorkbenchAccess` path was removed with
+  that role's remaining justification. This design only decides which models a
+  person's key may reach.
 - **Not a per-request check of group membership.** Membership is checked when a
   key is minted, `is_active` is checked on every request, and the janitor
   reconciles the two on every tick. The gateway itself knows nothing about the

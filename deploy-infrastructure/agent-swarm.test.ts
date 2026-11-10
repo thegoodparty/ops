@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
   hostFiles,
   hostFilesHash,
+  infraLogsReadStatements,
   panelRepliesPutStatement,
   SWARM_HOSTNAME,
   swarmHostPolicy,
@@ -50,28 +51,22 @@ describe("delegate swarm host files", () => {
     assert.ok(hostFiles().includes("install.sh"));
   });
 
-  // bootstrap.sh reads the lead's soul from /opt/agent-swarm/soul on the host.
-  it("ships bootstrap.sh and the soul files it reads", () => {
-    const files = hostFiles();
-    for (const file of ["bootstrap.sh", "soul/SOUL.md", "soul/IDENTITY.md"]) {
-      assert.ok(files.includes(file), file);
-    }
+  // up.sh runs it on every deploy; without it a merge to
+  // global-setup-script.sh or the model never reaches the agents.
+  it("ships the agent config sync up.sh runs", () => {
+    assert.ok(hostFiles().includes("sync-agent-config.sh"));
+    const up = fs.readFileSync(path.join(HOST_DIR, "up.sh"), "utf8");
+    assert.match(up, /^\.\/sync-agent-config\.sh$/m);
   });
 
-  // bootstrap.sh finds a skill by its directory name, so a name in the
-  // frontmatter that differs would create a second skill on every rerun.
-  it("ships each skill under the name its frontmatter declares", () => {
-    const skills = hostFiles().filter((f) =>
-      /^skills\/[^/]+\/SKILL\.md$/.test(f),
-    );
-    assert.ok(skills.includes("skills/scale-to-win-panel-wave/SKILL.md"));
-    for (const file of skills) {
-      const text = fs.readFileSync(path.join(HOST_DIR, file), "utf8");
-      assert.equal(
-        /^---\nname: (.+)\n/.exec(text)?.[1],
-        file.split("/")[1],
-        file,
-      );
+  // Scripts, skills and souls belong to the swarm's own database and are
+  // changed from Slack. Shipping them would let a deploy push over those
+  // changes.
+  it("ships no swarm-owned content", () => {
+    const files = hostFiles();
+    assert.ok(files.length > 0);
+    for (const file of files) {
+      assert.ok(!/^(scripts|skills|soul)\//.test(file), file);
     }
   });
 
@@ -119,5 +114,25 @@ describe("panel replies grant", () => {
   it("is in the host role's policy", () => {
     const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
     assert.ok(Statement.includes(panelRepliesPutStatement));
+  });
+});
+
+describe("infrastructure account log read access", () => {
+  const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+
+  it("is in the host role's policy", () => {
+    for (const statement of infraLogsReadStatements) {
+      assert.ok(Statement.includes(statement), statement.Sid);
+    }
+  });
+
+  it("is read-only and scopes stream and event reads to this account's log groups", () => {
+    const actions = infraLogsReadStatements.flatMap((s) => [s.Action].flat());
+    const write = /Put|Create|Delete|Set|Update|Tag|Associate|Disable|Enable/;
+    assert.deepEqual(actions.filter((a) => write.test(a.split(":")[1])), []);
+    const reads = infraLogsReadStatements.find((s) => s.Sid === "ReadAccountLogs");
+    for (const arn of [reads?.Resource].flat()) {
+      assert.match(String(arn), /^arn:aws:logs:[a-z0-9-]+:\d{12}:log-group:\*/);
+    }
   });
 });

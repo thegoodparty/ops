@@ -18,6 +18,7 @@ own.
 - `deploy-org/` — Pulumi IaC for organization-level resources (OUs, member accounts)
 - `deploy-workbench/` — Pulumi IaC for the contents of the `goodparty-workbench` account
 - `deploy-infrastructure/` — Pulumi IaC for the contents of the `goodparty-infrastructure` account
+- `agent-swarm/` — the self-hosted swarm that runs Delegate in Slack. Scripts, skills, schedules and config go into it through Slack, not a PR here; see `agent-swarm/README.md`
 - `.github/workflows/` — CI/CD and scheduled automation
 
 ## Repo-wide facts that will bite

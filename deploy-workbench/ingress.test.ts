@@ -67,6 +67,20 @@ const resourceBlock = (logicalName: string): string => {
   return next >= 0 ? rest.slice(0, next) : rest;
 };
 
+/**
+ * A file's source with its comments removed.
+ *
+ * The port-80 assertions have to match code, not prose. The module documents
+ * why the port is closed, and that explanation necessarily contains the
+ * strings the assertions look for (a `"HTTP"` listener, `HTTP_301`), so
+ * matching the raw source would fail on the documentation of the very thing it
+ * is guarding. Stripping comments leaves only what Pulumi would run.
+ */
+const codeOnly = (source: string): string =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|\s)\/\/[^\n]*/g, "$1");
+
 describe("bifrost ingress", () => {
   it("names the gateway under the delegated workbench zone", () => {
     assert.equal(BIFROST_HOSTNAME, "bifrost.workbench.goodparty.org");
@@ -96,21 +110,76 @@ describe("bifrost ingress", () => {
     assert.equal(OAUTH2_PROXY_HEALTH_CHECK_PATH, "/ping");
   });
 
-  it("listens on the ports item 5 pinned for the listeners", () => {
-    assert.equal(HTTP_PORT, 80);
+  it("listens on 443 and on nothing else", () => {
     assert.equal(HTTPS_PORT, 443);
+    // Port 80 is a named constant in `network.ts` so this test can assert on
+    // it, but nothing listens there. See "No port 80" in `ingress.ts`.
+    assert.equal(HTTP_PORT, 80);
+  });
+
+  it("has no HTTP listener and no ALB rule that opens port 80", () => {
+    // The regression this test exists to prevent.
+    //
+    // The inference prefixes are forwarded straight to Bifrost and the
+    // ALB-to-task hop is plaintext, so Bifrost's router canonicalises a
+    // trailing slash with a `301 Location: http://<host>/...` (fasthttp
+    // `Redirect` resolves the router's relative URI against a request URI
+    // whose scheme Bifrost saw as `http`). An HTTP listener on this ALB turned
+    // that into a working cleartext round trip: a client following the 301
+    // re-sent its `x-bf-vk` virtual key to port 80 before being redirected
+    // back. Closing port 80 makes the redirect a dead end.
+    //
+    // Both halves are asserted, because either one alone reopens it: a
+    // listener with no security-group rule is unreachable but will be opened
+    // by the next reader who wonders why it is dead, and a rule with no
+    // listener is one `aws.lb.Listener` away from being live.
+    //
+    // The checks read the source both for the `HTTP_PORT` constant and for a
+    // literal `80`, because a listener written as `port: 80` is the same
+    // regression and the constant is not the only way to spell it. They are
+    // scoped to the listener resource, not to the whole file: the target
+    // groups legitimately carry `protocol: "HTTP"` (the ALB terminates TLS and
+    // the app is spoken to in the clear over the VPC), so a file-wide match on
+    // the protocol would fail on correct code.
+    const listenerBlock = codeOnly(resourceBlock("bifrostHttpsListener"));
+    assert.ok(
+      !/port:\s*(?:HTTP_PORT|80)\b/.test(listenerBlock),
+      "the ALB listener serves cleartext on port 80 again; port 80 must stay closed (see 'No port 80' in ingress.ts)",
+    );
+    assert.ok(
+      !/protocol:\s*"HTTP"/.test(listenerBlock),
+      "the ALB listener is a cleartext HTTP listener again; port 80 must stay closed",
+    );
+    assert.ok(
+      !codeOnly(INGRESS_SOURCE).includes('"bifrostHttpListener"'),
+      "ingress.ts has an http listener resource again; port 80 must stay closed",
+    );
+    assert.ok(
+      !codeOnly(INGRESS_SOURCE).includes("HTTP_301"),
+      "ingress.ts redirects to HTTPS again; that is the downgrade this change removed",
+    );
+
+    // The security-group half lives in network.ts. Read the ALB group's rules
+    // as source and assert none of them admits 80.
+    const NETWORK_SOURCE = codeOnly(
+      fs.readFileSync(path.resolve(__dirname, "network.ts"), "utf8"),
+    );
+    assert.ok(
+      !/fromPort:\s*(?:HTTP_PORT|80)\b/.test(NETWORK_SOURCE),
+      "network.ts opens port 80 on a security group; port 80 must stay closed",
+    );
+    assert.ok(
+      !NETWORK_SOURCE.includes('"bifrostAlbIngressHttp"'),
+      "network.ts has an ALB ingress rule for HTTP again; port 80 must stay closed",
+    );
   });
 
   it("takes the target group ports from network.ts rather than a second copy", () => {
     // The port literals live in network.ts; this module must import them, or
     // the target group and the security group that admits the ALB would agree
-    // only by coincidence.
-    for (const name of [
-      "BIFROST_PORT",
-      "OAUTH2_PROXY_PORT",
-      "HTTP_PORT",
-      "HTTPS_PORT",
-    ]) {
+    // only by coincidence. HTTP_PORT is deliberately absent: this module no
+    // longer has an HTTP listener to name it for.
+    for (const name of ["BIFROST_PORT", "OAUTH2_PROXY_PORT", "HTTPS_PORT"]) {
       assert.ok(
         INGRESS_SOURCE.includes(name),
         `ingress.ts does not reference ${name} from network.ts`,

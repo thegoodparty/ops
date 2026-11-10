@@ -181,9 +181,7 @@ const main = async () => {
 
       // Shallow-clone the base repo, fetch the PR head ref, then check out the
       // exact SHA. Going through refs/pull/<n>/head is reliable even for fork
-      // PRs, whose head commit isn't on any base-repo branch. Submodules
-      // (e.g. the ai-rules submodule the deep-reviewer needs) are synced after
-      // the checkout so they match the PR's pinned state.
+      // PRs, whose head commit isn't on any base-repo branch.
       execFileSync(
         "gh",
         ["repo", "clone", repoFullName, reviewDir, "--", "--depth=50"],
@@ -205,11 +203,6 @@ const main = async () => {
         stdio: "inherit",
         timeout: 60_000,
       });
-      execFileSync(
-        "git",
-        ["-C", reviewDir, "submodule", "update", "--init", "--recursive"],
-        { stdio: "inherit", timeout: 120_000 },
-      );
       cwd = reviewDir;
       console.log(
         `${repoFullName} PR #${prNumber} checked out at ${reviewDir} (${headSha})`,

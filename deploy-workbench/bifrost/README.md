@@ -15,9 +15,9 @@ files that belong in review:
   deployment actually provides, no credential literal, the per-provider model
   rules (`global.` Bedrock profiles only, Fireworks US router ids and
   the `us.api.fireworks.ai` endpoint, and the agreed class set pinned as
-  literals), and Bedrock's `global.`-profile subset matching
-  `utils/bedrock-models.ts` (the list the task role's IAM is built from,
-  alongside the `bedrock:ListFoundationModels` grant that renders it).
+  literals), and Bedrock's `global.` profiles matching `utils/bedrock-models.ts`
+  exactly (the list the task role's IAM is built from, alongside the
+  `bedrock:ListFoundationModels` grant that renders it).
 - `vk-mint-template.json` — the default per-person virtual key shape, as data
   ([`docs/bifrost-virtual-keys.md`](../../docs/bifrost-virtual-keys.md),
   step 1). See "Virtual-key template" and "Governance overrides" below.
@@ -105,13 +105,14 @@ a later tag. It holds:
   (`accounts/fireworks/routers/<model>-us`) rather than `*`; and `bedrock`,
   whose key carries no credential at all: Bifrost inherits the ECS **task
   role** through the AWS default credential chain, so `bedrock_key_config`
-  sets only the region. The Bedrock model list is the `global.`-profile subset of
-  `utils/bedrock-models.ts`, which is what the task role's IAM policy
-  enumerates; the test fails if the two drift, because a model in one and not
-  the other is a 404 or an `AccessDenied` at runtime. The IAM grant is allowed
-  to be wider than the gateway's list — it is the sandbox's direct path too,
-  and during the 2026-11-04 rollover it still permits each model's outgoing
-  `us.` profile through `transitionalInvokeIds` — and that is why the config
+  sets only the region. The Bedrock model list is exactly the `global.`-profile
+  set in `utils/bedrock-models.ts`, which is what the task role's IAM policy
+  enumerates; the test fails if the two drift in **either** direction, because a
+  model in one and not the other is a 404 or an `AccessDenied` at runtime. That
+  equality is new with the removal of `transitionalInvokeIds` — the IAM list is
+  no longer the wider of the two, since there is no second direct path for it to
+  be wide for. `WorkbenchAccess` holds no Bedrock invoke at all, the gateway's
+  task role is the only principal that may invoke a model, and the config
   carries no bare foundation-model id and no `us.` profile: the gateway selects
   `global.` cross-region inference profiles, which is a cost decision recorded
   in `docs/bifrost-gateway.md`, "Inference residency". Fireworks did not change
@@ -123,10 +124,10 @@ a later tag. It holds:
   `bedrock:ListFoundationModels` (on `*`, since Bedrock defines no resource
   type for it). Without it the provider page shows
   `not authorized to perform: bedrock:ListFoundationModels` instead of the
-  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The `us.`
-  inference profiles in the list need no separate read — they come from the
-  key's own `models` allowlist and are invoked through profile ARNs the invoke
-  statement grants.
+  models, which the IAM tests in `deploy-workbench/ecs.test.ts` pin. The
+  `global.` inference profiles in the list need no separate read — they come
+  from the key's own `models` allowlist and are invoked through profile ARNs the
+  invoke statement grants.
 - **Prompt caching on Bedrock, and not on Fireworks.** `providers.bedrock`
   carries `prompt_cache` with `auto_inject: true` and two injection points, the
   system message and the last message (`{ "location": "message", "role":
@@ -214,7 +215,8 @@ a store has exactly one of them and both stores have to move in one change.
 
 The `timeout` is 30s rather than the pinned tag's 10s default. A timeout here
 fails store init and Bifrost exits, and the call it bounds is a cold Python
-`aws-cli` start on a task with 0.44 vCPU, not a warm one on a build machine;
+`aws-cli` start on a task reserving a fraction of a vCPU (0.44 when the timeout
+was chosen, 0.96 now), not a warm one on a build machine;
 the worst case is two of them at once at boot. 30s is still inside the container
 health check's 90s `startPeriod` even with the slowest measured boot (23.1s of
 store migrations) added to it, which is the constraint that makes it safe
@@ -263,12 +265,16 @@ starts, bounded by the same timeout and with a failure swallowed (the first
 dial then reports it, where Bifrost retries instead of exiting). That warm does
 not fill Bifrost's cache, which is inside the process it runs before; it fills
 the page cache, so the interpreter and botocore fault in once and alone instead
-of twice at once on a 0.44 vCPU task. The measured worst case, the gateway's
-676 MiB peak plus two concurrent 71 MiB forks, is 818 MiB of the 896 MiB
-reservation, so no task-size change was needed. Past about 750 MiB of gateway
-usage the reservation is what has to move, and a `cache_ttl` expiry after boot
-can still produce two concurrent forks, so that arithmetic rather than the warm
-is what bounds the risk.
+of twice at once on the 0.44 vCPU reservation it then had. The measured worst
+case, the gateway's 676 MiB peak plus two concurrent 71 MiB forks, was 818 MiB
+of the 896 MiB reservation, so no task-size change was needed for memory. Those
+were the numbers when the warm went in; the task has since been raised to
+1 vCPU / 2 GB for CPU headroom (`deploy-workbench/ecs.ts`), so
+the gateway now reserves 960 CPU / 1920 MiB and the same 818 MiB worst case sits
+at 43% of it. Past about 750 MiB of gateway usage the reservation was what had
+to move, and that is no longer 78 MiB away; a `cache_ttl` expiry after boot can
+still produce two concurrent forks, so that arithmetic rather than the warm is
+what bounds the risk.
 
 **How it reaches the container (item 10's second half).**
 `deploy-workbench/ecs.ts` reads this file at deploy time, stores it in the SSM
@@ -287,7 +293,7 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB and the file is **4,042 bytes**, so there are 54 bytes left rather
+holds 4 KiB and the file is **4,085 bytes**, so there are 11 bytes left rather
 than the room one earlier version of this paragraph claimed; every addition is
 now a deliberate byte budget, and `deploy-workbench/ecs.test.ts` fails the suite
 before the file crosses the ceiling. Past 4 KiB it needs `tier: "Advanced"`
@@ -403,7 +409,7 @@ the template's" would invite a reader to think the two differ. Naming
 wire, so an override that narrows one provider states the whole list it means.
 
 The reason it is a second parameter and not more of the first is the tier
-ceiling: `config.json` is **4,042 bytes** against the standard tier's 4 KiB,
+ceiling: `config.json` is **4,085 bytes** against the standard tier's 4 KiB,
 and the two governance documents have separate lifetimes anyway. Both are
 checked against the ceiling by `governance-parameters.test.ts`, which fails the
 build rather than the apply.

@@ -53,6 +53,53 @@ export const panelRepliesPutStatement = {
   ],
 };
 
+// Read-only access to CloudWatch Logs across this account, plus alarms and
+// metrics, so the swarm can triage infrastructure-account incidents the way it
+// does in the main account. Same-account grant on the host role, so no
+// cross-account role. Log content can be sensitive. No log write, no secrets.
+const ACCOUNT_LOG_GROUPS = `arn:aws:logs:${REGION}:${INFRASTRUCTURE_ACCOUNT_ID}:log-group:*`;
+
+export const infraLogsReadStatements = [
+  {
+    // Not resource-scoped in practice: DescribeLogGroups, query ids and
+    // log-record lookups do not authorize against one log group ARN.
+    Sid: "ListLogGroupsAndManageQueries",
+    Effect: "Allow",
+    Action: [
+      "logs:DescribeLogGroups",
+      "logs:DescribeQueries",
+      "logs:GetQueryResults",
+      "logs:StopQuery",
+      "logs:GetLogRecord",
+    ],
+    Resource: "*",
+  },
+  {
+    Sid: "ReadAccountLogs",
+    Effect: "Allow",
+    Action: [
+      "logs:DescribeLogStreams",
+      "logs:GetLogEvents",
+      "logs:FilterLogEvents",
+      "logs:StartQuery",
+      "logs:GetLogGroupFields",
+    ],
+    Resource: [ACCOUNT_LOG_GROUPS, `${ACCOUNT_LOG_GROUPS}:*`],
+  },
+  {
+    Sid: "ReadAlarmsAndMetrics",
+    Effect: "Allow",
+    Action: [
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:DescribeAlarmHistory",
+      "cloudwatch:GetMetricData",
+      "cloudwatch:GetMetricStatistics",
+      "cloudwatch:ListMetrics",
+    ],
+    Resource: "*",
+  },
+];
+
 // The host role's inline policy, kept pure so a test can read its statements.
 export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
   Version: "2012-10-17",
@@ -94,6 +141,7 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
       Resource: `${bucketArn}/ssm-output/*`,
     },
     panelRepliesPutStatement,
+    ...infraLogsReadStatements,
     {
       Sid: "ReadBucketEncryption",
       Effect: "Allow",
@@ -112,8 +160,13 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
   ],
 });
 
+// scripts/ and skills/ are the source for swarm-owned scripts and skills,
+// which reach the swarm through Delegate, not the host. Leaving them out of
+// the upload also keeps an edit to them from triggering a host deploy.
 export const hostFiles = () =>
-  listFiles(HOST_DIR).map((file) => path.relative(HOST_DIR, file));
+  listFiles(HOST_DIR)
+    .map((file) => path.relative(HOST_DIR, file))
+    .filter((file) => !/^(scripts|skills)\//.test(file));
 
 // Folded into the association's command so that any change to any host file
 // changes the association, which is what makes SSM run it again.

@@ -32,6 +32,33 @@ export const replayKey = (repoDir: string): string => {
   return git(["hash-object", "--stdin"], `${ids}\n`);
 };
 
+// Whether a cached result came from a main commit with this checkout's
+// reviewer. A result's variant is `main-<sha>`; the reviewer is the
+// `delegate/agents` tree at that sha. A sha the checkout can't resolve is not
+// the same reviewer. Needs full history.
+export const sameReviewerAs = (repoDir: string): ((result: Result) => boolean) => {
+  const tree = (rev: string): string | null => {
+    try {
+      return execFileSync("git", ["rev-parse", "--verify", "--quiet", `${rev}:delegate/agents`], {
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 30_000,
+      }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const current = tree("HEAD");
+  const seen = new Map<string, string | null>();
+  return (result) => {
+    const m = /^main-([0-9a-f]{7,40})$/.exec(result.variant ?? "");
+    if (!m || current === null) return false;
+    if (!seen.has(m[1])) seen.set(m[1], tree(m[1]));
+    return seen.get(m[1]) === current;
+  };
+};
+
 export const cachePrefix = (replayKey: string, suite: string): string =>
   `${CACHE_ROOT}/${replayKey}/${suite}/`;
 
@@ -97,6 +124,51 @@ export const pullCache = async (opts: CacheOptions, client: S3Client = new S3Cli
   mkdirSync(opts.dir, { recursive: true });
   writeFileSync(join(opts.dir, PULLED_MARKER), pulled.map((p) => `${p}\n`).join(""));
   return pulled;
+};
+
+const HISTORY_CONCURRENCY = 16;
+
+// Main's earlier expected-suite runs under other replay keys, kept when
+// `sameReviewer` accepts them. The key changes with any edit under
+// delegate/review, eval code included, so the current key alone often holds
+// only one check's three runs, too few to tell a stable case from a lucky
+// streak. Written as <dir>/<caseId>/run-<n>.json, numbered per case, and
+// never pushed back to the cache.
+export const pullHistory = async (
+  opts: { key: string; suitePrefix: string; dir: string; sameReviewer: (result: Result) => boolean },
+  client: S3Client = new S3Client({}),
+): Promise<number> => {
+  const perCase = new Map<string, number>();
+  let kept = 0;
+  let token: string | undefined;
+  do {
+    const res = await client.send(
+      new ListObjectsV2Command({ Bucket: REVIEW_BUCKET, Prefix: `${CACHE_ROOT}/`, ContinuationToken: token }),
+    );
+    const wanted = (res.Contents ?? []).flatMap((obj) => {
+      const m = obj.Key ? /^eval-cache\/main\/([^/]+)\/([^/]+)\/([^/]+)\/run-\d+\.json$/.exec(obj.Key) : null;
+      return m && obj.Key && m[1] !== opts.key && m[2].startsWith(opts.suitePrefix) ? [{ key: obj.Key, caseId: m[3] }] : [];
+    });
+    for (let i = 0; i < wanted.length; i += HISTORY_CONCURRENCY) {
+      const batch = await Promise.all(
+        wanted.slice(i, i + HISTORY_CONCURRENCY).map(async (w) => {
+          const got = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: w.key }));
+          return { caseId: w.caseId, result: JSON.parse(await readBody(got.Body)) as Result };
+        }),
+      );
+      for (const { caseId, result } of batch) {
+        if (!isCacheable(result) || !opts.sameReviewer(result)) continue;
+        const n = (perCase.get(caseId) ?? 0) + 1;
+        perCase.set(caseId, n);
+        mkdirSync(join(opts.dir, caseId), { recursive: true });
+        writeFileSync(join(opts.dir, caseId, `run-${n}.json`), JSON.stringify(result));
+        kept++;
+      }
+    }
+    token = res.NextContinuationToken;
+  } while (token);
+  mkdirSync(opts.dir, { recursive: true });
+  return kept;
 };
 
 export const isAlreadyExists = (err: unknown): boolean => {

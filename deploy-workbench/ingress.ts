@@ -4,7 +4,6 @@ import { WORKBENCH_ZONE_NAME } from "./dns";
 import {
   BIFROST_PORT,
   createWorkbenchNetwork,
-  HTTP_PORT,
   HTTPS_PORT,
   OAUTH2_PROXY_PORT,
 } from "./network";
@@ -18,9 +17,10 @@ import {
  *
  * - Owns: the internet-facing Application Load Balancer, its two target groups
  *   (Bifrost on 8080, oauth2-proxy on 4180), the HTTPS listener with the ACM
- *   certificate, the HTTP listener that redirects to HTTPS, the ACM
- *   certificate and its DNS validation record in the workbench zone, and the
- *   Route 53 alias for `bifrost.workbench.goodparty.org`.
+ *   certificate, the ACM certificate and its DNS validation record in the
+ *   workbench zone, and the Route 53 alias for
+ *   `bifrost.workbench.goodparty.org`. There is deliberately **no** HTTP
+ *   listener: see "No port 80" below.
  * - Owns since item 9: the four HTTPS listener rules that split inference from
  *   the admin surface — `/oauth2/*` and the admin paths to oauth2-proxy, the
  *   inference prefixes and `/health` to Bifrost — and the rule set that
@@ -34,6 +34,37 @@ import {
  * rules enumerate below. Item 8 could not register the task because no rule
  * referenced either group; item 9 supplies the rules and the registration
  * together.
+ *
+ * ## No port 80
+ *
+ * This module used to create an HTTP listener whose only job was to 301
+ * `http://` to HTTPS. It is gone, and the port is closed in `network.ts`,
+ * because on this host that redirect was an active downgrade rather than a
+ * convenience.
+ *
+ * The inference prefixes below are forwarded straight to Bifrost, and the
+ * ALB-to-task hop is plaintext, so Bifrost sees an `http` request URI. Its
+ * router (`github.com/fasthttp/router`, `RedirectTrailingSlash` and
+ * `RedirectFixedPath`, both on by default) canonicalises `GET /v1/models/` to
+ * `/v1/models` by calling `ctx.Redirect` with a **relative** URI. fasthttp
+ * resolves that against the request URI and emits `FullURI()`, which takes the
+ * scheme from the request as Bifrost saw it -- `http`. So a trailing slash on
+ * an inference route produced `301 Location: http://<host>/v1/models`, and a
+ * harness that followed it re-sent the request, virtual key included, to this
+ * listener in cleartext for one round trip before being redirected back.
+ *
+ * Closing port 80 is what removes the exposure: nothing answers there, so a
+ * client that follows the `http://` redirect target gets a connection failure
+ * instead of putting its key on the wire. The 301 itself still names `http://`
+ * (that is Bifrost's redirect, not this module's), but it is now a dead end
+ * rather than a detour.
+ *
+ * The alternative the previous comment offered -- that a harness starting on
+ * `http://` gets moved to TLS "rather than timing out" -- is worth less than
+ * the key it exposes. No working client depends on port 80: the OAuth redirect
+ * URI, the CORS `allowed_origins` and every documented invocation are HTTPS,
+ * and a harness that starts on `http://` is misconfigured. `ingress.test.ts`
+ * pins the absence so a future edit cannot quietly reintroduce it.
  *
  * Everything takes the explicit provider this project requires. The workbench
  * stack disables the default provider (`deploy.sh`), so a resource that omits
@@ -490,34 +521,21 @@ export const createBifrostIngress = (args: {
       ),
   );
 
-  /**
-   * HTTP, redirecting to HTTPS. Nothing is served in the clear; the listener
-   * exists so a harness that starts on `http://` is moved to the TLS endpoint
-   * rather than timing out, and so the name does not answer with a connection
-   * error over port 80.
-   */
-  const httpListener = new aws.lb.Listener(
-    "bifrostHttpListener",
-    {
-      loadBalancerArn: loadBalancer.arn,
-      port: HTTP_PORT,
-      protocol: "HTTP",
-      defaultActions: [
-        {
-          type: "redirect",
-          redirect: {
-            protocol: "HTTPS",
-            port: String(HTTPS_PORT),
-            statusCode: "HTTP_301",
-            host: "#{host}",
-            path: "/#{path}",
-            query: "#{query}",
-          },
-        },
-      ],
-    },
-    { provider },
-  );
+  // There is no HTTP listener. See "No port 80" in this file's header: port 80
+  // is closed in network.ts so that a client following Bifrost's `http://`
+  // trailing-slash redirect fails to connect instead of re-sending its virtual
+  // key in cleartext. An ALB with no listener on a port accepts no connections
+  // on it, so removing the listener and the security-group rule is the whole
+  // change; there is no bare-listener resource left behind.
+  //
+  // `albSecurityGroup`'s description still says "80 and 443 from the internet"
+  // and is deliberately left alone. It maps to the EC2 `GroupDescription`
+  // attribute, which has no Update API (`@pulumi/aws` documents exactly that on
+  // `SecurityGroupArgs.description`), so correcting the text would replace the
+  // security group and, through the ALB and its listener, most of this ingress.
+  // That is not a change to make in the PR that closes a port; it belongs with
+  // the next deliberate replacement of the group. The stale sentence is a
+  // property of the imported group, not of the rule this change deletes.
 
   /**
    * The alias. Route 53 points the name at the ALB's own name and zone id
@@ -556,7 +574,6 @@ export const createBifrostIngress = (args: {
     certificate,
     certificateValidation,
     httpsListener,
-    httpListener,
     dnsRecord,
   };
 };

@@ -24,7 +24,7 @@ Fields:
 - endLine: (optional) last line if the finding spans multiple lines
 - body: markdown comment. MUST end with a parenthetical: "(Falsification check: <what would disprove this and whether it is present in the code>.)"
 - suggestion: (optional) literal replacement text for line..endLine, no code fences. Only include when you are confident it will pass CI verbatim. Match the file's existing style (quotes, semicolons, indentation).
-- category: one of bugs | security | tests | conventions | ai-rules | cross-file | thematic | scale
+- category: one of bugs | security | tests | conventions | cross-file | thematic | scale
 - confidence: "high" | "medium"
 
 Emit a finding only if you would block merge on it alone. Drop everything else silently.
@@ -50,7 +50,6 @@ Lead categories:
 - security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
 - tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
-- ai-rules: probable violation of a rule in ai-rules/*.md — cite the suspected file
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
 - thematic: multiple files touching the same risk surface (all timezone code, all new validation paths)
 - scale: a new or changed query, loop, request-path computation or in-memory collection over voters, contacts, people, an audience, districts or tracts, whose cost grows with that size. Lead on it when the diff loads a whole set into memory, binds one parameter per row (an IN list, a bulk insert), does per-row or per-page work inside an HTTP request, runs a computation inside a request whose work grows with the number of rows, groups, tracts or model parameters (a model fit, an optimizer, nested loops), or calls an external API once per row. A request path that newly calls a function, or passes it a bigger input (a new dimension, a whole district instead of a sample), counts too: open that function's definition even when it is outside the diff, and estimate how its work grows with what the diff now passes it. For a model fit that is the number of parameters times the iterations, often squared or worse in the parameters. If the repo has docs/scale.md, read it: it lists the sizes and the traps. In a large diff, a scale lead outranks a style or doc lead. When the diff changes or adds a request path (a controller, a card or page loader, a chat tool) that reads voters, contacts, people, answers, districts or tracts, always emit one scale lead naming the most expensive operation that path now runs, including any function it calls outside the diff.
@@ -98,9 +97,8 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 
 1. Read the root CLAUDE.md and any CLAUDE.md in directories touched by your paths.
 2. Read each path in <lead> in full — not just the diff hunk; surrounding context is where bugs and their disproofs live.
-3. For ai-rules leads, read the relevant ai-rules/*.md file.
-4. For each candidate finding, run the disprove-it pass before emitting.
-5. Emit only blocker-grade findings.
+3. For each candidate finding, run the disprove-it pass before emitting.
+4. Emit only blocker-grade findings.
 
 ## Category lenses
 
@@ -111,8 +109,6 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 **tests:** New behavior without tests, tautological assertions (test passes for the wrong reason), test files that won't compile. Blocker only when the gap leaves a non-trivial path totally untested or the assertion is provably wrong. A test that the repo's written testing guide (linked from the nearest CLAUDE.md or AGENTS.md) says not to write is also blocker-grade: quote the guide's section and name the test that breaks it. The guide is the evidence; it does not also need a CI or runtime failure.
 
 **conventions:** CLAUDE.md violations or pattern divergence from 3+ existing files. Blocker only when the divergence will cause a CI failure or runtime bug — not for taste differences.
-
-**ai-rules:** Cite rule file and rule number in body. Blocker only when the rule uses must/never/required language AND the violation has a real runtime, security, or CI consequence.
 
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 

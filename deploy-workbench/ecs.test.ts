@@ -249,10 +249,12 @@ const containerDefinitionBlock = (nameConstant: string): string => {
 
 describe("bifrost ecs", () => {
   it("runs one Fargate task at the plan's sizing", () => {
-    // 0.5 vCPU / 1 GB, per "Compute: ECS Fargate" — the smallest valid
-    // Fargate pair, and a one-line change if the load ever needs more.
-    assert.equal(TASK_CPU, "512");
-    assert.equal(TASK_MEMORY, "1024");
+    // 1 vCPU / 2 GB. The plan started at 0.5 vCPU / 1 GB, the smallest valid
+    // Fargate pair; it was raised on measured CPU ceilings (see the comment on
+    // the constants in `ecs.ts`). What this pins is that the task size is this
+    // pair and that the definition uses the constants rather than a literal.
+    assert.equal(TASK_CPU, "1024");
+    assert.equal(TASK_MEMORY, "2048");
 
     const block = resourceBlock("bifrostTaskDefinition");
     assert.ok(block.includes('networkMode: "awsvpc"'), block);
@@ -411,8 +413,11 @@ describe("bifrost ecs", () => {
 
   it("scopes the task role to the model list, not to wildcard resources", () => {
     // The plan: "The role is scoped to the model list in
-    // utils/bedrock-models.ts". Composed here from the same function
-    // WorkbenchAccess uses, so adding a model there reaches the gateway too.
+    // utils/bedrock-models.ts". It is now the only invoke grant in the
+    // account — `WorkbenchAccess` holds none — so this statement is the whole
+    // Bedrock allowlist rather than half of it. The exact match between this
+    // list and the profiles the gateway serves is asserted in the module that
+    // owns that drift (`deploy-workbench/bifrost/config.test.ts`).
     const policy = taskRolePolicyDocument(bedrockInvokeResources(), [
       `arn:aws:secretsmanager:${REGION}:${WORKBENCH_ACCOUNT_ID}:secret:rds!db-x`,
     ]);
@@ -431,6 +436,16 @@ describe("bifrost ecs", () => {
       );
     }
     assert.ok(ECS_SOURCE.includes("bedrockInvokeResources()"));
+
+    // No `us.` geo profile in the grant. The rollover that permitted each
+    // entry's outgoing `us.` profile alongside its `global.` one is finished,
+    // and this keeps a reintroduction visible in the role rather than only in
+    // the list.
+    assert.equal(
+      resources.some((arn) => arn.includes(":inference-profile/us.")),
+      false,
+      "the task role permits a us. geo inference profile; only each model's global. profile is served",
+    );
   });
 
   it("has no wildcard IAM action or a wildcard resource on either role", () => {
@@ -1130,11 +1145,12 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("fits both containers' reservations inside the task, with no growth", () => {
+  it("fits both containers' reservations inside the task, with no slack", () => {
     // Fargate refuses a task whose container reservations exceed the task's
-    // cpu/memory. The sidecar's share comes out of the single container's
-    // former whole-task reservation rather than raising the task size, which
-    // is item 8's and stays at 0.5 vCPU / 1 GB.
+    // cpu/memory. The task was raised to 1 vCPU / 2 GB for CPU headroom, and
+    // the sidecar's share comes out of that: its 64/128 is unchanged, so
+    // Bifrost gets the rest. The sums still have to equal the task exactly,
+    // which is the invariant, not the numbers in it.
     assert.equal(
       BIFROST_CONTAINER_CPU + OAUTH2_PROXY_CONTAINER_CPU,
       Number(TASK_CPU),
@@ -1842,8 +1858,8 @@ describe("bifrost ecs", () => {
   });
 
   it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
-    // 4,042 bytes against the standard tier's 4 KiB, measured on 2026-11-04
-    // after the Bedrock model list moved to `global.` profiles: 54 bytes of
+    // 4,085 bytes against the standard tier's 4 KiB, measured on 2026-11-04
+    // after the Bedrock model list moved to `global.` profiles: 11 bytes of
     // headroom, not the couple of kilobytes a comment in `ecs.ts` and one in
     // `bifrost/README.md` used to claim. The number is asserted rather than
     // left to a comment, because the
@@ -1859,8 +1875,8 @@ describe("bifrost ecs", () => {
     // the comment block does. If this fails the comment is the stale part.
     assert.equal(
       BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
-      54,
-      "the 54-byte headroom in the ecs.ts comment block must be the measured one",
+      11,
+      "the 11-byte headroom in the ecs.ts comment block must be the measured one",
     );
   });
 
@@ -2030,14 +2046,20 @@ describe("the password command's memory at boot", () => {
    *   2026-10-25, i.e. about 676 MiB.
    *
    * The fix is the entry point's warm below rather than a bigger task: the
-   * measured concurrent figure fits inside the existing reservation, and the
-   * warm keeps the expensive cold part (the interpreter and botocore import
-   * faulting in from the image layer) to one serial pass before Bifrost starts
-   * instead of two racing for 0.44 vCPU.
+   * measured concurrent figure fits inside the reservation, and the warm keeps
+   * the expensive cold part (the interpreter and botocore import faulting in
+   * from the image layer) to one serial pass before Bifrost starts instead of
+   * two racing for a fraction of a vCPU.
    *
-   * 676 + 142 = 818 MiB of the 896 MiB limit, so the margin is 78 MiB. That is
-   * the tripwire: if the gateway's peak passes ~750 MiB the reservation is what
-   * needs to change, and the container will be killed before a deploy notices.
+   * 676 + 142 = 818 MiB of the 1920 MiB limit, so the margin is 1102 MiB. The
+   * limit was 896 MiB when this block was written, with a 78 MiB margin and a
+   * tripwire at about 750 MiB of gateway usage; the task was then raised to
+   * 1 vCPU / 2 GB for CPU headroom (see `ecs.ts`), which moved the limit without
+   * moving any of the measured numbers above. So the tripwire is now far below
+   * it rather than 78 MiB away: passing ~750 MiB of gateway usage would not by
+   * itself mean the reservation has to change, and the constants here stay the
+   * values that were measured rather than being re-derived against the larger
+   * limit.
    */
   const GATEWAY_PEAK_MIB = 676;
   const PASSWORD_COMMAND_PEAK_MIB = 71;
@@ -2055,7 +2077,7 @@ describe("the password command's memory at boot", () => {
     // already asserts; this only says the arithmetic above is not satisfied by
     // a value that is under what was measured.
     assert.ok(BIFROST_CONTAINER_MEMORY > GATEWAY_PEAK_MIB + CONCURRENT_PEAK_MIB);
-    assert.equal(BIFROST_CONTAINER_MEMORY, 896);
+    assert.equal(BIFROST_CONTAINER_MEMORY, 1920);
   });
 
   it("is not relying on singleflight across the two pools", () => {

@@ -4,7 +4,6 @@
 // AWS stores it.
 
 import { WORKBENCH_ACCOUNT_ID } from "../../../utils/accounts";
-import { bedrockInvokeResources } from "../../../utils/bedrock-models";
 
 type PolicyValue = string | string[];
 
@@ -154,9 +153,12 @@ export const engineerAccess: PolicyDocument = {
       // default rather than admitted until someone remembers this file.
       //
       // The management account is where production runs and is not the place
-      // for human Bedrock traffic. That is the workbench account, through
-      // `WorkbenchAccess`, which names its models and is the intended path;
+      // for human Bedrock traffic. The workbench account is, and since the
+      // sandbox's direct invoke was removed it is reached only through the
+      // Bifrost gateway, which names its models and is the intended path;
       // `AdministratorAccess` keeps invocation as the break-glass exception.
+      // `WorkbenchAccess` used to be the second way in and holds no Bedrock
+      // invoke at all now (see its own note in this file).
       //
       // Reads are also granted by the `ReadOnlyAccess` managed policy this set
       // carries; naming them here makes the intent explicit and keeps the
@@ -240,8 +242,7 @@ export const productManager: PolicyDocument = {
 
 // The whole grant for an engineer working in the workbench account. Unlike
 // every other set here it carries no managed policies, so this document is
-// the entire session: no `ReadOnlyAccess`, no S3, nothing but the two
-// services below.
+// the entire session: no `ReadOnlyAccess`, no S3, and no Bedrock invoke.
 //
 // Why a new set rather than assigning `engineerAccess` to the second account.
 // That set already grants `bedrock:*`, so it would work on day one, but it
@@ -268,10 +269,42 @@ export const productManager: PolicyDocument = {
 // scoped Allow on `bedrock:InvokeModel` at the account or organization level,
 // not withholding a subscription.
 //
-// So this statement is the allowlist, and it is the only one. Both halves
-// matter: the actions exclude every mutation, and the resources name the
-// models from `utils/bedrock-models.ts`, which is the same list the
-// subscription script works from.
+// **Invoke is gone as of this change, and that is the end of a sequence.** The
+// statement that used to sit here allowed the four invoke actions against the
+// model list from `utils/bedrock-models.ts`. It was the sandbox's direct
+// Bedrock path: a `pi` in a container called Bedrock as the engineer, with the
+// engineer's SSO session. The gateway replaced that path for cost attribution
+// and for revocation (`docs/bifrost-virtual-keys.md`), `gp-pi` retired its
+// built-in `amazon-bedrock` provider, and this PR closes the last door by
+// taking the grant away rather than by asking people not to use it. What is
+// left for an engineer is the reads below and the mint function's URL.
+//
+// **Why a Deny as well as the absence of an Allow.** Absence is what actually
+// refuses the call: with no statement allowing `bedrock:InvokeModel`, the
+// request is denied by default, and that is sufficient. It is the durability
+// argument that earns the Deny a place, not the refusal: an explicit Deny keeps
+// holding if a later edit adds a broad grant to this document, and the
+// tag-conditioned `Action: ["*"]` shape in `engineerAccess` is exactly that
+// pattern — this set is one copy-paste from it. `AdministratorAccess` is
+// deliberately unaffected: break-glass is how a person reaches Bedrock
+// directly now, and it is a separate permission set.
+//
+// What it does *not* buy is a better error message. An AccessDenied from an
+// explicit Deny names the action and the resource, which is the shape a missing
+// model agreement also produces; the two are told apart by which action is
+// named, not by the wording. Worth saying because "the Deny makes the failure
+// legible" is the intuitive claim and it is only half true.
+//
+// The five actions rather than `bedrock:Invoke*`: there is no wildcard verb on
+// the foundation-model service, and enumerating keeps the deny from silently
+// covering a read somebody adds later. They are the whole invoke family as of
+// this change — the two `InvokeModel` forms, the bidirectional stream the
+// speech models use, and the two `Converse` forms — so a broad grant added
+// later cannot slip past the durability argument above on the one variant this
+// list missed. The other Bedrock service prefixes (`bedrock-agentcore`,
+// `bedrock-mantle`, `bedrock-websearch`) are left alone because nothing here
+// allows them either, so they are already refused, and a deny naming them
+// would be a guess about their action vocabularies.
 //
 // Deliberately no `aws-marketplace` permissions anywhere in this set. Those
 // are what Bedrock needs to auto-subscribe on first use, and withholding them
@@ -283,24 +316,34 @@ export const productManager: PolicyDocument = {
 // It keeps the `adminReservedActions` denies, since `guardrails` defaults to
 // true. Those cover organization and identity actions, none of which are
 // Bedrock, so nothing here collides with them.
+//
+// **What this set must not grow back.** There is no `sts:AssumeRole` here, and
+// that is load-bearing rather than incidental: the gateway's task role
+// (`bifrost-task`) trusts only `ecs-tasks.amazonaws.com`, so an engineer
+// holding this session cannot assume its way back into a Bedrock invoke.
+// Removing the group grant without that check would have been cosmetic, which
+// is why `deploy/identity-center-workbench.test.ts` asserts both halves:
+// no invoke action here, and no assume grant that reaches the task role.
 export const workbenchAccess: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     {
-      Sid: "InvokeSelectedBedrockModels",
-      Effect: "Allow",
+      Sid: "DenyDirectBedrockInvoke",
+      Effect: "Deny",
       Action: [
         "bedrock:Converse",
         "bedrock:ConverseStream",
         "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithBidirectionalStream",
         "bedrock:InvokeModelWithResponseStream",
       ],
-      Resource: bedrockInvokeResources(),
+      Resource: "*",
     },
     // Reads, wide on purpose, per the note above. These enumerate and
-    // describe; none of them changes anything or costs anything beyond the
-    // request itself. Keeping them wide is what stops a narrowed policy from
-    // reintroducing the mid-task AccessDenied the previous version avoided.
+    // describe; none of them changes anything, costs anything beyond the
+    // request itself, or invokes a model. Keeping them wide is what stops a
+    // narrowed policy from reintroducing the mid-task AccessDenied the
+    // previous version avoided.
     {
       Sid: "ReadBedrockCatalogAndState",
       Effect: "Allow",

@@ -6,11 +6,12 @@ import {
   bedrockInvokeResources,
 } from "../utils/bedrock-models";
 
-// The composed `WorkbenchAccess` invoke statement is this list turned into
-// resource ARNs, so these assertions are the policy shape rather than a
-// convenience. They live under `deploy/` because that is the tree the test
-// runner globs and the tree that reads the list; the module itself is in
-// `utils/`.
+// These assertions are the policy shape rather than a convenience: the arns
+// composed here are the gateway task role's `InvokeSelectedBedrockModels`
+// resource list, and since the sandbox's direct grant was removed that is the
+// only place in the account a model can be invoked from. They live under
+// `deploy/` because that is the tree the test runner globs and the tree that
+// reads the list; the module itself is in `utils/`.
 const resources = bedrockInvokeResources();
 
 const profileArn = (id: string) =>
@@ -35,45 +36,49 @@ describe("bedrockInvokeResources", () => {
     }
   });
 
-  // A profile change keeps the old profile permitted until `gp-pi` has shipped
-  // the switch, which is what `transitionalInvokeIds` is for. Without the
-  // builder reading it, the old ARN would silently disappear and every image
-  // still selecting the old profile would be refused mid-session. Sonnet 5.5 is
-  // the entry with the longest history and the one this asserts in full: on
-  // 2026-11-04 the account moved from its `us.` geo profile to its `global.`
-  // one, so the pair inverted.
-  it("permits a transitional profile alongside the selected one", () => {
+  // The rollover that `transitionalInvokeIds` expressed is finished, and this
+  // is the assertion that keeps it finished. Every entry named one `us.` geo
+  // profile alongside its `global.` one until `gp-pi` had shipped the 2026-11-04
+  // switch; the field is gone from the type, so a reintroduction has to be a
+  // deliberate edit here rather than a value nobody notices. `us.` survives
+  // nowhere in the composed resources: no ARN, for any principal, names a geo
+  // profile. Sonnet 5.5 is checked by name because it is the entry with the
+  // longest history and the one a careless revert would put back first.
+  it("permits no us. geo profile anywhere in the resources", () => {
     const sonnet = WORKBENCH_MODELS.find(
       (m) => m.id === "anthropic.claude-sonnet-5-5"
     );
     assert.ok(sonnet);
     assert.equal(sonnet.invokeId, "global.anthropic.claude-sonnet-5-5");
-    assert.deepEqual(sonnet.transitionalInvokeIds, [
-      "us.anthropic.claude-sonnet-5-5",
-    ]);
     assert.ok(resources.includes(profileArn("global.anthropic.claude-sonnet-5-5")));
-    assert.ok(
-      resources.includes(profileArn("us.anthropic.claude-sonnet-5-5"))
-    );
     assert.ok(resources.includes(foundationArn("anthropic.claude-sonnet-5-5")));
+
+    assert.equal(
+      resources.some((r) => r.includes(":inference-profile/us.")),
+      false,
+      "a us. geo inference profile is in the policy; the rollover is finished and only global. profiles are permitted"
+    );
+    // And nothing in the list can smuggle one in through a field: the type has
+    // no `transitionalInvokeIds` any more, so this catches a reintroduction as
+    // an untyped escape rather than a compile error.
+    for (const model of WORKBENCH_MODELS) {
+      assert.equal(
+        "transitionalInvokeIds" in model,
+        false,
+        `${model.id} carries transitionalInvokeIds; the rollover is finished`
+      );
+    }
   });
 
-  // Every served model is a global. profile, and the only `us.` profiles left
-  // anywhere are the rollover ones. This is the assertion that would notice a
-  // half-finished switch: an entry that kept a `us. invokeId` while the
-  // gateway moved to global would be an AccessDenied at request time.
-  it("selects a global. profile for every entry, keeping us. only as the rollover", () => {
+  // Every served model is a global. profile. This is the assertion that would
+  // notice a half-finished switch: an entry that kept a `us. invokeId` while the
+  // gateway serves global would be an AccessDenied at request time.
+  it("selects a global. profile for every entry", () => {
     for (const model of WORKBENCH_MODELS) {
       assert.ok(
         model.invokeId.startsWith("global."),
         `${model.id} selects ${model.invokeId}; every entry is a global. profile`
       );
-      for (const transitional of model.transitionalInvokeIds ?? []) {
-        assert.ok(
-          transitional.startsWith("us."),
-          `${model.id} carries ${transitional} as transitional; the rollover is the outgoing us. profile`
-        );
-      }
     }
   });
 
