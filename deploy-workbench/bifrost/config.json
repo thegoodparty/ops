@@ -66,18 +66,15 @@
           "aliases": {
             "accounts/fireworks/models/deepseek-v4p1-flash-1017-us": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
-              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-              "description": "Catalog name for the US-only router: gives /v1/models the context window and price Bifrost's datasheet holds for this row. Requests are sent to model_id."
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us"
             },
             "worker-default": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
-              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-              "description": "gp-pi worker default. Lists without metadata; gp-pi copies it from the entry sharing this alias target."
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us"
             },
             "coordinator-default": {
               "model_id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
-              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us",
-              "description": "gp-pi coordinator default. Lists without metadata; gp-pi copies it from the entry sharing this alias target."
+              "model_name": "accounts/fireworks/models/deepseek-v4p1-flash-1017-us"
             }
           },
           "weight": 1
@@ -96,7 +93,7 @@
             "global.openai.gpt-6.1-sol",
             "global.openai.gpt-6.1-terra",
             "global.anthropic.claude-haiku-5-5",
-            "global.anthropic.claude-fable-5-2",
+            "global.xai.grok-4.7",
             "global.zai.glm-5.3"
           ],
           "weight": 1,

@@ -1804,7 +1804,7 @@ describe("bifrost ecs", () => {
     assert.ok(
       overlapping.some((problem) =>
         problem.includes(
-          "providers.fireworks.keys[0].aliases.worker-default.description",
+          "providers.fireworks.keys[0].aliases.worker-default.model_name",
         ),
       ),
       `an entry claiming a leaf the reconciler converges live must fail:\n${overlapping.join("\n")}`,
@@ -1858,25 +1858,26 @@ describe("bifrost ecs", () => {
   });
 
   it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
-    // 4,081 bytes against the standard tier's 4 KiB, measured on 2026-11-10
-    // after Kimi K3.1 and Claude Fable 5.2 replaced two Bedrock entries: 15
-    // bytes of headroom, not the couple of kilobytes a comment in `ecs.ts` and
-    // one in `bifrost/README.md` used to claim. The number is asserted rather
-    // than left to a comment, because the
-    // failure mode of getting it wrong is a rejected `PutParameter` in an
-    // apply that has already merged.
+    // 3,604 bytes against the standard tier's 4 KiB, measured on 2026-11-10
+    // after the three Fireworks alias descriptions moved into
+    // `docs/bifrost-fireworks-model-metadata.md`: 492 bytes of headroom, not the
+    // 11 the file had while those descriptions were in it and not the couple of
+    // kilobytes a comment in `ecs.ts` and one in `bifrost/README.md` used to
+    // claim. The number is asserted rather than left to a comment, because the
+    // failure mode of getting it wrong is a rejected `PutParameter` in an apply
+    // that has already merged.
     assert.equal(BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES, 4096);
     const bytes = Buffer.byteLength(BIFROST_CONFIG_SOURCE, "utf8");
     assert.ok(
       bytes < BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
       `bifrost/config.json is ${bytes} bytes and the standard tier holds ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; past that the parameter needs tier: "Advanced"`,
     );
-    // The headroom is small enough to be worth naming exactly, which is what
-    // the comment block does. If this fails the comment is the stale part.
+    // The headroom is worth naming exactly, which is what the comment block
+    // does. If this fails the comment is the stale part.
     assert.equal(
       BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
-      15,
-      "the 15-byte headroom in the ecs.ts comment block must be the measured one",
+      492,
+      "the 492-byte headroom in the ecs.ts comment block must be the measured one",
     );
   });
 

@@ -130,23 +130,10 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "Marketplace product prod-6cyn7tgqazjhu",
   },
   {
-    // Anthropic's frontier technical model, and the one tier this set did not
-    // have: above Opus 5.5 and priced at twice it. It is not a successor to
-    // Opus, so an earlier reading of this file would have called it an add; it
-    // took Grok 4.7's slot instead, because Grok 4.7 was measurably dominated
-    // by Haiku 5.5 on both intelligence and price per task and the set is
-    // meant to stay eight models.
-    //
-    // It is a Marketplace product (prod-m733do2vrmi3o), so unlike the Grok
-    // entry it needs an agreement, which the `enable-bedrock-models` step in
-    // deploy-workbench.yml creates with APPLY=1. Thinking is always on and
-    // cannot be disabled (effort is configurable), so every request pays
-    // reasoning tokens; cache reads are $0.20, which is what makes the price
-    // workable in a long session.
-    id: "anthropic.claude-fable-5-2",
-    invokeId: "global.anthropic.claude-fable-5-2",
+    id: "xai.grok-4.7",
+    invokeId: "global.xai.grok-4.7",
     crossRegion: true,
-    note: "added 2026-11-10 in Grok 4.7's slot; Marketplace product prod-m733do2vrmi3o; no in-region invocation, so a cross-region profile is mandatory; adaptive thinking always on, effort low through max",
+    note: "not sold through Marketplace, IAM only; replaced grok-4.6; the us. profile existed and was never used",
   },
   {
     id: "zai.glm-5.3",

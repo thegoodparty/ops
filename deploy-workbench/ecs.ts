@@ -715,7 +715,7 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * `BIFROST_CONFIG`.
  *
  * Why a parameter rather than an `environment` entry with the JSON inlined in
- * the task definition: the file is 4,081 bytes today (`wc -c`, measured on
+ * the task definition: the file is 3,604 bytes today (`wc -c`, measured on
  * `deploy-workbench/bifrost/config.json`) and grows when item 14 adds teams and
  * virtual keys, and task-definition environment entries are the wrong place for
  * a document that changes on its own schedule. Why SSM rather
@@ -733,15 +733,18 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
  * see what the gateway is actually running with.
  *
- * Standard tier, which holds 4 KiB. The file is 4,081 bytes today, so there are
- * **15 bytes** of headroom, not the couple of kilobytes an earlier version of
- * this comment claimed; every addition from here is a deliberate byte budget
- * rather than free space. Past 4 KiB this needs `tier: "Advanced"` explicitly
- * (8 KiB, and AWS charges for it), because the provider would otherwise fail
- * the apply rather than truncate. `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES`
- * below pins the ceiling and `ecs.test.ts` fails the suite before the file
- * crosses it, so the next person to add a provider finds out here rather than
- * in a failed apply.
+ * Standard tier, which holds 4 KiB. The file is 3,604 bytes today, so there are
+ * **492 bytes** of headroom, not the couple of kilobytes an earlier version of
+ * this comment claimed. Most of that room was recovered rather than always
+ * there: the file was 4,085 bytes, 11 bytes under the ceiling, until the three
+ * Fireworks alias descriptions moved into
+ * `docs/bifrost-fireworks-model-metadata.md` on 2026-11-10. Every addition is
+ * still a deliberate byte budget. Past 4 KiB this needs `tier: "Advanced"`
+ * explicitly (8 KiB, and AWS charges for it), because the provider would
+ * otherwise fail the apply rather than truncate.
+ * `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES` below pins the ceiling and
+ * `ecs.test.ts` fails the suite before the file crosses it, so the next person
+ * to add a provider finds out here rather than in a failed apply.
  *
  * The leading slash is not decoration: SSM rejects a hierarchical name that is
  * not fully qualified, so `PutParameter` fails with "Parameter name must be a
@@ -757,8 +760,8 @@ export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
  * The standard tier's content limit for an SSM `String` parameter, in bytes.
  *
  * Named rather than written into a comment because `bifrost/config.json` is
- * 4,081 bytes today, which leaves 15 bytes of headroom: the margin is small
- * enough that the suite should fail when it is crossed, not a reviewer. An
+ * 3,604 bytes today, which leaves 492 bytes of headroom: the margin is
+ * measured, so the suite fails when it is crossed rather than a reviewer. An
  * over-limit value is rejected by `PutParameter` rather than truncated, so the
  * apply fails loudly, but only after a merge. Past this the parameter needs
  * `tier: "Advanced"` (8 KiB, charged).

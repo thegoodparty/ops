@@ -293,11 +293,14 @@ no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
 `kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB and the file is **4,081 bytes**, so there are 15 bytes left rather
-than the room one earlier version of this paragraph claimed; every addition is
-now a deliberate byte budget, and `deploy-workbench/ecs.test.ts` fails the suite
-before the file crosses the ceiling. Past 4 KiB it needs `tier: "Advanced"`
-rather than a silent truncation.
+holds 4 KiB and the file is **3,604 bytes**, so there are 492 bytes left rather
+than the room one earlier version of this paragraph claimed. Most of that was
+recovered rather than always there: the file sat at 4,085 bytes, 11 under the
+ceiling, until the three Fireworks alias descriptions moved into
+[`docs/bifrost-fireworks-model-metadata.md`](../../docs/bifrost-fireworks-model-metadata.md)
+on 2026-11-10. Every addition is still a deliberate byte budget, and
+`deploy-workbench/ecs.test.ts` fails the suite before the file crosses the
+ceiling. Past 4 KiB it needs `tier: "Advanced"` rather than a silent truncation.
 
 **A change to this file reaches the gateway by rolling the task — but only a
 boot-only one.** The container's `secrets` entry names the parameter's ARN, and
@@ -409,7 +412,7 @@ the template's" would invite a reader to think the two differ. Naming
 wire, so an override that narrows one provider states the whole list it means.
 
 The reason it is a second parameter and not more of the first is the tier
-ceiling: `config.json` is **4,081 bytes** against the standard tier's 4 KiB,
+ceiling: `config.json` is **3,604 bytes** against the standard tier's 4 KiB,
 and the two governance documents have separate lifetimes anyway. Both are
 checked against the ceiling by `governance-parameters.test.ts`, which fails the
 build rather than the apply.
