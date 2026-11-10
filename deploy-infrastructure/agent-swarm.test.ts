@@ -16,6 +16,18 @@ import { INFRA_ZONE_NAME } from "./dns";
 
 const HOST_DIR = path.resolve(__dirname, "../agent-swarm/host");
 
+// render-env.sh is the only place the agent-swarm version lives; the compose
+// fallbacks have to agree, or a .env without the variable pulls an old image.
+function pinnedVersion(): string {
+  const renderEnv = fs.readFileSync(
+    path.join(HOST_DIR, "render-env.sh"),
+    "utf8",
+  );
+  const match = renderEnv.match(/^AGENT_SWARM_VERSION=(\d+\.\d+\.\d+)$/m);
+  assert.ok(match, "render-env.sh pins AGENT_SWARM_VERSION");
+  return match[1];
+}
+
 describe("delegate swarm hostname", () => {
   it("is delegate-swarm in the account's own zone", () => {
     assert.equal(INFRA_ZONE_NAME, "infra.goodparty.org");
@@ -81,9 +93,21 @@ describe("delegate swarm host files", () => {
     assert.ok(!compose.includes("ghcr.io/desplega-ai/agent-swarm-worker"));
     assert.ok(
       compose.includes(
-        'image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.6.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"',
+        `image: "delegate-swarm-worker:\${AGENT_SWARM_VERSION:-${pinnedVersion()}}-\${WORKER_PATCH_HASH:?rendered by render-env.sh}"`,
       ),
     );
+  });
+
+  it("falls back to the pinned version on every image tag", () => {
+    const compose = fs.readFileSync(
+      path.join(HOST_DIR, "docker-compose.yml"),
+      "utf8",
+    );
+    const defaults = [...compose.matchAll(/\$\{AGENT_SWARM_VERSION:-([0-9.]+)\}/g)].map(
+      (match) => match[1],
+    );
+    assert.ok(defaults.length >= 2, "compose keeps a default per image tag");
+    for (const fallback of defaults) assert.equal(fallback, pinnedVersion());
   });
 
   it("puts the content hash in the command, so a file change reruns it", () => {
