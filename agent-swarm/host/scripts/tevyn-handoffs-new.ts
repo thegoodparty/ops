@@ -4,6 +4,10 @@ import * as z from 'zod'
 // Finds gp-api agent hand-off posts in #tevyn-api that this swarm has not
 // returned before. The Slack token stays in this script; errors are built from
 // status codes and Slack's error code, never from a URL or response body.
+//
+// A post that carries the handling note but cannot be read is not dropped: it
+// is reported as unreadable, its thread gets one warning reply, and the cursor
+// stops short of it so Slack history still covers it on the next run.
 
 const SLACK_API = 'https://slack.com/api'
 const TIMEOUT_MS = 10_000
@@ -12,6 +16,13 @@ const MAX_PAGES = 5
 const FIRST_RUN_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
 const CURSOR_KEY = 'tevyn:cursor'
 const HANDLING_NOTE_MARKER = 'Delegate is handling this wave'
+const UNPARSED_PREFIX = 'unparsed:'
+const RELEASE_MS = 48 * 60 * 60 * 1000
+const REPLY_SCRIPT = 'tevyn-thread-reply'
+const UNREADABLE_REPLY =
+  'Automated panel-wave dispatcher could not read this hand-off post, so ' +
+  'nothing was scheduled from it. A person needs to check this post and ' +
+  'handle the wave by hand.'
 
 export const argsSchema = z.object({})
 
@@ -51,6 +62,10 @@ const historySchema = z.object({
     .optional(),
 })
 
+const replyRunSchema = z.object({
+  data: z.object({ exitCode: z.number(), error: z.string().optional() }),
+})
+
 export const handoffBlockSchema = z.object({
   outreachId: z.string().regex(/^\d+$/),
   sendAt: z.string().datetime(),
@@ -76,12 +91,19 @@ export type Kv = {
   set: (key: string, value: unknown) => Promise<void>
 }
 
+export type Reply = (args: {
+  channel: string
+  ts: string
+  text: string
+}) => Promise<void>
+
 export type Deps = {
   fetchFn: Fetch
   kv: Kv
   token: string
   channel: string
   env: string
+  reply: Reply
   now?: () => number
 }
 
@@ -131,31 +153,54 @@ const quotedMessage = (blocks: Block[]): string =>
     .map((e) => textOf(e.text))
     .join('')
 
-export const parseHandoff = (
-  message: Message,
-  channel: string,
-): Handoff | null => {
+export type UnreadableReason =
+  | 'no machine block'
+  | 'invalid fields'
+  | 'replies key mismatch'
+
+type Classification =
+  | { kind: 'handoff'; handoff: Handoff }
+  | { kind: 'not-handoff' }
+  | { kind: 'unreadable'; reason: UnreadableReason }
+
+// Detection is separate from parsing. The handling note is what makes a post
+// ours to act on, so once it is there a post that does not parse has to reach a
+// person: dropping it loses the wave with no trace.
+const classify = (message: Message, channel: string): Classification => {
   const blocks = message.blocks
-  if (!blocks) return null
+  if (!blocks) return { kind: 'not-handoff' }
   const texts = sectionTexts(blocks)
-  if (!texts.some((t) => t.includes(HANDLING_NOTE_MARKER))) return null
+  if (!texts.some((t) => t.includes(HANDLING_NOTE_MARKER))) {
+    return { kind: 'not-handoff' }
+  }
   const fields = parseMachineBlock(texts)
-  if (!fields) return null
+  if (!fields) return { kind: 'unreadable', reason: 'no machine block' }
   const block = handoffBlockSchema.safeParse(fields)
-  if (!block.success) return null
+  if (!block.success) return { kind: 'unreadable', reason: 'invalid fields' }
   if (block.data.repliesKey !== `agent-replies/${block.data.outreachId}.csv`) {
-    return null
+    return { kind: 'unreadable', reason: 'replies key mismatch' }
   }
   const recipients = texts
     .map((t) => /^\*Recipients:\*\s*(\d+)\s*$/.exec(t.trim())?.[1])
     .find((n) => n !== undefined)
   return {
-    ...block.data,
-    message: quotedMessage(blocks),
-    recipientCount: recipients === undefined ? 0 : Number(recipients),
-    channel,
-    ts: message.ts,
+    kind: 'handoff',
+    handoff: {
+      ...block.data,
+      message: quotedMessage(blocks),
+      recipientCount: recipients === undefined ? 0 : Number(recipients),
+      channel,
+      ts: message.ts,
+    },
   }
+}
+
+export const parseHandoff = (
+  message: Message,
+  channel: string,
+): Handoff | null => {
+  const classified = classify(message, channel)
+  return classified.kind === 'handoff' ? classified.handoff : null
 }
 
 const compareTs = (a: string, b: string): number => Number(a) - Number(b)
@@ -195,7 +240,29 @@ const fetchHistory = async (
   return messages
 }
 
-export const run = async (deps: Deps): Promise<Handoff[]> => {
+const unparsedKey = (ts: string): string => `${UNPARSED_PREFIX}${ts}`
+
+const postedAtOf = (record: unknown): number | null => {
+  const parsed = z.object({ postedAt: z.string() }).safeParse(record)
+  if (!parsed.success) return null
+  const at = Date.parse(parsed.data.postedAt)
+  return Number.isNaN(at) ? null : at
+}
+
+export type Unreadable = {
+  ts: string
+  reason: UnreadableReason
+  // True when the warning reply is in the thread, whether this run posted it or
+  // an earlier one did.
+  posted: boolean
+  // Set once the post stops holding the cursor: after 48h a person has had the
+  // warning, and a post that cannot be read must not stall discovery forever.
+  released?: true
+}
+
+export type RunResult = { handoffs: Handoff[]; unreadable: Unreadable[] }
+
+export const run = async (deps: Deps): Promise<RunResult> => {
   const stored = await deps.kv.get(CURSOR_KEY)
   const now = deps.now?.() ?? Date.now()
   const oldest =
@@ -206,13 +273,26 @@ export const run = async (deps: Deps): Promise<Handoff[]> => {
   const messages = (await fetchHistory(deps, oldest)).sort((a, b) =>
     compareTs(a.ts, b.ts),
   )
-  if (messages.length === 0) return []
+  if (messages.length === 0) return { handoffs: [], unreadable: [] }
 
   const fresh: Handoff[] = []
+  const unreadable: Unreadable[] = []
   const seen = new Set<string>()
   for (const message of messages) {
-    const handoff = parseHandoff(message, deps.channel)
-    if (!handoff || handoff.env !== deps.env) continue
+    const classified = classify(message, deps.channel)
+    if (classified.kind === 'not-handoff') continue
+    if (classified.kind === 'unreadable') {
+      unreadable.push({
+        ts: message.ts,
+        reason: classified.reason,
+        posted: false,
+      })
+      continue
+    }
+    const { handoff } = classified
+    // A post from the other environment parses fine and belongs to that
+    // environment's run, so it is a silent skip, never an unreadable one.
+    if (handoff.env !== deps.env) continue
     if (seen.has(handoff.outreachId)) continue
     if ((await deps.kv.get(`handoff:${handoff.outreachId}`)) !== null) continue
     seen.add(handoff.outreachId)
@@ -235,8 +315,45 @@ export const run = async (deps: Deps): Promise<Handoff[]> => {
       recipientCount: handoff.recipientCount,
     })
   }
-  await deps.kv.set(CURSOR_KEY, messages[messages.length - 1].ts)
-  return fresh
+
+  for (const entry of unreadable) {
+    const postedAt = postedAtOf(await deps.kv.get(unparsedKey(entry.ts)))
+    if (postedAt !== null && now - postedAt > RELEASE_MS) entry.released = true
+    if (postedAt !== null) {
+      entry.posted = true
+      continue
+    }
+    try {
+      await deps.reply({
+        channel: deps.channel,
+        ts: entry.ts,
+        text: UNREADABLE_REPLY,
+      })
+    } catch {
+      // A warning that cannot be posted must not fail the run: the post stays
+      // in the result with posted: false and the cursor holds for a retry.
+      continue
+    }
+    // Written only after the reply lands, so a failed reply is retried and a
+    // second run never posts a second warning.
+    await deps.kv.set(unparsedKey(entry.ts), {
+      postedAt: new Date(now).toISOString(),
+      reason: entry.reason,
+    })
+    entry.posted = true
+  }
+
+  const blocking = unreadable.find((entry) => entry.released !== true)
+  // Stop the cursor just before the oldest post a person still has to read, so
+  // Slack history covers it next run. When that post is the first message in
+  // the window there is nothing older to point at, so the stored cursor stays
+  // where it is and its window is not narrowed away.
+  const cursor =
+    blocking === undefined
+      ? messages[messages.length - 1].ts
+      : messages.filter((m) => compareTs(m.ts, blocking.ts) < 0).at(-1)?.ts
+  if (cursor !== undefined) await deps.kv.set(CURSOR_KEY, cursor)
+  return { handoffs: fresh, unreadable }
 }
 
 export default async function (
@@ -261,5 +378,18 @@ export default async function (
     token: need('SLACK_BOT_TOKEN'),
     channel: need('TEVYN_API_CHANNEL_ID'),
     env: need('HANDOFF_ENV'),
+    reply: async ({ channel, ts, text }) => {
+      const res = replyRunSchema.parse(
+        await ctx.swarm.script_run({
+          name: REPLY_SCRIPT,
+          args: { channel, ts, text },
+        }),
+      )
+      if (res.data.exitCode !== 0) {
+        throw new Error(
+          `${REPLY_SCRIPT} failed: exit ${res.data.exitCode}${res.data.error ? ` ${res.data.error}` : ''}`,
+        )
+      }
+    },
   })
 }
