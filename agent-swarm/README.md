@@ -94,7 +94,9 @@ reports its metrics and does nothing else: the sweep and the prunes compete
 with the container swap and with the migrations the new api applies before it
 serves, and a prune can drop an image the deploy pulled but has no container
 for yet. It reports `DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent`
-to the CloudWatch namespace `DelegateSwarm` either way.
+to the CloudWatch namespace `DelegateSwarm` either way. The lock is mutual, so
+a deploy that starts while a sweep is running waits for that sweep to finish
+before it touches a container.
 
 The alarms `delegate-swarm-data-volume-space` and
 `delegate-swarm-data-volume-inodes` fire at 85%, or when the metric stops

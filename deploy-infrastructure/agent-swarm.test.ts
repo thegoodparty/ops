@@ -176,7 +176,11 @@ describe("data volume cleanup", () => {
     assert.ok(gate > 0, "the sweep is behind the deploy lock");
     assert.ok(gate < script.indexOf('clean "$IDLE_MINUTES"'));
     assert.ok(gate < script.indexOf("docker image prune"));
-    assert.ok(script.indexOf("put-metric-data") > script.indexOf("docker builder prune"));
+    // Col 0 means outside the gate's block, which is indented by two spaces.
+    assert.match(script, /^used="\$\(used_percent\)"$/m);
+    assert.match(script, /^aws cloudwatch put-metric-data/m);
+    // A deploy waits on the lock in up.sh, so a hung metric call must not hold it.
+    assert.ok(script.indexOf("exec 9>&-") < script.indexOf("put-metric-data"));
   });
 
   it("lets the host put metrics only in its own namespace", () => {

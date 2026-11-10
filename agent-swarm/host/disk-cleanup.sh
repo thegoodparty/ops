@@ -67,6 +67,9 @@ if ((deploy_in_progress == 0)); then
   docker image prune -af >/dev/null
   docker builder prune -af >/dev/null
 fi
+# Release the lock before the metric call: a deploy blocks on it in up.sh, and
+# a slow or hung aws call must not keep a deploy waiting.
+exec 9>&-
 
 used="$(used_percent)"
 inodes="$(inodes_percent)"
