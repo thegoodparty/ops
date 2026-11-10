@@ -17,6 +17,21 @@ TIGHT_PERCENT=80
 # growing the filesystem is all that is left. A no-op at full size.
 xfs_growfs "$DATA" >/dev/null
 
+# up.sh holds this for the length of a deploy. While it does, this reports and
+# nothing else: walking the whole volume and pruning images both compete with
+# the container swap and with the migrations the new api applies before it
+# serves, and a prune can drop an image the deploy pulled but has no container
+# for yet. The metrics below are still published, so the alarms keep seeing
+# data. A deploy longer than a period is visible as a hung deploy, not as a
+# full volume.
+exec 9>>/opt/agent-swarm/.deploy.lock
+deploy_in_progress=1
+if flock -n 9; then
+  deploy_in_progress=0
+else
+  echo "disk-cleanup: deploy in progress, skipping the sweep and the image prune"
+fi
+
 used_percent() { df --output=pcent "$DATA" | tail -1 | tr -dc 0-9; }
 inodes_percent() { df --output=ipcent "$DATA" | tail -1 | tr -dc 0-9; }
 
@@ -43,21 +58,16 @@ clean() {
   echo "disk-cleanup: removed $freed node_modules idle ${idle}m"
 }
 
-clean "$IDLE_MINUTES"
-if (($(used_percent) >= TIGHT_PERCENT || $(inodes_percent) >= TIGHT_PERCENT)); then
-  clean "$TIGHT_IDLE_MINUTES"
-fi
+if ((deploy_in_progress == 0)); then
+  clean "$IDLE_MINUTES"
+  if (($(used_percent) >= TIGHT_PERCENT || $(inodes_percent) >= TIGHT_PERCENT)); then
+    clean "$TIGHT_IDLE_MINUTES"
+  fi
 
-# Outside a deploy every wanted image has a container, so this only drops
-# superseded versions. During one, up.sh holds the lock and this is skipped.
-exec 9>>/opt/agent-swarm/.deploy.lock
-if flock -n 9; then
+  # Containers keep their own image, so this only drops superseded versions.
   docker image prune -af >/dev/null
   docker builder prune -af >/dev/null
-else
-  echo "disk-cleanup: deploy in progress, skipping image prune"
 fi
-exec 9>&-
 
 used="$(used_percent)"
 inodes="$(inodes_percent)"
