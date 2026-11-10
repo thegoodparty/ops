@@ -801,7 +801,7 @@ test("a reworded lead is traced by the file and category its deep-reviewer promp
   assert.deepEqual(
     await traced(
       [{ area: "Unbounded IN list", paths: ["packages/api/src/text.service.ts"], category: "scale", hypothesis: "findTextedSince binds one parameter per person in the resolved audience" }],
-      ["Verify a scout lead. File: text.service.ts lines 66-85. Category: scale. Check whether the personId list can exceed the bind limit."],
+      ["Verify a scout lead. File: packages/api/src/text.service.ts lines 66-85. Category: scale. Check whether the personId list can exceed the bind limit."],
     ),
     [["Unbounded IN list", "reported"]],
   );
@@ -842,5 +842,15 @@ test("two leads on one file with different categories map to different calls", a
       ["Missing await", "dropped"],
       ["No test for the job", "reported"],
     ],
+  );
+});
+
+test("a file name inside a longer one is not a citation", async () => {
+  assert.deepEqual(
+    await traced(
+      [{ area: "Retry", paths: ["src/service.ts"], category: "bugs", hypothesis: "zzz qqq" }],
+      ["Paths: src/text.service.ts, lib/my-service.ts. Category: bugs. Check the cache keys."],
+    ),
+    [["Retry", "not-investigated"]],
   );
 });

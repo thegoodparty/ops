@@ -114,6 +114,11 @@ const words = (text: string): Set<string> =>
 const MIN_OVERLAP = 0.6;
 const PARTIAL_OVERLAP = 0.3;
 
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const mentions = (prompt: string, path: string): boolean =>
+  path !== "" && new RegExp(`(^|[^\\w./-])${escapeRegExp(path)}(?![\\w-]|\\.\\w)`).test(prompt);
+
 interface LeadKey {
   area: string;
   paths: string[];
@@ -137,10 +142,18 @@ const evidence = (lead: LeadKey, call: SubagentCall, all: SubagentCall[]): numbe
   const wanted = words(lead.hypothesis);
   const have = words(prompt);
   const overlap = wanted.size === 0 ? 0 : [...wanted].filter((w) => have.has(w)).length / wanted.size;
-  const cited = lead.paths.filter((p) => prompt.includes(p) || prompt.includes(p.split("/").pop() ?? p));
-  const fileShare = lead.paths.length === 0 ? 0 : cited.length / lead.paths.length;
-  const category = lead.category !== "" && new RegExp(`\\b${lead.category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(prompt);
-  const plausible = uniqueArea || overlap >= MIN_OVERLAP || (fileShare > 0 && (overlap >= PARTIAL_OVERLAP || category));
+  // A path counts only on its own, not inside a longer name (`service.ts` in
+  // `text.service.ts`). A bare file name is weaker than the full path: names
+  // like index.ts recur across a repo, so it needs the lead's words to back it.
+  const fullPaths = lead.paths.filter((p) => mentions(prompt, p)).length;
+  const fileNames = lead.paths.filter((p) => !mentions(prompt, p) && mentions(prompt, p.split("/").pop() ?? p)).length;
+  const fileShare = lead.paths.length === 0 ? 0 : (fullPaths + fileNames / 2) / lead.paths.length;
+  const category = lead.category !== "" && new RegExp(`\\b${escapeRegExp(lead.category)}\\b`, "i").test(prompt);
+  const plausible =
+    uniqueArea ||
+    overlap >= MIN_OVERLAP ||
+    (fullPaths > 0 && (overlap >= PARTIAL_OVERLAP || category)) ||
+    (fileNames > 0 && overlap >= PARTIAL_OVERLAP);
   if (!plausible) return 0;
   return (uniqueArea ? 50 : 0) + 10 * fileShare + 5 * overlap + (category ? 3 : 0);
 };
