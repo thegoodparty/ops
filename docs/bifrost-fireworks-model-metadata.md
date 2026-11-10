@@ -180,6 +180,52 @@ found"); I called it with a real key on 2026-10-30: the router id returns 200
 So the global-looking name cannot be reached by accident. The tests check
 residency against the **wire id**, so an alias to a non-US id fails them.
 
+## What the three alias descriptions said
+
+Each alias in `config.json` carried the same words that would have gone in a
+comment beside the JSON, and the only place a comment could sit was inside the
+SSM parameter's byte budget. All three strings were removed from
+`deploy-workbench/bifrost/config.json` on 2026-11-10 and are recorded here. The
+`description` field stays optional in the key-alias shape (`config.test.ts`'s
+`KeyAlias` type, and the schema this tag validates against), so the config is
+still valid without them. Nothing in this repository reads the field: no test
+or reconciler asserts it, and the drift test that provoked an overlap by
+claiming the `aliases` subtree as boot-only now names a `model_name` leaf as its
+witness. Whether Bifrost surfaces an alias description on `/v1/models` is not
+something this PR checked, and nothing here depends on the answer.
+
+The catalog name, `accounts/fireworks/models/deepseek-v4p1-flash-1017-us`:
+
+> Catalog name for the US-only router: gives /v1/models the context window and
+> price Bifrost's datasheet holds for this row. Requests are sent to model_id.
+
+`worker-default`:
+
+> gp-pi worker default. Lists without metadata by itself; gp-pi copies it from
+> the entry sharing this alias target.
+
+`coordinator-default`:
+
+> gp-pi coordinator default. Lists without metadata by itself; gp-pi copies it
+> from the entry sharing this alias target.
+
+The `by itself` phrase is the load-bearing part of the last two: the row lists
+bare when nothing shares its metadata, and it is safe only because the sibling
+it shares an `alias` value with is the one the datasheet has a row for (item I
+of [`bifrost-model-aliases.md`](./bifrost-model-aliases.md)). The first revision
+of the 2026-11-10 change took it out to buy 20 bytes at the ceiling; here it is
+back, because the byte pressure it answered is gone.
+
+The budget is the reason this section exists. `config.json` sat at 4,085 bytes
+against the standard tier's 4 KiB, 11 bytes of headroom, and every addition was
+a negotiation with that number. With the three descriptions out, `wc -c
+deploy-workbench/bifrost/config.json` reports **3,604 bytes**, which is **492
+bytes** of headroom. That buys room, not an absence of limits: the ceiling is
+still 4 KiB, and the next governance block or provider that wants more than 492
+bytes needs `tier: "Advanced"` (8 KiB, charged) or another pass like this one.
+`deploy-workbench/ecs.test.ts` pins the headroom, so the comment numbers and the
+file move together.
+
 ## Tests
 
 `config.test.ts` and `vk-mint-template.test.ts`:
