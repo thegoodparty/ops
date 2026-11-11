@@ -46,7 +46,7 @@ The orchestrator placed the diff and changed files in your prompt. The PR's repo
 Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, not a verified finding. Zero leads is a valid result when the diff is genuinely low-risk.
 
 Lead categories:
-- correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
+- correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling. For each guard, hold, retry or threshold the diff adds, ask what happens when its input is empty or missing, and whether an existing default or setting decides that path before the new mechanism can.
 - security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
 - tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
