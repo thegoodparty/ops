@@ -1,16 +1,38 @@
 /**
- * Subscribes the workbench account to the models the coding sandbox uses, so
- * that the sandbox itself never needs permission to do it. Step 11 of
- * `docs/workbench-account.md`.
+ * Subscribes an account to the Bedrock models it is allowed to invoke, so the
+ * caller never needs the marketplace permission that would let it subscribe a
+ * model nobody chose. Step 11 of `docs/workbench-account.md`; the second
+ * account it serves is step 1 of `docs/swarm-bedrock.md`.
+ *
+ * Two accounts, one script, selected by `BEDROCK_SCOPE`:
+ *
+ * - `workbench` (the default, and what CI runs today) subscribes the workbench
+ *   account to every entry in `WORKBENCH_MODELS`, which is the Bifrost
+ *   gateway's model list.
+ * - `swarm` subscribes the infrastructure account to `SWARM_MODELS`, the
+ *   two-model subset the Delegate swarm's `delegate-swarm-bedrock` role may
+ *   invoke (`deploy-infrastructure/agent-swarm.ts`).
+ *
+ * The scope carries the account, the role to assume and the model list
+ * together, rather than three independent env vars, because the three are one
+ * decision: a script pointed at the infrastructure account with the workbench
+ * model list would subscribe eight models there, and a script pointed at the
+ * workbench account with the swarm's list would create two agreements and
+ * report the other six as missing. Named scopes make the mismatched
+ * combinations unrepresentable. The default is the workbench scope, so
+ * `deploy-workbench.yml`'s unqualified `APPLY=1 npm run script
+ * enable-bedrock-models` keeps meaning exactly what it did.
  *
  * This is not "enabling models" in the old sense. Bedrock enables every
  * foundation model by default and subscribes in the background the first time
  * you invoke one, provided the invoking role holds `aws-marketplace:Subscribe`
- * and friends. `WorkbenchAccess` deliberately holds none of those, because
- * that permission is what would let a prompt-injected agent pull in any model
- * in the catalogue. AWS documents the way out of that directly: someone with
- * marketplace permissions subscribes once, and after that invoking needs no
- * marketplace permission at all. This script is that someone.
+ * and friends. Neither grant this script serves implies those: `WorkbenchAccess`
+ * deliberately holds none of them, because that permission is what would let a
+ * prompt-injected agent pull in any model in the catalogue, and
+ * `delegate-swarm-bedrock` holds only four invoke actions. AWS documents the
+ * way out of that directly: someone with marketplace permissions subscribes
+ * once, and after that invoking needs no marketplace permission at all. This
+ * script is that someone.
  *
  * It also removes a failure that is hard to read. With no marketplace
  * permission, the first invocation of an unsubscribed model succeeds for up
@@ -40,22 +62,28 @@
  * to a single region would trade that visibility for a second or two.
  *
  * Reports by default and changes nothing. Set `APPLY=1` to create the missing
- * agreements. The script runner takes no arguments, so this is an env var.
+ * agreements. Set `BEDROCK_SCOPE=swarm` (see `BEDROCK_SCOPES`) to run for the
+ * infrastructure account instead of the workbench one. The script runner takes
+ * no arguments, so these are env vars, and CI sets them on the step.
  *
- * Credentials, from either direction. Already inside the workbench account,
- * as a human with `AdministratorAccess`, the ambient credentials are used as
- * they are:
+ * Credentials, from either direction. Already inside the scope's account, as a
+ * human with `AdministratorAccess`, the ambient credentials are used as they
+ * are:
  *
  *   aws sso login --profile gp-admin
  *   AWS_PROFILE=gp-admin npm run script enable-bedrock-models
  *   AWS_PROFILE=gp-admin APPLY=1 npm run script enable-bedrock-models
  *
  * Anywhere else, including as `github-actions-workbench-deploy` in CI, it
- * assumes `pulumi-deploy` the same way `deploy-workbench/index.ts`
- * configures its provider to. That grant is `AssumeWorkbenchDeployRole` in
- * `ci-roles/policies.ts`. Until step 10's cutover this assumed
- * `OrganizationAccountAccessRole`, the Organizations-planted admin role; the
- * script moved with the provider, as this header always said it would.
+ * assumes the scope's deploy role: `pulumi-deploy` in that account, the same
+ * role `deploy-workbench/index.ts` and `deploy-infrastructure/index.ts`
+ * configure their providers to assume. In the workbench account that grant is
+ * `AssumeWorkbenchDeployRole` in `ci-roles/policies.ts`; in the infrastructure
+ * account it is the provider hop the infrastructure workflow already makes,
+ * because `BEDROCK_SCOPE=swarm` runs in `deploy-infrastructure.yml`. Until step
+ * 10's cutover this assumed `OrganizationAccountAccessRole`, the
+ * Organizations-planted admin role; the script moved with the provider, as
+ * this header always said it would.
  *
  * Note `ReadOnlyAccess` cannot run it: that set has no `sts:AssumeRole`, so
  * the hop into the account is refused. Verified, not assumed.
@@ -69,15 +97,91 @@ import {
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { fromTemporaryCredentials } from "@aws-sdk/credential-providers";
 import type { AwsCredentialIdentityProvider } from "@aws-sdk/types";
-import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
-import { WORKBENCH_MODELS } from "../utils/bedrock-models";
+import { INFRASTRUCTURE_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+import {
+  BedrockModel,
+  SWARM_MARKETPLACE_PRODUCTS,
+  SWARM_MODELS,
+  WORKBENCH_MODELS,
+} from "../utils/bedrock-models";
 
 /**
- * The same role `deploy-workbench/index.ts` has its provider assume: the way
- * into the account from CI credentials, administrator there by design
- * (step 10 — the trust policy, not the permission set, is the boundary).
+ * One account, the role that reaches it, and the models it may invoke.
+ *
+ * The role is `pulumi-deploy` in both accounts, and that is not a coincidence
+ * worth de-duplicating into a name: the two ARNs differ by account and each is
+ * the role that account's own Pulumi project already assumes, so a grant to run
+ * this script is a grant the deploy path needs anyway.
  */
-const DEPLOY_ROLE_ARN = `arn:aws:iam::${WORKBENCH_ACCOUNT_ID}:role/pulumi-deploy`;
+export type BedrockScope = {
+  /** What `BEDROCK_SCOPE` calls it, and the name it prints. */
+  name: string;
+  accountId: string;
+  deployRoleArn: string;
+  models: BedrockModel[];
+  /**
+   * Model id to AWS Marketplace product id, for the models whose product is on
+   * record. The closing check asserts an agreement exists for each one, and
+   * fails the run if not.
+   *
+   * Empty for the workbench scope, because the workbench run's job is to
+   * subscribe eight models across four regions and report — a report that is
+   * already part of that workflow's contract. Turning its `xai` row into a red
+   * run would be a new failure mode for a workflow this change is not about.
+   * The swarm scope populates it, which is what makes the subscription step in
+   * `deploy-infrastructure.yml` prove that the two models are actually entitled
+   * in the infrastructure account rather than merely offered.
+   */
+  expectedMarketplaceAgreements: Record<string, string>;
+};
+
+const deployRoleArn = (accountId: string) =>
+  `arn:aws:iam::${accountId}:role/pulumi-deploy`;
+
+export const BEDROCK_SCOPES: Record<string, BedrockScope> = {
+  /** The default: the Bifrost gateway's model list, in the workbench account. */
+  workbench: {
+    name: "workbench",
+    accountId: WORKBENCH_ACCOUNT_ID,
+    deployRoleArn: deployRoleArn(WORKBENCH_ACCOUNT_ID),
+    models: WORKBENCH_MODELS,
+    expectedMarketplaceAgreements: {},
+  },
+  /**
+   * The Delegate swarm host's two models, in the infrastructure account.
+   *
+   * The same two-model subset the swarm's IAM policy is built from, not a list
+   * of its own: subscribing a model the role cannot invoke is a no-op, and
+   * granting a model nothing subscribed is the fifteen-minute failure this
+   * script exists to prevent.
+   */
+  swarm: {
+    name: "swarm",
+    accountId: INFRASTRUCTURE_ACCOUNT_ID,
+    deployRoleArn: deployRoleArn(INFRASTRUCTURE_ACCOUNT_ID),
+    models: SWARM_MODELS,
+    expectedMarketplaceAgreements: SWARM_MARKETPLACE_PRODUCTS,
+  },
+};
+
+/**
+ * The scope `BEDROCK_SCOPE` names, or the workbench one.
+ *
+ * An unknown name throws rather than falling back, because a typo that silently
+ * subscribed the workbench account would look like success.
+ */
+export const resolveScope = (name?: string): BedrockScope => {
+  const requested = (name ?? process.env.BEDROCK_SCOPE ?? "workbench").trim();
+  const scope = BEDROCK_SCOPES[requested];
+  if (!scope) {
+    throw new Error(
+      `Unknown BEDROCK_SCOPE "${requested}". Known scopes: ${Object.keys(
+        BEDROCK_SCOPES
+      ).join(", ")}.`
+    );
+  }
+  return scope;
+};
 
 /**
  * Every region a `us.` geo profile can route to, per the model cards.
@@ -117,8 +221,12 @@ const PINNED_REGIONS = ["us-west-2"];
  *
  * Models that are not cross-region only ever run where the sandbox points, so
  * they are handled separately below rather than walked across the profile set.
+ * The list itself comes from the scope: `scope.models`. A named scope is
+ * strongly preferred over an ad-hoc `--account` flag, because it makes the
+ * matched triple the only expressible thing, which is the same property the
+ * grants have. For a one-off run against a third account, add a scope; do not
+ * add a flag that lets the account, the role and the model list disagree.
  */
-const MODELS = WORKBENCH_MODELS;
 
 type Outcome =
   | "already-entitled"
@@ -175,7 +283,7 @@ const looksLikeUseCaseForm = (err: unknown) => {
 
 async function enableInRegion(
   region: string,
-  models: typeof MODELS,
+  models: BedrockModel[],
   credentials: AwsCredentialIdentityProvider | undefined
 ) {
   const client = new BedrockClient({ region, credentials });
@@ -308,13 +416,14 @@ async function enableInRegion(
 }
 
 /**
- * Resolves credentials that act inside the workbench account, and fails once
+ * Resolves credentials that act inside the scope's account, and fails once
  * rather than producing one misleading error per model/region pair.
  *
- * Two callers, two paths. A human who has already logged in to the workbench
- * account keeps their ambient credentials. Anything else, CI included,
- * assumes into the account, which is what makes this runnable by
- * `github-actions-workbench-deploy` without a new grant.
+ * Two callers, two paths. A human who has already logged in to the account
+ * keeps their ambient credentials. Anything else, CI included, assumes into
+ * the account, which is what makes this runnable by
+ * `github-actions-workbench-deploy` and by `deploy-infrastructure.yml` without
+ * a new grant: both workflows already assume that account's `pulumi-deploy`.
  *
  * Returns the provider to hand to each client, or undefined to mean the
  * default chain is already correct.
@@ -324,9 +433,9 @@ async function enableInRegion(
  * wrong. Acting on the management account would be a real mistake and the
  * error it produced would not say so.
  */
-async function resolveWorkbenchCredentials(): Promise<
-  AwsCredentialIdentityProvider | undefined
-> {
+async function resolveCredentials(
+  scope: BedrockScope
+): Promise<AwsCredentialIdentityProvider | undefined> {
   let ambient;
   try {
     ambient = await new STSClient({ region: REGIONS[0] }).send(
@@ -334,27 +443,28 @@ async function resolveWorkbenchCredentials(): Promise<
     );
   } catch (err) {
     throw new Error(
-      "Could not resolve AWS credentials. Log in to the workbench account " +
-        `${WORKBENCH_ACCOUNT_ID} with AdministratorAccess, or run this as ` +
-        `a role that can assume ${DEPLOY_ROLE_ARN}. WorkbenchAccess cannot ` +
-        `do it: enabling models is a mutation it deliberately lacks.\n  ${
-          (err as Error).message
-        }`
+      `Could not resolve AWS credentials. Log in to the ${scope.name} account ` +
+        `${scope.accountId} with AdministratorAccess, or run this as ` +
+        `a role that can assume ${scope.deployRoleArn}. Neither principal this ` +
+        `script serves can do it: enabling models is a mutation they ` +
+        `deliberately lack.\n  ${(err as Error).message}`
     );
   }
 
-  if (ambient.Account === WORKBENCH_ACCOUNT_ID) {
+  if (ambient.Account === scope.accountId) {
     console.log(`Account ${ambient.Account} as ${ambient.Arn}`);
     return undefined;
   }
 
-  // Session name shows up in the workbench account's CloudTrail, which is
+  // Session name shows up in the account's CloudTrail, which is
   // worth setting for an assume this privileged: it separates this script
   // from a Pulumi apply and from a human who assumed the same role by hand.
+  // The scope is in it because two accounts' CloudTrails are now readable
+  // side by side and the session name is what tells the runs apart.
   const credentials = fromTemporaryCredentials({
     params: {
-      RoleArn: DEPLOY_ROLE_ARN,
-      RoleSessionName: "enable-bedrock-models",
+      RoleArn: scope.deployRoleArn,
+      RoleSessionName: `enable-bedrock-models-${scope.name}`,
     },
   });
 
@@ -366,17 +476,17 @@ async function resolveWorkbenchCredentials(): Promise<
   } catch (err) {
     throw new Error(
       `Credentials are in account ${ambient.Account} as ${ambient.Arn}, and ` +
-        `assuming ${DEPLOY_ROLE_ARN} failed. Either those credentials are not ` +
-        "allowed to assume it, or you are in the wrong account entirely.\n" +
+        `assuming ${scope.deployRoleArn} failed. Either those credentials are ` +
+        "not allowed to assume it, or you are in the wrong account entirely.\n" +
         `  ${(err as Error).message}`
     );
   }
 
   // Belt and braces: the assume could in principle resolve somewhere
   // unexpected, and this script is about to create agreements.
-  if (assumed.Account !== WORKBENCH_ACCOUNT_ID) {
+  if (assumed.Account !== scope.accountId) {
     throw new Error(
-      `Assumed into ${assumed.Account}, expected ${WORKBENCH_ACCOUNT_ID}.`
+      `Assumed into ${assumed.Account}, expected ${scope.accountId}.`
     );
   }
   console.log(`Assumed ${assumed.Arn} from ${ambient.Arn}`);
@@ -384,7 +494,12 @@ async function resolveWorkbenchCredentials(): Promise<
 }
 
 export default async function main() {
-  const credentials = await resolveWorkbenchCredentials();
+  const scope = resolveScope();
+  console.log(
+    `Scope ${scope.name}: account ${scope.accountId}, ${scope.models.length} ` +
+      `model(s): ${scope.models.map((m) => m.id).join(", ")}`
+  );
+  const credentials = await resolveCredentials(scope);
   const applying = Boolean(process.env.APPLY);
   console.log(
     applying
@@ -392,8 +507,8 @@ export default async function main() {
       : "Reporting only. Set APPLY=1 to create missing agreements."
   );
 
-  const geoModels = MODELS.filter((m) => m.crossRegion);
-  const pinnedModels = MODELS.filter((m) => !m.crossRegion);
+  const geoModels = scope.models.filter((m) => m.crossRegion);
+  const pinnedModels = scope.models.filter((m) => !m.crossRegion);
 
   // `geoModels` is every entry in practice: `crossRegion` means "invoked through
   // an inference profile", and since 2026-11-04 every entry is a `global.` one.
@@ -418,7 +533,7 @@ export default async function main() {
     console.log(`  ${outcome.padEnd(19)} ${count}`);
   }
 
-  const notes = MODELS.filter((m) => m.note);
+  const notes = scope.models.filter((m) => m.note);
   if (notes.length) {
     console.log("\nNotes");
     for (const m of notes) console.log(`  ${m.id}: ${m.note}`);
@@ -440,6 +555,46 @@ export default async function main() {
   }
 
   const unoffered = results.filter((r) => r.outcome === "no-agreement-offered");
+  // A model this scope expects a Marketplace agreement for, and where the
+  // report does not show one. It matters because both ends of the mistake look
+  // the same from the report: `no-agreement-offered` is the expected outcome for
+  // a provider AWS does not sell through Marketplace, and also what an
+  // unentitled product looks like. For a model whose product id is on record
+  // there is no ambiguity, so an account that cannot be offered an agreement on
+  // it fails the run: the alternative is the fifteen-minute AccessDenied this
+  // script exists to move out of the first invocation.
+  //
+  // Driven by the scope rather than by the model list, so the workbench run's
+  // reporting contract is untouched (see `expectedMarketplaceAgreements`).
+  const expected = scope.models.filter(
+    (m) => scope.expectedMarketplaceAgreements[m.id]
+  );
+  const unentitled = expected.filter(
+    (m) =>
+      !results.some(
+        (r) =>
+          r.model === m.id &&
+          (r.outcome === "created" ||
+            r.outcome === "already-entitled" ||
+            r.outcome === "pending")
+      )
+  );
+  for (const model of expected) {
+    console.log(
+      `  ${model.id} ${scope.expectedMarketplaceAgreements[model.id]}: ${
+        unentitled.includes(model) ? "NO AGREEMENT" : "entitled"
+      }`
+    );
+  }
+  if (unentitled.length) {
+    console.error(
+      `\n${unentitled.length} Marketplace model(s) have a product id on ` +
+        "record but no agreement in this account. Either the subscription " +
+        "failed above, or the model is not offered to this account at all."
+    );
+    process.exitCode = 1;
+  }
+
   if (unoffered.length) {
     console.log(
       `\n${unoffered.length} model/region pair(s) had no agreement offer. ` +

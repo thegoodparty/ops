@@ -7,10 +7,17 @@ import * as path from "node:path";
  * One invoke grant in the workbench account, and this is the file that says so.
  *
  * The requirement this pins is the whole point of the change: Bifrost is the
- * only path to a Bedrock model, so `bedrock:InvokeModel` (and its three
- * siblings) must appear as an **Allow** in exactly one policy in this repo —
- * the gateway's task role in `deploy-workbench/ecs.ts` — and as a **Deny** in
- * exactly one, `WorkbenchAccess`.
+ * only path to a Bedrock model in the workbench account, so `bedrock:InvokeModel`
+ * (and its three siblings) must appear as an **Allow** in exactly one policy
+ * there — the gateway's task role in `deploy-workbench/ecs.ts` — and as a
+ * **Deny** in exactly one, `WorkbenchAccess`.
+ *
+ * The infrastructure account has a second, deliberate principal since
+ * `docs/swarm-bedrock.md`: the Delegate swarm's `delegate-swarm-bedrock` role in
+ * `deploy-infrastructure/agent-swarm.ts`. It is named in the allowlist below
+ * and its own module test pins the four actions and the two models, so this
+ * file's job for it is only that it is a *named* file rather than a new one
+ * nobody looked at. Everywhere else the workbench rule is unchanged.
  *
  * Why a source scan rather than importing each document. There are five Pulumi
  * projects and a dozen policy modules, several of which cannot be imported
@@ -111,10 +118,14 @@ describe("the workbench account's Bedrock invoke grants", () => {
   // quiet widening. `utils/bedrock-models.ts` is here because its docstring
   // explains the grant and it defines no action of its own; `deploy-org/`
   // because an SCP exempts the service from its region deny, which is routing
-  // and can only subtract permission (asserted below).
-  it("mentions the invoke actions in exactly three policy files and the list", () => {
+  // and can only subtract permission (asserted below);
+  // `deploy-infrastructure/agent-swarm.ts` because it is the swarm's one
+  // invoke grant, in the other account, and the below asserts it stays scoped
+  // to the two models rather than turning into a second blanket allow.
+  it("mentions the invoke actions in exactly these policy files and the list", () => {
     const files = [...new Set(mentions().map((hit) => hit.file))].sort();
     assert.deepEqual(files, [
+      "deploy-infrastructure/agent-swarm.ts",
       "deploy-org/policies.ts",
       "deploy-workbench/ecs.ts",
       "deploy/components/identity-center/policies.ts",
@@ -122,11 +133,51 @@ describe("the workbench account's Bedrock invoke grants", () => {
     ]);
   });
 
+  // The swarm role is the second allow, and it is not a second gateway: its
+  // actions are declared once each in one statement, and it names no wildcard
+  // action and no wildcard resource. The model scope itself is asserted in
+  // `deploy-infrastructure/agent-swarm.test.ts`, which reads the document as
+  // data; here the point is that this file was not widened into a blanket
+  // grant behind the model list's back.
+  it("allows them in the swarm role, scoped and never wildcarded", () => {
+    const swarm = fs.readFileSync(
+      path.join(REPO_ROOT, "deploy-infrastructure/agent-swarm.ts"),
+      "utf8"
+    );
+
+    for (const action of INVOKE_ACTIONS.filter(
+      (a) => a !== "bedrock:InvokeModelWithBidirectionalStream"
+    )) {
+      const occurrences = swarm.split(`"${action}"`).length - 1;
+      assert.equal(
+        occurrences,
+        1,
+        `${action} appears ${occurrences} times in deploy-infrastructure/agent-swarm.ts; it belongs in the swarm's single invoke statement alone`
+      );
+    }
+
+    assert.equal(
+      /["']bedrock:\*["']/.test(swarm),
+      false,
+      "agent-swarm.ts names bedrock:* ; the model list is the allowlist"
+    );
+    assert.equal(
+      swarm.includes("bedrock:InvokeModelWithBidirectionalStream"),
+      false,
+      "the swarm role does not grant the bidirectional stream form"
+    );
+    assert.match(
+      swarm,
+      /Sid: "InvokeSwarmBedrockModels",[\s\S]{0,300}Resource: swarmBedrockInvokeResources\(\)/
+    );
+  });
+
   // The allow side: `ecs.ts` names the actions as data, and `TASK_BEDROCK_ACTIONS`
-  // is the only place in the repo an Allow can come from. `deploy-workbench/`
-  // has one task role, and `ecs.test.ts` asserts its policy is built from that
-  // constant, so the string appearing there once is the whole grant.
-  it("allows them only in the gateway's task role", () => {
+  // is the only place an allow can come from in the workbench account.
+  // `deploy-workbench/` has one task role, and `ecs.test.ts` asserts its policy
+  // is built from that constant, so the string appearing there once is the
+  // whole grant.
+  it("allows them once each in the gateway's task role", () => {
     const ecsSource = fs.readFileSync(
       path.join(REPO_ROOT, "deploy-workbench/ecs.ts"),
       "utf8"

@@ -1,9 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+import { INFRASTRUCTURE_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import {
+  SWARM_MODEL_IDS,
+  SWARM_MODELS,
   WORKBENCH_MODELS,
   bedrockInvokeResources,
+  bedrockInvokeResourcesFor,
+  swarmBedrockInvokeResources,
 } from "../utils/bedrock-models";
 
 // These assertions are the policy shape rather than a convenience: the arns
@@ -18,6 +22,8 @@ const profileArn = (id: string) =>
   `arn:aws:bedrock:*:${WORKBENCH_ACCOUNT_ID}:inference-profile/${id}`;
 const foundationArn = (id: string) =>
   `arn:aws:bedrock:*::foundation-model/${id}`;
+const infraProfileArn = (id: string) =>
+  `arn:aws:bedrock:*:${INFRASTRUCTURE_ACCOUNT_ID}:inference-profile/${id}`;
 
 describe("bedrockInvokeResources", () => {
   // The request names the inference profile and Bedrock then invokes the
@@ -122,5 +128,103 @@ describe("bedrockInvokeResources", () => {
   // policy. Nothing in the type prevents one, so this catches it.
   it("names each resource once", () => {
     assert.equal(new Set(resources).size, resources.length);
+  });
+});
+
+describe("the swarm's two-model subset", () => {
+  const swarmResources = swarmBedrockInvokeResources();
+
+  // The Delegate swarm host is a second principal in a second account, and its
+  // grant is deliberately narrower than the fleet's: two models, by id. Pinned
+  // as a list of ids so an addition is a visible edit here rather than a
+  // widening nobody reviews. Reasons in `docs/swarm-bedrock.md`.
+  it("is exactly the two models the swarm may invoke", () => {
+    assert.deepEqual([...SWARM_MODEL_IDS], [
+      "openai.gpt-6.1-sol",
+      "anthropic.claude-haiku-5-5",
+    ]);
+    assert.deepEqual(
+      SWARM_MODELS.map((m) => m.id),
+      [...SWARM_MODEL_IDS]
+    );
+  });
+
+  // Derived, not restated. A second copy of `invokeId` would let a profile move
+  // in WORKBENCH_MODELS leave the swarm naming the old profile, which fails as
+  // an AccessDenied rather than as a diff.
+  it("holds the same entries the model list does, field for field", () => {
+    for (const model of SWARM_MODELS) {
+      assert.equal(
+        WORKBENCH_MODELS.find((m) => m.id === model.id),
+        model,
+        `${model.id} is a copy rather than the entry from WORKBENCH_MODELS`
+      );
+    }
+  });
+
+  // Four ARNs: two profiles and two foundation models, both shapes, because a
+  // grant needs both and the region is the only wildcard.
+  it("composes both ARN shapes per model, in the infrastructure account", () => {
+    assert.deepEqual(swarmResources, [
+      infraProfileArn("global.openai.gpt-6.1-sol"),
+      infraProfileArn("global.anthropic.claude-haiku-5-5"),
+      foundationArn("openai.gpt-6.1-sol"),
+      foundationArn("anthropic.claude-haiku-5-5"),
+    ]);
+    assert.equal(swarmResources.length, 4);
+    for (const arn of swarmResources) {
+      assert.match(arn, /^arn:aws:bedrock:\*:/, arn);
+      assert.ok(
+        SWARM_MODEL_IDS.some(
+          (id) => arn.endsWith(`/${id}`) || arn.endsWith(`/global.${id}`)
+        ),
+        arn
+      );
+    }
+  });
+
+  // The workbench grant is unchanged by this: eight entries still, in that
+  // account, and no inference profile outside it.
+  it("leaves the workbench grant at every entry, in the workbench account", () => {
+    assert.equal(resources.length, WORKBENCH_MODELS.length * 2);
+    assert.equal(
+      resources.some((r) => r.includes(INFRASTRUCTURE_ACCOUNT_ID)),
+      false
+    );
+    assert.equal(
+      swarmResources.some((r) => r.includes(WORKBENCH_ACCOUNT_ID)),
+      false
+    );
+  });
+
+  // Neither subset may carry a geo profile: every entry in the model list is a
+  // `global.` profile, and `us.` was retired for every principal on 2026-11-04.
+  it("names no us. geo profile", () => {
+    assert.equal(
+      swarmResources.some((r) => r.includes(":inference-profile/us.")),
+      false
+    );
+    for (const model of SWARM_MODELS) {
+      assert.ok(model.invokeId.startsWith("global."), model.invokeId);
+    }
+  });
+
+  // The composer is the one place ARN shapes are decided, so the workbench
+  // grant has to be exactly what it produces for that list. This is the
+  // assertion that would catch a second, hand-written shape creeping into
+  // either caller.
+  it("composes the workbench grant through the same function", () => {
+    assert.deepEqual(
+      bedrockInvokeResources(),
+      bedrockInvokeResourcesFor(WORKBENCH_MODELS, WORKBENCH_ACCOUNT_ID)
+    );
+    assert.deepEqual(
+      swarmResources,
+      bedrockInvokeResourcesFor(SWARM_MODELS, INFRASTRUCTURE_ACCOUNT_ID)
+    );
+  });
+
+  it("names each resource once", () => {
+    assert.equal(new Set(swarmResources).size, swarmResources.length);
   });
 });

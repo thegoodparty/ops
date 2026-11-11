@@ -27,6 +27,16 @@ on:
       - "utils/accounts.ts"
       # The swarm host's files and first-boot script, synced by the stack.
       - "agent-swarm/**"
+      # The model list and the subscription script, which is the step below.
+      # The list lives in utils/ and is where a model is actually added, so
+      # without these two a change to the swarm's allowlist would merge, update
+      # the IAM policy and never create the Marketplace agreement — the exact
+      # failure `docs/swarm-bedrock.md` and the script's header describe: an
+      # invocation that works for up to fifteen minutes and then turns into
+      # AccessDenied. Same lesson as the identical pair in deploy-workbench.yml,
+      # which was missing `utils/bedrock-models.ts` until 2026-09-23.
+      - "utils/bedrock-models.ts"
+      - "scripts/enable-bedrock-models.ts"
 
 # Its own group: a different stack with a different S3 lock from the other
 # deploy workflows, so there is nothing to serialize between them.
@@ -82,3 +92,38 @@ jobs:
       - name: Deploy
         working-directory: deploy-infrastructure
         run: ./deploy.sh
+
+      # Bedrock model access is not a Pulumi resource, so it cannot ride in
+      # deploy.sh; see the header of the script for why none exists. Without
+      # this step the swarm's two models would have an IAM grant and no
+      # agreement in this account, which is the fifteen-minute failure rather
+      # than an obvious one: the first calls succeed while Bedrock subscribes in
+      # the background, then every call fails with AccessDeniedException.
+      #
+      # After the apply on purpose. Enablement does not depend on anything in
+      # the stack, but a failed apply is a reason to stop rather than to carry
+      # on mutating the account. This is the same ordering, and the same
+      # reasoning, as the Enable Bedrock models step in deploy-workbench.yml.
+      #
+      # `BEDROCK_SCOPE=swarm` is what selects the infrastructure account and the
+      # two-model subset. Unqualified, the script targets the workbench account,
+      # which is why the scope is spelled out here even though it looks like the
+      # default would do: the default belongs to the other workflow.
+      #
+      # It makes the second hop itself, assuming this account's `pulumi-deploy`
+      # exactly as index.ts does, so the first-hop credentials from the step
+      # above are all it needs. No new grant: the workflow already assumes that
+      # role for the apply.
+      #
+      # Idempotent, so running it on every infrastructure deploy is a handful of
+      # availability reads once the two models are entitled. It exits non-zero
+      # when a model still needs its terms accepted in the console, which will
+      # hold this workflow red until someone does it. That is deliberate: a
+      # green deploy over a half-enabled account is the exact state this step
+      # exists to make impossible.
+      #
+      # Worth naming, since merging now does it automatically: creating an
+      # agreement accepts that model provider's terms on GoodParty's behalf.
+      # The reviewed model list in the script is where that consent lives.
+      - name: Enable Bedrock models
+        run: BEDROCK_SCOPE=swarm APPLY=1 npm run script enable-bedrock-models

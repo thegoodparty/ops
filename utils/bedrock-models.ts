@@ -1,4 +1,4 @@
-import { WORKBENCH_ACCOUNT_ID } from "./accounts";
+import { INFRASTRUCTURE_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "./accounts";
 
 /**
  * The Bedrock models the coding sandbox may use.
@@ -28,13 +28,24 @@ import { WORKBENCH_ACCOUNT_ID } from "./accounts";
  * fail mid-session, and that rollover has finished: the field is gone, so the
  * policy names one profile per model. The half of that switch worth keeping in
  * mind is who held the grant. `WorkbenchAccess` — every engineer's own
- * session — used to name these models too; it does not now. Bifrost's task
- * role is the only principal that may invoke a Bedrock model, and the model
- * list is what its policy is built from. That is why this file reads as *the*
- * allowlist rather than as one of several.
+ * session — used to name these models too; it does not now. In the workbench
+ * account Bifrost's task role is the only principal that may invoke a Bedrock
+ * model, and the model list is what its policy is built from. That is why this
+ * file reads as *the* allowlist rather than as one of several.
  *
- * See `docs/workbench-account.md`, steps 11 and 15, and
- * `docs/bifrost-gateway.md`, "Direct Bedrock access is gone".
+ * Two principals now, in two accounts, and both are built from this list:
+ * Bifrost's task role for all eight entries in the workbench account, and
+ * `delegate-swarm-bedrock` in the infrastructure account for the two-entry
+ * `SWARM_MODELS` subset below. The swarm is not a gateway: it is one host
+ * role, and its grant is the whole of what it may reach. That second principal
+ * is why `bedrockInvokeResourcesFor` takes a model list and an account id
+ * rather than reading this one, and why the subset is derived from these
+ * entries instead of restated — an id added to the swarm is a model that has
+ * to exist here first.
+ *
+ * See `docs/workbench-account.md`, steps 11 and 15,
+ * `docs/bifrost-gateway.md`, "Direct Bedrock access is gone", and
+ * `docs/swarm-bedrock.md` for the second principal.
  */
 
 export type BedrockModel = {
@@ -162,13 +173,89 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
  * missing model access. Region was never the control we wanted; the model is.
  * So the model is enumerated and the region is not.
  */
+export const bedrockInvokeResourcesFor = (
+  models: BedrockModel[],
+  accountId: string
+): string[] => [
+  ...models
+    .filter((m) => m.crossRegion)
+    .map(
+      (m) => `arn:aws:bedrock:*:${accountId}:inference-profile/${m.invokeId}`
+    ),
+  ...models.map((m) => `arn:aws:bedrock:*::foundation-model/${m.id}`),
+];
+
+/**
+ * The workbench account's grant: every entry, in that account. Unchanged in
+ * behaviour and in its default; it is now the one-model-list call into the
+ * composer above, so a second principal could not fork the ARN shapes.
+ */
 export const bedrockInvokeResources = (
   accountId = WORKBENCH_ACCOUNT_ID
-): string[] => [
-  ...WORKBENCH_MODELS.filter((m) => m.crossRegion).map(
-    (m) => `arn:aws:bedrock:*:${accountId}:inference-profile/${m.invokeId}`
-  ),
-  ...WORKBENCH_MODELS.map(
-    (m) => `arn:aws:bedrock:*::foundation-model/${m.id}`
-  ),
-];
+): string[] => bedrockInvokeResourcesFor(WORKBENCH_MODELS, accountId);
+
+/**
+ * The two models the Delegate swarm may invoke, by id.
+ *
+ * A subset of `WORKBENCH_MODELS` rather than its own list of entries, and that
+ * is the decision worth recording. The swarm runs on one EC2 host in the
+ * infrastructure account (`deploy-infrastructure/agent-swarm.ts`) and its
+ * container's model traffic is the agent's own, so the question this answers
+ * is "which models may that host reach", not "which models does the fleet
+ * serve". Ids only: the profile, the region and the note stay in the one list
+ * above, so a profile move is still a one-line edit there and the swarm's ARNs
+ * follow it. `SWARM_MODELS` throws if an id here is missing from
+ * `WORKBENCH_MODELS`, which makes a removal from that list a failing import
+ * rather than a policy that silently grants nothing.
+ *
+ * Two, not eight, because the swarm is a different audience from the coding
+ * sandbox: it runs the Delegate agents in Slack, not a developer's editor. The
+ * reasoning, and what is deliberately not granted beside them (no catalog
+ * enumeration, so no `bedrock:Get*`/`List*`, and no `aws-marketplace`, so the
+ * host cannot subscribe a model nobody chose), is in `docs/swarm-bedrock.md`.
+ */
+export const SWARM_MODEL_IDS = [
+  "openai.gpt-6.1-sol",
+  "anthropic.claude-haiku-5-5",
+] as const;
+
+export const SWARM_MODELS: BedrockModel[] = SWARM_MODEL_IDS.map((id) => {
+  const model = WORKBENCH_MODELS.find((m) => m.id === id);
+  if (!model) {
+    throw new Error(
+      `SWARM_MODEL_IDS names ${id}, which is not in WORKBENCH_MODELS. The swarm's subset derives from that list, so the model has to be added there first.`
+    );
+  }
+  return model;
+});
+
+/**
+ * The infrastructure account's grant: the two swarm models, in that account.
+ *
+ * A separate function rather than `bedrockInvokeResources(INFRASTRUCTURE_ACCOUNT_ID)`,
+ * which would grant all eight. The account id is passed rather than defaulted,
+ * so a caller that means the swarm cannot get the workbench account by
+ * omission.
+ */
+export const swarmBedrockInvokeResources = (): string[] =>
+  bedrockInvokeResourcesFor(SWARM_MODELS, INFRASTRUCTURE_ACCOUNT_ID);
+
+/**
+ * The AWS Marketplace product id of each swarm model, as AWS records it.
+ *
+ * Both entries are Marketplace products, and that is why the swarm is not
+ * finished by an IAM grant: a Marketplace model needs an agreement in the
+ * account before its first invoke, or the first calls succeed for up to ~15
+ * minutes and then fail with `AccessDeniedException` (the docstring of
+ * `scripts/enable-bedrock-models.ts` explains the mechanism). So the
+ * subscription step in `.github/workflows/deploy-infrastructure.yml` is part of
+ * this change rather than an optional extra, and these ids are here rather
+ * than in a runbook so a test can assert that the set needing an agreement and
+ * the set the role may invoke are the same set. The values are the ones on
+ * record for each entry; a product id is per model, not per region, so one
+ * row per model is the whole list.
+ */
+export const SWARM_MARKETPLACE_PRODUCTS: Record<string, string> = {
+  "openai.gpt-6.1-sol": "prod-qco655ut2vn54",
+  "anthropic.claude-haiku-5-5": "prod-6cyn7tgqazjhu",
+};

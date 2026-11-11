@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  delegateSwarmBedrockPolicy,
+  delegateSwarmBedrockTrust,
   DISK_METRICS_NAMESPACE,
   diskMetricsPutStatement,
   hostFiles,
@@ -15,6 +17,7 @@ import {
   userData,
 } from "./agent-swarm";
 import { INFRA_ZONE_NAME } from "./dns";
+import { SWARM_MODEL_IDS } from "../utils/bedrock-models";
 
 const HOST_DIR = path.resolve(__dirname, "../agent-swarm/host");
 
@@ -211,5 +214,126 @@ describe("infrastructure account log read access", () => {
     for (const arn of [reads?.Resource].flat()) {
       assert.match(String(arn), /^arn:aws:logs:[a-z0-9-]+:\d{12}:log-group:\*/);
     }
+  });
+});
+
+// The swarm's model grant. `docs/swarm-bedrock.md` is the plan; this describe
+// is step 1's policy and trust, read as data rather than through a Pulumi
+// resource, the same way the host policy above is.
+describe("delegate swarm bedrock role", () => {
+  const HOST_ROLE_ARN =
+    "arn:aws:iam::394495727159:role/delegate-swarm-host";
+  const statements = delegateSwarmBedrockPolicy.Statement;
+  const asList = (value: string | string[]) =>
+    Array.isArray(value) ? value : [value];
+
+  const actions = statements.flatMap((s) => asList(s.Action));
+  const resources = statements.flatMap((s) => asList(s.Resource));
+
+  it("admits the swarm host role and nothing else", () => {
+    // The account root is the principal only because the host role may not
+    // exist when this applies; the condition is what narrows it. Same shape as
+    // delegate-swarm-prod-read, whose test reads it the same way.
+    assert.deepEqual(delegateSwarmBedrockTrust, {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Principal: { AWS: "arn:aws:iam::394495727159:root" },
+          Action: "sts:AssumeRole",
+          Condition: { ArnEquals: { "aws:PrincipalArn": HOST_ROLE_ARN } },
+        },
+      ],
+    });
+    // One statement, one condition: a second statement without one, or the
+    // role as a bare principal, would widen who may invoke the models.
+    assert.equal(delegateSwarmBedrockTrust.Statement.length, 1);
+    for (const statement of delegateSwarmBedrockTrust.Statement) {
+      assert.equal(statement.Action, "sts:AssumeRole");
+      assert.deepEqual(Object.keys(statement.Condition), ["ArnEquals"]);
+    }
+  });
+
+  it("allows exactly the four invoke actions on exactly four ARNs", () => {
+    assert.equal(statements.length, 1);
+    const [invoke] = statements;
+    assert.equal(invoke.Sid, "InvokeSwarmBedrockModels");
+    assert.equal(invoke.Effect, "Allow");
+    assert.deepEqual(invoke.Action, [
+      "bedrock:Converse",
+      "bedrock:ConverseStream",
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]);
+    // Two inference profiles and two foundation models, in this account for the
+    // profiles and with an empty account field for the foundation models.
+    assert.deepEqual(invoke.Resource, [
+      "arn:aws:bedrock:*:394495727159:inference-profile/global.openai.gpt-6.1-sol",
+      "arn:aws:bedrock:*:394495727159:inference-profile/global.anthropic.claude-haiku-5-5",
+      "arn:aws:bedrock:*::foundation-model/openai.gpt-6.1-sol",
+      "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5",
+    ]);
+    assert.equal(resources.length, 4);
+  });
+
+  // The grant exists to reach two models, so every ARN has to name one of them
+  // by id. This is what would catch a third model, or a profile whose entry in
+  // utils/bedrock-models.ts moved without the swarm following.
+  it("names one of the two swarm models in every ARN", () => {
+    assert.deepEqual([...SWARM_MODEL_IDS], [
+      "openai.gpt-6.1-sol",
+      "anthropic.claude-haiku-5-5",
+    ]);
+    for (const arn of resources) {
+      const named = SWARM_MODEL_IDS.filter(
+        (id) => arn.endsWith(`/${id}`) || arn.endsWith(`/global.${id}`)
+      );
+      assert.equal(named.length, 1, arn);
+      assert.match(arn, /^arn:aws:bedrock:\*:/, arn);
+    }
+  });
+
+  // Nothing wilder. Each of these is the line someone would add next, and each
+  // one makes the two-model list decoration: a wildcard action, a wildcard
+  // resource, a catalog read (the enumeration probe the plan leaves off), or
+  // the marketplace permission that would let the host subscribe a model
+  // nobody chose.
+  it("carries no wildcard action, no wildcard resource and no reads", () => {
+    for (const action of actions) {
+      assert.match(action, /^bedrock:/, action);
+      assert.equal(action.includes("*"), false, action);
+    }
+    for (const resource of resources) {
+      assert.equal(resource.includes("arn:aws:bedrock:*::foundation-model/*"), false);
+      assert.equal(resource.split("*").length - 1, 1, `${resource} has more than the region wildcard`);
+    }
+    // The region is the only wildcard in the document, and there is no service
+    // wildcard, no marketplace and no read of any kind.
+    assert.equal(
+      actions.some((a) => /:(Get|List)/.test(a)),
+      false,
+      "the role grants a Bedrock read; the catalog probe is deliberately off"
+    );
+    assert.equal(
+      JSON.stringify(delegateSwarmBedrockPolicy).includes("marketplace"),
+      false
+    );
+  });
+
+  // The host assumes the role, so the grant has to be on the host's policy as
+  // well. Both halves are required for a same-account assume, and a missing
+  // half is an AccessDenied at the first model call rather than a diff.
+  it("is assumable by the host role, which the host policy grants", () => {
+    const { Statement } = swarmHostPolicy(
+      "arn:aws:secretsmanager:secret",
+      "arn:aws:s3:::bucket"
+    );
+    const assume = Statement.find((s) => s.Sid === "AssumeSwarmBedrock");
+    assert.ok(assume);
+    assert.equal(assume.Action, "sts:AssumeRole");
+    assert.equal(
+      assume.Resource,
+      "arn:aws:iam::394495727159:role/delegate-swarm-bedrock"
+    );
   });
 });

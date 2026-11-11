@@ -7,6 +7,7 @@ import {
   INFRASTRUCTURE_ACCOUNT_ID,
   MANAGEMENT_ACCOUNT_ID,
 } from "../utils/accounts";
+import { swarmBedrockInvokeResources } from "../utils/bedrock-models";
 import { INFRA_ZONE_NAME } from "./dns";
 
 // The Delegate swarm host: one EC2 instance running agent-swarm in Docker
@@ -21,6 +22,10 @@ const SUBNET_ID = "subnet-0184e0f40b440ab13";
 const CONFIG_BUCKET = `delegate-swarm-config-${INFRASTRUCTURE_ACCOUNT_ID}`;
 const LOG_GROUP = "/delegate-swarm/containers";
 const PROD_READ_ROLE_ARN = `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/delegate-swarm-prod-read`;
+const HOST_ROLE_NAME = "delegate-swarm-host";
+const HOST_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${HOST_ROLE_NAME}`;
+const BEDROCK_ROLE_NAME = "delegate-swarm-bedrock";
+const BEDROCK_ROLE_ARN = `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${BEDROCK_ROLE_NAME}`;
 const DATA_VOLUME_NAME = "delegate-swarm-data";
 const DATA_VOLUME_PLACEHOLDER = "__DATA_VOLUME_ID__";
 
@@ -172,8 +177,89 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
       Action: "sts:AssumeRole",
       Resource: PROD_READ_ROLE_ARN,
     },
+    // The Bedrock hop, added with the role below. Containers reach the instance
+    // role through IMDS, then assume this in-account role for model calls, so
+    // the host's own policy stays free of any model grant: the models are
+    // reachable only as `delegate-swarm-bedrock`, which is a principal of its
+    // own in CloudTrail and can be revoked on its own. Same-account assume, so
+    // this half is the grant and the role's trust is the other.
+    {
+      Sid: "AssumeSwarmBedrock",
+      Effect: "Allow",
+      Action: "sts:AssumeRole",
+      Resource: BEDROCK_ROLE_ARN,
+    },
   ],
 });
+
+/**
+ * The swarm's model grant, kept pure so a test can read it. `docs/swarm-bedrock.md`
+ * is the plan; step 1 is this role.
+ *
+ * A dedicated role rather than one more statement on the host's policy, for
+ * three reasons. The host role is on an EC2 instance that every container on
+ * it shares, so a model grant on it would be a grant to the whole host, and
+ * the swarm runs other things beside the agent. A separate role is
+ * attributable: CloudTrail names `delegate-swarm-bedrock` per call, so "what
+ * did the swarm spend on models" is a question about one principal. And it is
+ * separate to be revocable: detaching this policy ends model access without
+ * touching the host's S3, logs or secret grants.
+ *
+ * Exactly two models, from the subset in `utils/bedrock-models.ts`, and exactly
+ * four actions. Deliberately absent, and each is the obvious next line someone
+ * would add:
+ *
+ * - `bedrock:Get*` and `bedrock:List*`. The gateway task role needed one
+ *   catalog read to render a dashboard; the swarm is not a dashboard, and the
+ *   model list is fixed here. The enumeration probe in the plan doc is
+ *   deliberately not enabled, so this role cannot ask the account what it is
+ *   allowed.
+ * - `aws-marketplace`, which is what would let the host subscribe a model
+ *   nobody chose. Agreements are created out of band by
+ *   `scripts/enable-bedrock-models.ts`, which is why that script takes an
+ *   account and a model list now.
+ * - `bedrock:*`, or a wildcard resource. Either one makes the two models
+ *   above decoration.
+ */
+export const delegateSwarmBedrockPolicy = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "InvokeSwarmBedrockModels",
+      Effect: "Allow",
+      Action: [
+        "bedrock:Converse",
+        "bedrock:ConverseStream",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+      ],
+      Resource: swarmBedrockInvokeResources(),
+    },
+  ],
+};
+
+/**
+ * Who may assume it: the swarm host role, and nothing else.
+ *
+ * The account root with an `aws:PrincipalArn` condition rather than the role as
+ * the principal, which is the shape `deploy/components/delegate-swarm-prod-read.ts`
+ * uses and explains: IAM rejects a trust naming a role that does not exist yet,
+ * and that stack and this one apply concurrently on the same push. The
+ * condition is what narrows it, so the root here is not a delegation — any
+ * other principal in the account is refused by the condition, and nothing
+ * outside the account matches `Principal: { AWS: <root> }` at all.
+ */
+export const delegateSwarmBedrockTrust = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: { AWS: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:root` },
+      Action: "sts:AssumeRole",
+      Condition: { ArnEquals: { "aws:PrincipalArn": HOST_ROLE_ARN } },
+    },
+  ],
+};
 
 // scripts/ and skills/ are the source for swarm-owned scripts and skills,
 // which reach the swarm through Delegate, not the host. Leaving them out of
@@ -317,7 +403,7 @@ export const createAgentSwarm = (args: {
   const role = new aws.iam.Role(
     "delegateSwarmHostRole",
     {
-      name: "delegate-swarm-host",
+      name: HOST_ROLE_NAME,
       assumeRolePolicy: JSON.stringify({
         Version: "2012-10-17",
         Statement: [
@@ -345,7 +431,7 @@ export const createAgentSwarm = (args: {
   const hostPolicy = new aws.iam.RolePolicy(
     "delegateSwarmHostPolicy",
     {
-      name: "delegate-swarm-host",
+      name: HOST_ROLE_NAME,
       role: role.name,
       policy: pulumi
         .all([secret.arn, configBucket.arn])
@@ -358,7 +444,45 @@ export const createAgentSwarm = (args: {
 
   const instanceProfile = new aws.iam.InstanceProfile(
     "delegateSwarmInstanceProfile",
-    { name: "delegate-swarm-host", role: role.name, tags: TAGS },
+    { name: HOST_ROLE_NAME, role: role.name, tags: TAGS },
+    { provider },
+  );
+
+  // The model role the host assumes ("the Bedrock hop" in swarmHostPolicy).
+  // Placed here only so the two roles read next to each other; it is not
+  // attached to the instance profile, so the instance carries no model grant.
+  // Containers reach it by assuming it from the host role, which keeps the
+  // models attributable to one principal and revocable on their own.
+  //
+  // Not `protect`ed, unlike the deploy role: losing it is an AccessDenied on
+  // the next model call, which is loud, and the next push re-creates it. Tags
+  // match the neighbouring resources as they are written rather than the
+  // `Environment: infrastructure` the provider default would give them,
+  // because this role's scope is the swarm (`Environment: infra` is what
+  // `EngineerAccess` and `delegate-swarm-prod-read` are scoped by) and the plan
+  // names both tags.
+  const bedrockRole = new aws.iam.Role(
+    "delegateSwarmBedrockRole",
+    {
+      name: BEDROCK_ROLE_NAME,
+      description:
+        "Invoke two Amazon Bedrock models for the Delegate swarm. Assumed only by delegate-swarm-host in this account. Step 1 of docs/swarm-bedrock.md.",
+      assumeRolePolicy: JSON.stringify(delegateSwarmBedrockTrust),
+      // Nothing secret is read through this role, so the default one-hour
+      // session is plenty; the dirty detail is that a hop from the instance
+      // role is role chaining, which AWS caps at an hour whatever this says.
+      tags: { Environment: "infra", Project: "delegate-swarm" },
+    },
+    { provider },
+  );
+
+  new aws.iam.RolePolicy(
+    "delegateSwarmBedrockPolicy",
+    {
+      name: BEDROCK_ROLE_NAME,
+      role: bedrockRole.name,
+      policy: JSON.stringify(delegateSwarmBedrockPolicy),
+    },
     { provider },
   );
 
