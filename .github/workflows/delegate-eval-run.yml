@@ -287,6 +287,31 @@ jobs:
               || { echo "::error::Main's replay failed; its log is withheld in gate mode."; exit 1; }
           fi
 
+      # Three passes in a row are often luck, so a case main passed on every
+      # run can regress only once main has 6 runs of it, here and earlier.
+      # Replays runs 4 to 6 where the record is shorter; cached runs are
+      # skipped. The ids stay in a file: in gate mode they name holdout cases.
+      - name: Replay main again where its record is short
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          REVIEW_BUCKET: delegate-reviews
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+          history=(); if [ -d ./history ]; then history=(--history ./history); fi
+          npm run -s review:expect -- --mode main-short --runs 3 --min-main-runs 6 "${split[@]}" "${history[@]}" \
+            --base ./baseline --ids-out "$RUNNER_TEMP/main-short.txt"
+          if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
+            ids=$(cat "$RUNNER_TEMP/main-short.txt")
+            npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency 5 \
+              --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main-more" \
+              > "$RUNNER_TEMP/replay-more.log" 2>&1 \
+              || { echo "::error::Main's extra replay failed; its log is withheld."; exit 1; }
+          fi
+
       # Uploaded even when the replay failed, so the good runs still reach the
       # cache. Hidden files are included for the pulled-results marker.
       - name: Upload main's results
@@ -324,6 +349,16 @@ jobs:
               process.exit(1);
             }
           '
+          # A case still short of 6 main runs after the extra replay had one
+          # error, and the gate would not hold it, so a regression would pass.
+          split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+          history=(); if [ -d ./history ]; then history=(--history ./history); fi
+          npm run -s review:expect -- --mode main-short --runs 3 --min-main-runs 6 "${split[@]}" "${history[@]}" \
+            --base ./baseline --ids-out "$RUNNER_TEMP/main-short.txt"
+          if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
+            echo "::error::Some cases are still short of 6 main runs. Re-dispatch to replay only those."
+            exit 1
+          fi
 
   # The only writer of the cache.
   main-cache-push:
@@ -474,7 +509,7 @@ jobs:
           split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
           history=(); if [ -d ./history ]; then history=(--history ./history); fi
           npm run -s review:expect -- \
-            --mode gate --runs 3 "${split[@]}" "${history[@]}" \
+            --mode gate --runs 3 --min-main-runs 6 "${split[@]}" "${history[@]}" \
             --base ./baseline --targets "$TARGETS" \
             --out ./cand > /dev/null 2>&1
           # The ids go in a file, not a step output: in gate mode they can name
@@ -720,7 +755,7 @@ jobs:
             history=(); if [ -d ./history ]; then history=(--history ./history); fi
             # Not printed: the gate report names holdout counts and the log is readable.
             npm run -s review:expect -- \
-              --mode gate --final true --runs 3 "${split[@]}" "${history[@]}" \
+              --mode gate --final true --runs 3 --min-main-runs 6 "${split[@]}" "${history[@]}" \
               --variant "cand-${SHA7}" --baseline-variant "main-${GITHUB_SHA:0:7}" \
               --base ./baseline --targets "$TARGETS" \
               --out ./cand > /dev/null 2>&1

@@ -92,6 +92,11 @@ export const ManifestSchema = z
 export const readManifest = (path: string): ExpectedCase[] =>
   ManifestSchema.parse(JSON.parse(readFileSync(path, "utf-8")));
 
+// expected/parked.json holds cases taken out of the suite, each with why: a
+// case no change to the reviewer's prompts can pass. Nothing replays or
+// scores them; moving one back to the manifest restores it.
+export const ParkedSchema = z.array(z.object({ reason: z.string().min(1), case: ExpectedCaseSchema }));
+
 export const selectCases = (
   all: ExpectedCase[],
   filter: { case?: string; split?: string },
@@ -283,7 +288,7 @@ const baselineCounts = (b: Baseline, r: CaseReport | undefined) => {
     runs: b.runs,
     completed: done.length,
     runsPassed: done.filter((s) => s.pass).length,
-    unfinished: b.runs - done.length,
+    unfinished: Math.max(0, b.runs - done.length),
   };
 };
 
@@ -322,6 +327,8 @@ export interface Gate {
   costRatio: number | null;
   costOver: boolean;
   pass: boolean;
+  // Completed main runs, here and earlier, a case needs before it can regress.
+  minMainRuns: number;
   cases: GateCase[];
 }
 
@@ -330,19 +337,50 @@ const avgCost = (reports: CaseReport[]): number | null => {
   return known.length === 0 ? null : known.reduce((a, b) => a + b, 0) / known.length;
 };
 
-// A case main passes on every run must not regress. One that drops below
-// 3/3 gets `runs` more runs and has to reach 2*runs-1 of 2*runs, so a single
-// unlucky run is not a regression. A case marked `flakyOnMain` cannot regress,
-// and neither can one that `history`, main's earlier runs of the same
-// reviewer, shows failing: three lucky runs are not a bar. A run that errored is a failed run, and
-// with `final` a rerun that never happened is a failed rerun, so infra noise
-// cannot pass as an improvement. Each target must pass every run.
+// Whether main's record on a case is a bar: at least `runs` completed runs in
+// this baseline, every one of them and of `earlier` passed, and `minMainRuns`
+// completed in all. A case main passes 9 times in 10 still passes 3 runs in a
+// row about 73% of the time, so 3/3 alone is often luck.
+const mainHolds = (c: ExpectedCase, main: { runsPassed: number; completed: number }, earlier: RunScore[], runs: number, minMainRuns: number): boolean =>
+  !c.flakyOnMain &&
+  main.completed >= runs &&
+  main.runsPassed === main.completed &&
+  earlier.every((s) => s.pass) &&
+  main.completed + earlier.length >= minMainRuns;
+
+const earlierRuns = (history: CaseReport[], id: string): RunScore[] =>
+  (history.find((h) => h.c.id === id)?.scores ?? []).filter((s) => !s.errored);
+
+// Cases main passed on every run so far whose record is still shorter than
+// `minMainRuns`: replaying main `runs` more times on these is what lets the
+// gate hold them. A case main failed once is already not held, so it is left out.
+export const mainRunsShort = (baseline: Baseline, history: CaseReport[], minMainRuns: number): string[] =>
+  baseline.reports
+    .filter((r) => {
+      const main = baselineCounts(baseline, r);
+      const earlier = earlierRuns(history, r.c.id);
+      return (
+        main.completed + earlier.length < minMainRuns &&
+        mainHolds(r.c, main, earlier, baseline.runs, 0)
+      );
+    })
+    .map((r) => r.c.id);
+
+// A case main passes on every run, over at least `minMainRuns` runs, must not
+// regress. One that drops below 3/3 gets `runs` more runs and has to reach
+// 2*runs-1 of 2*runs, so a single unlucky run is not a regression. A case
+// marked `flakyOnMain` cannot regress, and neither can one that main failed on
+// any run, here or in `history` (main's earlier runs of the same reviewer). A
+// run that errored is a failed run, and with `final` a rerun that never
+// happened is a failed rerun, so infra noise cannot pass as an improvement.
+// Each target must pass every run.
 export const computeGate = (
   reports: CaseReport[],
   baseline: Baseline,
   targets: string[],
   final: boolean,
   history: CaseReport[] = [],
+  minMainRuns: number = baseline.runs,
 ): Gate => {
   const runs = baseline.runs;
   const counts = reports.map((r) => baselineCounts(baseline, baseline.reports.find((b) => b.c.id === r.c.id)));
@@ -351,16 +389,14 @@ export const computeGate = (
   }
   const cases = reports.map((r, i): GateCase => {
     const main = counts[i];
-    const earlier = (history.find((h) => h.c.id === r.c.id)?.scores ?? []).filter((s) => !s.errored);
+    const earlier = earlierRuns(history, r.c.id);
     const earlierPassed = earlier.filter((s) => s.pass).length;
     const passed = main.runsPassed + earlierPassed;
     const completed = main.completed + earlier.length;
     const candPassed = r.scores.filter((s) => s.pass).length;
     const candRuns = r.scores.length;
     let outcome: GateCase["outcome"];
-    if (r.c.flakyOnMain || main.runsPassed !== runs || main.completed !== runs || earlierPassed !== earlier.length) {
-      outcome = "not-held";
-    }
+    if (!mainHolds(r.c, main, earlier, runs, minMainRuns)) outcome = "not-held";
     else if (candRuns > runs) outcome = candPassed >= 2 * runs - 1 ? "pass" : "regression";
     else if (candPassed >= runs) outcome = "pass";
     else outcome = final ? "regression" : "rerun";
@@ -394,6 +430,7 @@ export const computeGate = (
     costRatio,
     costOver: costRatio !== null && costRatio > COST_LIMIT,
     pass: regressions.length === 0 && rerun.length === 0 && targetsMissed.length === 0,
+    minMainRuns,
     cases,
   };
 };
@@ -424,7 +461,7 @@ const OUTCOME_TEXT: Record<GateCase["outcome"], string> = {
   pass: "pass",
   rerun: "needs 3 more runs",
   regression: "regression",
-  "not-held": "main does not pass this every run",
+  "not-held": "main does not pass this every run, or has too few runs",
 };
 
 // With a gate, holdout cases appear only as an aggregate: no ids, expectations
@@ -444,7 +481,7 @@ export const renderExpectReport = (
   const holdout = gate?.cases.filter((c) => c.split === "holdout") ?? [];
   const gateLines = gate
     ? [
-        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes on every run, here and in earlier runs of the same reviewer, may regress; one that drops gets 3 more runs and needs 5 of 6.`,
+        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes on every run, here and in earlier runs of the same reviewer, may regress${gate.minMainRuns > (baseline?.runs ?? gate.minMainRuns) ? ` once main has ${gate.minMainRuns} runs of it` : ""}; one that drops gets 3 more runs and needs 5 of 6.`,
         "",
         `Holdout: passed ${holdout.filter((c) => c.candRuns > 0 && c.candPassed === c.candRuns).length} of ${holdout.length}, regressions: ${holdout.filter((c) => c.outcome === "regression").length}.`,
         "",
@@ -565,6 +602,20 @@ const main = async () => {
     throw new Error(`no case matches${flags.case ? ` --case ${flags.case}` : ""}${flags.split ? ` --split ${flags.split}` : ""}`);
   }
 
+  const minMainRuns = Number(flags["min-main-runs"] ?? runs);
+
+  // Writes the ids of cases main needs more runs on to --ids-out and prints
+  // only a count: in gate mode the ids include holdout cases, and logs are readable.
+  if (mode === "main-short") {
+    if (!flags.base || !flags["ids-out"]) throw new Error("--mode main-short needs --base and --ids-out");
+    const baseline = { variant: "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
+    const history = flags.history ? scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const ids = mainRunsShort(baseline, history, minMainRuns);
+    writeFileSync(resolve(flags["ids-out"]), ids.join(","));
+    console.log(`${ids.length} case(s) need more main runs to reach ${minMainRuns}`);
+    return;
+  }
+
   if (mode === "gate") {
     if (!flags.base) throw new Error("--mode gate needs --base, main's baseline results");
     const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
@@ -572,7 +623,7 @@ const main = async () => {
     const final = flags.final === "true";
     const targets = flags.targets ? flags.targets.split(",") : [];
     const history = flags.history ? scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
-    const gate = computeGate(reports, baseline, targets, final, history);
+    const gate = computeGate(reports, baseline, targets, final, history, minMainRuns);
     writeFileSync(join(out, "gate.json"), JSON.stringify(gate, null, 2));
     const report = renderExpectReport(reports, variant ?? "unknown", baseline, gate);
     writeFileSync(join(out, "report.md"), report);

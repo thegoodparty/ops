@@ -78,6 +78,7 @@ test("the redacted gate carries holdout as counts only", () => {
     costRatio: 1.2,
     costOver: true,
     pass: false,
+    minMainRuns: 6,
     cases: [
       gateCase("t1", "tune", "regression", 1),
       gateCase("t2", "tune", "pass", 3),

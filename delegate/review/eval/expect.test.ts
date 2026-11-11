@@ -1,12 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   commitSyntheticHead,
   computeGate,
+  mainRunsShort,
+  ParkedSchema,
   scoreDir,
   scoreHistory,
   readBundleFile,
@@ -166,7 +168,7 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
 
 test("the checked-in manifest holds out a minority, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 37);
+  assert.equal(cases.length, 36);
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
@@ -617,6 +619,33 @@ test("gate: earlier main runs of the same reviewer that failed make a 3/3 case n
   assert.deepEqual([errored.cases[0].outcome, errored.cases[0].earlierCompleted], ["regression", 0]);
 });
 
+test("gate: with minMainRuns, main 3/3 holds a case only once its runs here and earlier reach it", () => {
+  const { tune } = gateCases();
+  const cand = mkReport(tune, runsOf(true, false, false, true, false, false));
+  const short = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true))]), [], true, [], 6);
+  assert.deepEqual([short.cases[0].outcome, short.regressions, short.minMainRuns], ["not-held", [], 6]);
+  const withEarlier = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true))]), [], true, [mkReport(tune, runsOf(true, true, true))], 6);
+  assert.deepEqual(withEarlier.regressions, [tune.id]);
+  const topped = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true, true, true, true))]), [], true, [], 6);
+  assert.deepEqual([topped.cases[0].mainCompleted, topped.regressions], [6, [tune.id]]);
+  const toppedFail = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true, true, false, true))]), [], true, [], 6);
+  assert.deepEqual([toppedFail.cases[0].outcome, toppedFail.cases[0].flaky], ["not-held", true]);
+});
+
+test("mainRunsShort names cases main passed every run so far with fewer than minMainRuns runs", () => {
+  const { tune, holdout } = gateCases();
+  const second = readManifest(MANIFEST).filter((c) => c.split === "tune")[1];
+  const base = mkBase([
+    mkReport(tune, runsOf(true, true, true)),
+    mkReport(holdout, runsOf(true, true, false)),
+    mkReport(second, runsOf(true, true, true)),
+  ]);
+  assert.deepEqual(mainRunsShort(base, [mkReport(second, runsOf(true, true, true))], 6), [tune.id]);
+  assert.deepEqual(mainRunsShort(base, [], 3), []);
+  const errored = mkBase([mkReport(tune, [P, P, { pass: false, outcome: "no review", errored: true }])]);
+  assert.deepEqual(mainRunsShort(errored, [], 6), []);
+});
+
 test("gate: a target below 3/3 fails, and an unknown target id does too", () => {
   const { tune } = gateCases();
   const base = mkBase([mkReport(tune, runsOf(false, false, false))]);
@@ -704,4 +733,10 @@ test("history drops runs cached before the harness recorded a gating verdict", (
   put("history", 2, { verdict: "approve", gates: [] });
   const [r] = scoreHistory([tune], join(root, "history"), join(root, "base"));
   assert.equal(r.scores.length, 1);
+});
+
+test("every parked case has a reason, a valid case and an id the manifest no longer uses", () => {
+  const parked = ParkedSchema.parse(JSON.parse(readFileSync(join(dirname(MANIFEST), "parked.json"), "utf-8")));
+  const ids = new Set(readManifest(MANIFEST).map((c) => c.id));
+  for (const p of parked) assert.equal(ids.has(p.case.id), false, p.case.id);
 });
