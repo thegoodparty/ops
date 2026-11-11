@@ -94,51 +94,6 @@
 			}
 		}
 
-		# TEMPORARY, remove after the Scale to Win sign-in (added 2026-11-11).
-		#
-		# A person has to sign in to Scale to Win by hand in the coder worker's
-		# agent-browser session: the login is reCAPTCHA-gated and no worker can
-		# solve it. There is no other way in (no SSH forward from the host to a
-		# worker, no public port), so the worker's agent-browser dashboard is
-		# served from this path, behind the login above and nothing else. It
-		# answers on `agent-browser dashboard start --port 4848` inside the
-		# worker, reached through a loopback relay on the worker's own 14848.
-		#
-		# The dashboard is a Next.js app: the page at /s2w/ loads its bundle,
-		# its API and its live-view websocket from the origin root, not from its
-		# own path, so the root paths it asks for are routed here as well. Each
-		# one below is either unused by this site or (for /api/sessions, which
-		# both apps own) only taken when the referer is the dashboard's own tab.
-		#
-		# Teardown is this whole commented region: close the s2w-login agent
-		# session, delete these blocks, then stop the dashboard and the 14848
-		# relay in the coder worker.
-		@s2w path /s2w/* /_next/* /favicon.ico /lightpanda.svg /providers/* /api/session/* /api/models /api/kill /api/exec /api/chat /api/chat/status
-		redir /s2w /s2w/ 308
-		handle @s2w {
-			uri strip_prefix /s2w
-			reverse_proxy worker-coder:14848 {
-				# The dashboard answers /api/* and its websocket only to its
-				# own loopback origin: without these three it is "Origin,
-				# Referer, or dashboard access token is invalid", so the page
-				# would load and then show nothing.
-				header_up Host 127.0.0.1:14848
-				header_up Origin http://127.0.0.1:14848
-				header_up Referer http://127.0.0.1:14848
-			}
-		}
-		@dashboard_sessions {
-			path /api/sessions
-			header_regexp referer ^https://delegate-swarm\.infra\.goodparty\.org/s2w
-		}
-		handle @dashboard_sessions {
-			reverse_proxy worker-coder:14848 {
-				header_up Host 127.0.0.1:14848
-				header_up Origin http://127.0.0.1:14848
-				header_up Referer http://127.0.0.1:14848
-			}
-		}
-
 		# The dashboard is built with a placeholder key (build-ui.sh); the API
 		# gets the signed-in person's token instead.
 		@api path /api/* /p/* /@swarm/* /agentfs/* /status/* /docs /docs/* /openapi.json /close
