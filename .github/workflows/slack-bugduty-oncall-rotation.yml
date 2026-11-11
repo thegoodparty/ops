@@ -26,7 +26,7 @@ jobs:
         [
           {"start": "2026-10-25", "end": "2026-11-01", "dev": "Sanjay"},
           {"start": "2026-11-01", "end": "2026-11-08", "dev": "Hugh"},
-          {"start": "2026-11-08", "end": "2026-11-15", "dev": "Swain"}
+          {"start": "2026-11-11", "end": "2026-11-22", "dev": "Swain"}
         ]
     steps:
       - uses: actions/checkout@v4
