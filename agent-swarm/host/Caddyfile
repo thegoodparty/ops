@@ -105,6 +105,39 @@
 			}
 		}
 
+		# Temporary: live view of the Scale to Win sign-in browser that runs in
+		# worker-coder (2026-11-11, Tomer Almog). agent-browser's dashboard binds
+		# 127.0.0.1:4848 inside that container; a socat relay publishes it on the
+		# compose network as worker-coder:14848. Nothing is published on the host,
+		# and every path below sits behind the same Google login as the dashboard.
+		#
+		# The dashboard is a root-origin Next.js app: the page loads at /s2w/ but
+		# it asks for /_next/*, its own /api/* and two root assets, so those are
+		# routed to it too. /api/sessions is the one path the swarm API answers as
+		# well, so it goes to the dashboard only for a browser that came from
+		# /s2w (the dashboard rejects any other Referer itself). Delete this block
+		# and stop the dashboard and the relay once the sign-in is done.
+		handle /s2w {
+			redir * /s2w/ 308
+		}
+
+		handle_path /s2w/* {
+			reverse_proxy worker-coder:14848
+		}
+
+		@s2w_paths path /_next/* /favicon.ico /lightpanda.svg /providers/* /api/session/* /api/exec /api/kill /api/chat /api/chat/status /api/models
+		handle @s2w_paths {
+			reverse_proxy worker-coder:14848
+		}
+
+		@s2w_sessions {
+			path /api/sessions
+			header Referer */s2w/*
+		}
+		handle @s2w_sessions {
+			reverse_proxy worker-coder:14848
+		}
+
 		handle {
 			import spa
 		}
