@@ -54,11 +54,12 @@ full once; it defines the suites, the gate and the budget.
 
 ## Loop
 
-1. **Pick a failing tune case.** Use the user's target case(s). Otherwise use a `tune` case that
-   fails on main's latest baseline (the latest `delegate eval` expected-suite report, or `tune`
-   dispatched on branch `main` if none exists). Skip a case whose row in the latest `gate.json` has
-   `flaky` true: main itself swings on it, so a 1-run change can't be told from noise. Never pick
-   from `holdout`. If the user wants new
+1. **Pick a failing tune case.** Use the user's target case(s). Otherwise pick from the `cases` table
+   of a `gate.json`: the newest `tune` or `gate` run made since main last changed an `editable`
+   file, or, if there is none, `tune` dispatched now on branch `main`. A case qualifies when
+   `mainPassed` is below `mainCompleted` and `flaky` is false; a flaky case swings on main itself,
+   so a change can't be told from noise. The expected-suite report has no `flaky` field, so don't
+   pick from it. Never pick from `holdout`. If the user wants new
    cases, `mine` proposes candidates for a human to label; do not add cases yourself.
 2. **Name the failure.** Read main's result for the case (`run-<n>.json`: `output.findings`,
    `leads`) and classify it from `leads`:
@@ -101,7 +102,7 @@ When a run starts from a Slack mention, the lead owns the run and these replace 
 
 - Acknowledge in the thread with the `run_id`, the target cases and the budget. The thread is the
   tried log; write nothing under `.hill-climb/` on a branch.
-- No target given: use every failing, non-flaky `tune` case. No budget given: use `budgetUsd`.
+- No target given: use every case that qualifies under Loop step 1. No budget given: use `budgetUsd`.
 - Hand up to 3 ideas to workers, one idea per worker, each on its own `branchPattern` branch with its
   own `n`, all sharing the run's `run_id`. Workers push as `delegate-gp[bot]`.
 - One dispatch per `run_id` at a time across all workers (step 5 says why). The lead hands out
