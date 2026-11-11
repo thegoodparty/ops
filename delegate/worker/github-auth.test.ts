@@ -53,11 +53,6 @@ describe("worker git credentials", () => {
     assert.doesNotMatch(reviewer, /GITHUB_APP_PRIVATE_KEY/);
   });
 
-  it("runs it for the delegate App path too", () => {
-    const delegate = declaration(auth, "setupGitHubAuth");
-    assert.match(delegate, /configureGitCredentials\(token\)/);
-  });
-
   it("sets up credentials before the reviewer clone in the entrypoint", () => {
     const entry = read("entrypoint.ts");
     const authCall = entry.indexOf("await setupReviewerGitHubAuth()");
