@@ -33,21 +33,6 @@
     "kind": "bug"
   },
   {
-    "id": "omni-2656-keep-firing-hold",
-    "key": "reviews/thegoodparty/omni/2656/080676f4f09f73acf86ea0cb031602e2327f5929/e5cd7541-701a-4c1b-ad0e-c623ef143d3d.json",
-    "expect": {
-      "verdict": "block",
-      "paths": [
-        "packages/gp-api/deploy/components/alerts.ts",
-        "packages/gp-api/deploy/components/grafana.ts"
-      ]
-    },
-    "tests": "Event rules rely on keepFiringFor to hold an incident open, but an idle count_over_time returns no series and noDataState OK resolves it, so bursts page repeatedly. Production approved; the bug was confirmed and fixed in 57cab94c1.",
-    "split": "tune",
-    "source": "production-missed",
-    "kind": "bug"
-  },
-  {
     "id": "omni-2618-missing-slug",
     "key": "reviews/thegoodparty/omni/2618/fc14cbe36c782623ec5699cb4eb8c661ceb0e81a/e811f0f9-1e83-4486-8fb5-6cc6ada4bbce.json",
     "expect": {
