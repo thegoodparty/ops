@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SLACK_USERGROUP_ID: S0C8MGD4BQS
-      ROTATION_START: "2026-10-12"
+      ROTATION_START: "2026-10-19"
       ROTATION_CADENCE_WEEKS: "1"
       USERMAP_JSON: >
         {
