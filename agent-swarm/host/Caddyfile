@@ -94,17 +94,6 @@
 			}
 		}
 
-		# The dashboard is built with a placeholder key (build-ui.sh); the API
-		# gets the signed-in person's token instead.
-		@api path /api/* /p/* /@swarm/* /agentfs/* /status/* /docs /docs/* /openapi.json /close
-		handle @api {
-			@unprovisioned vars {swarm_user_token} ""
-			respond @unprovisioned "Signed in, but this address has no dashboard token (allowed-emails.txt, sync-dashboard-users.sh)" 403
-			reverse_proxy api:3013 {
-				header_up Authorization "Bearer {swarm_user_token}"
-			}
-		}
-
 		# Temporary: live view of the Scale to Win sign-in browser that runs in
 		# worker-coder (2026-11-11, Tomer Almog). agent-browser's dashboard binds
 		# 127.0.0.1:4848 inside that container; a socat relay publishes it on the
@@ -115,8 +104,12 @@
 		# it asks for /_next/*, its own /api/* and two root assets, so those are
 		# routed to it too. /api/sessions is the one path the swarm API answers as
 		# well, so it goes to the dashboard only for a browser that came from
-		# /s2w (the dashboard rejects any other Referer itself). Delete this block
-		# and stop the dashboard and the relay once the sign-in is done.
+		# /s2w (the dashboard rejects any other Referer itself). These handles sit
+		# above @api on purpose: Caddy only sorts handle blocks whose matcher is a
+		# single path, so a multi-path matcher keeps its file order and a later one
+		# never wins.
+		# Delete this block and stop the dashboard and the relay once the
+		# sign-in is done.
 		handle /s2w {
 			redir * /s2w/ 308
 		}
@@ -136,6 +129,17 @@
 		}
 		handle @s2w_sessions {
 			reverse_proxy worker-coder:14848
+		}
+
+		# The dashboard is built with a placeholder key (build-ui.sh); the API
+		# gets the signed-in person's token instead.
+		@api path /api/* /p/* /@swarm/* /agentfs/* /status/* /docs /docs/* /openapi.json /close
+		handle @api {
+			@unprovisioned vars {swarm_user_token} ""
+			respond @unprovisioned "Signed in, but this address has no dashboard token (allowed-emails.txt, sync-dashboard-users.sh)" 403
+			reverse_proxy api:3013 {
+				header_up Authorization "Bearer {swarm_user_token}"
+			}
 		}
 
 		handle {
