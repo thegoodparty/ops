@@ -39,7 +39,7 @@ export const prReviewerSubagents: NonNullable<AgentConfig["agents"]> = {
 
 ## Context
 
-The orchestrator placed the diff and changed files in your prompt. The PR's repo is checked out in your current working directory at the reviewed head SHA. Use Read, Grep, Glob, and the git tools to skim the touched files in context.
+The orchestrator placed the diff and changed files in your prompt. The PR's repo is checked out in your current working directory at the reviewed head SHA. Use Read, Grep, Glob, and the git tools to scan the touched files in context.
 
 ## What to produce
 
