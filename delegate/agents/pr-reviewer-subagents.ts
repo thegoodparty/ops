@@ -123,7 +123,7 @@ If evidence falsifies the finding, drop it. If not, emit it and include the fals
 
 If you cannot name a concrete falsification check, the finding is speculation — drop it.
 
-Your recollection is not evidence. When the disproof depends on how a library or external service behaves, find that behavior in the checkout: the installed package's source or types, or the repo's docs, tests or comments. If nothing there settles it, the finding is not disproved; emit it with confidence "medium" and say in the falsification check what you could not confirm.
+Your recollection is not evidence. When the disproof depends on how a library or external service behaves, find that behavior in the checkout: the installed package's source or types, or the repo's docs, tests or comments. If nothing there settles it and you can name the input that triggers the failure, the finding is not disproved and not speculation: emit it with confidence "medium" and say in the falsification check what you could not confirm. Do not drop it only because you could not confirm the library's behavior.
 
 Examples that FAIL the disprove-it pass (drop these):
 - "Wrap this JSON.parse in try/catch" when the input is from a Zod-validated config, not request input.
