@@ -31,5 +31,5 @@
   },
   "holdoutPerCaseReadable": false,
   "frozen": ["judge model", "judge rubric", "expected-result cases and manifest", "holdout split"],
-  "budgetUsd": 150
+  "budgetUsd": 200
 }

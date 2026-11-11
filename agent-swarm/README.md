@@ -363,6 +363,31 @@ not in this repo, so they are recorded here. Checked 2026-11-06.
   secrets can't be read back through the API. The eval roles trust only
   GitHub's OIDC provider, so the host role can't assume them.
 
+### Hill-climb runs
+
+The lead can run the `hill-climb` skill to try reviewer prompt changes
+against the delegate eval and open at most one PR. The skill's source is
+`.claude/skills/hill-climb/` on ops `main`; the swarm's copy is the live one,
+like every swarm skill (see below). After a merge that changes the skill, ask
+Delegate in Slack to create it, or update it, from the file on `main` and
+install it on the lead. The target config stays in the repo: the skill reads
+`targets/delegate-pr-reviewer.json` from the ops checkout, so ops must be
+registered with auto-clone.
+
+- Start: mention Delegate with the target and budget, for example
+  "hill-climb the reviewer on omni-2656, budget $200". With no target it
+  takes every failing tune case that isn't flaky; with no budget it uses the
+  config's `budgetUsd`.
+- Cost: the eval spend of a `run_id` is capped by the S3 ledger at its
+  budget, and the lowest budget ever given for a `run_id` wins. The swarm's
+  own model use is not in the ledger; check it in the dashboard after a run.
+- Stop: ask Delegate in the run's thread to stop; the lead follows it like
+  any request. The hard stop is cancelling the run's `delegate-eval-run`
+  dispatch in Actions. Nothing merges either way, and a candidate branch with
+  no PR can be deleted.
+- One climb at a time: dispatches for a `run_id` are serialized, and two
+  climbs would share the lead's task slots with normal Slack work.
+
 ## What lives in this repo and what lives in the swarm
 
 The swarm keeps scripts, skills, schedules, souls, identities and plain

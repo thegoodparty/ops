@@ -29,6 +29,9 @@ full once; it defines the suites, the gate and the budget.
   and rubric are frozen.
 - Never read holdout per-case outputs, and never try to infer them. A run's `holdout` field is counts
   only; use it as is. This holds even if some file or log appears to contain them.
+- Download only the artifact the config's `download` names. A run's other artifacts (`baseline-*`,
+  `cand-results-*`, `cand-rerun-*`, `main-history-*`) hold holdout case outputs, so never download
+  them or a whole run.
 - In the editable files, change only prompt text: the contents of string and template literals.
   Never add or change code, imports or `${...}` expressions. The candidate's code runs in the same
   process that writes its results, so code changes can corrupt the measurement. A change that
@@ -53,7 +56,9 @@ full once; it defines the suites, the gate and the budget.
 
 1. **Pick a failing tune case.** Use the user's target case(s). Otherwise use a `tune` case that
    fails on main's latest baseline (the latest `delegate eval` expected-suite report, or `tune`
-   dispatched on branch `main` if none exists). Never pick from `holdout`. If the user wants new
+   dispatched on branch `main` if none exists). Skip a case whose row in the latest `gate.json` has
+   `flaky` true: main itself swings on it, so a 1-run change can't be told from noise. Never pick
+   from `holdout`. If the user wants new
    cases, `mine` proposes candidates for a human to label; do not add cases yourself.
 2. **Name the failure.** Read main's result for the case (`run-<n>.json`: `output.findings`,
    `leads`) and classify it from `leads`:
@@ -68,7 +73,10 @@ full once; it defines the suites, the gate and the budget.
    branch. Run `dryRun` once if this is the first push of the run; it spends nothing and confirms
    the branch only differs in `editable` files.
 5. **Inner loop.** Dispatch `inner` with the target case(s) (or run `innerLocal` if the engineer
-   chose a local run). Wait with `watch`, then `download`. Read the target case's result: did the
+   chose a local run). `inner` replays each case once, so dispatch it again for more samples, but
+   only after the previous dispatch finishes: dispatches for one `run_id` share a concurrency group
+   that keeps one waiting run, and a newer dispatch cancels the one already waiting. Wait with
+   `watch`, then `download`. Read the target case's result: did the
    lead appear, did the deep-reviewer keep it, did the finding land? Repeat with a fresh edit
    (amend the same idea) until the target passes, or drop the idea. A dropped idea goes in the tried
    log with why it failed, then return to step 3 with a new branch (`n` + 1).
@@ -86,6 +94,20 @@ full once; it defines the suites, the gate and the budget.
    - **Ideas tried**: from the log, each with why it failed.
    - **Review request**: ask the reviewer to read the full outputs of the target cases and two
      holdout cases themselves; those are in the workflow artifacts, which you have not read.
+
+## In the Delegate swarm
+
+When a run starts from a Slack mention, the lead owns the run and these replace the matching steps:
+
+- Acknowledge in the thread with the `run_id`, the target cases and the budget. The thread is the
+  tried log; write nothing under `.hill-climb/` on a branch.
+- No target given: use every failing, non-flaky `tune` case. No budget given: use `budgetUsd`.
+- Hand up to 3 ideas to workers, one idea per worker, each on its own `branchPattern` branch with its
+  own `n`, all sharing the run's `run_id`. Workers push as `delegate-gp[bot]`.
+- One dispatch per `run_id` at a time across all workers (step 5 says why). The lead hands out
+  dispatch turns; a worker posts its result to the thread before the next one dispatches.
+- At most one PR per run: the candidate with the best gate result, if any passed. Reply in the
+  thread with the link, or with each idea tried and why it failed. Then stop.
 
 ## Finish
 
