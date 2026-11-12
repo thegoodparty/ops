@@ -9,8 +9,9 @@ name: Pulumi preview
 # must not be reachable from. Fork PRs are skipped explicitly below even
 # though they cannot obtain an OIDC token.
 #
-# Third-party actions are pinned by commit SHA here, unlike the rest of the
-# repo's workflows: this job holds AWS credentials and runs PR-authored code.
+# Third-party actions are pinned to an immutable commit by
+# .github/workflows/actions.lock, like the rest of the repo's workflows: this
+# job holds AWS credentials and runs PR-authored code.
 
 on:
   pull_request:
