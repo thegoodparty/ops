@@ -24,7 +24,7 @@ Fields:
 - endLine: (optional) last line if the finding spans multiple lines
 - body: markdown comment. MUST end with a parenthetical: "(Falsification check: <what would disprove this and whether it is present in the code>.)"
 - suggestion: (optional) literal replacement text for line..endLine, no code fences. Only include when you are confident it will pass CI verbatim. Match the file's existing style (quotes, semicolons, indentation).
-- category: one of bugs | security | tests | conventions | cross-file | thematic
+- category: one of bugs | security | tests | conventions | cross-file | thematic | scale
 - confidence: "high" | "medium"
 
 Emit a finding only if you would block merge on it alone. Drop everything else silently.
@@ -52,6 +52,7 @@ Lead categories:
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
 - thematic: multiple files touching the same risk surface (all timezone code, all new validation paths)
+- scale: a new or changed query, loop, request-path computation or in-memory collection over voters, contacts, people, an audience, districts or tracts, whose cost grows with that size. Lead on it when the diff loads a whole set into memory, binds one parameter per row (an IN list, a bulk insert), does per-row or per-page work inside an HTTP request, runs a computation inside a request whose work grows with the number of rows, groups, tracts or model parameters (a model fit, an optimizer, nested loops), or calls an external API once per row. A request path that newly calls a function, or passes it a bigger input (a new dimension, a whole district instead of a sample), counts too: open that function's definition even when it is outside the diff, and estimate how its work grows with what the diff now passes it. For a model fit that is the number of parameters times the iterations, often squared or worse in the parameters. If the repo has docs/scale.md, read it: it lists the sizes and the traps. In a large diff, a scale lead outranks a style or doc lead. When the diff changes or adds a request path (a controller, a card or page loader, a chat tool) that reads voters, contacts, people, answers, districts or tracts, always emit one scale lead naming the most expensive operation that path now runs, including any function it calls outside the diff.
 
 Do NOT lead on: fabricated findings, pre-existing code the diff does not touch, theoretical risks requiring unlikely preconditions, or style preferences where the diff already matches surrounding code.
 
@@ -112,6 +113,15 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 
 **thematic:** Read all paths together. Emit one finding per distinct verified sub-issue.
+
+**scale:** Work through these steps in order.
+1. Name the operation and what it grows with: rows loaded or iterated, values bound, API calls made, or model parameters (a fit with one parameter per tract grows with the tract count, often cubed per iteration).
+2. Find the largest N the repo documents for that unit. Read docs/scale.md if it exists. Either way, run Grep over every *.md file in the repo, not just the folders you are reviewing, with this pattern for a number next to a unit: "[0-9][0-9,.]*[kKM]? *(million )?(constituents|voters|people|residents|households|rows|tracts)". Show every match; never cut the output with head or a limit, because the largest size is often one line among many. The data-access package's AGENTS.md usually has district sizes, often written as a range such as "from ~2k to 4.5M voters". Write down each size you find with its file:line. A size in people, voters or constituents counts for a per-tract operation: step 3 converts it.
+3. Convert units when the size is written in a different unit. A census tract holds about 4,000 people (US Census), so a district of P people has about P/4,000 tracts. A converted N counts as written; cite the size and the conversion.
+4. Take that largest N as reachable unless code on this path restricts it. A belief that real inputs are smaller is not a falsification, and neither is a code comment, doc or ADR that assumes a small input ("a few dozen parameters", "about 1 ms"): that assumption is what this lens checks.
+5. Name the limit it breaks at that N: a bind-parameter or statement-size cap, task memory, a request or gateway timeout, a vendor rate limit, or CPU time inside a request. For CPU work, estimate the time at N: count the operations (a dense P by P Cholesky is about P^3/3, times the iterations) and assume JavaScript does about 10^8 to 10^9 simple operations a second. More than a few seconds inside a request breaks the limit: Node serves every request on one thread, so the whole server stops answering. A hard failure is not required; a stalled server is the failure. When the lead names a query or a frame, follow its output to the code that consumes it, a fit included.
+6. Look for the falsification: the code caps the input and refuses early, pages within the limit (keyset or fixed-size chunks), streams, or moves the work to a queue or job.
+Blocker when the code as written breaks the limit at N and step 6 finds nothing. Drop it only when step 2 found no size at all: "could be slow at scale" without a number is speculation. The body names N with its source (file:line), the operation, and the limit. Emit scale findings with category scale.
 
 ## The disprove-it pass — required
 
