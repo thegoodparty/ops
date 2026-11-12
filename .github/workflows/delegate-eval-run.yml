@@ -390,9 +390,14 @@ jobs:
       main-sha: ${{ github.sha }}
 
   # The only job that runs the candidate's files, with the read-only eval role.
+  # Waits for main's baseline in tune and gate mode: when main's record is
+  # incomplete the gate cannot run, so replaying the candidate would only spend
+  # the run id's budget. Inner mode skips main-baseline and starts at once.
   candidate:
-    needs: prepare
-    if: needs.prepare.outputs.measure == 'true'
+    needs: [prepare, main-baseline]
+    if: |
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.measure == 'true'
+      && (needs.main-baseline.result == 'success' || needs.main-baseline.result == 'skipped')
     permissions:
       contents: read
       id-token: write
