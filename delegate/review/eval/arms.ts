@@ -1,8 +1,8 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { ensureInMirror, readBundleFile, readManifest, scoreDir, selectCases } from "./expect";
-import type { CaseReport } from "./expect";
+import { computeGate, ensureInMirror, readBundleFile, readManifest, scoreDir, selectCases } from "./expect";
+import type { CaseReport, Gate } from "./expect";
 import type { Result } from "./replay";
 
 // Local A/B over structural changes. Each arm is a checkout of ops (usually a
@@ -10,6 +10,10 @@ import type { Result } from "./replay";
 // subagent, injected context, a new tool. Every arm replays the same tune
 // cases with its own code, and this checkout scores all of them, so an arm
 // cannot change what it is graded on. Holdout cases are never run.
+//
+// Results are kept per commit, under <out>/runs/<sha>, so an arm whose code
+// has not changed since an earlier round reuses its runs under any name, and
+// an arm whose code changed always replays.
 
 const parseFlags = (args: string[]): Record<string, string> => {
   const flags: Record<string, string> = {};
@@ -39,9 +43,19 @@ const main = async () => {
     .map((a) => {
       const [name, path] = a.split("=");
       if (!/^[a-z0-9-]+$/.test(name) || !path) throw new Error(`bad arm "${a}", want name=path`);
-      return { name, path: resolve(path) };
+      const git = (...a: string[]) => execFileSync("git", ["-C", resolve(path), ...a], { encoding: "utf-8" }).trim();
+      // Runs are keyed by commit, so uncommitted agent code would be filed
+      // under a commit that does not contain it.
+      if (git("status", "--porcelain", "--", "delegate", "package.json", "package-lock.json")) {
+        throw new Error(`arm "${name}" has uncommitted changes under delegate/; commit them first`);
+      }
+      const sha = git("rev-parse", "HEAD");
+      return { name, path: resolve(path), sha, dir: join(out, "runs", sha) };
     });
   if (arms.length === 0) throw new Error("--arms name=path[,name=path...] is required");
+  const base = flags.base ? arms.find((a) => a.name === flags.base) : undefined;
+  if (flags.base && !base) throw new Error(`--base ${flags.base} is not one of the arms`);
+  const targets = flags.targets ? flags.targets.split(",") : [];
 
   const cases = selectCases(readManifest(manifestPath), { case: flags.case, split: "tune" });
   if (cases.length === 0) throw new Error("no tune case matches");
@@ -63,7 +77,7 @@ const main = async () => {
     }
     for (const [repo, shas] of byRepo) ensureInMirror(mirrorDir, repo, shas);
 
-    const runArm = (arm: { name: string; path: string }) =>
+    const runArm = (arm: (typeof arms)[number], only = flags.case, fromRun = 1) =>
       new Promise<void>((done) => {
         const args = [
           "tsx", "delegate/review/eval/expect.ts",
@@ -72,11 +86,12 @@ const main = async () => {
           "--split", "tune",
           "--runs", String(runs),
           "--concurrency", String(concurrency),
-          "--out", join(out, arm.name),
-          "--work-dir", join(workDir, arm.name),
+          "--from-run", String(fromRun),
+          "--out", arm.dir,
+          "--work-dir", join(workDir, arm.sha),
           "--mirror-dir", mirrorDir,
-          "--variant", arm.name,
-          ...(flags.case ? ["--case", flags.case] : []),
+          "--variant", `${arm.name}@${arm.sha.slice(0, 7)}`,
+          ...(only ? ["--case", only] : []),
         ];
         const child = spawn("npx", args, { cwd: arm.path, stdio: ["ignore", "pipe", "pipe"] });
         const tag = (chunk: Buffer) =>
@@ -88,15 +103,35 @@ const main = async () => {
           done();
         });
       });
+    // Two arms on the same commit share one set of runs, so replay it once.
+    const unique = arms.filter((a, i) => arms.findIndex((b) => b.sha === a.sha) === i);
     let next = 0;
     await Promise.all(
-      Array.from({ length: Math.min(parallelArms, arms.length) }, async () => {
-        while (next < arms.length) await runArm(arms[next++]);
+      Array.from({ length: Math.min(parallelArms, unique.length) }, async () => {
+        while (next < unique.length) await runArm(unique[next++]);
       }),
     );
+
+    // A case the base held that an arm dropped below every run gets `runs`
+    // more runs, and then has to pass 2*runs-1 of 2*runs, so one unlucky run
+    // is not a regression.
+    if (base) {
+      const baseline = { variant: base.name, runs, reports: scoreDir(cases, base.dir) };
+      for (const arm of unique.filter((a) => a.sha !== base.sha)) {
+        const { rerun } = computeGate(scoreDir(cases, arm.dir), baseline, targets, false, [], runs);
+        if (rerun.length > 0) await runArm(arm, rerun.join(","), runs + 1);
+      }
+    }
   }
 
-  const reports = arms.map((a) => ({ arm: a.name, reports: scoreDir(cases, join(out, a.name)) }));
+  const reports = arms.map((a) => ({ arm: a.name, reports: scoreDir(cases, a.dir) }));
+  const gates: { arm: string; gate: Gate }[] = [];
+  if (base) {
+    const baseline = { variant: base.name, runs, reports: scoreDir(cases, base.dir) };
+    for (const a of arms.filter((a) => a.sha !== base.sha)) {
+      gates.push({ arm: a.name, gate: computeGate(scoreDir(cases, a.dir), baseline, targets, true, [], runs) });
+    }
+  }
   const costOf = (dir: string) => {
     let total = 0;
     let n = 0;
@@ -115,7 +150,7 @@ const main = async () => {
   const lines = [
     "### Arms",
     "",
-    `| Case | Expected | ${arms.map((a) => a.name).join(" | ")} |`,
+    `| Case | Expected | ${arms.map((a) => `${a.name} (${a.sha.slice(0, 7)})`).join(" | ")} |`,
     `| --- | --- | ${arms.map(() => "---").join(" | ")} |`,
     ...cases.map((c) => {
       const cells = reports.map(({ reports: rs }) => {
@@ -127,11 +162,28 @@ const main = async () => {
     }),
     `| **Block cases passed (runs)** | | ${reports.map(({ reports: rs }) => { const b = rs.filter((r) => r.c.expect.verdict === "block"); return `${b.reduce((a, r) => a + passes(r), 0)}/${b.reduce((a, r) => a + r.scores.length, 0)}`; }).join(" | ")} |`,
     `| **Approve cases passed (runs)** | | ${reports.map(({ reports: rs }) => { const b = rs.filter((r) => r.c.expect.verdict === "approve"); return `${b.reduce((a, r) => a + passes(r), 0)}/${b.reduce((a, r) => a + r.scores.length, 0)}`; }).join(" | ")} |`,
-    `| **Avg cost per run** | | ${arms.map((a) => { const c = costOf(join(out, a.name)); return c.n ? money(c.total / c.n) : "n/a"; }).join(" | ")} |`,
+    `| **Avg cost per run** | | ${arms.map((a) => { const c = costOf(a.dir); return c.n ? money(c.total / c.n) : "n/a"; }).join(" | ")} |`,
     "",
-    `Total spend in ${out}: ${money(arms.reduce((sum, a) => sum + costOf(join(out, a.name)).total, 0))}.`,
+    `Total spend in ${out}, every round: ${money(
+      existsSync(join(out, "runs"))
+        ? readdirSync(join(out, "runs")).reduce((sum, sha) => sum + costOf(join(out, "runs", sha)).total, 0)
+        : 0,
+    )}.`,
     "",
   ];
+  if (base) {
+    lines.push(`### Gate against ${base.name}`, "");
+    for (const { arm, gate } of gates) {
+      const parts = [
+        gate.pass ? "pass" : "FAIL",
+        gate.regressions.length ? `regressed: ${gate.regressions.join(", ")}` : "",
+        gate.targetsMissed.length ? `targets missed: ${gate.targetsMissed.join(", ")}` : "",
+        gate.costRatio === null ? "" : `cost ${gate.costRatio.toFixed(2)}x${gate.costOver ? " (over)" : ""}`,
+      ].filter(Boolean);
+      lines.push(`- **${arm}**: ${parts.join("; ")}`);
+    }
+    lines.push("");
+  }
   const detail = ["### Every run", ""];
   for (const c of cases) {
     detail.push(`**${c.id}** (${c.expect.verdict}): ${c.tests}`, "");
@@ -143,6 +195,7 @@ const main = async () => {
   }
   mkdirSync(out, { recursive: true });
   writeFileSync(join(out, "arms.md"), [...lines, ...detail].join("\n"));
+  if (base) writeFileSync(join(out, "gate.json"), JSON.stringify({ base: base.name, gates }, null, 2));
   console.log(lines.join("\n"));
 };
 
