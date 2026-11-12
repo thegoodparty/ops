@@ -39,29 +39,36 @@ a place to tick.
 
 The plan has two halves, and they are ordered rather than interchangeable:
 
-- **Part A, steps 1 to 5** — the two-model grant. Model subscriptions, the
-  dedicated role, the credential switch, the catalogue rows, and the proof.
-- **Part B, steps 6 and 7** — the Anthropic key. An investigation, then the
+- **Part A, steps 1 to 6** — the two-model grant. Model subscriptions, the
+  dedicated role with its control-plane reads, the credential switch, the
+  readiness gate, the model-tier mapping, and the proof.
+- **Part B, steps 7 and 8** — the Anthropic key. An investigation, then the
   removal, and only if the investigation says the removal is safe.
 
 - [ ] 1. Subscribe `394495727159` to the two models. Reporting first, then
-      `APPLY=1`, and the account id and agreement outcomes recorded. `todo`
+      `APPLY=1`, and the account id and agreement outcomes recorded.
 - [ ] 2. Create `delegate-swarm-bedrock` in `deploy-infrastructure/`, with an
-      invoke grant scoped to those two models and nothing else, trusted by the
-      swarm host role, and give the host role `sts:AssumeRole` on it. `todo`
+      invoke grant scoped to those two models, the two control-plane reads the
+      readiness probe needs, and nothing else; trusted by the swarm host role,
+      which is given `sts:AssumeRole` on it.
 - [ ] 3. Point `agent-swarm/host/aws-config` at the new role as `[default]` and
       demote `delegate-swarm-prod-read` to `[profile prod-read]`, after auditing
-      what reaches for `[default]` today. `todo`
-- [ ] 4. Write one model-catalogue overlay row per model in
-      `agent-swarm/host/sync-agent-config.sh`. `todo`
+      what reaches for `[default]` today.
+- [ ] 4. Set `BEDROCK_AUTH_MODE=sdk` and `AWS_REGION` in the worker and api
+      environments, so the readiness check is satisfied by the AWS credential
+      rather than by an API key.
 - [ ] 5. Prove it: an invocation of each model from a worker container, with the
-      ARNs and the refusal shape recorded, and the Fireworks default re-checked
-      in the same session. Operational, no PR. `todo`
-- [ ] 6. Establish what actually consumes `ANTHROPIC_API_KEY`, in the worker and
-      in the api. Investigation, no code change, and step 7 waits on its answer.
-      `todo`
-- [ ] 7. Remove the key from the swarm's secret and every surface that carries
-      it, or record why it stays. `todo`
+      ARNs and the refusal shape recorded, the model list the probe enumerated,
+      and the Fireworks default re-checked in the same session. Operational, no
+      PR.
+- [ ] 6. Propose the `MODEL_TIER_PI_*` mapping, so "hard" tasks can be routed to
+      a Bedrock model while `smol` and `regular` stay on Fireworks. A proposal for
+      the engineer to confirm, applied through swarm config.
+- [ ] 7. Establish what actually consumes `ANTHROPIC_API_KEY` in the worker and
+      in the api, and what each of the three trades under "The gate" costs.
+      Investigation, no code change, and step 8 waits on its answer.
+- [ ] 8. Remove the key from the swarm's secret and every surface that carries
+      it, with the trade step 7 chose recorded, or record why it stays.
 
 ## Goal
 
@@ -79,22 +86,23 @@ while two other callers are quietly using one. Either the key is needed and the
 wrong sentence is written about it, or it is not needed and neither is the key.
 This plan does not assume which; it makes the plan say so in writing.
 
-Two outcomes, stated as invariants rather than features:
+Four invariants, stated as properties rather than features:
 
 - **Two models are reachable from a worker container, through the AWS credential
-  chain, and nothing else in Bedrock is.** Not "Bedrock works": a named pair,
-  invoked by a role that can reach no other model and no Bedrock control-plane
-  read.
-- **The default does not move.** A task that names no model still runs
-  Fireworks, on the same router id, with the same behaviour, whether or not the
-  Bedrock path is healthy. A change here that risks the default is a change that
-  is wrong.
+  chain, and no other model is.** Not "Bedrock works": a named pair, invoked by a
+  role whose only other Bedrock permissions are the two reads the readiness probe
+  calls.
+- **The default does not move.** A task that names no model and no tier still runs
+  Fireworks, on the same router id. A change here that risks the default is a
+  change that is wrong.
 - **No new key.** Bedrock authenticates through the AWS SDK's chain, which in
   that container means the instance role from IMDS. Nothing is added to
   `DELEGATE_SWARM` to enable this.
 - **The Anthropic key is either justified in writing or gone.** Not "left in
-  place because removing it is risky": step 6 establishes what reads it, and
-  step 7 either removes it or replaces that sentence with a true one.
+  place because removing it is risky": step 7 establishes the trade, and step 8
+  either removes it or replaces that sentence with a true one. The key's second
+  job — satisfying the worker's readiness check — is taken over by the Bedrock
+  probe (decision 3), which is what makes this reachable at all.
 
 ## What is being enabled
 
@@ -107,6 +115,9 @@ Two outcomes, stated as invariants rather than features:
 | Selection id in a container | `amazon-bedrock/global.anthropic.claude-haiku-5-5` |
 | Role that invokes them | `delegate-swarm-bedrock`, new, in the infrastructure account |
 | Who may assume it | `arn:aws:iam::394495727159:role/delegate-swarm-host` only |
+| Bedrock reads it also holds | `bedrock:ListFoundationModels`, `bedrock:ListInferenceProfiles` (the probe) |
+| Readiness satisfier | `BEDROCK_AUTH_MODE=sdk`, region us-west-2, on the worker env |
+| Tier mapping (proposed) | `MODEL_TIER_PI_SMART` → `amazon-bedrock/global.openai.gpt-6.1-sol` |
 | Default model, unchanged | `fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us` |
 | Anchors in this repo | `utils/bedrock-models.ts` entries `openai.gpt-6.1-sol` and `anthropic.claude-haiku-5-5`; `deploy-infrastructure/agent-swarm.ts` for the host |
 
@@ -234,131 +245,255 @@ from the instance role, which is role chaining, and AWS caps that at an hour. Th
 SDK re-assumes as credentials near expiry, the same way the prod-read path
 already does, so a long task does not lose its credential mid-run.
 
-## Decision 3: `BEDROCK_AUTH_MODE` is deliberately not set
+## Decision 3: `BEDROCK_AUTH_MODE=sdk` is set, deliberately
 
-**Decision: `BEDROCK_AUTH_MODE` is not set anywhere — not in `render-env.sh`, not
-in `docker-compose.yml`, not in swarm config. Bedrock models are reached by
-naming an `amazon-bedrock/<profile-id>` model per task or per agent, and the
-agents' default stays `fireworks-us/…`.**
+**Decision: `BEDROCK_AUTH_MODE=sdk` is set on the pi workers' environment, and
+`AWS_REGION` with it. The Bedrock readiness probe becomes the thing that satisfies
+the `pi` credential check, which is what lets `ANTHROPIC_API_KEY` leave the
+swarm.** The api container is deliberately not included: it has no AWS access at
+all today, so a Bedrock auth mode there would only park it.
 
-This was verified in the pinned tag, agent-swarm v2.10.0, rather than reasoned
-about (`src/providers/pi-mono-adapter.ts`, `checkPiMonoCredentials`, and
-`isBedrockMode` in `src/commands/provider-credentials.ts`). The Bedrock
-credential branch is entered when `BEDROCK_AUTH_MODE=sdk`, when
-`BEDROCK_AUTH_MODE=bearer`, or — the prefix-inference fallback — when
-`BEDROCK_AUTH_MODE` is absent *and* `MODEL_OVERRIDE` starts with
-`amazon-bedrock/`.
+**This reverses what this plan first said**, and the reasoning that replaces it
+came from review of PR #524 rather than from the first draft. The original
+decision was to leave the variable unset so the gate would never be entered,
+because the gate is hard. That was correct about the mechanism and wrong about
+the trade: leaving it unset keeps a key nobody wants and forces a picker
+workaround, so the plan paid two prices to avoid one coupling it was going to
+accept anyway. Both halves of that are recorded below.
 
-The gate is hard, in the way that matters. In `sdk` mode the worker runs a real
-enumeration against Bedrock (`ListFoundationModels` + `ListInferenceProfiles`)
-before it reports ready, and a failed probe returns `ready: false` with a
-classified hint. The worker's boot path then parks in the credential wait loop
-(`src/commands/credential-wait.ts`) — `BOOT_MAX_WAIT_SECONDS` defaults to
-"forever" — so a Bedrock probe that fails for any reason (a missing agreement, a
-region that has not propagated, a wrong account) takes *the whole worker* out of
-service, including the Fireworks work that is healthy today. Setting
-`BEDROCK_AUTH_MODE=sdk` would therefore make two opt-in models a gate on the
-default.
+What the pin does, verified in agent-swarm v2.10.0
+(`src/providers/pi-mono-adapter.ts`, `checkPiMonoCredentials`):
 
-Leaving it unset is safe because of where the gate reads from. It reads
-`MODEL_OVERRIDE`, which is the agent's container default, not the task's model.
-`MODEL_OVERRIDE` stays a `fireworks-us/…` id, so the branch is never entered and
-the Fireworks readiness path is untouched. A task or an agent whose model is
-`amazon-bedrock/<profile-id>` still runs on Bedrock, because `amazon-bedrock` is
-a built-in pi provider (`bedrock-converse-stream`, wired through pi-ai's
-`amazon-bedrock` provider and `ConverseStream`) and per-task model resolution
-outranks `MODEL_OVERRIDE` on the claim path
-(`src/be/model-tier-resolution.ts`, precedence 1 "task `model`" then agent
-default; the runner then uses the server's `resolvedModel`, which wins over the
-local one).
+- **The Bedrock branch is evaluated first, and it does not depend on
+  `MODEL_OVERRIDE`.** `isBedrockSdk` is true when `BEDROCK_AUTH_MODE=sdk`, full
+  stop; the `MODEL_OVERRIDE` prefix check is the *fallback* for when the variable
+  is absent. So a worker with the variable set takes the Bedrock branch no matter
+  which model its agent runs, including a `fireworks-us/…` one.
+- **On a successful probe it returns `{ ready: true, satisfiedBy: "sdk-delegated" }`.**
+  That is the whole point: the `pi` readiness check is satisfied by an AWS
+  credential, and no `ANTHROPIC_API_KEY` is involved. This is what makes Part B's
+  removal possible at all — see the reversal recorded there.
+- **The probe is what enumerates the models.** It calls `ListFoundationModels`
+  and `ListInferenceProfiles`, intersects the result with the ids pi-ai can
+  drive, and returns them as `bedrockModels`. The worker reports that list, and
+  the console's Bedrock group goes `enabled: true` with those two models in it
+  (`apps/ui/src/lib/agent-runtime-models.ts` prefers `liveBedrockStatus` when it
+  is present). **So the overlay rows this plan first proposed to work around the
+  picker are no longer needed** — the probe supplies the list, and "The model
+  catalogue overlay" keeps them only as optional metadata for a fact the probe
+  does not carry; if no such fact survives, they are dropped. This is a cost
+  *removed*, not added.
+- **`AWS_REGION` becomes load-bearing, not a question.** The probe reads
+  `env.AWS_REGION` and, when it is absent, returns `ready: false` with "set it to
+  the region where your Bedrock models are accessible" rather than guessing. The
+  containers did not receive `AWS_REGION` when this plan was written
+  (`agent-swarm/host/docker-compose.yml` enumerates them, and the systemd unit
+  sets it for the compose process only); sibling PR #523 adds it to
+  `x-worker-env`, so by the time this lands the variable should be there and step
+  4's job is only `BEDROCK_AUTH_MODE`. Treat it as a requirement either way — see
+  "Region".
 
-**What that costs, stated plainly.** With no probe there is no live model
-enumeration, so the console does not discover the two models by itself. The
-worker reports no `credStatus.bedrock`, and the dashboard's Bedrock group falls
-back to the static models.dev snapshot with `enabled: false` and "Awaiting worker
-probe" (agent-swarm v2.10.0, `apps/ui/src/lib/agent-runtime-models.ts`). The
-plan's answer is the model-catalogue overlay row per model, which is the
-mechanism this repo already uses for `fireworks-us` (step 4).
+**The cost, which the engineer has explicitly accepted: a failed probe parks the
+whole worker, Fireworks tasks included.** In `sdk` mode a probe failure returns
+`ready: false` with a classified hint, and the boot path parks in the credential
+wait loop (`src/commands/credential-wait.ts`) — `BOOT_MAX_WAIT_SECONDS` defaults
+to "forever". So a missing agreement, a region that has not propagated, a trust
+change, or an IAM edit that drops a read takes the worker out of service even
+though its Fireworks credential is fine.
 
-**The row is not proven to be enough, and this plan says so rather than assuming
-it.** An overlay row merges into the served catalogue, so the two models will
-*appear* in the Bedrock group. But the group's `enabled` flag comes from the
-probe, and the model combobox renders a group with `disabled={!group.enabled}`
-(`apps/ui/src/components/shared/model-combobox.tsx`), so a row alone may list
-the models and still leave them unpickable. What is certain and does not depend
-on the console at all:
+Why that is the right trade now, in the order that decided it:
 
-- a task can be created with `model: "amazon-bedrock/global.openai.gpt-6.1-sol"`,
-  which the claim path resolves directly and which outranks `MODEL_OVERRIDE`;
-- an agent's runtime can be PATCHed to that model the same way
-  `sync-agent-config.sh` already sets `fireworks-us` — and it already sends
-  `allow_custom_model: true`, which is what makes a catalogued id acceptable on
-  that route.
+1. **It removes a long-lived API key.** The worker's readiness no longer depends
+   on a credential nobody wants to keep, which is Part B's whole goal.
+2. **It removes the picker workaround.** The probe is the enumeration the overlay
+   rows existed to imitate badly.
+3. **It is the same credential the Bedrock path will use anyway.** The invoke
+grant and the probe read sit on one role assumed from the instance, so the check
+is testing the exact path a Bedrock task will take — unlike the permissive-key
+branch, which tests for `ANTHROPIC_API_KEY` while a Fireworks task uses
+`FIREWORKS_API_KEY` it never looks at.
+4. **The coupling is already load-bearing.** A worker that cannot reach the AWS
+   credential chain has no Bedrock path at all; the probe merely says so at boot
+   instead of at the first task.
 
-So step 4 verifies the console and records what it says. If the row is enough, a
-second model is pickable. If it is not, the models are reachable by id and the
-rows remain correct as catalogue metadata — reasoning levels, context window,
-prices — and the console gap is an open question rather than a reason to turn the
-probe on. What would not be acceptable is turning the probe on to fix a picker,
-which is the failure this decision exists to avoid.
+**Rollback, recorded so a park is not a dead end.** Unset `BEDROCK_AUTH_MODE` and
+the old permissive-key branch returns: the worker boots on whatever API key it
+holds, at the cost of needing some other readiness satisfier — which, for a
+`fireworks-us/…` `MODEL_OVERRIDE`, means an `ANTHROPIC_API_KEY` in the secret
+again, because `FIREWORKS_API_KEY` is not in `modelToCredKeys`' permissive list.
+That is the state this plan is leaving, and the price of going back to it is
+reinstating the key. It also means the interactive escape hatch for a parked
+worker is one variable, not a redeploy.
 
-**If the probe is ever turned on**, it is one PR that says so, and it comes with
-the two reads decision 4 withholds, plus a considered answer to "what happens to
-Fireworks tasks while the probe is failing".
+**What does not change.** Per-task and per-agent model selection is untouched.
+A task or an agent whose model is `amazon-bedrock/<profile-id>` runs on Bedrock
+because `amazon-bedrock` is a built-in pi provider (`bedrock-converse-stream`,
+via pi-ai's `amazon-bedrock` provider and `ConverseStream`), and per-task model
+resolution outranks `MODEL_OVERRIDE` on the claim path
+(`src/be/model-tier-resolution.ts`; the runner uses the server's
+`resolvedModel`). The agents' default stays `fireworks-us/…`, and the probe
+being on does not move a Fireworks task onto Bedrock.
 
-## Decision 4: no Bedrock control-plane reads on this role
+## Decision 4: the two control-plane reads belong on this role
 
-**Decision: `delegate-swarm-bedrock` holds no `bedrock:ListInferenceProfiles`, no
-`bedrock:ListFoundationModels`, and no other `bedrock:Get*` / `bedrock:List*`.
-Its grant is the invoke family, on two models' ARNs.**
+**Decision: `delegate-swarm-bedrock` holds `bedrock:ListFoundationModels` and
+`bedrock:ListInferenceProfiles` on `*`, in addition to the two models' invoke
+grant.**
 
-Those reads exist to serve one thing: the enumeration probe that decision 3 does
-not enable. The gateway needed `ListFoundationModels` and nothing else —
-`deploy-workbench/ecs.ts` grants exactly that, `TASK_BEDROCK_READ_ACTIONS`,
-because Bifrost's Bedrock provider draws its model list from a signed
-`GET /foundation-models` — and the swarm is not a gateway; it does not draw a
-model list from AWS at all. A read with no caller is a permission that will
-still be there when someone builds a caller.
+**This also reverses the first draft**, and it reverses as a consequence rather
+than a second judgement: the reads exist to serve the probe, the probe is now on
+(decision 3), so the reads have a caller. A permission that serves a stated,
+enabled mechanism is the kind of grant this plan should be making; the first
+draft's rule was not "no reads", it was "no reads without a caller", and the
+caller has arrived.
 
-The asymmetry with `deploy-workbench/ecs.ts` is deliberate and worth stating,
-because a reviewer will notice it: that role grants `bedrock:ListFoundationModels`
-on `*` and this one does not. The difference is the probe. If the swarm's probe is
-ever turned on, both reads get added then, in a PR that says it is turning the
-probe on — not in advance, and not "for symmetry".
+Where they come from, exactly. `runBedrockSdkProbeAndEnumerate`
+(`src/providers/pi-mono-adapter.ts`) imports `BedrockClient` and calls
+`ListFoundationModelsCommand` with `byInferenceType: "ON_DEMAND"`,
+`byOutputModality: "TEXT"`, and then `ListInferenceProfilesCommand`. Two reads,
+both of them, plus nothing else. The intersect-with-pi-ai step is client-side, so
+it needs no further AWS call.
 
-The invoke actions themselves: the harness calls the Converse API
+Both resources are `*`, and that is not laziness. Bedrock's service authorization
+reference defines no resource type for either action — no model ARN, no profile
+ARN — so a narrower `Resource` fails rather than scoping the call. This is the
+same fact `deploy-workbench/ecs.ts` records for `ListFoundationModels` in
+`TASK_BEDROCK_READ_ACTIONS`, and it is why the wildcard here is named and
+commented rather than dropped into the invoke statement.
+
+**The asymmetry with `deploy-workbench/ecs.ts` is now the reverse, and worth
+stating because a reviewer will notice.** That role grants `ListFoundationModels`
+and deliberately not `ListInferenceProfiles`, because Bifrost at `v2.3.0` never
+calls the latter: it lists inference profiles from its own key allowlist. The
+probe here is agent-swarm's, not Bifrost's, and agent-swarm calls both — the
+gateway's reading of "the model list" does not carry over, and copying its
+narrower grant would fail the probe on the second call. So this role holds one
+read Bifrost does not need, for a reason recorded in agent-swarm's code rather
+than inferred.
+
+The invoke actions are unchanged by this: the harness calls the Converse API
 (`ConverseStreamCommand` from `@aws-sdk/client-bedrock-runtime`, via pi-ai's
-`bedrock-converse-stream`), so the grant is `bedrock:Converse` and
+`bedrock-converse-stream`), so the invoke grant is `bedrock:Converse` and
 `bedrock:ConverseStream`. `InvokeModel` and `InvokeModelWithResponseStream` are
-*not* granted. Step 2 records whatever the invocation in step 5 proves, and
-widening to the invoke pair afterwards is a one-line change with a reason.
+*not* granted. Step 5 records whatever the invocation proves, and widening to the
+invoke pair afterwards is a one-line change with a reason.
 
-Resources are the shape `bedrockInvokeResources()` in `utils/bedrock-models.ts`
-already uses for exactly this grant, restricted to two models: each model's
+Invoke resources keep the shape `bedrockInvokeResources()` in
+`utils/bedrock-models.ts` already uses, restricted to two models: each model's
 `global.` inference-profile ARN in this account, plus the foundation-model ARN
 (which carries no account) for routing outside the home region. Both are needed
 and neither alone is enough — the request names the profile, and Bedrock then
 invokes the foundation model wherever the global profile routes — and the region
 is wildcarded on purpose, for the reasons that file records.
 
-## The model catalogue overlay
+**What the reads do not buy.** They enumerate models the account can *see*, not
+models this role can *invoke*: `ListFoundationModels` reports what exists in a
+region, so the probe's list is wider than the two-model grant and a model picked
+from it that is not one of the two fails at invocation with an AccessDenied. That
+is the correct failure — the grant is the allowlist, and it stays two models —
+but it means the picker can offer a model that will not run, and step 5 should
+record what the list actually returns so the size of that gap is known rather
+than guessed. Narrowing the *list* would mean filtering it client-side, which is
+an agent-swarm change; narrowing the picker is not this plan's job.
 
-One overlay row per model, written by
-`agent-swarm/host/sync-agent-config.sh` the same way the `fireworks-us` row is:
-`PUT /api/models-catalog/overlay`, keyed on provider and model id, upserted on
-every deploy, so a merge is enough to apply it.
+## Model tiers: routing "hard" tasks to a Bedrock model
 
-| Field | Value for both rows |
-|---|---|
-| `provider` | `amazon-bedrock` |
-| `modelId` | `global.openai.gpt-6.1-sol`, `global.anthropic.claude-haiku-5-5` |
-| `reason` | required by the API; states that the probe is off and the row is hand-verified |
-| `verifiedBy` | `sync-agent-config.sh` |
-| `reasoning`, `reasoningOptions` | from the model facts, not from memory |
-| `contextWindow`, `maxOutput` | ditto |
-| `pricing` | display only |
+**This is what makes the two models useful rather than merely present.** A tier is
+a per-task hint — `modelTier: smol | regular | smart | ultra` — that the API
+resolves at claim time to a concrete model. Because the tier map is swarm config,
+the swarm can route work by difficulty without every task naming a model and
+without a code change.
 
-Two things to get right, both learned from the `fireworks-us` row:
+**Today tiering does not work in this swarm at all, and that is not this plan's
+fault.** `DEFAULT_MODEL_TIER_MAP.pi` (`src/types.ts`) points all four tiers at
+`openrouter/…` ids — `openrouter/deepseek/deepseek-v4.1-flash` for `smol` and
+`regular`, `openrouter/deepseek/deepseek-v4-pro-0813` for `smart`,
+`openrouter/anthropic/claude-opus-5.5` for `ultra` — and the swarm holds no
+OpenRouter credential. So a tiered task already resolves to a model with no key
+and fails. Adding tier-config rows is what turns tiering *on*; Bedrock is what
+makes it possible to turn on usefully. Nothing here regresses: a tiered task does
+not work less well after this change than before it.
+
+The precedence, first hit wins, verified at v2.10.0 in
+`src/be/model-tier-resolution.ts` (`taskModelCandidates`) and `src/types.ts`:
+
+1. the task's `model` — an explicit pin;
+2. the task's `profile` — a named model profile;
+3. the claiming worker's `MODEL_TIER_<PROV>_<TIER>` (worker-env);
+4. `swarm_config` `MODEL_TIER_<PROV>_<TIER>` (tier-config);
+5. `DEFAULT_MODEL_TIER_MAP` (tier-default), or the seeded `<harness>-<tier>`
+   profile when one exists;
+6. the agent's default profile.
+
+**Layer 4 is the one to set.** It outranks the seeded default map, it is
+`swarm_config` rather than code, and for the `pi` harness the key form is
+`MODEL_TIER_PI_<TIER>` — `tierConfigKey` upper-cases the provider and replaces
+dashes, so `pi` gives `MODEL_TIER_PI_SMOL` and so on. Setting those four keys is
+the whole change; no deploy, no code.
+
+### The mapping, as a proposal
+
+The plan proposes this and **the engineer confirms it**; it is not a decision this
+plan makes on their behalf, because which model a `smart` task should get is a
+judgement about cost and quality that belongs with whoever pays for it.
+
+| Tier | Model | Why |
+|---|---|---|
+| `smol` | Fireworks DeepSeek router (unchanged) | the default, and the cheapest thing that works |
+| `regular` | Fireworks DeepSeek router (unchanged) | ditto — most tasks live here |
+| `smart` | `amazon-bedrock/global.openai.gpt-6.1-sol` | the reason this plan exists: a stronger model on hard work |
+| `ultra` | the engineer's call, possibly Sol as well | there is no third Bedrock model, so "ultra" is either Sol again or the Fireworks default |
+
+Two honest notes about it:
+
+- **`ULTRA` has no distinct answer**, because the grant is two models and one of
+them is the `smart` choice. Pointing `ultra` at Sol makes it identical to `smart`,
+which is harmless but means the tier carries no information; pointing it back at
+Fireworks would make `ultra` *weaker* than `smart`, which is worse. Two ways out,
+neither in this plan: a third Bedrock model (costs an edit to this plan and to
+`utils/bedrock-models.ts`), or leaving `MODEL_TIER_PI_ULTRA` unset so it falls
+through to the seeded default — which is an `openrouter/…` id and therefore fails,
+so that is not really a way out either. Recorded so `ultra` is a known gap rather
+than an oversight.
+- **The validation is real.** `validateTierConfigValue` (`src/be/model-tier-keys.ts`)
+  rejects whitespace, over-long values and — relevant here — a model that
+  `harnessModelMismatch` says does not run on the `pi` harness. A
+  `MODEL_TIER_PI_SMART` of `amazon-bedrock/global.openai.gpt-6.1-sol` passes,
+  because the `pi` harness is not one of the section-pinned harnesses and an
+  uncatalogued id defers to the caller's custom-model check. The tier rows
+  therefore need no `allow_custom_model` dance of their own; the agent runtime
+  PATCH in `sync-agent-config.sh` is a different route with a different rule.
+
+Step 6 is where these are set, and where the console's tier preview
+(`GET /api/models-catalog/tiers`, `previewModelTiers`) is read to prove each tier
+resolves to what the table says.
+
+## The model catalogue overlay: now optional, and probably not needed
+
+**This section is what is left of a workaround that decision 3's reversal made
+unnecessary.** It stays in the document because the rows may still be worth
+having, and because deleting the reasoning would lose why.
+
+The first draft needed overlay rows because nothing enumerated the models: with
+no probe the console's Bedrock group stayed at `enabled: false` and the models
+were unpickable. With `BEDROCK_AUTH_MODE=sdk` the worker runs the probe, reports
+`bedrockModels`, and the group goes `enabled: true` with the live list
+(`apps/ui/src/lib/agent-runtime-models.ts`, `liveBedrockStatus`). The picker
+problem is solved by the mechanism that was already there.
+
+So the rows are `agent-swarm/host/sync-agent-config.sh` rows the plan proposes
+rather than requires — `PUT /api/models-catalog/overlay`, keyed on provider and
+model id, the same path the `fireworks-us` row uses. What they would still add is
+facts the probe does not carry: the probe returns `{ id, name }` only, and the
+picker cross-references the static snapshot *best-effort* for reasoning levels
+and context window, treating a miss as unrestricted. Both these models are in
+that snapshot at v2.10.0, so the cross-reference should hit and the rows buy
+nothing. **Propose them only if step 5 shows a fact the console gets wrong**, and
+otherwise drop them — a row written for a reason that has gone is exactly the
+kind of thing that is never removed later.
+
+If a row is written anyway, two things to get right, both learned from the
+`fireworks-us` row:
 
 - **The facts must be derived, not restated.** The `fireworks-us` row reads its
   reasoning levels out of the `models.json` heredoc in
@@ -373,41 +508,56 @@ Two things to get right, both learned from the `fireworks-us` row:
   sets it `false` because models.dev has no `fireworks-us` section and the
   condition can never be met. That reasoning does not transfer: models.dev *does*
   list both of these under `amazon-bedrock`, so a row whose facts match upstream
-  should be allowed to delete itself. Copying `false` here would turn a temporary
-  enrichment into a permanent one.
+  should be allowed to delete itself.
 
-These rows are display and selection metadata. They never touch the swarm's price
+Either way these rows are display metadata. They never touch the swarm's price
 book, so they do not change what a session is charged — the same caveat the
 README's "Models" section records at length for `fireworks-us`.
 
-## Region
+## Region: a required setting, not a question
 
 `docker-compose.yml` enumerates every environment variable a container receives,
 and `AWS_REGION` is not among them; the systemd unit sets `AWS_REGION=us-west-2`
-for the compose process, not for the containers. That is harmless today because
-nothing in a container picks a region. It is worth naming here because Bedrock is
-the first thing that might care, and the answer is not obviously "it works":
+for the compose process, not for the containers. That was harmless while nothing
+in a container picked a region. It is not harmless any more: **the Bedrock probe
+reads `env.AWS_REGION` and refuses to run without it.**
 
-- pi-ai's Bedrock path resolves a region from the ARN embedded in the model id,
-  then an explicit option, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the
-  region in the model's `baseUrl`, then falls back to `us-east-1`. The bundled
-  catalog's `baseUrl` for both of these models is the us-east-1 endpoint, and the
-  swarm's containers have none of `AWS_REGION`, `AWS_DEFAULT_REGION` or
-  `AWS_PROFILE` — so unless step 3 sets one, the endpoint path wins and the call
-  goes to us-east-1. Worth being precise about, because the same code uses
-  `AWS_PROFILE`'s presence to decide whether to pin that endpoint at all.
-- The IAM grant wildcards region, and a `global.` profile routes wherever AWS
-  chooses, so a call made against the us-east-1 endpoint from a us-west-2 host
-  is not an authorization problem. It is a "which endpoint did we actually talk
-  to" question, and the answer decides what CloudTrail and VPC flow logs show.
-- Step 5 records the region the invocation actually used. If it is not us-west-2,
-  step 3 sets `AWS_REGION` (or `AWS_DEFAULT_REGION`) explicitly in
-  `x-worker-env` so the container's region is a stated fact rather than a
-  default. That is a one-line change in
-  `agent-swarm/host/docker-compose.yml`, checked the way
-  `agent-swarm/host/scripts/fireworks-residency.test.ts` checks the other env
-  values, and it is cheaper than discovering the answer in a bill or a log
-  search.
+`checkPiMonoCredentials` returns `ready: false` with "AWS_REGION is not set — set
+it to the region where your Bedrock models are accessible so model enumeration
+matches the inference region" rather than guessing a region, and the comment in
+that branch is explicit about why: a guessed `us-east-1` can enumerate the wrong
+region's models. With decision 3 in force that is a **boot-blocking** condition,
+not a warning — a worker without `AWS_REGION` parks. So step 4 sets it in
+`x-worker-env` alongside `BEDROCK_AUTH_MODE`, and the two travel together.
+
+us-west-2, and the reasons stack up rather than being arbitrary:
+
+- it is the account's and the host's region (`utils/accounts.ts`,
+  `deploy-infrastructure/agent-swarm.ts`);
+- the probe enumerates the region it will be asked to infer in, which is the
+  property that branch exists to preserve;
+- pi-ai's own resolution order is ARN-embedded region, then an explicit option,
+  then `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the model's `baseUrl`, then
+  `us-east-1`. Both these models' bundled `baseUrl` is the us-east-1 endpoint, so
+  without `AWS_REGION` the endpoint path would win and the call would go to
+  us-east-1 while the probe enumerated us-west-2. Setting the variable makes the
+  two agree.
+
+Two things that follow and are worth stating:
+
+- The IAM grant wildcards region and a `global.` profile routes wherever AWS
+  chooses, so us-west-2 is not an authorization boundary and a us-east-1 call
+  would not have been *refused*. It is a "which endpoint did we actually talk to"
+  fact, which decides what CloudTrail and VPC flow logs show — and now also what
+  the probe enumerated, so getting it wrong is visible as a mismatch between the
+  picker's list and a working invocation.
+- `AWS_PROFILE` must stay unset in the container env, and the probe is why it
+  matters more now. pi-ai treats a set `AWS_PROFILE` as a reason *not* to pin the
+  model's endpoint, and it resolves `AWS_PROFILE` ahead of the ambient chain. This
+  plan's aws-config change makes `[default]` the Bedrock role, so an empty
+  `AWS_PROFILE` is what the probe and the invoke path both use; a `prod-read`
+  value here would fail the probe on the read actions and fail every invocation
+  on the invoke ones.
 
 ## Part B: removing the Anthropic key
 
@@ -462,28 +612,35 @@ Everything here was read in agent-swarm v2.10.0, the tag
   and `openai` kinds and throws otherwise (`src/workflows/executors/workflow-llm.ts`).
   So the README's "api service … fallback path" is neither of the two real
   callers, and the sentence to write later is a different one.
-- **Verified, and it is the second reason this is a gate:** the key is
-  load-bearing for the *credential check* even though no agent uses an Anthropic
-  model. `checkPiMonoCredentials` maps `MODEL_OVERRIDE` to required keys, and
-  `fireworks-us/…` is not a provider it recognises: `modelToCredKeys` returns
-  `null` for it, which selects the permissive case — "any one of
-  `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY`
+- **Verified, and until decision 3 was reversed it was the reason this is a gate:**
+  the key is load-bearing for the *credential check* even though no agent uses an
+  Anthropic model. `checkPiMonoCredentials` maps `MODEL_OVERRIDE` to required
+  keys, and `fireworks-us/…` is not a provider it recognises: `modelToCredKeys`
+  returns `null` for it, which selects the permissive case — "any one of
+  `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY`"
   (`src/providers/pi-mono-adapter.ts`). `FIREWORKS_API_KEY` is not in that list
-  and no `~/.pi/agent/auth.json` exists in the worker, so with the key gone and
-  nothing added a worker's readiness check fails and the boot loop parks. This is
-  not a theory: PR #491 removed the key for the right reason (a stray Anthropic
-  model pin would bill about 9× the Fireworks price) and the swarm stopped
-  detecting a valid credential in production, and it was reverted in `88a5a1f`.
-  That commit and its revert are the record, and they are why step 7 is gated.
+  and no `~/.pi/agent/auth.json` exists in the worker, so on the permissive path
+  a key-less secret fails the readiness check and the boot loop parks. This is not
+  a theory: PR #491 removed the key for the right reason (a stray Anthropic model
+  pin would bill about 9× the Fireworks price) and the swarm stopped detecting a
+  valid credential in production, and it was reverted in `88a5a1f`. That commit
+  and its revert are the record.
 
-So removing the key is two problems, not one: replace the credential that two
-internal callers are silently using, and replace what satisfies the `pi`
-readiness check. Neither has an answer in this repository today, and neither is
-solved by Part A — Bedrock is available to the *worker* through aws-config, but
-`internal-ai` has no Bedrock credential kind at all in v2.10.0, and the api
-container has no AWS access ([`../agent-swarm/README.md`](../agent-swarm/README.md),
-"AWS access from inside the swarm"). That is worth knowing before anyone assumes
-the two halves of this plan meet.
+  **`BEDROCK_AUTH_MODE=sdk` retires this problem rather than working around it.**
+  The Bedrock branch is checked above the permissive one and returns
+  `satisfiedBy: "sdk-delegated"` on a successful probe, so the readiness check is
+  answered by the AWS credential and never reaches the list that names
+  `ANTHROPIC_API_KEY`. That is why step 4 comes before step 8 and not after: the
+  key's last load-bearing job in the worker is discharged by an IAM role, and the
+  fix for #491 is the same change that lets the key go.
+
+So removing the key is still two problems, and they now have different shapes. The
+readiness half is solved by Part A. The other half is not: two internal callers in
+`internal-ai` resolve an Anthropic credential, and **neither can be repointed at a
+Bedrock model**, because `internal-ai` has no Bedrock credential kind in v2.10.0
+and the api container has no AWS access at all
+([`../agent-swarm/README.md`](../agent-swarm/README.md), "AWS access from inside
+the swarm"). Part A makes the removal *possible*; it does not make it free.
 
 ### The surfaces that carry it
 
@@ -508,46 +665,89 @@ And one that is *not* a surface of this secret, though it looks like one:
   `deploy/delegate-secret.ts` is untouched by this plan, and a step that "removes
   the Anthropic key" by editing it is wrong.
 
-### The gate
+### The three trades
 
-Step 7 is authorised by answers, not by a mood. Four questions, each answerable
-from the swarm's own state and the pinned source:
+Step 8 is authorised by a choice the engineer makes, not by a mood and not by a
+model pin. **Pinning DeepSeek does not work, and it is worth recording why**, since
+it is the obvious first idea and it fails for a structural reason:
 
-1. **Is the session-summarisation caller actually producing summaries?** The code
-   path is unconditional, but the evidence is in the swarm, not the source: rows
-   in the memory index with `source: "session_summary"`, or `session_summary …`
-   lines in the worker log streams. If summaries are being written, the key has a
-   real consumer and removing it is a behaviour change to state out loud, not a
-   tidy-up. If they are *not* being written, something already fails the call,
-   and that is worth understanding before blaming the key.
-2. **Same question for task auto-titles** — are recent tasks getting generated
-   titles, and do the api logs show `[task-title] … via anthropic/claude-haiku-5-5`?
-3. **If either is live, what replaces it?** This is where the honest answer is
-   probably "the key stays, for these two callers only", and the plan's job
-   becomes saying that precisely. The alternatives each cost something:
-   `OPENROUTER_API_KEY` or `OPENAI_API_KEY` is a *new* credential, which is what
-   this plan is trying not to add; `SKIP_SESSION_SUMMARY=1` and
-   `TASK_AUTO_TITLE_ENABLED=false` make the loss deliberate and visible instead of
-   silent, which is honest but is still a feature removal; an upstream change to
-   teach `internal-ai` a credential kind it can reach in this account is the only
-   answer that keeps both features and drops the key, and it is an agent-swarm
-   change, not an ops one.
-4. **What satisfies the `pi` readiness check once the key is gone?** A named
-   upstream fix, a version bump that carries one, or `CRED_CHECK_DISABLE=1` — a
-   real lever and a poor one, since it also turns off the check that would catch
-   a genuinely missing Fireworks key. Step 7 names which in its PR body.
+- `MEMORY_RATER_MODEL` does override the model *string* — `resolveRaterModelString`
+  returns `process.env.MEMORY_RATER_MODEL ?? MEMORY_RATER_DEFAULT_MODEL[kind]`
+  (`src/utils/internal-ai/models.ts`). But the credential **kind** is resolved
+  first, by `resolveCredential`, walking
+  `openrouter → anthropic → openai → openai-codex → claude-cli`
+  (`src/utils/internal-ai/credentials.ts`). The model string then has to belong to
+  that kind, and `kindForModelString` maps a provider *prefix* through
+  `PROVIDER_TO_KIND`, which lists only those four. **`fireworks` is not one of
+  them.** So the swarm's `FIREWORKS_API_KEY` is invisible to `internal-ai`: no
+  `fireworks-us/…` string can be resolved to a credential, and pinning one fails
+  at `kindForModelString` returning `null` rather than at the call. Setting
+  `MEMORY_RATER_MODEL` to a DeepSeek string therefore does not conjure a DeepSeek
+  credential — it changes the model asked of whichever credential *does* resolve,
+  which is the Anthropic one.
+- Pinning DeepSeek does work on **OpenRouter**, whose kind is first in precedence
+  and whose default is `openrouter/deepseek/deepseek-v4.1-flash`. That is a new
+  key, and the plan's "no new key" invariant is the one thing it is trying to
+  keep.
 
-And one check that is not a question but a search: **does the swarm set the key
-anywhere outside the secret?** `set-config` at agent scope, a live script, a
-skill. The secret and this repository are not the whole surface, and a key in
-swarm config survives every deploy.
+So the lever that works without a new key is not a pin at all: **turn the two
+consumers off.** Session summarisation runs on `session_shutdown` unless
+`SKIP_SESSION_SUMMARY` is set; task auto-titles are gated by
+`TASK_AUTO_TITLE_ENABLED` and default to `true`. Setting `SKIP_SESSION_SUMMARY=1`
+and `TASK_AUTO_TITLE_ENABLED=false` removes both consumers, which is what would
+let `ANTHROPIC_API_KEY` go with step 4's readiness fix in place.
 
-Only then is deleting it from the secret safe. The order is: change the repo
-(compose, render-env, fill-secrets, README, the test), deploy, confirm the stack
-and a worker both come up healthy and a Fireworks task runs, and only after that
-prune the key from the secret — the reverse order leaves a window where the
-container env and the secret disagree and the failure looks like a credential
-bug.
+That leaves three trades, and they are the decision step 8 records:
+
+| Trade | Keeps | Costs |
+|---|---|---|
+| **A. Keep the key** | session summaries, task titles, no new credential | the key this plan set out to remove, still in every worker's env and the api's |
+| **B. Turn both features off** | no Anthropic key, no new key | no session summaries, no generated task titles |
+| **C. Add an OpenRouter key** | both features, drops the Anthropic key | a different long-lived API key, so "no new key" is gone |
+
+**The cost of B, stated plainly.** Summaries are what feed memory: the session
+summary is POSTed to `/api/memory/index` at shutdown and is the only record of
+what a long session learned, and `MEMORY_RATERS` ratings ride on the same call.
+With it off, a long session leaves nothing behind beyond its transcript, so the
+memory and ranking path degrades exactly where it matters most — the sessions with
+the most context to lose. Task titles are smaller: a task keeps its prompt as the
+display title, which is what the sidebar falls back to, so B costs readability
+rather than behaviour. Both losses are *silent*, which is the part worth
+engineering around: whichever trade is chosen, the README should say which
+features are off and why, because otherwise the next reader sees absent summaries
+and assumes a bug.
+
+**What this plan recommends: A, for now**, with the recommendation held loosely.
+The reasoning is that B trades a credential for a feature that has no
+replacement, and the replacement exists but is not in this repository — an
+`internal-ai` credential kind that this account can satisfy. If someone is willing
+to do that upstream work, B becomes correct and A becomes the interim. C is the
+weakest of the three: it keeps both features and drops the Anthropic key, but it
+does so by adding the exact kind of long-lived credential this plan exists to
+stop carrying, and it adds it to solve a problem the account's IAM already
+solves for the worker. **The choice is the engineer's**, and step 8 records which
+was made and why — that is the whole point of the gate, not this paragraph's
+lean.
+
+Two checks that are not trades but prerequisites for any of them:
+
+- **Do the callers actually run?** The code path is unconditional, but the
+  evidence is in the swarm: rows in the memory index with
+  `source: "session_summary"`, `session_summary …` lines in the worker streams, and
+  `[task-title] … via anthropic/claude-haiku-5-5` in the api stream. If they are
+  not running today, then B costs nothing *now* and the question becomes why they
+  are already dead — which is worth knowing before attributing the loss to this
+  change.
+- **Does the swarm set the key anywhere outside the secret?** `set-config` at
+  agent scope, a live script, a skill. The secret and this repository are not the
+  whole surface, and a key in swarm config survives every deploy.
+
+The order, whichever trade is chosen: change the repo (compose, render-env,
+fill-secrets, README, the test), deploy, confirm the stack and a worker both come
+up healthy and a Fireworks task runs, and only after that prune the key from the
+secret — the reverse order leaves a window where the container env and the secret
+disagree and the failure looks like a credential bug. With trade A or C the key
+stays in the secret and only the README changes.
 
 ## What is NOT in scope
 
@@ -562,21 +762,28 @@ bug.
 - **No model other than the two named.** Not the other `WORKBENCH_MODELS`
   entries, not a `us.` profile of either of these, not a "spare" model for
   testing. A third model is an edit to this plan.
-- **No new secret or API key**, in either half. Part A adds none, and Part B only
-  removes one.
+- **No new secret or API key.** Part A adds none, and Part B's preferred trade
+  removes one. Trade C, which would add an `OPENROUTER_API_KEY`, is the exception
+  the gate exists to weigh — it is not this plan's default and it gives up this
+  invariant if chosen.
 - **No change to the default model**, to `HARNESS_PROVIDER`, or to the
-  `fireworks-us` provider block and its residency rules.
-- **No probe.** `BEDROCK_AUTH_MODE` stays unset (decision 3), so no enumeration
-  and no live Bedrock status in the console. Turning it on is a later decision
-  with its own step.
+  `fireworks-us` provider block and its residency rules. The tier mapping changes
+  which model a *tiered* task gets; an untiered one is untouched.
+- **No change to agent-swarm's code.** `BEDROCK_AUTH_MODE` is an environment
+  variable this repo already passes through, the probe already exists in the
+  pinned tag, and the tier keys are swarm config. Nothing here needs an upstream
+  patch — including the `internal-ai` credential kind in the open questions, which
+  would be one, and is therefore out of this plan.
 - **`delegate/` and `deploy/`'s `DELEGATES` stack** are other deployments with
   other secrets and their own review requirements. Out of scope entirely.
 
 ## Rejected alternatives
 
 Recorded so a later reader can tell these were considered rather than missed.
-The first four are the decisions above, listed as what they reject; the rest are
-the alternatives that came up while writing them.
+The first two are the decisions above, listed as what they reject. **The middle
+three were this plan's own first answers, and review reversed them** — they are
+kept, with the argument that defeated them, because the argument for leaving
+`BEDROCK_AUTH_MODE` unset is genuinely tempting and will come back.
 
 - **Route through the workbench Bifrost gateway.** A cross-account hop, a virtual
   key, a second account's spend, and a dependency on a service in another account
@@ -592,18 +799,29 @@ the alternatives that came up while writing them.
   secret and assumes the production-read role. A container that reaches IMDS
   would inherit both alongside the invoke grant, and the three have nothing to do
   with each other. (Decision 2.)
-- **Set `BEDROCK_AUTH_MODE=sdk`.** It turns a failing Bedrock probe into a worker
-  parked in the credential wait, which takes Fireworks work down with it. The
-  gate reads the agent default, so leaving it unset keeps the default healthy
-  while a per-task `amazon-bedrock/…` model still runs on Bedrock. (Decision 3.)
-- **`BEDROCK_AUTH_MODE=bearer`.** Same gate, plus a Bedrock API key in the secret
-  — a new long-lived credential in exactly the place Part B is trying to empty,
-  for a scope the AWS role already gives.
-- **Grant `ListInferenceProfiles` / `ListFoundationModels` "in case".** Nothing
-  would call them: the enumeration they serve is off. `deploy-workbench/ecs.ts`
-  grants one of them because Bifrost draws a model list from AWS; the swarm does
-  not. A permission with no caller is the one that gets used accidentally.
-  (Decision 4.)
+- **Leave `BEDROCK_AUTH_MODE` unset and reach Bedrock only by naming a
+  `amazon-bedrock/…` model.** This was the first draft's decision 3, and it is
+  tempting because it never enters the hard gate: the readiness check keeps
+  running on the permissive-key branch, so a failing Bedrock probe cannot park a
+  Fireworks worker. It loses on what it pays for that. The permissive branch needs
+  `ANTHROPIC_API_KEY`, so the key can never go; there is no enumeration, so the
+  picker needs overlay rows that may not even make the models selectable; and the
+  readiness check then tests a key the Bedrock path does not use. Turning the
+  probe on buys back both problems and costs a coupling the plan was going to
+  accept anyway. (Decision 3.)
+- **Withhold the control-plane reads.** The first draft's decision 4, and it was
+  right *for the first draft*: the reads serve the probe, and the first draft had
+  no probe, so granting them would have been a permission with no caller. Once the
+  probe is on they have exactly one caller, named in the action list. The rule was
+  never "no reads"; it was "no reads without a caller". (Decision 4.)
+- **Overlay rows per model, to make the models pickable.** The first draft's
+  answer to having no enumeration. With the probe on, the console's Bedrock group
+  is `enabled: true` and lists the live result, so the rows answer a question
+  nobody is asking. They stay in the document as optional metadata for a fact the
+  probe does not carry, not as the plan.
+- **`BEDROCK_AUTH_MODE=bearer`.** Same gate as `sdk`, plus a Bedrock API key in
+  the secret — a new long-lived credential in exactly the place Part B is trying to
+  empty, for a scope the AWS role already gives.
 - **Grant the whole invoke family because it is one line.** `Converse` and
   `ConverseStream` are what the harness calls. `InvokeModel` is a different API
   the harness does not use, and adding it "for symmetry" is the shape of grant
@@ -614,30 +832,31 @@ the alternatives that came up while writing them.
 - **Pin the models in `models.json` so they appear in the picker.** The
   `fireworks-us` provider id exists there to *remove* models from pi's built-in
   catalogue. Adding `amazon-bedrock` blocks would fork pi's own Bedrock provider
-  and lose its catalog and pricing; the picker's gap is a catalogue gap, and the
-  overlay row is the mechanism this repo already uses for one.
-- **Turn the probe on so the console lists the models for us.** It is the same
-  failure as `BEDROCK_AUTH_MODE=sdk`: the picker's convenience is not worth a
-  worker that parks when a Bedrock call fails.
+  and lose its catalog and pricing, and the probe already supplies the list.
+- **Pin `MEMORY_RATER_MODEL` to a DeepSeek model to drop the Anthropic key.** The
+  obvious first idea, and it fails structurally: `MEMORY_RATER_MODEL` overrides the
+  model string, but `resolveCredential` picks the credential *kind* first, and
+  `kindForModelString` maps a provider prefix through `PROVIDER_TO_KIND`, which has
+  no `fireworks` entry. The swarm's `FIREWORKS_API_KEY` is invisible to
+  `internal-ai`, so a DeepSeek pin changes the model asked of the Anthropic
+  credential rather than replacing it. ("The three trades".)
 - **Remove the Anthropic key now, on the strength of "no agent uses it".** That
   was PR #491, and it took the swarm's credential check down in production. The
   sentence in the README is about agents; the key also answers the `pi` readiness
-  check and feeds session summarisation and task titles. Hence the gate.
-  (Part B.)
+  check and feeds session summarisation and task titles. Part A now fixes the first
+  of those and cannot fix the second. (Part B.)
 - **Treat "the api service" as the consumer and call it answered.** Workflow LLM
   nodes reject an Anthropic credential, so the README's phrase points at the one
   caller that cannot be using it. The callers are the worker's session summary
   and the api's task titles, and they are found by reading `internal-ai`'s
   credential precedence, not by reading the README. (Part B.)
-- **Assume Part A solves Part B.** It does not. Bedrock is reachable from a
-  worker container through aws-config, but `internal-ai` has no Bedrock
-  credential kind in v2.10.0 and the api container has no AWS access at all, so
-  neither internal caller can be repointed at a Bedrock model without an upstream
-  change. The two halves of this plan are independent.
-- **`CRED_CHECK_DISABLE=1` as the answer to the readiness check.** It is the
-  lever that exists, and it also disables the check that would tell us a Fireworks
-  key had gone missing. If it is the answer, it is said out loud in step 7 with
-  that cost written next to it, not slipped in.
+- **Assume Part A solves Part B.** It solves the readiness half and nothing
+  else. `internal-ai` has no Bedrock credential kind in v2.10.0 and the api
+  container has no AWS access at all, so neither internal caller can be repointed
+  at a Bedrock model without an upstream change.
+- **`CRED_CHECK_DISABLE=1` as the answer to the readiness check.** It also
+  disables the check that would tell us a Fireworks key had gone missing. The probe
+  is the answer that keeps a check, which is why it was chosen over this.
 - **A second model provider instead of Bedrock.** Fireworks stays the default;
   the point of these two is a credential and an account we already have, with no
   new key. That is also why this is not "add an OpenAI key".
@@ -680,15 +899,22 @@ than restate it.
    - A role named `delegate-swarm-bedrock`, trust principal
      `arn:aws:iam::394495727159:role/delegate-swarm-host`, `sts:AssumeRole` only,
      no condition — same stack, so the direct ARN is available (decision 2).
-   - An inline policy (inline, matching the other scoped roles here) allowing
-     `bedrock:Converse` and `bedrock:ConverseStream` on two models'
-     `inference-profile` ARNs in this account and their `foundation-model` ARNs,
-     region wildcarded, and nothing else. The ids come from
-     `utils/bedrock-models.ts` by `id` lookup, not retyped, so a model's profile
-     moving is one edit in the file that already owns that decision. That file is
-     under `utils/`, which `.github/CODEOWNERS` keeps human-owned, so a PR
-     touching it needs a human even though `deploy-infrastructure/` does not — the
-     ids' single source of truth is worth that.
+   - An inline policy (inline, matching the other scoped roles here) with two
+     statements, kept apart because they take opposite resource shapes:
+     - **invoke:** `bedrock:Converse` and `bedrock:ConverseStream` on two models'
+       `inference-profile` ARNs in this account and their `foundation-model` ARNs,
+       region wildcarded. The ids come from `utils/bedrock-models.ts` by `id`
+       lookup, not retyped, so a model's profile moving is one edit in the file
+       that already owns that decision. That file is under `utils/`, which
+       `.github/CODEOWNERS` keeps human-owned, so a PR touching it needs a human
+       even though `deploy-infrastructure/` does not — the ids' single source of
+       truth is worth that.
+     - **the probe's reads:** `bedrock:ListFoundationModels` and
+       `bedrock:ListInferenceProfiles` on `*`, because Bedrock defines no resource
+       type for either and a narrower `Resource` fails rather than scoping
+       (decision 4). Named as their own exported constant, the way
+       `TASK_BEDROCK_READ_ACTIONS` is in `deploy-workbench/ecs.ts`, so a test can
+       tell this deliberate wildcard from an edit that widens something else.
    - The host role's `AssumeProdRead` statement echoed for the new role: an
      `sts:AssumeRole` on its ARN added to `swarmHostPolicy` in `agent-swarm.ts`.
      Nothing else on the host role changes, and the existing `AssumeProdRead`
@@ -699,10 +925,24 @@ than restate it.
 
    Tests, in the style `deploy-infrastructure/agent-swarm.test.ts` already uses
    on the host policy: export the policy document as a pure function and assert
-   (a) every action is one of the two invoke actions, (b) every resource names one
-   of the two models, (c) no `bedrock:List*`/`Get*` and no wildcard action,
-   (d) the trust admits only the host role, (e) the host policy gained exactly one
-   statement.
+   (a) invoke is exactly the two Converse actions, (b) every invoke resource names
+   one of the two models, (c) the read statement is exactly the two `List*`
+   actions the probe calls and on `*`, (d) no `bedrock:*` and no
+   `bedrock:Get*`, (e) the trust admits only the host role, (f) the host policy
+   gained exactly one statement.
+
+   **This is a sibling PR's file, and it already carries most of it.** PR #518
+   creates the role and its policy in `deploy-infrastructure/agent-swarm.ts`, and
+   its `ProbeBedrockCatalog` statement already names `bedrock:ListFoundationModels`
+   and `bedrock:ListInferenceProfiles` on `*` — so the reads this plan now needs are
+   in place before this document merges. Recorded so the plan does not ask for work
+   that exists. Two things #518 does that this plan's text does not, both harmless
+   and not worth reopening: its invoke statement also grants `bedrock:InvokeModel`
+   and `bedrock:InvokeModelWithResponseStream` (this plan narrows to the two
+   Converse actions, which is what the harness calls; the extras are unused rather
+   than wrong), and it adds the reads because its author anticipated the probe
+   rather than because this decision existed yet. Where the two documents disagree,
+   #518's policy is the fact and this plan's step 5 verifies it.
 
    **`deploy/bedrock-invoke-principals.test.ts` will fail on this PR, and that is
    the tripwire working.** It asserts that the invoke actions appear in an
@@ -754,18 +994,40 @@ than restate it.
    `aws sts get-caller-identity --profile prod-read` must report
    `delegate-swarm-prod-read`.
 
-4. **The two overlay rows.** `agent-swarm/host/sync-agent-config.sh`, following
-   the `fireworks-us` row's shape and its comment style, and extending
-   `agent-swarm/host/scripts/model-catalog-overlay.test.ts` to cover them. Note
-   that `host/scripts/` is deliberately not uploaded to the host (`hostFiles` in
-   `deploy-infrastructure/agent-swarm.ts` filters `scripts/` and `skills/`), so
-   the test runs in CI and the script runs from the host's copy of `host/` — both
-   from the same merge.
+4. **Turn the readiness gate on, and give it the region.** `agent-swarm/host/docker-compose.yml`,
+   `x-worker-env` (which all three agents share):
 
-   Confirm on the console afterwards that the two models can be **selected**, not
-   merely listed, and record what the picker says about the group. If a row is not
-   enough (decision 3's cost), say so in the PR and leave the rows in place as
-   catalogue metadata.
+   ```yaml
+   BEDROCK_AUTH_MODE: sdk
+   AWS_REGION: us-west-2
+   ```
+
+   Both, in the same change, because the probe refuses to run without the region
+   (decision 3, "Region"). The **api** service needs them too if anything in it is
+   ever expected to reach Bedrock; today it has no AWS access at all, so the honest
+   scope is the worker env, and the api is left alone until there is a caller.
+   `AWS_PROFILE` must stay unset here — the aws-config change makes `[default]` the
+   Bedrock role, and a set `AWS_PROFILE` would aim the probe at whichever profile
+   it names.
+
+   **This is sibling PR #523's file, and the change is not purely additive.** That
+   PR already adds `AWS_REGION: ${AWS_REGION:-us-west-2}` to `x-worker-env`, which
+   step 4 needs and which this plan should treat as done. It also adds a long
+   comment saying `BEDROCK_AUTH_MODE` is *deliberately absent*, because the Bedrock
+   role is granted "only the four invoke actions (no bedrock:List*/Get*,
+   deliberately)" and a probe would therefore "park the worker in credential-wait
+   forever". **That comment is now false in both its premises:** #518 does grant the
+   two reads, and this plan deliberately turns the probe on. The follow-up change is
+   to set `BEDROCK_AUTH_MODE: sdk` and to replace that comment with the reasoning at
+   decision 3 — not to add a variable underneath a paragraph explaining why it must
+   not be there. Leaving the comment would make the next reader delete the variable
+   to restore consistency.
+
+   The proof that this landed is not the apply: it is a worker that boots with no
+   `ANTHROPIC_API_KEY` in its env and reports ready, and `agent.credStatus`
+   carrying a `bedrock` block with a model count. `agent-swarm/README.md`'s
+   "Models" and "AWS access from inside the swarm" sections need the new variable
+   explained in the same PR, since the readiness story changes.
 
 5. **Prove it, from inside a worker container.** Operational, no PR; the record
    is the PR bodies of steps 2 to 4 and, where it is not a git fact, ClickUp.
@@ -777,68 +1039,103 @@ than restate it.
      build installed by `global-setup-script.sh` has the `converse` subcommand;
      otherwise a short `@aws-sdk/client-bedrock-runtime` script. Success proves
      the agreement, the region, the trust and the policy at once.
+   - The readiness path, which is the one that matters most: with
+     `ANTHROPIC_API_KEY` removed from a worker's env, the worker must still report
+     ready (`satisfiedBy: "sdk-delegated"`). That is the single observation that
+     authorises step 8.
+   - **What the probe enumerated**, recorded verbatim: the model count and the ids
+     it returned. It is wider than the two-model invoke grant (decision 4, "What
+     the reads do not buy"), and the size of that gap decides whether the picker
+     offering an uninvokable model is a real problem or a theoretical one.
    - A refusal, deliberately: the same call for a model this plan does *not*
      grant (say `global.openai.gpt-6.1-terra`) must fail with an AccessDenied
      that names `bedrock:Converse` and this role. If it succeeds, the grant is
      wider than this plan says and step 2 is wrong.
    - The default, unchanged: a task with no model named still runs Fireworks,
      and the agent's runtime model is still the `fireworks-us/…` router.
-   - If the region the call used is not us-west-2, go back to step 3 and set it
-     explicitly.
 
-6. **What consumes the Anthropic key.** Investigation, no code change, and no PR
-   is required unless the answer belongs in the repo. Answer the four questions
-   under "The gate" with evidence rather than inference: the swarm's own logs
-   and tables (`session_summary` rows in the memory index, `[task-title]` lines
-   in the api stream, `session_summary skipped` lines in the worker streams), the
-   config that gates them (`SKIP_SESSION_SUMMARY`, `TASK_AUTO_TITLE_ENABLED`,
-   `MEMORY_RATERS`, `MEMORY_RATER_MODEL`), and a search of swarm config for the
-   key itself. Record the answers wherever step 7's PR can cite them.
+6. **Propose the tier mapping.** Set `MODEL_TIER_PI_SMOL`, `MODEL_TIER_PI_REGULAR`,
+   `MODEL_TIER_PI_SMART` and `MODEL_TIER_PI_ULTRA` in `swarm_config` — through the
+   dashboard or `set-config`, not a Pulumi resource, because tier config is swarm
+   state and this repository has no path to it. The mapping is the proposal in
+   "Model tiers", and **it needs the engineer's confirmation before it is set**, so
+   this step is a question as much as a change.
 
-   Two findings from the pinned source are already known and must be re-checked,
-   not re-derived: `internal-ai` resolves an Anthropic credential for session
-   summarisation and task titles because nothing else in this secret satisfies
-   its precedence list, and the `pi` readiness check does not count
-   `FIREWORKS_API_KEY` for a `fireworks-us/…` override. Those two, not the
-   README's sentence, decide step 7.
+   Read back `GET /api/models-catalog/tiers` (`previewModelTiers`) and check each
+   row's `source` is `tier-config` and its `resolvedModel` is what the table says.
+   Then create one task with `modelTier: smart` and confirm from its `resolvedModel`
+   that it ran on the Bedrock model — the tier preview is a projection, and the
+   claim path is what actually decides.
 
-7. **Remove the key, or record why it stays.** Two outcomes, both acceptable, and
-   the PR (or a doc-only PR) says which and why:
+   Leave `MODEL_TIER_PI_ULTRA` as whatever the engineer decides, and record the
+   consequence if it is left pointing at an `openrouter/…` id: an `ultra` task
+   fails on a model this swarm cannot authenticate, which is the state every tier
+   is in today.
 
-   - **Stays:** name the callers and the surface. The README's sentence becomes
-     true and specific — the worker's session summary and the api's task titles
-     resolve an Anthropic credential, and nothing else does — instead of the
-     current "api service and fallback path", which points at the one caller
-     that rejects it. No code changes, and the open question about how the key
-     is retired later stays open.
-   - **Goes:** compose (both places), `render-env.sh`'s `REQUIRED_KEYS`,
-     `fill-secrets.sh`, the README's three mentions, and the assertion in
-     `fireworks-residency.test.ts` — one PR. **Not** `deploy/delegate-secret.ts`,
-     which is the pr-reviewer stack's key list and a different secret. Then
-     deploy, confirm the stack and a worker are healthy and that a Fireworks task
-     runs end to end, and only after that prune the key from `DELEGATE_SWARM`
-     (`fill-secrets.sh` has the prune pattern the reverted change wrote). The
-     readiness-check answer and the summarisation/title answer both ship in that
-     PR, or the worker parks and two features go quiet.
+7. **Which of the three trades.** Investigation, no code change, and no PR is
+   required unless the answer belongs in the repo. Establish the two facts under
+   "The three trades" with evidence rather than inference: whether the summariser
+   and the title generator are actually running (memory-index rows,
+   `[task-title] … via anthropic/claude-haiku-5-5` lines, `session_summary skipped`
+   lines), and whether swarm config sets the key anywhere outside the secret. Then
+   put trades A, B and C to the engineer with the costs already written, and record
+   which one applies.
+
+   The pinned-source findings are already known and are not to be re-derived:
+   `internal-ai` resolves an Anthropic credential for both callers because
+   `fireworks` is not a credential kind, and the readiness check — which was the
+   other reason the key could not go — is now satisfied by the probe from step 4.
+
+8. **Remove the key, or record why it stays.** Whichever trade step 7 chose:
+
+   - **Trade A, keep it:** name the callers and the surface. The README's sentence
+     becomes true and specific — the worker's session summary and the api's task
+     titles resolve an Anthropic credential, and nothing else does — instead of the
+     current "api service and fallback path", which points at the one caller that
+     rejects it. No code changes; the key stays in the secret.
+   - **Trade B, turn the features off:** add `SKIP_SESSION_SUMMARY=1` and
+     `TASK_AUTO_TITLE_ENABLED=false` to the container env (and to
+     `agent-swarm/README.md`, saying plainly that summaries and titles are off and
+     why), then remove the key from compose (both places), `render-env.sh`'s
+     `REQUIRED_KEYS`, `fill-secrets.sh`, the README's three mentions, and the
+     assertion in `fireworks-residency.test.ts` — one PR. **Not**
+     `deploy/delegate-secret.ts`, which is the pr-reviewer stack's key list and a
+     different secret.
+   - **Trade C, add OpenRouter:** a new `OPENROUTER_API_KEY` in the secret, which
+     makes the Anthropic one removable and keeps both features. The plan's "no new
+     key" invariant goes with it, and that should be said in the same sentence.
+
+   Then deploy, confirm the stack and a worker are healthy, that a worker reports
+   ready with no `ANTHROPIC_API_KEY`, and that a Fireworks task runs end to end —
+   and only after that prune the key from `DELEGATE_SWARM` (`fill-secrets.sh` has
+   the prune pattern the reverted change wrote). The reverse order leaves a window
+   where the container env and the secret disagree and the failure looks like a
+   credential bug.
 
 ## Open questions
 
-- **Whether the two internal callers are live, and what happens to them.**
-  Step 6's answer. It decides whether Part B is a deletion or a precise
-  paragraph. It cannot be read from the repository: the code path is
+- **Whether the two internal callers are live, and which trade follows.**
+  Step 7's answer. It decides whether Part B is a deletion, a feature removal or a
+  precise paragraph. It cannot be read from the repository: the code path is
   unconditional, so the evidence is in the swarm's own rows and log streams.
 - **Whether `internal-ai` should gain a credential kind this account can reach.**
   Today it knows `openrouter`, `anthropic`, `openai`, `openai-codex` and
-  `claude-cli`, and the swarm has only two credentials in play: Fireworks, which
-  it does not model, and Anthropic. A Bedrock kind would let the summariser and
-  the titler run on the grant this plan creates, with no new key and no lost
-  feature — but it is an agent-swarm change (a pinned-tag bump, or an upstream
-  PR), not an ops one, and it is the only path that satisfies both "drop the key"
-  and "keep the features". Recording it here so the trade in step 7 is a real one
-  rather than "the key stays, then".
-- **Whether an overlay row is enough for the console picker.** Step 4's
-  verification. If not, selection by id works and the rows stay as metadata; the
-  question is only about the console.
+  `claude-cli`, and the swarm has two credentials in play: Fireworks, which it does
+  not model, and Anthropic. A kind that resolves through the AWS chain — or a
+  `fireworks` kind that reads `FIREWORKS_API_KEY` — would let the summariser and
+  the titler keep working with no new key. It is an agent-swarm change (a
+  pinned-tag bump, or an upstream PR), not an ops one, and it is the only path that
+  turns trade B into trade A's feature set. Recording it here so the choice in step
+  7 is a real one rather than "the key stays, then".
+- **Whether the probe's model list is a picker problem.** Step 5 records what the
+  probe enumerated. `ListFoundationModels` reports what exists in a region, not
+  what this role may invoke, so the picker can offer a model that fails at
+  invocation (decision 4, "What the reads do not buy"). If the list is the whole
+  catalogue, that is a real papercut; filtering it client-side is an agent-swarm
+  change. The overlay rows are the local lever and this plan now treats them as
+  optional.
+- **What `MODEL_TIER_PI_ULTRA` should be.** The two-model grant leaves `ultra`
+  with no model of its own ("Model tiers"). The engineer's call.
 - **Cost and accounting for these two models in this account.** The swarm keeps
   its own price book keyed by harness and model id, and a Bedrock session
   records what pi reports. Whether an `amazon-bedrock/…` session lands as
