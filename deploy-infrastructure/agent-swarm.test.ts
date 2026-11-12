@@ -11,6 +11,8 @@ import {
   hostFilesHash,
   infraLogsReadStatements,
   panelRepliesPutStatement,
+  SWARM_BEDROCK_READ_ACTIONS,
+  SWARM_BEDROCK_READ_RESOURCES,
   SWARM_HOSTNAME,
   swarmHostPolicy,
   syncCommand,
@@ -255,9 +257,11 @@ describe("delegate swarm bedrock role", () => {
   });
 
   it("allows exactly the four invoke actions on exactly four ARNs", () => {
-    assert.equal(statements.length, 1);
-    const [invoke] = statements;
-    assert.equal(invoke.Sid, "InvokeSwarmBedrockModels");
+    assert.equal(statements.length, 2);
+    const invoke = statements.find(
+      (s) => s.Sid === "InvokeSwarmBedrockModels"
+    );
+    assert.ok(invoke);
     assert.equal(invoke.Effect, "Allow");
     assert.deepEqual(invoke.Action, [
       "bedrock:Converse",
@@ -273,18 +277,60 @@ describe("delegate swarm bedrock role", () => {
       "arn:aws:bedrock:*::foundation-model/openai.gpt-6.1-sol",
       "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5",
     ]);
-    assert.equal(resources.length, 4);
+    // The invoke half is four ARNs and no wildcard resource. The wildcard
+    // count below is `resources`, which includes the read statement's `*`.
+    assert.equal(invoke.Resource.length, 4);
   });
 
-  // The grant exists to reach two models, so every ARN has to name one of them
-  // by id. This is what would catch a third model, or a profile whose entry in
-  // utils/bedrock-models.ts moved without the swarm following.
-  it("names one of the two swarm models in every ARN", () => {
+  // The swarm worker's `BEDROCK_AUTH_MODE=sdk` probe calls
+  // `ListFoundationModels` and `ListInferenceProfiles` before any per-key
+  // check, and a probe failure parks the worker in credential-wait. Both are
+  // required, and the second is not in the Bifrost task role's read set because
+  // Bifrost's provider never calls it.
+  it("allows exactly the two catalog reads the sdk probe makes", () => {
+    assert.deepEqual([...SWARM_BEDROCK_READ_ACTIONS], [
+      "bedrock:ListFoundationModels",
+      "bedrock:ListInferenceProfiles",
+    ]);
+    const probe = statements.find((s) => s.Sid === "ProbeBedrockCatalog");
+    assert.ok(probe);
+    assert.equal(probe.Effect, "Allow");
+    assert.deepEqual(probe.Action, [...SWARM_BEDROCK_READ_ACTIONS]);
+    // `*` for both: IAM defines no resource type for either action, so a
+    // narrower Resource fails rather than scoping the call. Named through the
+    // constant, as `deploy-workbench/ecs.ts` does with
+    // TASK_BEDROCK_READ_RESOURCES, so this wildcard is distinguishable from an
+    // edit that widens something else.
+    assert.deepEqual(probe.Resource, [...SWARM_BEDROCK_READ_RESOURCES]);
+    assert.deepEqual([...SWARM_BEDROCK_READ_RESOURCES], ["*"]);
+  });
+
+  // Six actions in total: four invoke, two read. Pinned as a set so neither a
+  // quiet addition nor a quiet removal passes.
+  it("grants six actions and no more", () => {
+    assert.deepEqual([...actions].sort(), [
+      "bedrock:Converse",
+      "bedrock:ConverseStream",
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+      "bedrock:ListFoundationModels",
+      "bedrock:ListInferenceProfiles",
+    ]);
+  });
+
+  // The grant exists to reach two models, so every model ARN has to name one of
+  // them by id. This is what would catch a third model, or a profile whose
+  // entry in utils/bedrock-models.ts moved without the swarm following. The
+  // read statement's `*` is excluded: it names no model at all, and the test
+  // above pins it instead.
+  it("names one of the two swarm models in every model ARN", () => {
     assert.deepEqual([...SWARM_MODEL_IDS], [
       "openai.gpt-6.1-sol",
       "anthropic.claude-haiku-5-5",
     ]);
-    for (const arn of resources) {
+    const modelArns = resources.filter((r) => r !== "*");
+    assert.equal(modelArns.length, 4);
+    for (const arn of modelArns) {
       const named = SWARM_MODEL_IDS.filter(
         (id) => arn.endsWith(`/${id}`) || arn.endsWith(`/global.${id}`)
       );
@@ -294,29 +340,49 @@ describe("delegate swarm bedrock role", () => {
   });
 
   // Nothing wilder. Each of these is the line someone would add next, and each
-  // one makes the two-model list decoration: a wildcard action, a wildcard
-  // resource, a catalog read (the enumeration probe the plan leaves off), or
-  // the marketplace permission that would let the host subscribe a model
-  // nobody chose.
-  it("carries no wildcard action, no wildcard resource and no reads", () => {
+  // one makes the two-model list decoration.
+  it("carries no wildcard action, and one named wildcard resource", () => {
     for (const action of actions) {
       assert.match(action, /^bedrock:/, action);
       assert.equal(action.includes("*"), false, action);
     }
-    for (const resource of resources) {
-      assert.equal(resource.includes("arn:aws:bedrock:*::foundation-model/*"), false);
-      assert.equal(resource.split("*").length - 1, 1, `${resource} has more than the region wildcard`);
+
+    // Exactly one wildcard resource, and it is the read statement's, which is
+    // the one IAM forces. Every other resource is a Bedrock ARN whose only
+    // wildcard is the region (spelled "*" in the middle of the ARN, so counted
+    // separately from a bare `*`).
+    assert.deepEqual(
+      resources.filter((r) => r === "*"),
+      [...SWARM_BEDROCK_READ_RESOURCES]
+    );
+    for (const resource of resources.filter((r) => r !== "*")) {
+      assert.match(resource, /^arn:aws:bedrock:\*:/, resource);
+      assert.equal(
+        resource.split("*").length - 1,
+        1,
+        `${resource} has more than the region wildcard`
+      );
     }
-    // The region is the only wildcard in the document, and there is no service
-    // wildcard, no marketplace and no read of any kind.
+
+    // No `Get`, no service wildcard, and nothing beyond the two named reads.
     assert.equal(
-      actions.some((a) => /:(Get|List)/.test(a)),
+      actions.some((a) => a.startsWith("bedrock:Get")),
       false,
-      "the role grants a Bedrock read; the catalog probe is deliberately off"
+      "the probe lists; it does not describe"
+    );
+    assert.equal(
+      actions.filter((a) => a.startsWith("bedrock:List")).sort().join(","),
+      [...SWARM_BEDROCK_READ_ACTIONS].sort().join(","),
+      "a Bedrock List action is granted beyond the two the sdk probe makes"
     );
     assert.equal(
       JSON.stringify(delegateSwarmBedrockPolicy).includes("marketplace"),
       false
+    );
+    assert.equal(
+      JSON.stringify(delegateSwarmBedrockPolicy).includes('"bedrock:*"'),
+      false,
+      "the policy names bedrock:* ; the six named actions are the allowlist"
     );
   });
 

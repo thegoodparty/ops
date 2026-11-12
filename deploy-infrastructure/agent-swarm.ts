@@ -193,8 +193,60 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
 });
 
 /**
- * The swarm's model grant, kept pure so a test can read it. `docs/swarm-bedrock.md`
- * is the plan; step 1 is this role.
+ * The two Bedrock control-plane reads the swarm worker makes before it will
+ * report credentials ready.
+ *
+ * At agent-swarm v2.10.0, `src/providers/pi-mono-adapter.ts` calls
+ * `runBedrockSdkProbeAndEnumerate(region)` in `checkPiMonoCredentials` when
+ * `BEDROCK_AUTH_MODE=sdk`, before any per-key check, and that probe makes
+ * exactly two control-plane calls:
+ *
+ *     new ListFoundationModelsCommand({ byInferenceType: "ON_DEMAND", byOutputModality: "TEXT" })
+ *     new ListInferenceProfilesCommand({})
+ *
+ * On success it returns `ready: true, satisfiedBy: "sdk-delegated"` and the
+ * enumerated model list, which is both what satisfies pi's credential
+ * readiness and what populates the console's model picker. On failure it
+ * returns `ready: false` and the worker parks in credential-wait, so without
+ * these two actions the swarm does not start.
+ *
+ * That is an accepted coupling, not an accident: a Bedrock probe failure takes
+ * the whole pi worker out, Fireworks included. It was decided in review of
+ * `docs/swarm-bedrock.md` and it replaces an earlier reading of this role in
+ * which control-plane reads were withheld because the model list was fixed.
+ *
+ * `ListFoundationModels` alone would be enough for Bifrost, whose provider
+ * calls only that one (`TASK_BEDROCK_READ_ACTIONS` in
+ * `deploy-workbench/ecs.ts`). The swarm's probe calls both, so both are named
+ * here rather than borrowed from that constant: the two roles are different
+ * programs and a shared name would hide the difference.
+ */
+export const SWARM_BEDROCK_READ_ACTIONS = [
+  "bedrock:ListFoundationModels",
+  "bedrock:ListInferenceProfiles",
+] as const;
+
+/**
+ * Both reads are account-wide, so their resource can only be `*`.
+ *
+ * Bedrock's service authorization reference defines no resource type for
+ * either action — not a model ARN, not a profile ARN — so a narrower
+ * `Resource` fails rather than scoping the call. This is therefore the only
+ * wildcard resource in the policy besides the region wildcard inside the model
+ * ARNs, and it is named here once rather than inline so the test can tell this
+ * deliberate one from an edit that widens something else.
+ *
+ * Deliberately not combined with the invoke statement: the two take opposite
+ * resource shapes, invoke naming the models and this naming nothing, and one
+ * wider statement would make the model list decoration. A read is also the
+ * safe half of the pair — it can enumerate the catalog and cannot invoke what
+ * it finds.
+ */
+export const SWARM_BEDROCK_READ_RESOURCES = ["*"] as const;
+
+/**
+ * The swarm's Bedrock grant, kept pure so a test can read it.
+ * `docs/swarm-bedrock.md` is the plan; step 1 is this role.
  *
  * A dedicated role rather than one more statement on the host's policy, for
  * three reasons. The host role is on an EC2 instance that every container on
@@ -205,21 +257,25 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
  * separate to be revocable: detaching this policy ends model access without
  * touching the host's S3, logs or secret grants.
  *
- * Exactly two models, from the subset in `utils/bedrock-models.ts`, and exactly
- * four actions. Deliberately absent, and each is the obvious next line someone
- * would add:
+ * Two statements, and between them six actions. `InvokeSwarmBedrockModels`
+ * names four invoke actions on the model ARNs — exactly two models, from the
+ * subset in `utils/bedrock-models.ts`, and no wildcard action or resource.
+ * `ProbeBedrockCatalog` names the two control-plane reads the worker's
+ * `BEDROCK_AUTH_MODE=sdk` probe makes, on `*` because IAM defines no resource
+ * type for either.
  *
- * - `bedrock:Get*` and `bedrock:List*`. The gateway task role needed one
- *   catalog read to render a dashboard; the swarm is not a dashboard, and the
- *   model list is fixed here. The enumeration probe in the plan doc is
- *   deliberately not enabled, so this role cannot ask the account what it is
- *   allowed.
+ * Deliberately absent, and each is the obvious next line someone would add:
+ *
+ * - `bedrock:Get*`, and any `List` beyond the two the probe makes. The probe
+ *   asks two questions; it does not browse. `GetFoundationModel`,
+ *   `GetInferenceProfile` and `ListGuardrails` all look harmless from here and
+ *   none of them is called.
  * - `aws-marketplace`, which is what would let the host subscribe a model
  *   nobody chose. Agreements are created out of band by
  *   `scripts/enable-bedrock-models.ts`, which is why that script takes an
  *   account and a model list now.
- * - `bedrock:*`, or a wildcard resource. Either one makes the two models
- *   above decoration.
+ * - `bedrock:*`. It would make the two models above decoration, and the reads
+ *   in the second statement are named for the same reason.
  */
 export const delegateSwarmBedrockPolicy = {
   Version: "2012-10-17",
@@ -234,6 +290,12 @@ export const delegateSwarmBedrockPolicy = {
         "bedrock:InvokeModelWithResponseStream",
       ],
       Resource: swarmBedrockInvokeResources(),
+    },
+    {
+      Sid: "ProbeBedrockCatalog",
+      Effect: "Allow",
+      Action: [...SWARM_BEDROCK_READ_ACTIONS],
+      Resource: [...SWARM_BEDROCK_READ_RESOURCES],
     },
   ],
 };

@@ -210,9 +210,12 @@ export const bedrockInvokeResources = (
  *
  * Two, not eight, because the swarm is a different audience from the coding
  * sandbox: it runs the Delegate agents in Slack, not a developer's editor. The
- * reasoning, and what is deliberately not granted beside them (no catalog
- * enumeration, so no `bedrock:Get*`/`List*`, and no `aws-marketplace`, so the
- * host cannot subscribe a model nobody chose), is in `docs/swarm-bedrock.md`.
+ * reasoning is in `docs/swarm-bedrock.md`. Beside these two, the role also
+ * holds the two control-plane reads its worker's `BEDROCK_AUTH_MODE=sdk` probe
+ * makes (`bedrock:ListFoundationModels`, `bedrock:ListInferenceProfiles` —
+ * see `delegateSwarmBedrockPolicy`), but those are not model entries and do not
+ * belong in this list: this list is what an invoke grant is composed from, and
+ * a read takes `Resource: "*"` because IAM defines no resource type for it.
  */
 export const SWARM_MODEL_IDS = [
   "openai.gpt-6.1-sol",

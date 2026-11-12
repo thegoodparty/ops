@@ -133,12 +133,13 @@ describe("the workbench account's Bedrock invoke grants", () => {
     ]);
   });
 
-  // The swarm role is the second allow, and it is not a second gateway: its
-  // actions are declared once each in one statement, and it names no wildcard
-  // action and no wildcard resource. The model scope itself is asserted in
-  // `deploy-infrastructure/agent-swarm.test.ts`, which reads the document as
-  // data; here the point is that this file was not widened into a blanket
-  // grant behind the model list's back.
+  // The swarm role is the second allow, and it is not a second gateway: the
+  // four invoke actions are declared once each, in one statement, on the model
+  // ARNs. Its other statement is the two catalog reads its `BEDROCK_AUTH_MODE=sdk`
+  // probe makes, which grant no invocation at all. The model scope itself is
+  // asserted in `deploy-infrastructure/agent-swarm.test.ts`, which reads the
+  // document as data; here the point is that this file was not widened into a
+  // blanket grant behind the model list's back.
   it("allows them in the swarm role, scoped and never wildcarded", () => {
     const swarm = fs.readFileSync(
       path.join(REPO_ROOT, "deploy-infrastructure/agent-swarm.ts"),
@@ -159,7 +160,7 @@ describe("the workbench account's Bedrock invoke grants", () => {
     assert.equal(
       /["']bedrock:\*["']/.test(swarm),
       false,
-      "agent-swarm.ts names bedrock:* ; the model list is the allowlist"
+      "agent-swarm.ts names bedrock:* ; the six named actions are the allowlist"
     );
     assert.equal(
       swarm.includes("bedrock:InvokeModelWithBidirectionalStream"),
@@ -169,6 +170,19 @@ describe("the workbench account's Bedrock invoke grants", () => {
     assert.match(
       swarm,
       /Sid: "InvokeSwarmBedrockModels",[\s\S]{0,300}Resource: swarmBedrockInvokeResources\(\)/
+    );
+    // The control-plane reads are named, not wildcarded, and are confined to
+    // `bedrock:List`: the probe lists the catalog and does not describe it. The
+    // match is on quoted actions, so the docstring's explanation of what is
+    // absent (which names `bedrock:Get*` in prose) does not trip it.
+    assert.match(
+      swarm,
+      /Sid: "ProbeBedrockCatalog",[\s\S]{0,200}Action: \[\.\.\.SWARM_BEDROCK_READ_ACTIONS\]/
+    );
+    assert.equal(
+      /["']bedrock:Get/.test(swarm),
+      false,
+      "agent-swarm.ts grants a Bedrock Get; the sdk probe only lists"
     );
   });
 
