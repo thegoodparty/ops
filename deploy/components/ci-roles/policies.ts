@@ -1503,6 +1503,11 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // update and one teardown of a live preview under the shared role
 // (2026-10-28), not by enumerating services. Widened only by observed
 // failures, the discipline `pr-previews.md` step 4 set.
+//
+// It is omni's one pull-request role, so other omni jobs that run pull
+// request code assume it too: the image builds' ECR Public login
+// (`RegistryLogin`), and the E2E report upload and Universal Judge sweep,
+// whose grants are in `githubActionsPullRequestJobs` at the end of this file.
 
 export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
@@ -1516,11 +1521,33 @@ export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
       Condition: {
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          // omni's pull_request subject exactly, and nothing else ever. Main
-          // runs, including the scheduled preview cleanup, keep the deploy
-          // role. No `job_workflow_ref` pin: it would name
-          // `@refs/pull/N/merge` and constrain nothing.
+          // omni's pull_request subject exactly. Main runs, including the
+          // scheduled preview cleanup, keep the deploy role. No
+          // `job_workflow_ref` pin: it would name `@refs/pull/N/merge` and
+          // constrain nothing.
           "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:pull_request",
+        },
+      },
+    },
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // omni's Universal Judge sweep. judge.yml is started from main (a
+          // dispatch, a `/judge` comment, or the guard's
+          // `pull_request_target`), so it presents the main ref, but it runs
+          // the pull request's own code with these credentials in its
+          // environment. That is a pull-request job, and the deploy role's
+          // AdministratorAccess must never reach it. Pinned to the one
+          // workflow file on main, so no other main job can assume this role.
+          "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:ref:refs/heads/main",
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            "thegoodparty/omni/.github/workflows/judge.yml@refs/heads/main",
         },
       },
     },
@@ -2070,6 +2097,93 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       Action: "*",
       NotResource: [PROD_SERVICE, PROD_APP_SECRET],
       Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
+    },
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// The pull-request role's other jobs
+//
+// A managed policy attached to `github-actions-preview-deploy` beside its
+// inline one, for the omni jobs that moved onto the role from roles of their
+// own. The inline document is within a few hundred characters of the 10,240
+// quota role inline policies share, and a managed policy does not count
+// against it. `DenyProductionTagged` in the inline document still applies:
+// an explicit deny holds across every policy on the role.
+//
+// Each statement is what the old role granted and the job still calls,
+// taken from the old role's policy and the workflow, nothing wider:
+//
+// - `E2eReports`, from `web-app-e2e-tests`. gp-webapp.yml's pull request E2E
+//   publishes its HTML report with `aws s3 sync` (no `--delete`) under
+//   `gp-webapp/<pr>/`. The old role also held `sqs:*` on `*`, a PutObject on
+//   `serve-analyze-data-*` and DeleteObject on the reports bucket, all for the
+//   `@dev-only` specs and the main run, which pull requests exclude and which
+//   moved to the deploy role.
+// - The rest, from `github-actions-judge-sweep` (omni gp-ai's
+//   `universal-judge-sweep-policy`), verbatim. The sweep stages an override
+//   config, sends one dispatch, polls for the artifact and keeps its records.
+//   dev only: the broker and the dispatch Lambda refuse a judge override
+//   anywhere else.
+export const PULL_REQUEST_JOBS_POLICY_NAME = "GitHubActionsPullRequestJobs";
+
+export const githubActionsPullRequestJobs: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "E2eReports",
+      Effect: "Allow",
+      Action: ["s3:PutObject"],
+      Resource: "arn:aws:s3:::gp-playwright-reports/gp-webapp/*",
+    },
+    {
+      Sid: "E2eReportsList",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::gp-playwright-reports",
+      Condition: { StringLike: { "s3:prefix": ["gp-webapp/*"] } },
+    },
+    {
+      Sid: "StageJudgeOverrideConfig",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:GetObject"],
+      Resource: "arn:aws:s3:::agent-experiment-metadata-dev/_judge/*",
+    },
+    {
+      Sid: "KeepJudgeRecords",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:GetObject"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev/_judge/*",
+    },
+    {
+      Sid: "ReadOwnJudgeRunArtifacts",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev/*/_judge-*/*",
+    },
+    {
+      // So a key not written yet returns 404 rather than 403.
+      Sid: "JudgeListMetadata",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::agent-experiment-metadata-dev",
+      Condition: { StringLike: { "s3:prefix": ["_judge/*"] } },
+    },
+    {
+      // The same, while polling for a dispatched run's artifact. Unprefixed,
+      // as on the old role: run artifacts land under `<experiment>/_judge-*/`.
+      Sid: "JudgeListArtifacts",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev",
+    },
+    {
+      // Send and look up only. Receiving or deleting would let a job consume
+      // the queue the platform dispatches real runs from.
+      Sid: "DispatchJudgeRuns",
+      Effect: "Allow",
+      Action: ["sqs:SendMessage", "sqs:GetQueueUrl"],
+      Resource: "arn:aws:sqs:us-west-2:333022194791:agent-dispatch-dev.fifo",
     },
   ],
 };

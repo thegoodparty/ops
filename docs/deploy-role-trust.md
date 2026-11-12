@@ -59,17 +59,46 @@ two. None is consolidated yet; each is its own change.
   `main`, chaining into the infrastructure account.
 - `github-actions-pulumi-preview`: ops `pull_request` runs, `pulumi-preview.yml`
   and the ECR Public login in `deploy.yml`.
-- `github-actions-pulumi-plan`: omni `pull_request` runs (`gp-ai.yml`'s
-  Terraform plan and ECR Public login, `gp-api.yml`'s ECR Public login) and
-  gp-terraform-dataplatform's pull request plan.
+- `github-actions-pulumi-plan`: omni `gp-ai.yml`'s pull request Terraform
+  plan and gp-terraform-dataplatform's pull request plan. omni's pull request
+  ECR Public logins move to the pull-request role (below).
 - `github-actions-delegate-eval`: ops `delegate-eval.yml` and
   `delegate-eval-run.yml`.
 - `github-actions-delegate-eval-cache-push`: ops
   `delegate-eval-cache-push.yml`.
 - `github-actions-delegate-eval-ledger`: ops `delegate-eval-ledger.yml`.
 
-omni also assumes `web-app-e2e-tests` (`gp-webapp.yml`, `release.yml`) and
-`github-actions-judge-sweep` (`judge.yml`). Neither is defined in this repo.
+### Folding omni's E2E, judge and ECR Public login roles
+
+omni also assumed two roles this repo does not define, `web-app-e2e-tests`
+(made in the console) and `github-actions-judge-sweep` (omni gp-ai's
+`universal-judge-sweep-policy` Terraform), and borrowed the plan role for
+its pull request ECR Public logins. Each moves onto one of the two roles, in
+three changes, so nothing loses access in between:
+
+1. This repo grants first. The pull-request role gets a managed policy,
+   `GitHubActionsPullRequestJobs`, because its inline document is within a
+   few hundred characters of the quota. It holds what the old roles granted
+   and the jobs still call: the pull request E2E report upload and the
+   judge's dev staging, records and dispatch. The ECR Public login needs
+   nothing new: `RegistryLogin` already grants it.
+2. omni switches its workflows. Pull request E2E and the ECR Public logins
+   assume the pull-request role, and the pull request E2E shards drop
+   credentials, since the one spec that calls AWS is `@dev-only`. The main
+   E2E in `release.yml` assumes the deploy role.
+3. The old roles go once nothing assumes them: `web-app-e2e-tests` by hand,
+   as it was made, and `github-actions-judge-sweep` from omni's Terraform.
+   The plan role's `EcrPublicLogin` statement is removed here.
+
+**The judge goes to the pull-request role, not the deploy role.** judge.yml
+starts from omni's main (a dispatch, a `/judge` comment or the guard's
+`pull_request_target`), so it presents the main ref, but its sweep job runs
+the judged branch's code with the credentials in its environment. On the
+deploy role that would be `AdministratorAccess` for unreviewed code. So the
+pull-request role trusts omni's main ref as well, pinned by
+`job_workflow_ref` to `judge.yml` on main, and allows a four-hour session,
+which the sweep asks for so its credentials outlast the background runs it
+polls.
 
 ## Progress
 
@@ -687,12 +716,12 @@ role. Stray permission, no effect, remove it.
 Docker builds in ops and omni pull their base images from ECR Public and log
 in first, because anonymous pulls are limited per IP and shared runners hit
 429s, while logged-in pulls are limited per account. Pull request builds get
-no deploy role, so each borrows the PR-only role its repository already has:
-ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni `gp-ai.yml`
-assumes `github-actions-pulumi-plan`. Both carry one extra statement,
-`EcrPublicLogin` (`ecr-public:GetAuthorizationToken`,
-`sts:GetServiceBearerToken`), which mints a login token and reads or pushes
-nothing. Any pull request in those repositories can already assume its role
+no deploy role, so each uses the PR-only role its repository already has:
+ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni's
+`gp-ai.yml` and `gp-api.yml` assume `github-actions-preview-deploy`. Both
+grant `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken`
+(`EcrPublicLogin` and `RegistryLogin`), which mint a login token and read or
+push nothing. Any pull request in those repositories can already assume its role
 by editing the workflow, so the build job holding it exposes nothing new.
 Main builds log in with `github-actions-pulumi-deploy`.
 

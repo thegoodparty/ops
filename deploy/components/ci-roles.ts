@@ -22,6 +22,8 @@ import {
   gpApiPreviewRoleBoundary,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
+  PULL_REQUEST_JOBS_POLICY_NAME,
+  githubActionsPullRequestJobs,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -301,29 +303,51 @@ export const createCiRoles = () => {
     policy: JSON.stringify(gpApiPreviewRoleBoundary),
   });
 
-  // The gp-api preview deploy role, step 6 of docs/deploy-role-trust.md.
-  // Trusted by `pull_request` runs in omni alone. It applies, unlike the plan
+  // The gp-api preview deploy role, step 6 of docs/deploy-role-trust.md, and
+  // omni's one pull-request role. Trusted by `pull_request` runs in omni, and
+  // by judge.yml on main, which runs pull request code. It applies, unlike the plan
   // and preview roles above, so its policy is scoped to preview names and
   // tags, and the roles it creates must carry the boundary above.
   //
   // It runs omni's gp-api infrastructure diff as well (step 5b), with reads
   // only. Any omni pull request can assume every role trusted on its
-  // subject, so a second role for the diff would separate nothing.
+  // subject, so a second role for the diff would separate nothing. The same
+  // reasoning moved omni's E2E report upload, its pull request image builds'
+  // ECR Public login and the Universal Judge sweep onto it.
   //
   // No protect. Nothing depends on it until step 7 points omni's preview and
   // teardown workflows at it.
+  //
+  // Four hours, for the Universal Judge sweep. It dispatches background runs
+  // that take up to an hour each and polls for their artifacts, and asks for
+  // a session that outlasts the poll. Every other job keeps the one-hour
+  // default it asks for.
   const previewDeployRole = new aws.iam.Role("githubActionsPreviewDeploy", {
     name: "github-actions-preview-deploy",
     description:
-      "gp-api preview deploys, teardowns and infrastructure diffs from pull_request runs in thegoodparty/omni.",
+      "omni's pull-request role: gp-api previews, teardowns and infrastructure diffs, E2E reports, image builds and the Universal Judge sweep.",
     assumeRolePolicy: JSON.stringify(githubActionsPreviewDeployTrust),
-    maxSessionDuration: 3600,
+    maxSessionDuration: 14400,
   });
 
   new aws.iam.RolePolicy("githubActionsPreviewDeployPolicy", {
     name: "PreviewDeploy",
     role: previewDeployRole.id,
     policy: JSON.stringify(githubActionsPreviewDeploy),
+  });
+
+  // The pull-request role's grants for jobs other than the gp-api preview
+  // path, which do not fit beside the inline document above.
+  const pullRequestJobsPolicy = new aws.iam.Policy("githubActionsPullRequestJobs", {
+    name: PULL_REQUEST_JOBS_POLICY_NAME,
+    description:
+      "omni pull-request role grants beyond gp-api previews: E2E report uploads and the Universal Judge sweep.",
+    policy: JSON.stringify(githubActionsPullRequestJobs),
+  });
+
+  new aws.iam.RolePolicyAttachment("githubActionsPullRequestJobsAttachment", {
+    role: previewDeployRole.name,
+    policyArn: pullRequestJobsPolicy.arn,
   });
 
   return {
