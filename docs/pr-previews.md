@@ -278,7 +278,12 @@ bearing, since trust is by `sub` only, but keep it stable):
 - Concurrency per PR with `cancel-in-progress: true`, only if the lock check
   in step 4 confirms preview is read-only.
 - Pin third-party actions by SHA: this is a public repo and the job holds AWS
-  credentials.
+  credentials. **Amended 2026-11-12:** the pin is in
+  [`.github/workflows/actions.lock`](../.github/workflows/actions.lock) now,
+  not in the workflow file. `gh actions-lock` locks every action to an
+  immutable commit, `verify-lockfile.yml` fails any PR whose lockfile has
+  drifted from the workflows, and the workflow carries tag refs that resolve
+  through the lock. The reason above is unchanged.
 - Update `CLAUDE.md` ("PRs run type-checking and builds but skip the deploy
   step"). No `CODEOWNERS` change: the new workflow lands under `/.github/`,
   which is already code-owned.

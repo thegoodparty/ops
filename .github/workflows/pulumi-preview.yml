@@ -63,7 +63,7 @@ jobs:
       # `mergeable` is computed lazily, so poll before deciding; if it never
       # resolves, skip rather than preview the wrong tree.
       - name: Is the PR mergeable?
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@v8.0.0
         id: guard
         with:
           script: |
@@ -80,7 +80,7 @@ jobs:
             core.setOutput("value", mergeable === true ? "false" : "true");
 
       - name: Handle conflict comment
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@v8.0.0
         env:
           CONFLICTED: ${{ steps.guard.outputs.value }}
         with:
@@ -118,7 +118,7 @@ jobs:
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
 
-      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      - uses: actions/github-script@v8.0.0
         id: matrix
         with:
           script: |
@@ -175,11 +175,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -193,13 +193,13 @@ jobs:
         run: npm run build
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: ${{ env.PREVIEW_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Install Pulumi
-        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6
+        uses: pulumi/actions@v6.6.1
         with:
           pulumi-version: "^3"
 
@@ -296,7 +296,7 @@ jobs:
       # run a plan belongs to.
       - name: Post comment
         if: steps.preview.outcome == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@v8.0.0
         env:
           COMMENT_FILE: /tmp/${{ matrix.project }}.comment.md
         with:

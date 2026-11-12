@@ -183,20 +183,20 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR scenario manifest (data only)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
           sparse-checkout: delegate/review/eval/scenarios.json
           sparse-checkout-cone-mode: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -205,14 +205,14 @@ jobs:
         run: npm ci
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
 
       - name: Create GitHub App token for repo cloning
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
@@ -275,7 +275,7 @@ jobs:
       - name: Upload main's results
         id: upload-results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/results-main
@@ -283,7 +283,7 @@ jobs:
 
       - name: Upload cases
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/cases
@@ -298,18 +298,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout main (tooling)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR head (agent under test)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -322,14 +322,14 @@ jobs:
         working-directory: pr/
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
 
       - name: Create GitHub App token for repo cloning
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
@@ -366,7 +366,7 @@ jobs:
 
       - name: Upload PR results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/results-pr
@@ -383,20 +383,20 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR scenario manifest (data only)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
           sparse-checkout: delegate/review/eval/scenarios.json
           sparse-checkout-cone-mode: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -405,19 +405,19 @@ jobs:
         run: npm ci
 
       - name: Download main's results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/results-main
 
       - name: Download cases
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-cases-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/cases
 
       - name: Download PR results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/results-pr
@@ -461,7 +461,7 @@ jobs:
 
       - name: Upload eval artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-${{ needs.prepare.outputs.sha7 }}
           path: ./eval/
@@ -498,12 +498,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -512,14 +512,14 @@ jobs:
         run: npm ci
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
 
       - name: Create GitHub App token for repo cloning
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
@@ -564,7 +564,7 @@ jobs:
       - name: Upload main's results
         id: upload-results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-main/
@@ -594,18 +594,18 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout main (cases and scoring)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR head (agent under test)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -615,14 +615,14 @@ jobs:
         working-directory: pr/
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
 
       - name: Create GitHub App token for repo cloning
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
@@ -648,7 +648,7 @@ jobs:
 
       - name: Upload PR results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected/
@@ -665,12 +665,12 @@ jobs:
       rerun: ${{ steps.gate.outputs.rerun }}
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -679,13 +679,13 @@ jobs:
         run: npm ci
 
       - name: Download main's results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-main
 
       - name: Download PR results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected
@@ -712,18 +712,18 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout main (cases and scoring)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
       - name: Checkout PR head (agent under test)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
           path: pr/
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -733,14 +733,14 @@ jobs:
         working-directory: pr/
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval
           aws-region: us-west-2
 
       - name: Create GitHub App token for repo cloning
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.DELEGATE_EVAL_APP_ID }}
           private-key: ${{ secrets.DELEGATE_EVAL_APP_PRIVATE_KEY }}
@@ -769,7 +769,7 @@ jobs:
 
       - name: Upload PR rerun results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-expected-rerun-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-rerun/
@@ -787,12 +787,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.main_sha }}
           path: .
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -801,13 +801,13 @@ jobs:
         run: npm ci
 
       - name: Download main's results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-expected-main-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-main
 
       - name: Download PR results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-expected-pr-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected
@@ -817,7 +817,7 @@ jobs:
       - name: Download PR rerun results
         if: needs.expected-rerun.result != 'skipped'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           name: delegate-eval-expected-rerun-${{ needs.prepare.outputs.sha7 }}
           path: ./eval-expected-rerun
@@ -884,7 +884,7 @@ jobs:
 
       - name: Upload artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: delegate-eval-expected-${{ needs.prepare.outputs.sha7 }}
           path: |

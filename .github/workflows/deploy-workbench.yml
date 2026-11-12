@@ -108,9 +108,9 @@ jobs:
     # rather than as a killed run that lost its own diagnosis.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -119,13 +119,13 @@ jobs:
       # makes the second hop into 024901689212 by assuming pulumi-deploy
       # through an explicit provider.
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-workbench-deploy
           aws-region: us-west-2
 
       - name: Install Pulumi
-        uses: pulumi/actions@v6
+        uses: pulumi/actions@v6.6.1
         with:
           pulumi-version: "^3"
 
@@ -228,7 +228,7 @@ jobs:
       # needs `sts:TagSession` too, and neither side of this hop has it. See
       # the input comment below.
       - name: Configure AWS Credentials (workbench)
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::024901689212:role/pulumi-deploy
           role-chaining: true
@@ -246,7 +246,7 @@ jobs:
 
       - name: Login to Amazon ECR
         id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@v2.1.7
 
       - name: Mirror the pinned Bifrost image
         env:
@@ -402,7 +402,7 @@ jobs:
       # `index.ts`. Same ARN as the first `Configure AWS Credentials` step; the
       # duplication is the point, since the ordering is what changed.
       - name: Configure AWS Credentials (first hop, for the apply)
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-workbench-deploy
           aws-region: us-west-2
