@@ -22,8 +22,6 @@ import {
   gpApiPreviewRoleBoundary,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
-  githubActionsVercelConfigDeploy,
-  githubActionsVercelConfigDeployTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -49,6 +47,15 @@ const ADMINISTRATOR_ACCESS_ARN = "arn:aws:iam::aws:policy/AdministratorAccess";
  * update, so a bad edit to the trust policy can still lock CI out of the
  * account. The recovery path is the AdministratorAccess permission set, which
  * a human assumes directly and which does not depend on CI.
+ *
+ * The rule for CI roles (decided by swain, 2026-11-12): one deploy role,
+ * `github-actions-pulumi-deploy`, for `main` and production-environment runs,
+ * and one pull-request role, `github-actions-preview-deploy`, for omni pull
+ * request runs. A new workflow assumes one of them. If it needs more access,
+ * widen that role's policy, moving to a managed policy when the inline one is
+ * near the size limit, rather than adding a role here. The other roles below
+ * predate the rule and are consolidation candidates; docs/deploy-role-trust.md,
+ * "One deploy role, one pull-request role", lists them.
  */
 export const createCiRoles = () => {
   const deployRole = new aws.iam.Role(
@@ -110,7 +117,7 @@ export const createCiRoles = () => {
   //
   // The boundary belongs on who may assume the role, which is the trust
   // policy in ci-roles/policies.ts. Every subject there is an exact `main`
-  // ref, or one deploy environment, and none is a pull request.
+  // ref, or a production environment, and none is a pull request.
   new aws.iam.RolePolicyAttachment(
     "githubActionsPulumiDeployAdminAttachment",
     { role: deployRole.name, policyArn: ADMINISTRATOR_ACCESS_ARN },
@@ -319,25 +326,8 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsPreviewDeploy),
   });
 
-  // omni's vercel-config apply. Pulumi state for that one project and the
-  // passphrase, nothing else in AWS. No protect, like the scoped roles above.
-  const vercelConfigDeployRole = new aws.iam.Role("githubActionsVercelConfigDeploy", {
-    name: "github-actions-vercel-config-deploy",
-    description:
-      "Pulumi state for omni's packages/vercel-config. Assumed only by vercel-config.yml on thegoodparty/omni main, in the production environment.",
-    assumeRolePolicy: JSON.stringify(githubActionsVercelConfigDeployTrust),
-    maxSessionDuration: 3600,
-  });
-
-  new aws.iam.RolePolicy("githubActionsVercelConfigDeployPolicy", {
-    name: "VercelConfigDeploy",
-    role: vercelConfigDeployRole.id,
-    policy: JSON.stringify(githubActionsVercelConfigDeploy),
-  });
-
   return {
     gpApiPreviewBoundary,
-    vercelConfigDeployRole,
     previewDeployRole,
     deployRole,
     deployPolicy,

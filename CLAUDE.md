@@ -217,6 +217,15 @@ plan:
 [`docs/deploy-role-trust.md`](./docs/deploy-role-trust.md). Read it alongside
 the above before editing `githubActionsPulumiDeployTrust`.
 
+**Do not add a CI role per workflow** (decided by swain, 2026-11-12). There is
+one pull-request role, `github-actions-preview-deploy` (omni `pull_request`
+runs), and one deploy role, `github-actions-pulumi-deploy` (`main` and
+production-environment runs). A new workflow assumes one of them. If it needs
+more access, widen that role's policy, moving to a managed policy when the
+inline one is near the size limit. The other roles in
+`deploy/components/ci-roles.ts` predate the rule; "One deploy role, one
+pull-request role" in `docs/deploy-role-trust.md` lists them.
+
 ## Build Commands
 
 ```bash
