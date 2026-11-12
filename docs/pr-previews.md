@@ -283,7 +283,12 @@ bearing, since trust is by `sub` only, but keep it stable):
   not in the workflow file. `gh actions-lock` locks every action to an
   immutable commit, `verify-lockfile.yml` fails any PR whose lockfile has
   drifted from the workflows, and the workflow carries tag refs that resolve
-  through the lock. The reason above is unchanged.
+  through the lock. The lock is enforced when the workflow runs, not only by
+  the verifier: [workflow dependency
+  lockfiles](https://docs.github.com/en/actions/concepts/security/workflow-dependency-lockfiles)
+  says the locked commit is what runs and that a commit no longer reachable from
+  the branch or tag recorded for it is rejected at run time. The reason above
+  is unchanged.
 - Update `CLAUDE.md` ("PRs run type-checking and builds but skip the deploy
   step"). No `CODEOWNERS` change: the new workflow lands under `/.github/`,
   which is already code-owned.
