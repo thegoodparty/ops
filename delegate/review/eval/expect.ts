@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
@@ -137,10 +137,51 @@ export const commitSyntheticHead = (bundle: Bundle, repoDir: string): void => {
   }
 };
 
-const checkoutFor = (synthetic: Set<string>): CheckoutFn => (bundle, repoDir) => {
+// A local run replays many cases against one repo, so with a mirror each
+// checkout is a `--shared` clone of a bare mirror instead of a fresh clone
+// from GitHub. The mirror only gains objects; a sha already in it is never
+// fetched again.
+export const mirrorPath = (mirrorDir: string, repo: string): string =>
+  join(mirrorDir, `${repo.replace("/", "__")}.git`);
+
+export const ensureInMirror = (mirrorDir: string, repo: string, shas: string[]): string => {
+  const mirror = mirrorPath(mirrorDir, repo);
+  if (!existsSync(mirror)) {
+    // Cloned aside and renamed into place, so a process racing on a fresh
+    // mirror dir never sees a half-cloned repo; the loser's copy is dropped.
+    mkdirSync(mirrorDir, { recursive: true });
+    const tmp = `${mirror}.tmp-${process.pid}`;
+    rmSync(tmp, { recursive: true, force: true });
+    execFileSync("gh", ["repo", "clone", repo, tmp, "--", "--bare"], { stdio: "pipe", timeout: 1_800_000 });
+    try {
+      renameSync(tmp, mirror);
+    } catch {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  for (const sha of shas) {
+    try {
+      execFileSync("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd: mirror, stdio: "ignore" });
+    } catch {
+      execFileSync("git", ["fetch", "-q", "origin", sha], { cwd: mirror, stdio: "pipe", timeout: 600_000 });
+    }
+  }
+  return mirror;
+};
+
+const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
   const git = (args: string[], timeout = 120_000) =>
     execFileSync("git", args, { cwd: repoDir, stdio: "pipe", timeout });
   rmSync(repoDir, { recursive: true, force: true });
+  if (mirrorDir) {
+    const sha = synthetic.has(bundle.headSha) ? bundle.baseSha : bundle.headSha;
+    const mirror = ensureInMirror(mirrorDir, bundle.repo, [sha]);
+    execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", mirror, repoDir], { stdio: "pipe", timeout: 300_000 });
+    git(["checkout", "-q", sha], 120_000);
+    if (synthetic.has(bundle.headSha)) commitSyntheticHead(bundle, repoDir);
+    git(["submodule", "update", "--init", "--recursive"]);
+    return;
+  }
   execFileSync(
     "gh",
     ["repo", "clone", bundle.repo, repoDir, "--", "--depth=1", "--no-checkout"],
@@ -637,10 +678,12 @@ const main = async () => {
     const client = new S3Client({});
     const records = new Map<string, ReviewRecord>();
     for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
+    // A bundle case is simulated unless its source says it is a real PR,
+    // whose head commit GitHub still serves.
     const synthetic = new Set(
-      cases.filter((c) => c.bundle).map((c) => records.get(c.id)!.bundle.headSha),
+      cases.filter((c) => c.bundle && c.source === "simulated").map((c) => records.get(c.id)!.bundle.headSha),
     );
-    const checkout = checkoutFor(synthetic);
+    const checkout = checkoutFor(synthetic, flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined);
 
     const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: fromRun + i })));
     let next = 0;

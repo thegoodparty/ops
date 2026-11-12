@@ -1,6 +1,46 @@
 # PR-reviewer eval
 
-Replay recorded production reviews against the agent code in any checkout and compare two variants pairwise.
+Replay PRs with known right answers against the reviewer code in any checkout, and score how often each version gets them right.
+
+## Start here: measure a change locally
+
+`review:arms` is the one command for trying a change to the reviewer, prompt text or structure (a new subagent, injected context, a new tool). Each version you want to compare is an arm: a worktree on its own commit. Every arm replays the same tune cases from `expected/manifest.json` with its own code, and the checkout you run from scores them all, so an arm can't change what it is graded on. Holdout cases never run locally.
+
+```sh
+# from a checkout of main: it is the scorer, and the `main` arm
+git worktree add ../ops-arms/idea -b arm/idea origin/main
+(cd ../ops-arms/idea && npm ci)          # each arm runs its own install
+# ...make the change in ../ops-arms/idea and commit it
+
+npm run review:arms -- --arms main=.,idea=../ops-arms/idea --base main --out ~/delegate-lab
+```
+
+- **Results are kept per commit**, under `<out>/runs/<sha>`. An arm whose commit already has runs reuses them under any name, and changed code always replays. So keep one `--out` for a whole session. Uncommitted changes under `delegate/` are refused, because they would be filed under a commit that doesn't contain them.
+- **An arm may not differ from the scorer's commit in the hill-climb `neverTouch` paths** (`delegate/review/`, `delegate/framework/`, `.github/`, `package.json`, `package-lock.json`; the list is in `.claude/skills/hill-climb/targets/delegate-pr-reviewer.json`). Each arm replays with its own eval code and writes the results the scorer reads, so a change there could grade itself. Structural changes under `delegate/agents/` are fine. An arm made from an older main has to be rebased onto the scorer's commit.
+- **`--base <arm>` gates every other arm against that one.** A case the base passed on every run must not get worse. An arm that drops it gets `--runs` more runs and needs 5 of 6, so one unlucky run isn't a regression. `--targets a,b` names cases an arm must pass on every run. The verdict is printed under the table and written to `<out>/gate.json`.
+- `--case a,b` narrows to some tune cases. `--runs` (default 3), `--concurrency` (replays per arm, default 2) and `--parallel-arms` (default 3) set the load. Keep them low on a shared laptop.
+- `--mode score` re-renders the table and the gate from results already on disk, without replaying.
+- Credentials: `ANTHROPIC_API_KEY` if set, otherwise your Claude Code login. `gh` auth clones the reviewed repos. About half the tune cases are recorded production reviews, which need read access to `REVIEW_BUCKET` (`aws sso login`). A local manifest of bundle cases needs no AWS access.
+
+## Hill-climbing
+
+Improve the reviewer one idea at a time, against whichever version is best so far, which is main only at the start.
+
+1. **Pick a case to fix.** Run main alone (`--arms main=.`) and take a tune case it fails, or one the change is meant to cover. Read its runs: `leads` on each `run-<n>.json` says whether the scout never raised the problem or a deep-reviewer dropped it.
+2. **Make one change** in a new arm worktree and commit it. One idea per arm, so a result can be traced to its cause.
+3. **Inner loop.** `--arms best=<path>,idea=<path> --base best --case <id>` until the case passes. Amend and rerun; changed commits replay, and `best` comes from disk.
+4. **Check for regressions.** The same command without `--case`, plus `--targets <id>`. The idea has to pass the gate against `best`.
+5. **Promote it.** The winning arm becomes `best` for the next idea, and its runs carry over. Try several ideas side by side as separate arms against the same base.
+6. **Open a PR** from the winning branch, with the final table in the body. Comment `delegate eval` on it to run the full suite in CI, holdout included. That is the only place holdout runs, and it gates against main. A human code owner approves and merges.
+
+The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of this loop.
+
+## Other ways to run it
+
+- **`delegate eval` on a PR** (next section): CI runs the full expected-result suite against main, holdout included, plus a pairwise judge on `scenarios.json`. Use it once, on the PR, as the final check.
+- **Dispatched run** (`delegate-eval-run.yml`, below): the same gate in CI on a branch without a PR, for prompt-text changes only, with a per-run budget. It is how the Delegate swarm hill-climbs, always, and how any agent without local credentials does.
+- **`review:expect`**: the replay and scoring engine under all of the above, for one checkout at a time.
+- **`review:eval replay` and `judge`**: pairwise comparison of two result sets by a model judge, on recorded production reviews.
 
 ## From a PR
 
@@ -165,6 +205,21 @@ The two files are TypeScript that replay runs in-process, so `prepare` also comp
 Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (red when the gate fails) and download the artifact `eval-run-<run_id>-<mode>-<attempt>`: `gate.json` (tune and gate; `pass`, `regressions`, `targetsMissed`, `costRatio`, `cases` for tune cases, and `holdout: { total, passed, regressions }` as counts only), `report.md`, `meta.json`, and the results of tune cases. Holdout results never leave the job, and in `gate` mode the replay logs are withheld.
 
 **Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
+
+## Cases outside the suite
+
+To try a PR that isn't in `expected/manifest.json` yet, build a local manifest of the same shape and pass it with `--manifest`. Its bundles resolve next to it.
+
+```sh
+# a real PR as a case, from GitHub alone (no S3), as production would have seen it at that sha
+npm run review:from-pr -- --pr 2977 --sha <reviewed sha> --out ~/delegate-lab/bundles/omni-2977.bundle.json
+
+npm run review:arms -- --manifest ~/delegate-lab/manifest.json --arms main=.,idea=../ops-arms/idea --base main --out ~/delegate-lab
+```
+
+- A bundle case whose `source` is `simulated` gets its head commit rebuilt from the diff; any other source is a real PR, and its head is fetched from GitHub.
+- `--mirror-dir` (default under `--work-dir`) keeps one bare clone per repo. Each replay is a `--shared` clone of it, and every sha the cases need is fetched once before the arms start.
+- Runs are keyed by commit and case id, not by the case's contents. After editing a case, delete its directory under `<out>/runs/*/`.
 
 ## Mining candidate cases
 
