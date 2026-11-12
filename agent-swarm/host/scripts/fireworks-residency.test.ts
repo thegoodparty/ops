@@ -269,13 +269,25 @@ describe('agent-swarm inference residency', () => {
     const source = read(COMPOSE)
     assert.match(source, /^\s+FIREWORKS_API_KEY: \$\{FIREWORKS_API_KEY\}$/m)
     assert.match(source, /^\s+PI_CODING_AGENT_DIR: \$\{PI_CODING_AGENT_DIR:-\/workspace\/personal\/\.pi\}$/m)
-    // Anthropic stays: the pi boot credential gate does not know
-    // FIREWORKS_API_KEY, so it is the only key in the container that satisfies
-    // it, and internal-ai's session summaries resolve to the anthropic branch
-    // (no OpenRouter or OpenAI key is set). See "The Anthropic key" in
-    // agent-swarm/README.md. Removing it parks every worker in
-    // credential-wait.
-    assert.match(source, /^\s+ANTHROPIC_API_KEY: \$\{ANTHROPIC_API_KEY\}$/m)
+    // The worker carries no Anthropic key: pi's readiness check is satisfied
+    // by the Bedrock probe (BEDROCK_AUTH_MODE=sdk), which is the whole reason
+    // this is possible. The api service still gets it, for its own AI calls.
+    // See "The Anthropic key" in agent-swarm/README.md.
+    const workerEnv = source.split(/^x-worker-base:/m)[0]
+    assert.ok(workerEnv, 'docker-compose.yml no longer has an x-worker-env block')
+    // Match the key declaration, not the word: the comment above it names the
+    // variable on purpose, so a bare substring check would fail on prose.
+    assert.ok(
+      !/^\s+ANTHROPIC_API_KEY:/m.test(workerEnv),
+      'the worker env must not carry ANTHROPIC_API_KEY; readiness comes from the Bedrock probe',
+    )
+    // The probe is what provides that readiness, so it must stay set.
+    assert.match(source, /^\s+BEDROCK_AUTH_MODE: \$\{BEDROCK_AUTH_MODE:-sdk\}$/m)
+    // ...and AWS_REGION is load-bearing in that mode: without it the probe
+    // returns ready:false with a set-region hint and the worker parks.
+    assert.match(source, /^\s+AWS_REGION: \$\{AWS_REGION:-us-west-2\}$/m)
+    // The api service is the one caller that does use the key.
+    assert.match(source, /^\s+- ANTHROPIC_API_KEY=\$\{ANTHROPIC_API_KEY\}$/m)
   })
 
   it('marks the model as custom when sync-agent-config.sh writes it through the API', () => {

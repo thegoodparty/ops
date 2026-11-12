@@ -48,7 +48,9 @@ host; the next deploy overwrites them.
   with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
   `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
   `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
-  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login
+  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login.
+  `ANTHROPIC_API_KEY` currently reaches only the api service, for task
+  auto-titles; see "The Anthropic key" under Models
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -738,30 +740,67 @@ runs").
 
 ### The Anthropic key
 
-No agent runs an Anthropic model. `ANTHROPIC_API_KEY` stays in the secret and in
-the worker and api env anyway, because two things in the pinned 2.10.0 image
-read it and neither has a Fireworks or Bedrock equivalent yet:
+No agent runs an Anthropic model, and as of step 4 of `docs/swarm-bedrock.md`
+**the workers no longer receive `ANTHROPIC_API_KEY` at all**. It stays in the
+secret and in the api service's environment, where one caller still needs it.
 
-- **The pi boot credential gate.** `checkPiMonoCredentials`
-  (`src/providers/pi-mono-adapter.ts`) decides whether a worker may claim tasks.
-  With `MODEL_OVERRIDE=fireworks-us/...` it falls to the permissive branch, and
-  that branch accepts only `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`,
-  `OPENAI_API_KEY` or one of the `nan`/`helmcode`/`vercel` registry keys. It
-  does not know `FIREWORKS_API_KEY`. Removing the key from the worker env
-  therefore parks all three workers in credential-wait (`[boot] waiting for` in
-  the container log), which is the symptom to look for.
-- **Session summaries and `llm` memory ratings.** `resolveCredential`
-  (`src/utils/internal-ai/credentials.ts`) walks a fixed precedence list,
-  `openrouter → anthropic → openai → openai-codex → claude-cli`. This swarm sets
-  none of the OpenRouter or OpenAI keys, so the anthropic branch is the one that
-  resolves, and a session summary is a Haiku call to Anthropic. Upstream's own
-  provider matrix records the limit: "Bedrock session summaries and memory
-  rating … Native Bedrock support is not available yet."
+**What replaced it in the workers: the Bedrock readiness probe.** `pi`'s boot
+credential check (`checkPiMonoCredentials`, `src/providers/pi-mono-adapter.ts`)
+is what the key was actually holding up. With `BEDROCK_AUTH_MODE=sdk` set in
+`docker-compose.yml`, that function takes its Bedrock branch *before* the
+permissive "any one of ANTHROPIC/OPENROUTER/OPENAI" fallback, and a successful
+probe returns `ready: true` with `satisfiedBy: "sdk-delegated"`. That branch is
+taken whenever the variable is set, whatever `MODEL_OVERRIDE` says, so a worker
+running a `fireworks-us/...` model is still readied by the AWS credential. The
+permissive branch could never have done this job: it does not know
+`FIREWORKS_API_KEY`, which is the only model key a worker holds.
 
-So removing the key is not a config cleanup: it is blocked on an upstream
-change. The lead's harness can be switched per agent to a Bedrock model to
-avoid Anthropic inference, but the two reads above are in the worker and API
-images, not in the model selection.
+The probe calls `ListFoundationModels` and `ListInferenceProfiles`, which is
+why `delegate-swarm-bedrock` grants those two catalog reads
+(`deploy-infrastructure/agent-swarm.ts`) on top of the invoke grant. The list it
+returns is also what makes the two Bedrock models pickable in the console.
+
+**The accepted cost, so a park is diagnosable rather than mysterious: a failed
+probe parks the whole worker in credential-wait, Fireworks tasks included.**
+`BOOT_MAX_WAIT_SECONDS` defaults to waiting forever. A missing Marketplace
+agreement, a region that has not propagated, or an IAM edit that drops one of
+those reads takes every agent out of service even though `FIREWORKS_API_KEY` is
+fine. The rollback is to unset `BEDROCK_AUTH_MODE`, which restores the
+permissive branch — but that branch then needs a readiness satisfier again, and
+for a `fireworks-us/...` model that means `ANTHROPIC_API_KEY` back in the
+worker. The rollback is one variable, not a redeploy, but it is not free.
+
+**`AWS_REGION` is load-bearing for the same reason.** The probe reads it and
+returns `ready: false` with a set-region hint rather than fabricating one, so
+without it the worker parks in exactly the state above. `render-env.sh` renders
+it and `docker-compose.yml` passes it into every worker.
+
+**What still consumes the key, and what happens when it is gone:**
+
+- **Task auto-titles, in the api.** `startTaskAutoTitleListener` runs in the api
+  server and resolves credentials from the api's own environment. With the key
+  there, titles are generated as before. This is the one live caller left, and
+  it is why the key stays in the secret and in the api service's environment.
+- **Session summaries and `llm` memory ratings, in the worker.** The
+  `session_shutdown` hook in `pi-mono-extension.ts` calls `summarizeSession`,
+  which goes through the same `resolveCredential` chain
+  (`openrouter → anthropic → openai → openai-codex → claude-cli`). A worker now
+  holds none of those credentials, so it returns `null` and the hook logs
+  "summarizer returned no result" and moves on. **Session summaries are
+  silently off for pi agents. So are `llm` memory ratings** — those are fetched
+  inside the same summarise path and gated on its result. The default
+  `MEMORY_RATERS` value is `implicit-citation,explicit-self`, which does not
+  include `llm`, so today this costs nothing; enabling `llm` would not work
+  until a credential is available in the worker. Upstream's own provider matrix
+  says so: "Bedrock session summaries and memory rating … Native Bedrock
+  support is not available yet."
+
+The ways back, which are the engineer's call and are recorded in
+`docs/swarm-bedrock.md`: keep an Anthropic key and the features, drop both the
+features and the key, or add an OpenRouter key (which `resolveCredential` would
+pick up first, in the worker and the api alike). This PR removes the key from
+the workers and leaves the secret, `fill-secrets.sh` and `deploy/delegate-secret.ts`
+alone.
 
 ## MCP servers
 
@@ -822,8 +861,9 @@ AWS_PROFILE=prod-read aws s3 ls s3://...
 
 Both profiles take the instance's own credentials from IMDS (the instance's hop
 limit is 2 so containers can reach IMDS). `AWS_REGION` is passed into every
-worker through `docker-compose.yml`, because pi's Bedrock provider reads it and
-refuses to fabricate one. The api container has no AWS access.
+worker through `docker-compose.yml`, and with `BEDROCK_AUTH_MODE=sdk` set there
+(see the comment in that file) the boot readiness probe depends on it. The api
+container has no AWS access.
 `host/global-setup-script.sh` installs the AWS CLI into the workers.
 
 The Bedrock role may not exist yet when this lands; nothing here looks it up.
