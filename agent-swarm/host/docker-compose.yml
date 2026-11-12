@@ -37,9 +37,13 @@ x-agent-entrypoint: &agent-entrypoint
 x-worker-env: &worker-env
   ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
-  # Anthropic is kept for the api service and as the fallback path; the agents
-  # themselves run Fireworks US-only (see PI_MODELS_JSON in
-  # global-setup-script.sh and the "Models" section of agent-swarm/README.md).
+  # Kept, though no agent runs an Anthropic model. Two things in the pinned
+  # 2.10.0 image read it and there is nothing to replace it with yet: the pi
+  # boot credential gate (checkPiMonoCredentials' permissive branch does not know
+  # FIREWORKS_API_KEY, so without this the workers report "waiting for
+  # credentials" forever), and internal-ai session summaries, whose credential
+  # chain reaches the anthropic branch because no OpenRouter or OpenAI key is
+  # set here. See the "Anthropic key" section of agent-swarm/README.md.
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   # The pi harness's own key for the ONE model it may run. render-env.sh copies
   # it from the secret; compose has to enumerate it or nothing passes it into
@@ -68,10 +72,28 @@ x-worker-env: &worker-env
   SWARM_URL: delegate-swarm.infra.goodparty.org
   APP_URL: ${APP_URL:-https://delegate-swarm.infra.goodparty.org}
   PUBLIC_MCP_BASE_URL: ${PUBLIC_MCP_BASE_URL:-https://delegate-swarm.infra.goodparty.org}
-  # Production AWS, read-only: the SDKs and the CLI assume the prod-read role
-  # with the instance credentials from IMDS (hop limit 2). See aws-config.
+  # Every AWS SDK and CLI call in a worker assumes the aws-config DEFAULT
+  # profile, which is Bedrock-only, with the instance credentials from IMDS
+  # (hop limit 2). Production reads are then an explicit `AWS_PROFILE=prod-read`
+  # on the command that needs them. See aws-config.
   AWS_CONFIG_FILE: /etc/delegate-swarm/aws-config
   AWS_SDK_LOAD_CONFIG: "1"
+  # pi's Bedrock provider reads AWS_REGION and refuses to fabricate one, so
+  # without this a Bedrock model selection fails at the region check rather
+  # than at inference. compose enumerates the container's env, so the host's
+  # Environment=AWS_REGION in agent-swarm.service does not reach here.
+  # Deliberately absent: BEDROCK_AUTH_MODE, and any Bedrock value for
+  # MODEL_OVERRIDE. Fireworks stays the default every agent runs, and Bedrock
+  # is chosen per agent or per task; set it in swarm_config on the agent that
+  # needs it rather than here, because either key set here flips the boot gate
+  # for all three agents at once. BEDROCK_AUTH_MODE=sdk would be fatal here
+  # specifically: that branch runs runBedrockSdkProbeAndEnumerate, which calls
+  # ListFoundationModels and ListInferenceProfiles, and the Bedrock role is
+  # granted only the four invoke actions (no bedrock:List*/Get*, deliberately).
+  # The probe would fail AccessDenied on every tick and park the worker in
+  # credential-wait forever. Left unset, a Bedrock miss surfaces on the task
+  # that chose a Bedrock model and nothing else is affected.
+  AWS_REGION: ${AWS_REGION:-us-west-2}
 
 # Built by up.sh from worker-patch/ on top of the upstream worker image. The
 # tag changes with the version or the patch, which is what makes compose

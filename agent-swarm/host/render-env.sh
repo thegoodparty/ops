@@ -13,6 +13,17 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
   --query SecretString --output text)"
 
 REQUIRED_KEYS=(
+  # Nothing the agents *run* needs an Anthropic model, but two things in the
+  # pinned image still stop working without this key, so it stays required:
+  #  - checkPiMonoCredentials' permissive branch is the boot gate that decides
+  #    whether a worker may claim tasks, and it does not know
+  #    FIREWORKS_API_KEY. This is the only key in the container that satisfies
+  #    it; remove it and all three workers park in credential-wait.
+  #  - internal-ai's resolveCredential falls through its precedence list to the
+  #    anthropic branch, because this swarm sets no OpenRouter or OpenAI key.
+  #    That chain is what session summaries and `llm` memory ratings use.
+  # Drop it once agent-swarm accepts a Fireworks or Bedrock credential in both
+  # places; see "The Anthropic key" in agent-swarm/README.md.
   ANTHROPIC_API_KEY
   API_KEY
   CLICKUP_API_TOKEN
@@ -107,6 +118,11 @@ HARNESS_PROVIDER=pi
 # is written by global-setup-script.sh into PI_CODING_AGENT_DIR.
 LEAD_MODEL_OVERRIDE=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
 WORKER_MODEL_OVERRIDE=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
+
+# The region pi's Bedrock provider probes and infers in. compose passes it into
+# every worker; pi refuses to fabricate one, so an agent switched to a Bedrock
+# model would otherwise fail at the region check rather than at inference.
+AWS_REGION=us-west-2
 
 LEAD_AGENT_ID=9f8efd62-469d-4067-9dca-24d72b13864b
 CODER_AGENT_ID=458bcd6d-4384-4366-83fa-63072ef55eab

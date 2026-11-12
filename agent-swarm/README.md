@@ -734,8 +734,34 @@ later date) is the same edit; there is no `-latest` US router to track it, which
 is why the dated id is pinned deliberately.
 
 `FIREWORKS_API_KEY` is a key in the `DELEGATE_SWARM` secret (see "Where it
-runs"). `ANTHROPIC_API_KEY` stays in the secret and in the worker env for the
-api service and as a fallback path, but no agent runs an Anthropic model.
+runs").
+
+### The Anthropic key
+
+No agent runs an Anthropic model. `ANTHROPIC_API_KEY` stays in the secret and in
+the worker and api env anyway, because two things in the pinned 2.10.0 image
+read it and neither has a Fireworks or Bedrock equivalent yet:
+
+- **The pi boot credential gate.** `checkPiMonoCredentials`
+  (`src/providers/pi-mono-adapter.ts`) decides whether a worker may claim tasks.
+  With `MODEL_OVERRIDE=fireworks-us/...` it falls to the permissive branch, and
+  that branch accepts only `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`,
+  `OPENAI_API_KEY` or one of the `nan`/`helmcode`/`vercel` registry keys. It
+  does not know `FIREWORKS_API_KEY`. Removing the key from the worker env
+  therefore parks all three workers in credential-wait (`[boot] waiting for` in
+  the container log), which is the symptom to look for.
+- **Session summaries and `llm` memory ratings.** `resolveCredential`
+  (`src/utils/internal-ai/credentials.ts`) walks a fixed precedence list,
+  `openrouter → anthropic → openai → openai-codex → claude-cli`. This swarm sets
+  none of the OpenRouter or OpenAI keys, so the anthropic branch is the one that
+  resolves, and a session summary is a Haiku call to Anthropic. Upstream's own
+  provider matrix records the limit: "Bedrock session summaries and memory
+  rating … Native Bedrock support is not available yet."
+
+So removing the key is not a config cleanup: it is blocked on an upstream
+change. The lead's harness can be switched per agent to a Bedrock model to
+avoid Anthropic inference, but the two reads above are in the worker and API
+images, not in the model selection.
 
 ## MCP servers
 
@@ -773,13 +799,36 @@ Both are scope swarm, installed on all three agents, and registered by
 
 ## AWS access from inside the swarm
 
-The agents read production AWS (account 333022194791) through the role
-`arn:aws:iam::333022194791:role/delegate-swarm-prod-read`. `host/aws-config`
-is mounted read-only into the lead and both workers, and
-`AWS_CONFIG_FILE` points at it: the default profile assumes that role with
-the instance's own credentials from IMDS (the instance's hop limit is 2 so
-containers can reach IMDS). The api container has no AWS access.
+Two roles, and the narrow one is the default.
+
+`host/aws-config` is mounted read-only into the lead and both workers, and
+`AWS_CONFIG_FILE` points at it. Its **`[default]` profile** assumes
+`arn:aws:iam::394495727159:role/delegate-swarm-bedrock` in the infrastructure
+account: Bedrock inference and nothing else. That is what every AWS SDK and
+CLI call in a worker gets without saying anything, and it is what pi's Bedrock
+provider authenticates with. The default is the narrow role on purpose: a
+prompt-injected agent runs under whatever the default profile assumes, without
+being asked, so the ambient identity must not be able to read anything it was
+not asked to.
+
+**Production reads (account 333022194791) are opt-in.** They used to be the
+default; the role is still there, as
+`arn:aws:iam::333022194791:role/delegate-swarm-prod-read` under
+`[profile prod-read]`, and a task that genuinely needs one says so:
+
+```sh
+AWS_PROFILE=prod-read aws s3 ls s3://...
+```
+
+Both profiles take the instance's own credentials from IMDS (the instance's hop
+limit is 2 so containers can reach IMDS). `AWS_REGION` is passed into every
+worker through `docker-compose.yml`, because pi's Bedrock provider reads it and
+refuses to fabricate one. The api container has no AWS access.
 `host/global-setup-script.sh` installs the AWS CLI into the workers.
+
+The Bedrock role may not exist yet when this lands; nothing here looks it up.
+Until it does, a Bedrock call fails to assume and prod reads still work through
+`prod-read`.
 
 ## Bringing it up
 

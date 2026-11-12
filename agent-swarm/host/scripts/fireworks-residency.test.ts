@@ -269,7 +269,12 @@ describe('agent-swarm inference residency', () => {
     const source = read(COMPOSE)
     assert.match(source, /^\s+FIREWORKS_API_KEY: \$\{FIREWORKS_API_KEY\}$/m)
     assert.match(source, /^\s+PI_CODING_AGENT_DIR: \$\{PI_CODING_AGENT_DIR:-\/workspace\/personal\/\.pi\}$/m)
-    // Anthropic stays for the api service and the fallback path.
+    // Anthropic stays: the pi boot credential gate does not know
+    // FIREWORKS_API_KEY, so it is the only key in the container that satisfies
+    // it, and internal-ai's session summaries resolve to the anthropic branch
+    // (no OpenRouter or OpenAI key is set). See "The Anthropic key" in
+    // agent-swarm/README.md. Removing it parks every worker in
+    // credential-wait.
     assert.match(source, /^\s+ANTHROPIC_API_KEY: \$\{ANTHROPIC_API_KEY\}$/m)
   })
 

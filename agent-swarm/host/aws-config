@@ -1,4 +1,25 @@
+# Shared AWS config for the lead and both worker containers. `host/` is uploaded
+# to the host verbatim and this file is bind-mounted read-only, so an edit is a
+# deploy. AWS_CONFIG_FILE points at it, which makes whatever the DEFAULT
+# profile assumes the ambient identity of every AWS SDK and CLI call a worker
+# makes.
+
+# The default is the narrow role: Bedrock inference only, in the
+# infrastructure account, on the two models deploy-infrastructure/ names. A
+# prompt-injected agent runs under this identity without being asked, so it
+# must not be able to read anything. It is also what pi's Bedrock provider
+# authenticates with, so it has to be reachable with no explicit selection.
 [default]
+role_arn = arn:aws:iam::394495727159:role/delegate-swarm-bedrock
+credential_source = Ec2InstanceMetadata
+role_session_name = delegate-swarm-bedrock
+region = us-west-2
+
+# Production reads are an explicit opt-in: `AWS_PROFILE=prod-read` on the one
+# command that needs it. It used to be the default, which meant every agent
+# session, including one steered by text a model read somewhere, held
+# read access to production the whole time. Keep it opt-in.
+[profile prod-read]
 role_arn = arn:aws:iam::333022194791:role/delegate-swarm-prod-read
 credential_source = Ec2InstanceMetadata
 role_session_name = delegate-swarm
