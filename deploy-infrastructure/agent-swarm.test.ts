@@ -256,7 +256,11 @@ describe("delegate swarm bedrock role", () => {
     }
   });
 
-  it("allows exactly the four invoke actions on exactly four ARNs", () => {
+  // Converse only. The harness is pi, whose Bedrock provider drives the
+  // Converse API, so the two InvokeModel forms are unused here and are not
+  // granted; the ARNs are still all four, because the caller picks the model
+  // and Bedrock then routes to the foundation model.
+  it("allows exactly the two Converse actions on exactly four ARNs", () => {
     assert.equal(statements.length, 2);
     const invoke = statements.find(
       (s) => s.Sid === "InvokeSwarmBedrockModels"
@@ -266,8 +270,6 @@ describe("delegate swarm bedrock role", () => {
     assert.deepEqual(invoke.Action, [
       "bedrock:Converse",
       "bedrock:ConverseStream",
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream",
     ]);
     // Two inference profiles and two foundation models, in this account for the
     // profiles and with an empty account field for the foundation models.
@@ -305,17 +307,26 @@ describe("delegate swarm bedrock role", () => {
     assert.deepEqual([...SWARM_BEDROCK_READ_RESOURCES], ["*"]);
   });
 
-  // Six actions in total: four invoke, two read. Pinned as a set so neither a
-  // quiet addition nor a quiet removal passes.
-  it("grants six actions and no more", () => {
+  // Four actions in total: two invoke, two read. Pinned as a set so neither a
+  // quiet addition nor a quiet removal passes. The two InvokeModel forms are
+  // deliberately not here: nothing this role serves calls them.
+  it("grants four actions and no more", () => {
     assert.deepEqual([...actions].sort(), [
       "bedrock:Converse",
       "bedrock:ConverseStream",
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream",
       "bedrock:ListFoundationModels",
       "bedrock:ListInferenceProfiles",
     ]);
+    assert.equal(
+      actions.filter(
+        (a) =>
+          a === "bedrock:InvokeModel" ||
+          a === "bedrock:InvokeModelWithResponseStream" ||
+          a === "bedrock:InvokeModelWithBidirectionalStream"
+      ).length,
+      0,
+      "an InvokeModel form is granted; the harness calls Converse only"
+    );
   });
 
   // The grant exists to reach two models, so every model ARN has to name one of

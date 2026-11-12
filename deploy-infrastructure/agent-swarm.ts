@@ -257,15 +257,30 @@ export const SWARM_BEDROCK_READ_RESOURCES = ["*"] as const;
  * separate to be revocable: detaching this policy ends model access without
  * touching the host's S3, logs or secret grants.
  *
- * Two statements, and between them six actions. `InvokeSwarmBedrockModels`
- * names four invoke actions on the model ARNs — exactly two models, from the
- * subset in `utils/bedrock-models.ts`, and no wildcard action or resource.
+ * Two statements, and between them four actions. `InvokeSwarmBedrockModels`
+ * names the two Converse actions on the model ARNs — exactly two models, from
+ * the subset in `utils/bedrock-models.ts`, and no wildcard action or resource.
  * `ProbeBedrockCatalog` names the two control-plane reads the worker's
  * `BEDROCK_AUTH_MODE=sdk` probe makes, on `*` because IAM defines no resource
  * type for either.
  *
+ * Converse only, and that is a decision rather than an omission. The swarm's
+ * harness is pi, and pi-ai's Bedrock provider drives the Converse API
+ * (`bedrock-converse-stream` → `ConverseStreamCommand`), so
+ * `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` are the
+ * two actions nothing here calls. Granting them "in case" is the widening this
+ * repo's other Bedrock role avoids on purpose: `TASK_BEDROCK_ACTIONS` in
+ * `deploy-workbench/ecs.ts` names the four its provider needs and reasons
+ * about each, and `deploy-workbench/bifrost/README.md` treats "all Bedrock" as
+ * the thing to avoid. A grant wider than the caller is one nobody notices is
+ * unused. If the harness ever moves to the InvokeModel form, this is a one-line
+ * addition with a reason, which is the right shape for it.
+ *
  * Deliberately absent, and each is the obvious next line someone would add:
  *
+ * - `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream` and
+ *   `bedrock:InvokeModelWithBidirectionalStream`. Nothing this role serves
+ *   calls them; see above.
  * - `bedrock:Get*`, and any `List` beyond the two the probe makes. The probe
  *   asks two questions; it does not browse. `GetFoundationModel`,
  *   `GetInferenceProfile` and `ListGuardrails` all look harmless from here and
@@ -283,12 +298,7 @@ export const delegateSwarmBedrockPolicy = {
     {
       Sid: "InvokeSwarmBedrockModels",
       Effect: "Allow",
-      Action: [
-        "bedrock:Converse",
-        "bedrock:ConverseStream",
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream",
-      ],
+      Action: ["bedrock:Converse", "bedrock:ConverseStream"],
       Resource: swarmBedrockInvokeResources(),
     },
     {

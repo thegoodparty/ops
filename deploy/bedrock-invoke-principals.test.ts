@@ -133,22 +133,24 @@ describe("the workbench account's Bedrock invoke grants", () => {
     ]);
   });
 
-  // The swarm role is the second allow, and it is not a second gateway: the
-  // four invoke actions are declared once each, in one statement, on the model
-  // ARNs. Its other statement is the two catalog reads its `BEDROCK_AUTH_MODE=sdk`
-  // probe makes, which grant no invocation at all. The model scope itself is
-  // asserted in `deploy-infrastructure/agent-swarm.test.ts`, which reads the
-  // document as data; here the point is that this file was not widened into a
-  // blanket grant behind the model list's back.
+  // The swarm role is the second allow, and it is not a second gateway: its
+  // invoke actions are declared once each, in one statement, on the model ARNs.
+  // It grants the two Converse actions only — the swarm's harness is pi, whose
+  // Bedrock provider drives the Converse API, so the InvokeModel forms have no
+  // caller and are not granted. Its other statement is the two catalog reads its
+  // `BEDROCK_AUTH_MODE=sdk` probe makes, which grant no invocation at all. The
+  // model scope itself is asserted in `deploy-infrastructure/agent-swarm.test.ts`,
+  // which reads the document as data; here the point is that this file was not
+  // widened into a blanket grant behind the model list's back.
   it("allows them in the swarm role, scoped and never wildcarded", () => {
     const swarm = fs.readFileSync(
       path.join(REPO_ROOT, "deploy-infrastructure/agent-swarm.ts"),
       "utf8"
     );
 
-    for (const action of INVOKE_ACTIONS.filter(
-      (a) => a !== "bedrock:InvokeModelWithBidirectionalStream"
-    )) {
+    // The two the swarm grants, once each: the statement that names them, and
+    // nothing else in the module may spell them out by hand.
+    for (const action of ["bedrock:Converse", "bedrock:ConverseStream"]) {
       const occurrences = swarm.split(`"${action}"`).length - 1;
       assert.equal(
         occurrences,
@@ -157,15 +159,20 @@ describe("the workbench account's Bedrock invoke grants", () => {
       );
     }
 
+    // And the three the swarm does not grant appear nowhere, not even quoted.
+    // `bedrock:InvokeModel` would also match inside `InvokeModelWithResponseStream`
+    // as a substring, so this is a `"bedrock:InvokeModel` prefix test: any
+    // occurrence at all is a grant the harness never calls.
+    assert.equal(
+      swarm.includes('"bedrock:InvokeModel'),
+      false,
+      "agent-swarm.ts grants an InvokeModel form; pi's Bedrock provider calls Converse only"
+    );
+
     assert.equal(
       /["']bedrock:\*["']/.test(swarm),
       false,
-      "agent-swarm.ts names bedrock:* ; the six named actions are the allowlist"
-    );
-    assert.equal(
-      swarm.includes("bedrock:InvokeModelWithBidirectionalStream"),
-      false,
-      "the swarm role does not grant the bidirectional stream form"
+      "agent-swarm.ts names bedrock:* ; the four named actions are the allowlist"
     );
     assert.match(
       swarm,
