@@ -199,7 +199,9 @@ jobs:
       suite: ${{ steps.cache.outputs.suite }}
       results_artifact_id: ${{ steps.upload-results.outputs.artifact-id }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A cold cache replays every case 3 times, then again where main's record
+    # is short of 6 runs; that does not fit in an hour.
+    timeout-minutes: 120
     steps:
       # Full history, so the history step can tell which main commit each
       # earlier cached run came from.
