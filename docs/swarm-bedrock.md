@@ -48,10 +48,12 @@ The plan has two halves, and they are ordered rather than interchangeable:
 
 - [ ] 1. Subscribe `394495727159` to the two models. Reporting first, then
       `APPLY=1`, and the account id and agreement outcomes recorded.
-- [ ] 2. Create `delegate-swarm-bedrock` in `deploy-infrastructure/`, with an
-      invoke grant scoped to those two models, the two control-plane reads the
-      readiness probe needs, and nothing else; trusted by the swarm host role,
-      which is given `sts:AssumeRole` on it.
+- [ ] 2. Land `delegate-swarm-bedrock` — PR #518 owns this, in
+      `deploy-infrastructure/agent-swarm.ts`: the role trusted by the swarm host
+      role, an invoke grant scoped to those two models, the two control-plane
+      reads the readiness probe needs, and the host's `sts:AssumeRole` on it. The
+      one follow-up is narrowing #518's invoke set from four actions to the two
+      Converse actions the harness calls.
 - [ ] 3. Point `agent-swarm/host/aws-config` at the new role as `[default]` and
       demote `delegate-swarm-prod-read` to `[profile prod-read]`, after auditing
       what reaches for `[default]` today.
@@ -221,9 +223,12 @@ narrows with an `ArnEquals` condition on `aws:PrincipalArn`, because it is
 created in a different Pulumi project (`deploy/`, in the management account) than
 the host role it trusts, and IAM rejects a trust naming a role that does not
 exist yet in that ordering. This role and the host role are in the *same* stack,
-so `deploy-infrastructure/` can name the host role ARN as the principal directly
-and let Pulumi order the two. If this ever moves projects, it takes the
-account-root-plus-condition shape.
+so naming the host role ARN as the principal is available here — and **PR #518
+uses the account-root-plus-condition shape anyway**, on the argument that the
+trust applies concurrently with the role it names. The two shapes admit exactly
+the same single principal, so this plan accepts #518's as equivalent rather than
+asking for a cosmetic edit; what matters is the property, not the spelling. One
+principal, named precisely, refused for everything else.
 
 **The cost, and it is the sharpest thing in this plan.** `agent-swarm/host/aws-config`
 is mounted read-only into the lead and both workers, and `AWS_CONFIG_FILE` points
@@ -387,8 +392,11 @@ The invoke actions are unchanged by this: the harness calls the Converse API
 (`ConverseStreamCommand` from `@aws-sdk/client-bedrock-runtime`, via pi-ai's
 `bedrock-converse-stream`), so the invoke grant is `bedrock:Converse` and
 `bedrock:ConverseStream`. `InvokeModel` and `InvokeModelWithResponseStream` are
-*not* granted. Step 5 records whatever the invocation proves, and widening to the
-invoke pair afterwards is a one-line change with a reason.
+*not* granted. **PR #518 currently grants all four, so this is the one place the
+plan and #518 disagree** — resolved by narrowing #518 in a follow-up rather than
+by widening the plan (step 2). If step 5 ever shows the harness issuing an
+`InvokeModel` call, that is evidence to add the pair back, in a PR that says what
+issued it.
 
 Invoke resources keep the shape `bedrockInvokeResources()` in
 `utils/bedrock-models.ts` already uses, restricted to two models: each model's
@@ -482,20 +490,20 @@ not "the same as the others", it is a task that resolves to a model which cannot
 authenticate. Setting all four is what makes the fallback unreachable rather than
 merely unlikely.
 
-**`ULTRA` is the single Bedrock tier by design.** That is worth recording as a
-property rather than a gap: the grant is two models and one of them is a Fireworks
-router, so exactly one tier can be Bedrock. If a third Bedrock model is ever added,
-`smart` is the natural place to differentiate — it is the tier between "the default
-is fine" and "spend on the best", and it is the one that currently carries no
-information.
+**`ultra` is the single Bedrock tier because of the mapping, not the grant.** The
+grant enables two Bedrock models; the decided mapping routes only Sol by tier and
+leaves Haiku reachable by name. If the mapping is ever revisited, `smart` is the
+natural place to differentiate — it is the tier between "the default is fine" and
+"spend on the best", and it is the one that currently carries no information.
 
 **So `anthropic.claude-haiku-5-5` has no tier.** Both models are enabled and both
-are invocable (Part A grants the pair), but the decided mapping routes only the Sol
-model, which leaves Haiku reachable by naming it on a task or an agent and not by
-tier. That is a deliberate consequence of reserving the cheap-but-strong tier for
-the cheap default: Haiku is a plausible `smart` model and `smart` is taken. Worth
-knowing before someone concludes the second model is unused by mistake — it is
-unused by *tier*, and it is the obvious candidate if the mapping is revisited.
+are invocable (Part A grants the pair), but the decided mapping routes only Sol by
+tier, which leaves Haiku reachable by naming it on a task or an agent and not by
+tier. That is a consequence of the mapping rather than of the grant: the mapping
+keeps `smart` on the cheap default, so the second Bedrock model has no tier to land
+in. Worth knowing before someone concludes the second model is unused by mistake —
+it is unused by *tier*, and it is the obvious candidate for `smart` if the mapping
+is revisited.
 
 **Validation passes for both values, and that is worth knowing before it is
 tried.** `validateTierConfigValue` (`src/be/model-tier-keys.ts:34-46`) rejects
@@ -977,7 +985,16 @@ kept, with the argument that defeated them, because the argument for leaving
 - **Grant the whole invoke family because it is one line.** `Converse` and
   `ConverseStream` are what the harness calls. `InvokeModel` is a different API
   the harness does not use, and adding it "for symmetry" is the shape of grant
-  that outlives its reason.
+  that outlives its reason. **This is the decision the #518 follow-up enforces**:
+  that PR currently grants all four, and step 2 narrows it to the two the caller
+  makes rather than widening this plan to match the code.
+- **A separate `deploy-infrastructure/bedrock-role.ts`.** The shape
+  `deploy-role.ts` and `preview-role.ts` use, and rejected because the role would
+  be split from the host role it trusts, the `AssumeSwarmBedrock` statement that
+  names it, and the tags they share — all of which already live in
+  `agent-swarm.ts`. A second file declaring `delegate-swarm-bedrock` would be a
+  duplicate role name, which IAM refuses at apply time with an error that reads
+  like a permissions fault.
 - **A second hand-kept model list in `deploy-infrastructure/`.** Two lists is the
   drift `utils/bedrock-models.ts` was created to stop — its header says so, and
   says what it cost the last time. The two ids are a selection from that list.
@@ -1051,17 +1068,25 @@ than restate it.
    works for up to fifteen minutes and then fails with AccessDenied, which reads
    like an outage.
 
-2. **The role, its policy, and the host's one extra statement.** A new
-   `deploy-infrastructure/bedrock-role.ts`, following `deploy-role.ts` and
-   `preview-role.ts`: the trust and the policy document are exported constants so
-   a test can read them without a Pulumi runtime, and a `createBedrockRole`
-   function takes the explicit `provider` every resource in this project must
-   name. `deploy-infrastructure/index.ts` calls it; `agent-swarm.ts` gains one
-   statement.
+2. **The role, its policy, and the host's one extra statement — owned by PR #518.**
+   **#518 implements this step in `deploy-infrastructure/agent-swarm.ts`**, beside
+   `createAgentSwarm`, and this plan's job is to specify what must be true rather
+   than to create a second file. What it already does, verified on
+   `swarm-bedrock-iam` at `26a2e1b`: a `bedrockRole` resource named
+   `delegate-swarm-bedrock`; an inline policy of two statements; the
+   `AssumeSwarmBedrock` statement added to `swarmHostPolicy`; and
+   `ProbeBedrockCatalog` carrying both reads the probe makes. What has to change
+   there is one thing — the invoke set, below — and it is a follow-up to #518, not
+   work for another PR.
 
-   - A role named `delegate-swarm-bedrock`, trust principal
-     `arn:aws:iam::394495727159:role/delegate-swarm-host`, `sts:AssumeRole` only,
-     no condition — same stack, so the direct ARN is available (decision 2).
+   The requirements, so a reader can check #518 against them:
+
+   - A role named `delegate-swarm-bedrock`, trusted by
+     `arn:aws:iam::394495727159:role/delegate-swarm-host` and nothing else. #518
+     writes this as the account root with an `aws:PrincipalArn` condition, which is
+     the shape `deploy/components/delegate-swarm-prod-read.ts` uses and explains:
+     IAM rejects a trust naming a role that does not exist yet, and the two
+     stacks apply concurrently. Equivalent, and the condition is what narrows it.
    - An inline policy (inline, matching the other scoped roles here) with two
      statements, kept apart because they take opposite resource shapes:
      - **invoke:** `bedrock:Converse` and `bedrock:ConverseStream` on two models'
@@ -1078,13 +1103,25 @@ than restate it.
        (decision 4). Named as their own exported constant, the way
        `TASK_BEDROCK_READ_ACTIONS` is in `deploy-workbench/ecs.ts`, so a test can
        tell this deliberate wildcard from an edit that widens something else.
-   - The host role's `AssumeProdRead` statement echoed for the new role: an
-     `sts:AssumeRole` on its ARN added to `swarmHostPolicy` in `agent-swarm.ts`.
-     Nothing else on the host role changes, and the existing `AssumeProdRead`
-     stays as it is.
-   - `protect` on the new role, as `pulumi-deploy` has: it is a credential path
-     the containers depend on, and a replace is an outage that reads as an
-     AccessDenied.
+     - **`sts:AssumeRole` on the role's ARN for the host**, as `swarmHostPolicy`'s
+       `AssumeSwarmBedrock`. Nothing else on the host role changes, and its
+       existing `AssumeProdRead` stays as it is.
+     - `protect` on the role, as `pulumi-deploy` has: it is a credential path the
+       containers depend on, and a replace is an outage that reads as an
+       AccessDenied.
+
+   **The one open item: #518's invoke set is wider than the harness needs.**
+   `InvokeSwarmBedrockModels` grants four actions — `Converse`, `ConverseStream`,
+   `InvokeModel` and `InvokeModelWithResponseStream` — and the pi harness's Bedrock
+   provider calls the Converse API only (`bedrock-converse-stream` issues
+   `ConverseStreamCommand`). The other two are unused by this path, and a grant
+   wider than its caller is exactly what the repo's other Bedrock role avoids:
+   `deploy-workbench/ecs.ts` documents granting only what the provider actually
+   calls, and `deploy/bedrock-invoke-principals.test.ts` exists to keep that true.
+   **So the resolution is to narrow #518 to the two Converse actions in a small
+   follow-up**, not to widen this specification to match it. Test (a) below stays
+   as written and fails against #518 until that follow-up lands, which is the
+   intended direction: the spec is the thing the code should converge on.
 
    Tests, in the style `deploy-infrastructure/agent-swarm.test.ts` already uses
    on the host policy: export the policy document as a pure function and assert
@@ -1094,25 +1131,24 @@ than restate it.
    `bedrock:Get*`, (e) the trust admits only the host role, (f) the host policy
    gained exactly one statement.
 
-   **This is a sibling PR's file, and it already carries most of it.** PR #518
-   creates the role and its policy in `deploy-infrastructure/agent-swarm.ts`, and
-   its `ProbeBedrockCatalog` statement already names `bedrock:ListFoundationModels`
-   and `bedrock:ListInferenceProfiles` on `*` — so the reads this plan now needs are
-   in place before this document merges. Recorded so the plan does not ask for work
-   that exists. Two things #518 does that this plan's text does not, both harmless
-   and not worth reopening: its invoke statement also grants `bedrock:InvokeModel`
-   and `bedrock:InvokeModelWithResponseStream` (this plan narrows to the two
-   Converse actions, which is what the harness calls; the extras are unused rather
-   than wrong), and it adds the reads because its author anticipated the probe
-   rather than because this decision existed yet. Where the two documents disagree,
-   #518's policy is the fact and this plan's step 5 verifies it.
+   **Why not a separate `bedrock-role.ts`.** It reads as the tidier shape —
+   `deploy-role.ts` and `preview-role.ts` are separate files — and it is rejected
+   because `agent-swarm.ts` already holds the host role this one hangs off, the
+   `AssumeSwarmBedrock` statement that points at it, and the tags the two share.
+   Splitting it would put the role and the statement that references it in
+   different files with nothing but a string between them, and a second file that
+   also declared `delegate-swarm-bedrock` would be a duplicate role name, which
+   IAM rejects at apply time with an error that reads like a permissions problem.
+   Keeping it beside the host role is what makes "one role, one name, one place"
+   checkable.
 
-   **`deploy/bedrock-invoke-principals.test.ts` will fail on this PR, and that is
+   **`deploy/bedrock-invoke-principals.test.ts` will fail on #518, and that is
    the tripwire working.** It asserts that the invoke actions appear in an
    enumerated set of files, and the list is meant to grow one reviewed entry at a
-   time. The same PR adds this file to that list, with its comment updated to say
-   why a second account now has an invoke grant. Do not "fix" it by widening the
-   scan or by putting the actions in a file the test cannot see.
+   time. That PR adds `deploy-infrastructure/agent-swarm.ts` to the list, with its
+   comment updated to say why a second account now has an invoke grant. Do not
+   "fix" it by widening the scan or by putting the actions in a file the test
+   cannot see.
 
    Applied by `deploy-infrastructure.yml`, which already triggers on
    `deploy-infrastructure/**` and `utils/accounts.ts` — check the path filter for
@@ -1296,10 +1332,12 @@ than restate it.
   catalogue, that is a real papercut; filtering it client-side is an agent-swarm
   change. The overlay rows are the local lever and this plan now treats them as
   optional.
-- **What a third Bedrock model would change.** Not an open question about this
-  plan — the mapping is decided — but recorded as the natural next step: `ultra`
-  is the single Bedrock tier by design ("Model tiers"), and `smart` is where a
-  second one would land, since it currently carries no information of its own.
+- **What routing Haiku by tier would take.** Not an open question about this plan
+  — the mapping is decided — but the natural next step if it is revisited: the
+  grant already covers two Bedrock models and the mapping routes only Sol, so
+  pointing `smart` at Haiku is a one-value change with no IAM work. It would also
+  give `smart` a meaning, which it currently does not have. Recorded so the
+  decision reads as "not now" rather than "not possible".
 - **Cost and accounting for these two models in this account.** The swarm keeps
   its own price book keyed by harness and model id, and a Bedrock session
   records what pi reports. Whether an `amazon-bedrock/…` session lands as
