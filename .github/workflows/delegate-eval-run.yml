@@ -329,6 +329,9 @@ jobs:
       # not finish as not gated, so a regression on it would pass. Fail the job
       # instead; the good runs are cached, so a re-dispatch replays only the
       # gaps. Prints a count, never case ids, since gate mode includes holdout.
+      # A review that came back "failed" is the reviewer giving up, not a gap:
+      # it is never cached, recurs on every dispatch, and shows main does not
+      # pass that case every run, so the gate already does not hold it.
       - name: Require a complete baseline
         env:
           MODE: ${{ inputs.mode }}
@@ -338,14 +341,17 @@ jobs:
             const cases = require("./delegate/review/eval/expected/manifest.json")
               .filter((c) => process.env.MODE !== "tune" || c.split === "tune");
             let missing = 0;
+            let gaveUp = 0;
             for (const c of cases) for (let r = 1; r <= 3; r++) {
               let ok = false;
               try {
                 const x = JSON.parse(fs.readFileSync(`./baseline/${c.id}/run-${r}.json`, "utf-8"));
-                ok = !x.error && x.output?.status === "complete";
+                ok = !x.error && (x.output?.status === "complete" || x.output?.status === "failed");
+                if (x.output?.status === "failed") gaveUp++;
               } catch {}
               if (!ok) missing++;
             }
+            if (gaveUp) console.log(`${gaveUp} of ${cases.length * 3} main reviews came back failed; those cases are not held.`);
             if (missing) {
               console.log(`::error::${missing} of ${cases.length * 3} main baseline runs are missing or errored. Re-dispatch to replay only those.`);
               process.exit(1);
