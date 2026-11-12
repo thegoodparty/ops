@@ -62,9 +62,11 @@ The plan has two halves, and they are ordered rather than interchangeable:
       ARNs and the refusal shape recorded, the model list the probe enumerated,
       and the Fireworks default re-checked in the same session. Operational, no
       PR.
-- [ ] 6. Propose the `MODEL_TIER_PI_*` mapping, so "hard" tasks can be routed to
-      a Bedrock model while `smol` and `regular` stay on Fireworks. A proposal for
-      the engineer to confirm, applied through swarm config.
+- [ ] 6. Set the four `MODEL_TIER_PI_*` keys to the decided mapping: `smol`,
+      `regular` and `smart` on the Fireworks DeepSeek 4.1 Flash 1017 US-only
+      router, `ultra` on `amazon-bedrock/global.openai.gpt-6.1-sol`. All four,
+      even though three match, because an unset tier falls through to an
+      `openrouter/…` id this swarm cannot authenticate.
 - [ ] 7. Turn the two `internal-ai` features off: `SKIP_SESSION_SUMMARY=1` on the
       workers and `TASK_AUTO_TITLE_ENABLED=false` on the api, both with the reason
       recorded. This is what leaves the key with no consumer.
@@ -101,8 +103,9 @@ Four invariants, stated as properties rather than features:
   role whose only other Bedrock permissions are the two reads the readiness probe
   calls.
 - **The default does not move.** A task that names no model and no tier still runs
-  Fireworks, on the same router id. A change here that risks the default is a
-  change that is wrong.
+  Fireworks, on the same router id — and that id stays US-only in both halves, the
+  `-us` variant and the `us.api.fireworks.ai` endpoint ("US-only is a rule"). A
+  change here that risks the default is a change that is wrong.
 - **No new key.** Bedrock authenticates through the AWS SDK's chain, which in
   that container means the instance role from IMDS. Nothing is added to
   `DELEGATE_SWARM` to enable this.
@@ -126,8 +129,8 @@ Four invariants, stated as properties rather than features:
 | Who may assume it | `arn:aws:iam::394495727159:role/delegate-swarm-host` only |
 | Bedrock reads it also holds | `bedrock:ListFoundationModels`, `bedrock:ListInferenceProfiles` (the probe) |
 | Readiness satisfier | `BEDROCK_AUTH_MODE=sdk`, region us-west-2, on the worker env |
-| Tier mapping (proposed) | `MODEL_TIER_PI_SMART` → `amazon-bedrock/global.openai.gpt-6.1-sol` |
-| Default model, unchanged | `fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us` |
+| Tier mapping (decided) | `smol`/`regular`/`smart` → the Fireworks US-only DeepSeek router; `ultra` → `amazon-bedrock/global.openai.gpt-6.1-sol` |
+| Default model, unchanged | `fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us` (US-only; see "US-only is a rule") |
 | Anchors in this repo | `utils/bedrock-models.ts` entries `openai.gpt-6.1-sol` and `anthropic.claude-haiku-5-5`; `deploy-infrastructure/agent-swarm.ts` for the host |
 
 Both models are already entries in `WORKBENCH_MODELS` in
@@ -407,11 +410,11 @@ an agent-swarm change; narrowing the picker is not this plan's job.
 
 ## Model tiers: routing "hard" tasks to a Bedrock model
 
-**This is what makes the two models useful rather than merely present.** A tier is
-a per-task hint — `modelTier: smol | regular | smart | ultra` — that the API
-resolves at claim time to a concrete model. Because the tier map is swarm config,
-the swarm can route work by difficulty without every task naming a model and
-without a code change.
+**This is what makes the two models useful rather than merely present, and the
+mapping is decided.** A tier is a per-task hint — `modelTier: smol | regular |
+smart | ultra` — that the API resolves at claim time to a concrete model. Because
+the tier map is swarm config, the swarm routes work by difficulty without every
+task naming a model and without a code change.
 
 **Today tiering does not work in this swarm at all, and that is not this plan's
 fault.** `DEFAULT_MODEL_TIER_MAP.pi` (`src/types.ts`) points all four tiers at
@@ -419,9 +422,8 @@ fault.** `DEFAULT_MODEL_TIER_MAP.pi` (`src/types.ts`) points all four tiers at
 `regular`, `openrouter/deepseek/deepseek-v4-pro-0813` for `smart`,
 `openrouter/anthropic/claude-opus-5.5` for `ultra` — and the swarm holds no
 OpenRouter credential. So a tiered task already resolves to a model with no key
-and fails. Adding tier-config rows is what turns tiering *on*; Bedrock is what
-makes it possible to turn on usefully. Nothing here regresses: a tiered task does
-not work less well after this change than before it.
+and fails. Setting the four keys below is what turns tiering on. Nothing here
+regresses: a tiered task does not work less well after this change than before it.
 
 The precedence, first hit wins, verified at v2.10.0 in
 `src/be/model-tier-resolution.ts` (`taskModelCandidates`) and `src/types.ts`:
@@ -440,42 +442,112 @@ The precedence, first hit wins, verified at v2.10.0 in
 dashes, so `pi` gives `MODEL_TIER_PI_SMOL` and so on. Setting those four keys is
 the whole change; no deploy, no code.
 
-### The mapping, as a proposal
+### The mapping
 
-The plan proposes this and **the engineer confirms it**; it is not a decision this
-plan makes on their behalf, because which model a `smart` task should get is a
-judgement about cost and quality that belongs with whoever pays for it.
+**Decided by the engineer.** `smart` stays on the DeepSeek router "for now" and
+`ultra` takes Sol: the cheap default does the bulk of the work, and the one Bedrock
+model is reserved for the tier that has asked for the most. The asymmetry is the
+point rather than a compromise — `smol`, `regular` and `smart` are all the same
+router, so the tier a task picks only changes what happens at `ultra`, which is
+exactly where the cost argument is weakest and the quality argument strongest.
 
-| Tier | Model | Why |
-|---|---|---|
-| `smol` | Fireworks DeepSeek router (unchanged) | the default, and the cheapest thing that works |
-| `regular` | Fireworks DeepSeek router (unchanged) | ditto — most tasks live here |
-| `smart` | `amazon-bedrock/global.openai.gpt-6.1-sol` | the reason this plan exists: a stronger model on hard work |
-| `ultra` | the engineer's call, possibly Sol as well | there is no third Bedrock model, so "ultra" is either Sol again or the Fireworks default |
+| Tier | Value |
+|---|---|
+| `smol` | Fireworks DeepSeek 4.1 Flash 1017 (US only) |
+| `regular` | Fireworks DeepSeek 4.1 Flash 1017 (US only) |
+| `smart` | Fireworks DeepSeek 4.1 Flash 1017 (US only) |
+| `ultra` | `amazon-bedrock/global.openai.gpt-6.1-sol` |
 
-Two honest notes about it:
+The exact `swarm_config` keys, written out because the Fireworks string has to match
+what the agents already run character for character — a tier that disagrees with
+the default is two models where one was intended:
 
-- **`ULTRA` has no distinct answer**, because the grant is two models and one of
-them is the `smart` choice. Pointing `ultra` at Sol makes it identical to `smart`,
-which is harmless but means the tier carries no information; pointing it back at
-Fireworks would make `ultra` *weaker* than `smart`, which is worse. Two ways out,
-neither in this plan: a third Bedrock model (costs an edit to this plan and to
-`utils/bedrock-models.ts`), or leaving `MODEL_TIER_PI_ULTRA` unset so it falls
-through to the seeded default — which is an `openrouter/…` id and therefore fails,
-so that is not really a way out either. Recorded so `ultra` is a known gap rather
-than an oversight.
-- **The validation is real.** `validateTierConfigValue` (`src/be/model-tier-keys.ts`)
-  rejects whitespace, over-long values and — relevant here — a model that
-  `harnessModelMismatch` says does not run on the `pi` harness. A
-  `MODEL_TIER_PI_SMART` of `amazon-bedrock/global.openai.gpt-6.1-sol` passes,
-  because the `pi` harness is not one of the section-pinned harnesses and an
-  uncatalogued id defers to the caller's custom-model check. The tier rows
-  therefore need no `allow_custom_model` dance of their own; the agent runtime
-  PATCH in `sync-agent-config.sh` is a different route with a different rule.
+```
+MODEL_TIER_PI_SMOL=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
+MODEL_TIER_PI_REGULAR=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
+MODEL_TIER_PI_SMART=fireworks-us/accounts/fireworks/routers/deepseek-v4p1-flash-1017-us
+MODEL_TIER_PI_ULTRA=amazon-bedrock/global.openai.gpt-6.1-sol
+```
+
+`fireworks-us` is the provider id `agent-swarm/host/global-setup-script.sh` writes
+into the worker's `models.json` — the custom provider, not pi's built-in
+`fireworks` — and the router id is the one `render-env.sh` pins as both
+`LEAD_MODEL_OVERRIDE` and `WORKER_MODEL_OVERRIDE`. So `smol`, `regular` and `smart`
+name precisely the model an untiered task already gets.
+
+**All four keys must be set, even though three carry the same value.** An unset tier
+falls through layer 5 to `DEFAULT_MODEL_TIER_MAP.pi`, which names `openrouter/…` ids
+for every tier, and this swarm holds no OpenRouter credential — so a missing key is
+not "the same as the others", it is a task that resolves to a model which cannot
+authenticate. Setting all four is what makes the fallback unreachable rather than
+merely unlikely.
+
+**`ULTRA` is the single Bedrock tier by design.** That is worth recording as a
+property rather than a gap: the grant is two models and one of them is a Fireworks
+router, so exactly one tier can be Bedrock. If a third Bedrock model is ever added,
+`smart` is the natural place to differentiate — it is the tier between "the default
+is fine" and "spend on the best", and it is the one that currently carries no
+information.
+
+**So `anthropic.claude-haiku-5-5` has no tier.** Both models are enabled and both
+are invocable (Part A grants the pair), but the decided mapping routes only the Sol
+model, which leaves Haiku reachable by naming it on a task or an agent and not by
+tier. That is a deliberate consequence of reserving the cheap-but-strong tier for
+the cheap default: Haiku is a plausible `smart` model and `smart` is taken. Worth
+knowing before someone concludes the second model is unused by mistake — it is
+unused by *tier*, and it is the obvious candidate if the mapping is revisited.
+
+**Validation passes for both values, and that is worth knowing before it is
+tried.** `validateTierConfigValue` (`src/be/model-tier-keys.ts:34-46`) rejects
+whitespace, over-long values and a model that `harnessModelMismatch` says does not
+run on the harness. That last check only judges models present in the runtime
+catalog, and neither the custom `fireworks-us` provider nor the Bedrock ids are in
+it: `HARNESS_CATALOG_SECTION` has no `pi` entry, so `harnessModelMismatch` returns
+`null` for the `pi` harness and both values pass. The tier rows therefore need no
+`allow_custom_model` dance of their own; the agent runtime PATCH in
+`sync-agent-config.sh` is a different route with a different rule.
 
 Step 6 is where these are set, and where the console's tier preview
 (`GET /api/models-catalog/tiers`, `previewModelTiers`) is read to prove each tier
 resolves to what the table says.
+
+## US-only is a rule, not a convention
+
+**Every Fireworks model in this swarm must use a US-only endpoint *and* a US-only
+model variant. Both halves are required, and either one alone is wrong.** The
+engineer asked for this to be stated plainly because it is the kind of thing that
+fails silently and shows up in a bill or a residency question months later.
+
+- **Endpoint:** `https://us.api.fireworks.ai/inference`. Never the global
+  `https://api.fireworks.ai/inference`.
+- **Variant:** a `-us` router id, such as
+  `accounts/fireworks/routers/deepseek-v4p1-flash-1017-us`. Never a global model id.
+- **Why both, and why it is not cosmetic.** A US router addressed at the global
+  endpoint, or a global model id at the US endpoint, is a global request that looks
+  correctly configured and logs nothing unusual. The residency reasoning is in
+  [`bifrost-gateway.md`](./bifrost-gateway.md) under "Inference residency". The
+  cost half is why it also misprices: US-only Serverless is 1.5x, and pi's built-in
+  catalogue carries the *global* rate for these ids, so a global model reached by
+  accident under-reports the bill by a third.
+- **Enforcement already exists, and it must keep passing.**
+  `agent-swarm/host/scripts/fireworks-residency.test.ts` pins both halves —
+  `US_BASE_URL` and the `US_FIREWORKS_ROUTER` pattern — across
+  `global-setup-script.sh`, `render-env.sh`, `docker-compose.yml` and
+  `sync-agent-config.sh`, and it fails on the global host appearing anywhere under
+  `host/`. **Every tier value and model row this plan adds is subject to the same
+  rule**, which is why `smol`, `regular` and `smart` above name the `-us` router
+  rather than any other DeepSeek string — the OpenRouter-shaped
+  `openrouter/deepseek/deepseek-v4.1-flash` that the seeded default map carries is
+  exactly the mistake being avoided, and it would be a global request even if the
+  key existed.
+- **The Bedrock models are not subject to it.** Their residency is decided by the
+  `global.` inference profile, which is the separate decision already recorded in
+  this plan (`utils/bedrock-models.ts` and "Inference residency"): a `global.`
+  profile routes by capacity rather than staying in-region, and that was accepted
+  deliberately. The two rules look similar and are not — one is a Fireworks
+  endpoint-and-variant pairing, the other is a Bedrock profile choice — so
+  `MODEL_TIER_PI_ULTRA` is the one value here that is not a US-only Fireworks id,
+  and that is correct rather than an exception to the rule.
 
 ## The model catalogue overlay: now optional, and probably not needed
 
@@ -1146,23 +1218,21 @@ than restate it.
    - The default, unchanged: a task with no model named still runs Fireworks,
      and the agent's runtime model is still the `fireworks-us/…` router.
 
-6. **Propose the tier mapping.** Set `MODEL_TIER_PI_SMOL`, `MODEL_TIER_PI_REGULAR`,
-   `MODEL_TIER_PI_SMART` and `MODEL_TIER_PI_ULTRA` in `swarm_config` — through the
-   dashboard or `set-config`, not a Pulumi resource, because tier config is swarm
-   state and this repository has no path to it. The mapping is the proposal in
-   "Model tiers", and **it needs the engineer's confirmation before it is set**, so
-   this step is a question as much as a change.
+6. **Set the decided tier mapping.** Write `MODEL_TIER_PI_SMOL`,
+   `MODEL_TIER_PI_REGULAR`, `MODEL_TIER_PI_SMART` and `MODEL_TIER_PI_ULTRA` in
+   `swarm_config` — through the dashboard or `set-config`, not a Pulumi resource,
+   because tier config is swarm state and this repository has no path to it. The
+   values are the four-key block in "Model tiers", decided; set all four even
+   though three carry the same Fireworks router id, or the unset one falls through
+   to an `openrouter/…` model that cannot authenticate.
 
    Read back `GET /api/models-catalog/tiers` (`previewModelTiers`) and check each
    row's `source` is `tier-config` and its `resolvedModel` is what the table says.
-   Then create one task with `modelTier: smart` and confirm from its `resolvedModel`
-   that it ran on the Bedrock model — the tier preview is a projection, and the
-   claim path is what actually decides.
-
-   Leave `MODEL_TIER_PI_ULTRA` as whatever the engineer decides, and record the
-   consequence if it is left pointing at an `openrouter/…` id: an `ultra` task
-   fails on a model this swarm cannot authenticate, which is the state every tier
-   is in today.
+   Then create one task with `modelTier: ultra` and confirm from its `resolvedModel`
+   that it ran on `amazon-bedrock/global.openai.gpt-6.1-sol` — the tier preview is a
+   projection, and the claim path is what actually decides. One task on
+   `modelTier: smart` is worth running too, to show it lands on the Fireworks router
+   and therefore behaves exactly like an untiered task.
 
 7. **Turn the two `internal-ai` features off.** `SKIP_SESSION_SUMMARY=1` on the
    workers (`x-worker-env` in `agent-swarm/host/docker-compose.yml`) and
@@ -1226,8 +1296,10 @@ than restate it.
   catalogue, that is a real papercut; filtering it client-side is an agent-swarm
   change. The overlay rows are the local lever and this plan now treats them as
   optional.
-- **What `MODEL_TIER_PI_ULTRA` should be.** The two-model grant leaves `ultra`
-  with no model of its own ("Model tiers"). The engineer's call.
+- **What a third Bedrock model would change.** Not an open question about this
+  plan — the mapping is decided — but recorded as the natural next step: `ultra`
+  is the single Bedrock tier by design ("Model tiers"), and `smart` is where a
+  second one would land, since it currently carries no information of its own.
 - **Cost and accounting for these two models in this account.** The swarm keeps
   its own price book keyed by harness and model id, and a Bedrock session
   records what pi reports. Whether an `amazon-bedrock/…` session lands as
