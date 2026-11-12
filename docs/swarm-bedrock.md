@@ -42,8 +42,9 @@ The plan has two halves, and they are ordered rather than interchangeable:
 - **Part A, steps 1 to 6** — the two-model grant. Model subscriptions, the
   dedicated role with its control-plane reads, the credential switch, the
   readiness gate, the model-tier mapping, and the proof.
-- **Part B, steps 7 and 8** — the Anthropic key. An investigation, then the
-  removal, and only if the investigation says the removal is safe.
+- **Part B, steps 7 to 9** — the Anthropic key. Turn the two `internal-ai` features
+  off, remove the key from every surface including the secret, and correct the
+  README. The decision is made; these steps execute it.
 
 - [ ] 1. Subscribe `394495727159` to the two models. Reporting first, then
       `APPLY=1`, and the account id and agreement outcomes recorded.
@@ -64,11 +65,18 @@ The plan has two halves, and they are ordered rather than interchangeable:
 - [ ] 6. Propose the `MODEL_TIER_PI_*` mapping, so "hard" tasks can be routed to
       a Bedrock model while `smol` and `regular` stay on Fireworks. A proposal for
       the engineer to confirm, applied through swarm config.
-- [ ] 7. Establish what actually consumes `ANTHROPIC_API_KEY` in the worker and
-      in the api, and what each of the three trades under "The gate" costs.
-      Investigation, no code change, and step 8 waits on its answer.
-- [ ] 8. Remove the key from the swarm's secret and every surface that carries
-      it, with the trade step 7 chose recorded, or record why it stays.
+- [ ] 7. Turn the two `internal-ai` features off: `SKIP_SESSION_SUMMARY=1` on the
+      workers and `TASK_AUTO_TITLE_ENABLED=false` on the api, both with the reason
+      recorded. This is what leaves the key with no consumer.
+- [ ] 8. Remove `ANTHROPIC_API_KEY` from every surface — compose (worker **and**
+      api), `render-env.sh`'s `REQUIRED_KEYS`, `fill-secrets.sh`, the README, the
+      residency test — and then prune it from the `DELEGATE_SWARM` secret. Lands
+      after #523, whose api line and "stays here and only here" comment this step
+      reverses.
+- [ ] 9. Record the gap: `agent-swarm/README.md` names the two switches that are
+      off, what is lost (no session summaries, so memory and ranking degrade on
+      long sessions; task titles fall back to the prompt), and that an
+      `internal-ai` credential kind is the upstream fix. Unowned follow-up.
 
 ## Goal
 
@@ -98,11 +106,12 @@ Four invariants, stated as properties rather than features:
 - **No new key.** Bedrock authenticates through the AWS SDK's chain, which in
   that container means the instance role from IMDS. Nothing is added to
   `DELEGATE_SWARM` to enable this.
-- **The Anthropic key is either justified in writing or gone.** Not "left in
-  place because removing it is risky": step 7 establishes the trade, and step 8
-  either removes it or replaces that sentence with a true one. The key's second
-  job — satisfying the worker's readiness check — is taken over by the Bedrock
-  probe (decision 3), which is what makes this reachable at all.
+- **The swarm has no explicit Anthropic dependency.** Not "the key is justified
+  if it turns out to be used": it goes, and the two `internal-ai` features that
+  read it are turned off rather than the key being kept alive for them. The
+  readiness job it also did — satisfying the worker's `pi` credential check — is
+  taken over by the Bedrock probe (decision 3), which is what makes the removal
+  possible at all. Steps 7 to 9 execute this; none of them is optional.
 
 ## What is being enabled
 
@@ -561,11 +570,16 @@ Two things that follow and are worth stating:
 
 ## Part B: removing the Anthropic key
 
-This half is **not a finished decision.** `agent-swarm/README.md` says today that
-`ANTHROPIC_API_KEY` "stays in the secret and in the worker env for the api
-service and as a fallback path, but no agent runs an Anthropic model". That
-sentence is two claims, and only the second is one anybody has checked. The plan
-is to establish the first before acting on it.
+**The engineer has decided this: the swarm carries no explicit Anthropic
+dependency.** `agent-swarm/README.md` says today that `ANTHROPIC_API_KEY` "stays in
+the secret and in the worker env for the api service and as a fallback path, but no
+agent runs an Anthropic model". That sentence is two claims, and only the second is
+one anybody had checked. What the pinned source shows is that the first is wrong in
+an interesting way: the "api service and fallback path" it names is the one caller
+that *rejects* an Anthropic credential, while two other callers resolve one
+silently. The decision below is the consequence — the key goes, and the two callers
+that needed it are turned off, because there is no supported way to run them on
+this plan's Bedrock models.
 
 ### What the pinned source says
 
@@ -577,13 +591,13 @@ Everything here was read in agent-swarm v2.10.0, the tag
   cross-provider fallback. Bedrock needs nothing from it either: Bedrock
   authenticates through the AWS credential chain, which is the whole point of
   Part A.
-- **Verified: two internal callers almost certainly do, and neither is the
-  "fallback path".** agent-swarm's `internal-ai` layer resolves a credential by
+- **Verified: two internal callers do, and neither is the "fallback path".**
+  agent-swarm's `internal-ai` layer resolves a credential by
   walking `openrouter → anthropic → openai → openai-codex → claude-cli`
   (`src/utils/internal-ai/credentials.ts`, `CREDENTIAL_KIND_PRECEDENCE`), and
   this swarm's secret has none of `OPENROUTER_API_KEY`, `OPENAI_API_KEY` or
   `CLAUDE_CODE_OAUTH_TOKEN`. So Anthropic is the only kind it can satisfy. Two
-  callers reach that path and neither is gated by a flag:
+  callers reach that path:
   - **Session summarisation, in the worker.** `summarizeSessionForPi` runs on
     `session_shutdown` (`src/providers/pi-mono-extension.ts`) unless
     `SKIP_SESSION_SUMMARY` is set, which this swarm does not set. It calls
@@ -602,19 +616,19 @@ Everything here was read in agent-swarm v2.10.0, the tag
 
   Both return a graceful no-op when no credential resolves (`completeStructured`
   returns `null`; `session_summary` logs "summarizer returned no result"). So
-  deleting the key would not break anything loudly — it would silently stop
-  writing session summaries and stop titling new tasks. **That is the finding
-  that makes this a step rather than a cleanup**, and it is why deleting the key
-  is not the same change as "the agents don't use it".
+  deleting the key does not break anything loudly — it silently stops writing
+  session summaries and stops titling new tasks, which is why step 7 flips the
+  switches *first*: an intended stop is a decision, and the same stop by accident
+  is a bug that takes a day to find.
 
   Note what is *not* a consumer: **workflow LLM nodes reject an Anthropic
   credential outright** — `resolveWorkflowLlmConfig` accepts only `openrouter`
   and `openai` kinds and throws otherwise (`src/workflows/executors/workflow-llm.ts`).
   So the README's "api service … fallback path" is neither of the two real
-  callers, and the sentence to write later is a different one.
-- **Verified, and until decision 3 was reversed it was the reason this is a gate:**
-  the key is load-bearing for the *credential check* even though no agent uses an
-  Anthropic model. `checkPiMonoCredentials` maps `MODEL_OVERRIDE` to required
+  callers, and correcting that sentence is part of step 9.
+- **Verified, and until decision 3 was reversed it was the reason this looked
+  blocked:** the key is load-bearing for the *credential check* even though no
+  agent uses an Anthropic model. `checkPiMonoCredentials` maps `MODEL_OVERRIDE` to required
   keys, and `fireworks-us/…` is not a provider it recognises: `modelToCredKeys`
   returns `null` for it, which selects the permissive case — "any one of
   `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENAI_API_KEY`"
@@ -630,27 +644,31 @@ Everything here was read in agent-swarm v2.10.0, the tag
   The Bedrock branch is checked above the permissive one and returns
   `satisfiedBy: "sdk-delegated"` on a successful probe, so the readiness check is
   answered by the AWS credential and never reaches the list that names
-  `ANTHROPIC_API_KEY`. That is why step 4 comes before step 8 and not after: the
+  `ANTHROPIC_API_KEY`. That is why step 4 comes before the key's removal: the
   key's last load-bearing job in the worker is discharged by an IAM role, and the
   fix for #491 is the same change that lets the key go.
 
-So removing the key is still two problems, and they now have different shapes. The
-readiness half is solved by Part A. The other half is not: two internal callers in
-`internal-ai` resolve an Anthropic credential, and **neither can be repointed at a
-Bedrock model**, because `internal-ai` has no Bedrock credential kind in v2.10.0
-and the api container has no AWS access at all
+So removing the key is two problems. The readiness half is solved by Part A. The
+other half is the two `internal-ai` callers, and it is solved by turning them off
+rather than by re-pointing them: `internal-ai` has no credential kind this
+account can satisfy, and the api container has no AWS access at all
 ([`../agent-swarm/README.md`](../agent-swarm/README.md), "AWS access from inside
-the swarm"). Part A makes the removal *possible*; it does not make it free.
+the swarm"), so a Bedrock model is not reachable from either caller. Part A makes
+the removal *possible*; the decision below makes it complete.
 
 ### The surfaces that carry it
 
+Every one of these goes. The key is being removed, not re-pointed, so there is no
+surface that keeps it.
+
 | Surface | What it does | What removal means |
 |---|---|---|
-| `agent-swarm/host/docker-compose.yml` | `ANTHROPIC_API_KEY` in `x-worker-env` (all three agents) and in the `api` service env | drop both lines |
+| `agent-swarm/host/docker-compose.yml` | `ANTHROPIC_API_KEY` in `x-worker-env` (all three agents) **and** in the `api` service env | drop both. The api line is the one PR #523 argued to keep; see below |
 | `agent-swarm/host/render-env.sh` | `ANTHROPIC_API_KEY` in `REQUIRED_KEYS`, and the render flushes *every* secret key into `.env` | drop it from `REQUIRED_KEYS`; the flush then has nothing to flush |
 | `agent-swarm/fill-secrets.sh` | asks for it ("3/5 Anthropic key"), and lists it in the final missing-key report | stop asking, stop listing, and prune it from an older secret the way the reverted change did |
-| `agent-swarm/README.md` | the "Where it runs" key list, the "Models" paragraph quoted above, and the "Bringing it up" step 2 | correct all three in the same PR |
+| `agent-swarm/README.md` | the "Where it runs" key list, the "Models" paragraph quoted above, and the "Bringing it up" step 2 | correct all three, and **name the two switches now off and why**, in the same PR |
 | `agent-swarm/host/scripts/fireworks-residency.test.ts` | asserts the key's presence in compose | invert the assertion; it is the test that will fail otherwise |
+| `DELEGATE_SWARM` secret | holds the value | prune it. This is the step that makes "no explicit Anthropic dependency" true rather than aspirational |
 
 And one that is *not* a surface of this secret, though it looks like one:
 
@@ -663,91 +681,153 @@ And one that is *not* a surface of this secret, though it looks like one:
   secret against that list on every apply, so removing the entry there would fail
   the deploy, and removing the key from that secret would break review.
   `deploy/delegate-secret.ts` is untouched by this plan, and a step that "removes
-  the Anthropic key" by editing it is wrong.
+  the Anthropic key" by editing it is wrong. This is the one Anthropic dependency
+  in the repository that stays, and it belongs to a different deployment with its
+  own review requirements.
 
-### The three trades
+### Decision: no explicit Anthropic dependency
 
-Step 8 is authorised by a choice the engineer makes, not by a mood and not by a
-model pin. **Pinning DeepSeek does not work, and it is worth recording why**, since
-it is the obvious first idea and it fails for a structural reason:
+**Decision, made by the engineer: the swarm carries no explicit Anthropic
+dependency. The two `internal-ai` features that resolve an Anthropic credential are
+turned off, and `ANTHROPIC_API_KEY` comes out of the secret. This is not an open
+choice with a recommendation attached; it is what the plan now does.**
 
-- `MEMORY_RATER_MODEL` does override the model *string* — `resolveRaterModelString`
-  returns `process.env.MEMORY_RATER_MODEL ?? MEMORY_RATER_DEFAULT_MODEL[kind]`
-  (`src/utils/internal-ai/models.ts`). But the credential **kind** is resolved
-  first, by `resolveCredential`, walking
-  `openrouter → anthropic → openai → openai-codex → claude-cli`
-  (`src/utils/internal-ai/credentials.ts`). The model string then has to belong to
-  that kind, and `kindForModelString` maps a provider *prefix* through
-  `PROVIDER_TO_KIND`, which lists only those four. **`fireworks` is not one of
-  them.** So the swarm's `FIREWORKS_API_KEY` is invisible to `internal-ai`: no
-  `fireworks-us/…` string can be resolved to a credential, and pinning one fails
-  at `kindForModelString` returning `null` rather than at the call. Setting
-  `MEMORY_RATER_MODEL` to a DeepSeek string therefore does not conjure a DeepSeek
-  credential — it changes the model asked of whichever credential *does* resolve,
-  which is the Anthropic one.
-- Pinning DeepSeek does work on **OpenRouter**, whose kind is first in precedence
-  and whose default is `openrouter/deepseek/deepseek-v4.1-flash`. That is a new
-  key, and the plan's "no new key" invariant is the one thing it is trying to
-  keep.
+It supersedes an earlier draft of this section that priced three options — keep the
+key, drop the features, or add an OpenRouter key — and leant towards keeping the
+key. That draft was written as if "the features have no replacement" were a reason
+to keep a credential. The engineer's answer is the better one: a credential the
+organisation has decided it does not want is not made acceptable by the features
+hanging off it, and the honest response to "there is no replacement yet" is to turn
+the features off and record the gap, not to keep the key alive indefinitely.
 
-So the lever that works without a new key is not a pin at all: **turn the two
-consumers off.** Session summarisation runs on `session_shutdown` unless
-`SKIP_SESSION_SUMMARY` is set; task auto-titles are gated by
-`TASK_AUTO_TITLE_ENABLED` and default to `true`. Setting `SKIP_SESSION_SUMMARY=1`
-and `TASK_AUTO_TITLE_ENABLED=false` removes both consumers, which is what would
-let `ANTHROPIC_API_KEY` go with step 4's readiness fix in place.
+#### Why Bedrock is not the answer here
 
-That leaves three trades, and they are the decision step 8 records:
+This is the question the decision turns on, and the answer is **no**. Bedrock is
+not a supported credential source for `internal-ai` at agent-swarm v2.10.0, and the
+reasons are structural rather than configuration:
 
-| Trade | Keeps | Costs |
-|---|---|---|
-| **A. Keep the key** | session summaries, task titles, no new credential | the key this plan set out to remove, still in every worker's env and the api's |
-| **B. Turn both features off** | no Anthropic key, no new key | no session summaries, no generated task titles |
-| **C. Add an OpenRouter key** | both features, drops the Anthropic key | a different long-lived API key, so "no new key" is gone |
+- **`CredentialKind` is a closed union with no Bedrock member.** It is
+  `"openrouter" | "anthropic" | "openai" | "openai-codex" | "claude-cli"`
+  (`src/utils/internal-ai/models.ts`). `resolveCredential` walks
+  `CREDENTIAL_KIND_PRECEDENCE` and can only ever return one of those five, so it
+  can never hand `completeStructured` a Bedrock credential. There is nothing to
+  configure — the type has no place to put one.
+- **`PROVIDER_TO_KIND` maps only those provider prefixes.** `kindForModelString`
+  returns `null` for anything else, `DEFAULT_MODEL` and
+  `MEMORY_RATER_DEFAULT_MODEL` are `Record<CredentialKind, string>` with an entry
+  per member and no more, and `credentials.ts`'s `resolveKind` switches on exactly
+  those five. An `amazon-bedrock/…` model string is not merely unwired; it has no
+  kind to belong to.
+- **`src/utils/internal-ai/register-bedrock.ts` looks like the missing piece and is
+  not.** Its own header says what it is: a Bun `--compile` bundler workaround. pi-ai
+  loads its Bedrock provider through a lazy `import("./amazon-bedrock.js")` that the
+  compiled binary cannot resolve ("Cannot find module './amazon-bedrock.js' from
+  '/$bunfs/root/agent-swarm'"), and the module calls `setBedrockProviderModule` to
+  wire it statically. It adds no credential kind, resolves no credential, and is not
+  a supported path for `internal-ai` calls. **Recorded explicitly because finding
+  that file is exactly how someone concludes Bedrock *is* supported and is wrong** —
+  it is a packaging fix for the harness's own model calls, one layer below the
+  abstraction this section is about.
 
-**The cost of B, stated plainly.** Summaries are what feed memory: the session
-summary is POSTed to `/api/memory/index` at shutdown and is the only record of
-what a long session learned, and `MEMORY_RATERS` ratings ride on the same call.
-With it off, a long session leaves nothing behind beyond its transcript, so the
-memory and ranking path degrades exactly where it matters most — the sessions with
-the most context to lose. Task titles are smaller: a task keeps its prompt as the
-display title, which is what the sidebar falls back to, so B costs readability
-rather than behaviour. Both losses are *silent*, which is the part worth
-engineering around: whichever trade is chosen, the README should say which
-features are off and why, because otherwise the next reader sees absent summaries
-and assumes a bug.
+And the readiness work does not change this. `BEDROCK_AUTH_MODE=sdk` makes a
+worker's `pi` credential check pass via `satisfiedBy: "sdk-delegated"` (decision
+3), which is what lets the key leave the *worker*. It does not reach `internal-ai`,
+which is a separate layer inside both the worker and the api with its own closed
+list of credential kinds. Two different questions that happen to involve the same
+account: "can this harness authenticate" is answered by the probe, "can
+`internal-ai` make a structured call" is answered by `CredentialKind`.
 
-**What this plan recommends: A, for now**, with the recommendation held loosely.
-The reasoning is that B trades a credential for a feature that has no
-replacement, and the replacement exists but is not in this repository — an
-`internal-ai` credential kind that this account can satisfy. If someone is willing
-to do that upstream work, B becomes correct and A becomes the interim. C is the
-weakest of the three: it keeps both features and drops the Anthropic key, but it
-does so by adding the exact kind of long-lived credential this plan exists to
-stop carrying, and it adds it to solve a problem the account's IAM already
-solves for the worker. **The choice is the engineer's**, and step 8 records which
-was made and why — that is the whole point of the gate, not this paragraph's
-lean.
+#### What is turned off, and what it costs
 
-Two checks that are not trades but prerequisites for any of them:
+Two switches, both verified at v2.10.0, both environment variables that this repo
+already passes through — no agent-swarm change is needed to turn either off.
 
-- **Do the callers actually run?** The code path is unconditional, but the
-  evidence is in the swarm: rows in the memory index with
-  `source: "session_summary"`, `session_summary …` lines in the worker streams, and
+**Worker: `SKIP_SESSION_SUMMARY=1`.** Gates the shutdown summariser at
+`src/providers/pi-mono-extension.ts:763-766`, which logs
+`session_summary skipped (pi): SKIP_SESSION_SUMMARY is set`. It is read through
+`isSessionSummarySkipped` → `parseEnvFlag`, so any of `1`/`true` works. Off, the
+worker does not call `summarizeSession` at all, and with it goes the
+`POST /api/memory/index` at shutdown and the `MEMORY_RATERS` ratings that ride on
+the same call.
+
+**Api: `TASK_AUTO_TITLE_ENABLED=false`.** Gates `startTaskAutoTitleListener`;
+`isTaskAutoTitleEnabled` uses `parseEnvFlag(env.TASK_AUTO_TITLE_ENABLED, true)`
+(`src/be/task-auto-title-listener.ts:10, 26-28`), so it defaults on and reads the
+flag per event, meaning a config reload applies without a restart. This is a
+swarm-config value rather than only a container env, since the api reads
+`process.env` that `loadGlobalConfigsIntoEnv` hydrates.
+
+**The cost of losing summaries, stated plainly.** The session summary is the only
+record of what a long session learned: it is what lands in the memory index, and
+the `MEMORY_RATERS` ratings that rank memories later are produced from the same
+call. With it off, a long session leaves its transcript and nothing else, so the
+memory and ranking path degrades **exactly where there is the most context to
+lose** — the long, expensive sessions that most needed a summary. Re-reading the
+transcript is the fallback and it is a worse one: transcripts are large, and
+memory is what makes them retrievable rather than merely stored.
+
+**Task titles cost almost nothing.** A task keeps its prompt as the display
+title, which is what the sidebar already falls back to when no title was
+generated (`task-auto-title-listener.ts` says so in its header: "a failed or
+skipped generation changes nothing visible"). So this one is readability, not
+behaviour: untitled tasks show a prompt fragment where a summary line would be.
+
+**Both losses are silent, and that is the part to engineer around.** Neither
+writes an error, because both return a graceful no-op when there is nothing to
+call with; a missing summary looks like a memory feature that never fired, and an
+untitled task looks like one somebody forgot to name. `agent-swarm/README.md` must
+name both switches, what is off, and why, in the same PR that removes the key —
+otherwise the next reader debugs a bug that is a decision.
+
+#### The replacement that does not exist yet
+
+The durable fix is not config: it is an `internal-ai` credential kind this account
+can actually satisfy — Bedrock, or a `fireworks` kind reading `FIREWORKS_API_KEY`,
+which the swarm already holds. Either way it means a member on `CredentialKind`, an
+entry in `PROVIDER_TO_KIND`, a `resolveKind` branch, defaults in `DEFAULT_MODEL`
+and `MEMORY_RATER_DEFAULT_MODEL`, and the tests that pin all of it
+(`src/tests/internal-ai/credentials.test.ts`, the same directory's `models.test.ts`,
+and `complete-structured.test.ts` / `summarize-session.test.ts` beside them).
+
+That is an upstream agent-swarm change, not something ops can enable by config, and
+**it is unowned** — no step in this plan does it, and nothing here assumes it
+arrives. Recorded so the gap has a name and the next person to want summaries back
+starts from a design rather than from re-adding the key. If it does land, turning
+the two switches back on is the whole reversal.
+
+#### Consequence for the key
+
+With both consumers off, `ANTHROPIC_API_KEY` has **no remaining consumer anywhere in
+the swarm**: not the workers (which run Fireworks, and whose readiness is satisfied
+by the Bedrock probe), not the api (whose only use of it was task titles), not
+`internal-ai` in either process. So it comes out of *the secret*, not merely out of
+the container env — the difference matters, because a key left in `DELEGATE_SWARM`
+is one `render-env.sh` run away from reappearing in `.env` and one revert away from
+reappearing in a container.
+
+**This reverses what PR #523 currently assumes.** #523 keeps the key on the api
+service, with a comment saying it "Stays here and only here" because removing it
+"silently disables generated task titles". That sentence was correct when written
+and is now the *intent* rather than a hazard: titles going away is the decision, not
+the accident. Steps 8 and 9 name #523 so the two changes agree, and the api's line
+and that comment come out with the rest.
+
+#### Two checks before the removal
+
+They no longer decide anything — the decision is made — but they say what to
+expect and what else might need attention:
+
+- **Are the callers producing output today?** Rows in the memory index with
+  `source: "session_summary"`, `session_summary …` in the worker streams,
   `[task-title] … via anthropic/claude-haiku-5-5` in the api stream. If they are
-  not running today, then B costs nothing *now* and the question becomes why they
-  are already dead — which is worth knowing before attributing the loss to this
-  change.
-- **Does the swarm set the key anywhere outside the secret?** `set-config` at
-  agent scope, a live script, a skill. The secret and this repository are not the
-  whole surface, and a key in swarm config survives every deploy.
-
-The order, whichever trade is chosen: change the repo (compose, render-env,
-fill-secrets, README, the test), deploy, confirm the stack and a worker both come
-up healthy and a Fireworks task runs, and only after that prune the key from the
-secret — the reverse order leaves a window where the container env and the secret
-disagree and the failure looks like a credential bug. With trade A or C the key
-stays in the secret and only the README changes.
+  already dead, the loss is smaller than this section assumes, and *why* they are
+  dead is worth knowing before the key goes; if they are alive, expect both to
+  stop and expect nobody to notice until somebody looks.
+- **Does the swarm set the key anywhere outside the secret?** `set-config` at agent
+  scope, a live script, a skill. The secret and this repository are not the whole
+  surface, and a key in swarm config survives every deploy — so it has to go too,
+  or the "no explicit Anthropic dependency" claim is false in a place nobody
+  greps.
 
 ## What is NOT in scope
 
@@ -762,10 +842,10 @@ stays in the secret and only the README changes.
 - **No model other than the two named.** Not the other `WORKBENCH_MODELS`
   entries, not a `us.` profile of either of these, not a "spare" model for
   testing. A third model is an edit to this plan.
-- **No new secret or API key.** Part A adds none, and Part B's preferred trade
-  removes one. Trade C, which would add an `OPENROUTER_API_KEY`, is the exception
-  the gate exists to weigh — it is not this plan's default and it gives up this
-  invariant if chosen.
+- **No new secret or API key.** Part A adds none, and Part B removes one. Adding
+  an OpenRouter key to keep the two `internal-ai` features alive was considered and
+  is not what the engineer decided: it would swap one long-lived credential for
+  another, which is the thing this plan exists to stop.
 - **No change to the default model**, to `HARNESS_PROVIDER`, or to the
   `fireworks-us` provider block and its residency rules. The tier mapping changes
   which model a *tiered* task gets; an untiered one is untouched.
@@ -839,7 +919,18 @@ kept, with the argument that defeated them, because the argument for leaving
   `kindForModelString` maps a provider prefix through `PROVIDER_TO_KIND`, which has
   no `fireworks` entry. The swarm's `FIREWORKS_API_KEY` is invisible to
   `internal-ai`, so a DeepSeek pin changes the model asked of the Anthropic
-  credential rather than replacing it. ("The three trades".)
+  credential rather than replacing it. ("Why Bedrock is not the answer here".)
+- **Point the two `internal-ai` callers at a Bedrock model instead.** The same
+  structural wall: `CredentialKind` has no Bedrock member, so there is no path at
+  all — not a misconfiguration. (Part B.)
+- **Keep the key because the features have no replacement.** This was the earlier
+  draft's lean, and the engineer overruled it: a credential the organisation has
+  decided against is not made acceptable by the features hanging off it. Turn them
+  off, record the gap. (Part B.)
+- **Swap in an OpenRouter key to keep both features.** It works — `openrouter` is
+  first in credential precedence and its default is a DeepSeek model — but it keeps
+  a long-lived provider key in the secret, which is the thing being removed rather
+  than the vendor.
 - **Remove the Anthropic key now, on the strength of "no agent uses it".** That
   was PR #491, and it took the swarm's credential check down in production. The
   sentence in the README is about agents; the key also answers the `pi` readiness
@@ -1042,7 +1133,8 @@ than restate it.
    - The readiness path, which is the one that matters most: with
      `ANTHROPIC_API_KEY` removed from a worker's env, the worker must still report
      ready (`satisfiedBy: "sdk-delegated"`). That is the single observation that
-     authorises step 8.
+     authorises step 8 — if it fails, stop there rather than turning features off
+     for a key that cannot go.
    - **What the probe enumerated**, recorded verbatim: the model count and the ids
      it returned. It is wider than the two-model invoke grant (decision 4, "What
      the reads do not buy"), and the size of that gap decides whether the picker
@@ -1072,61 +1164,61 @@ than restate it.
    fails on a model this swarm cannot authenticate, which is the state every tier
    is in today.
 
-7. **Which of the three trades.** Investigation, no code change, and no PR is
-   required unless the answer belongs in the repo. Establish the two facts under
-   "The three trades" with evidence rather than inference: whether the summariser
-   and the title generator are actually running (memory-index rows,
-   `[task-title] … via anthropic/claude-haiku-5-5` lines, `session_summary skipped`
-   lines), and whether swarm config sets the key anywhere outside the secret. Then
-   put trades A, B and C to the engineer with the costs already written, and record
-   which one applies.
+7. **Turn the two `internal-ai` features off.** `SKIP_SESSION_SUMMARY=1` on the
+   workers (`x-worker-env` in `agent-swarm/host/docker-compose.yml`) and
+   `TASK_AUTO_TITLE_ENABLED=false` where the api reads it — swarm config, since the
+   api hydrates `swarm_config` into `process.env` and `isTaskAutoTitleEnabled`
+   reads the flag per event. Both land with the reason written next to them, so the
+   next reader sees a decision rather than a missing feature.
 
-   The pinned-source findings are already known and are not to be re-derived:
-   `internal-ai` resolves an Anthropic credential for both callers because
-   `fireworks` is not a credential kind, and the readiness check — which was the
-   other reason the key could not go — is now satisfied by the probe from step 4.
+   This is the step that leaves `ANTHROPIC_API_KEY` with no consumer, so it comes
+   before step 8 and not with it: removing the key first would leave two callers
+   resolving nothing and no explanation in the diff.
 
-8. **Remove the key, or record why it stays.** Whichever trade step 7 chose:
+8. **Remove the key from every surface, then from the secret.** Compose — **both**
+   the worker env and the api service env — `render-env.sh`'s `REQUIRED_KEYS`,
+   `fill-secrets.sh` (the prompt and the final missing-key report), the README's
+   three mentions, and the assertion in `fireworks-residency.test.ts`. **Not**
+   `deploy/delegate-secret.ts`, which is the pr-reviewer stack's key list and a
+   different secret.
 
-   - **Trade A, keep it:** name the callers and the surface. The README's sentence
-     becomes true and specific — the worker's session summary and the api's task
-     titles resolve an Anthropic credential, and nothing else does — instead of the
-     current "api service and fallback path", which points at the one caller that
-     rejects it. No code changes; the key stays in the secret.
-   - **Trade B, turn the features off:** add `SKIP_SESSION_SUMMARY=1` and
-     `TASK_AUTO_TITLE_ENABLED=false` to the container env (and to
-     `agent-swarm/README.md`, saying plainly that summaries and titles are off and
-     why), then remove the key from compose (both places), `render-env.sh`'s
-     `REQUIRED_KEYS`, `fill-secrets.sh`, the README's three mentions, and the
-     assertion in `fireworks-residency.test.ts` — one PR. **Not**
-     `deploy/delegate-secret.ts`, which is the pr-reviewer stack's key list and a
-     different secret.
-   - **Trade C, add OpenRouter:** a new `OPENROUTER_API_KEY` in the secret, which
-     makes the Anthropic one removable and keeps both features. The plan's "no new
-     key" invariant goes with it, and that should be said in the same sentence.
+   **This lands after #523 and reverses its api line.** #523 deliberately keeps
+   `ANTHROPIC_API_KEY` on the api service with a comment saying it "Stays here and
+   only here" because removing it "silently disables generated task titles". That
+   is now the intent: titles go away, on purpose, with the switch flipped in step 7
+   rather than the key simply vanishing. The comment goes with the line, and its
+   replacement should say the listener is off and where the decision is recorded.
 
-   Then deploy, confirm the stack and a worker are healthy, that a worker reports
-   ready with no `ANTHROPIC_API_KEY`, and that a Fireworks task runs end to end —
-   and only after that prune the key from `DELEGATE_SWARM` (`fill-secrets.sh` has
-   the prune pattern the reverted change wrote). The reverse order leaves a window
-   where the container env and the secret disagree and the failure looks like a
-   credential bug.
+   Then deploy and confirm three things before touching the secret: the stack comes
+   up, a worker reports ready with no `ANTHROPIC_API_KEY` (the probe satisfying it
+   from step 4), and a Fireworks task runs end to end. Only then prune the key from
+   `DELEGATE_SWARM` — `fill-secrets.sh` has the prune pattern the reverted change
+   wrote. The reverse order leaves a window where the container env and the secret
+   disagree and the failure looks like a credential bug.
+
+9. **Record the gap in `agent-swarm/README.md`.** Name the two switches, what each
+   was, and what is lost: no session summaries, so the memory index stops receiving
+   them and the `MEMORY_RATERS` ratings that ride on the same call stop, which is
+   felt on long sessions; task titles fall back to the prompt, which is visible and
+   harmless. Say that the fix is an `internal-ai` credential kind in agent-swarm and
+   that it is unowned — **not** that it is blocked on this plan. A reader who finds
+   summaries missing should land on this paragraph, not on a bug report.
 
 ## Open questions
 
-- **Whether the two internal callers are live, and which trade follows.**
-  Step 7's answer. It decides whether Part B is a deletion, a feature removal or a
-  precise paragraph. It cannot be read from the repository: the code path is
-  unconditional, so the evidence is in the swarm's own rows and log streams.
+- **How much the loss costs in practice.** Not a blocker — the decision is made —
+  but worth measuring once the switches are on: how often session summaries were
+  being written, and whether memory retrieval noticeably worsens on long sessions.
+  Step 9's README paragraph is where that observation would land if it turns out to
+  be worth knowing.
 - **Whether `internal-ai` should gain a credential kind this account can reach.**
   Today it knows `openrouter`, `anthropic`, `openai`, `openai-codex` and
   `claude-cli`, and the swarm has two credentials in play: Fireworks, which it does
-  not model, and Anthropic. A kind that resolves through the AWS chain — or a
-  `fireworks` kind that reads `FIREWORKS_API_KEY` — would let the summariser and
-  the titler keep working with no new key. It is an agent-swarm change (a
-  pinned-tag bump, or an upstream PR), not an ops one, and it is the only path that
-  turns trade B into trade A's feature set. Recording it here so the choice in step
-  7 is a real one rather than "the key stays, then".
+  not model, and Anthropic, which is going. A kind that resolves through the AWS
+  chain — or a `fireworks` kind that reads `FIREWORKS_API_KEY` — would bring both
+  features back with no new key. It is an agent-swarm change (a pinned-tag bump, or
+  an upstream PR), not an ops one, and it is **unowned**: no step here does it, and
+  turning the two switches back on is the whole reversal when it exists.
 - **Whether the probe's model list is a picker problem.** Step 5 records what the
   probe enumerated. `ListFoundationModels` reports what exists in a region, not
   what this role may invoke, so the picker can offer a model that fails at
