@@ -18,7 +18,9 @@
   "triedLog": ".hill-climb/{run_id}.md",
   "readme": "delegate/review/eval/README.md",
   "mine": "npm run -s review:mine",
-  "innerLocal": "npm run -s review:expect -- --case {case} --split tune --runs 1",
+  "arms": "npm run -s review:arms -- --arms {arms} --base {base} --out {armsOut} [--case {cases}] [--targets {cases}]",
+  "armsDir": "../ops-arms/{run_id}-{n}",
+  "armsOut": "~/delegate-lab/{run_id}",
   "dryRun": "gh workflow run delegate-eval-run.yml --ref main -f mode=dry-run -f branch={branch} -f run_id={run_id}",
   "inner": "gh workflow run delegate-eval-run.yml --ref main -f mode=inner -f branch={branch} -f cases={cases} -f run_id={run_id} -f budget_usd={budget_usd}",
   "tune": "gh workflow run delegate-eval-run.yml --ref main -f mode=tune -f branch={branch} -f targets={cases} -f run_id={run_id} -f budget_usd={budget_usd}",
@@ -30,6 +32,11 @@
     "gate": "gate.json: pass, regressions, targetsMissed, costRatio, costOver, cases (tune only), holdout {total, passed, regressions}"
   },
   "holdoutPerCaseReadable": false,
-  "frozen": ["judge model", "judge rubric", "expected-result cases and manifest", "holdout split"],
+  "frozen": [
+    "judge model",
+    "judge rubric",
+    "expected-result cases and manifest",
+    "holdout split"
+  ],
   "budgetUsd": 200
 }
