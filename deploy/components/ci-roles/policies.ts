@@ -703,6 +703,42 @@ const pulumiBackendReadStatements = (projects: string[]): PolicyStatement[] => [
   },
 ];
 
+// omni's `packages/vercel-config` apply. `vercel-config.yml` runs in the
+// `production` environment for its Vercel token, so its job presents the
+// environment subject, not the main ref, and the shared deploy role does not
+// trust it. A role of its own rather than widening that one: the shared role
+// carries AdministratorAccess, and every other omni workflow in `production`
+// would get it too. Here the `job_workflow_ref` pin holds the subject to one
+// workflow file on `main`, whatever else runs in that environment.
+export const githubActionsVercelConfigDeployTrust: TrustPolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub":
+            "repo:thegoodparty/omni:environment:production",
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            "thegoodparty/omni/.github/workflows/vercel-config.yml@refs/heads/main",
+        },
+      },
+    },
+  ],
+};
+
+// State and passphrase only. The program calls Vercel with a Vercel token and
+// nothing in AWS.
+export const githubActionsVercelConfigDeploy: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: pulumiBackendStatements("vercel-config"),
+};
+
 // Correction to an earlier version of this comment, which said Organizations
 // actions "are not resource-scopable in any useful way" and that the API
 // takes "*" for the calls we make. That is true only of `CreateAccount`.
@@ -1978,12 +2014,19 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       // `stacks/gp-api/*`, whose `.json.bak` files still hold the Aurora
       // master passwords, and this role has no `s3:GetObjectVersion`
       // anywhere. A preview takes no state lock and writes no state.
+      //
+      // The third is omni's `vercel-config-diff.yml`, which previews the one
+      // vercel-config stack under this role. That stack holds no secret by
+      // design (packages/vercel-config/AGENTS.md in omni). In this statement
+      // rather than one of its own because a new statement does not fit the
+      // inline policy quota's headroom (ci-roles-preview-deploy.test.ts).
       Sid: "DiffCheckpoints",
       Effect: "Allow",
       Action: ["s3:GetObject"],
       Resource: [
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+        `${BUCKET}/.pulumi/stacks/vercel-config/prod.json`,
       ],
     },
     {

@@ -29,6 +29,7 @@ const allowsWith = (action: string) =>
 const CHECKPOINTS = [
   "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-dev.json",
   "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-prod.json",
+  "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/vercel-config/prod.json",
 ];
 
 const DIFF_PROD_RESOURCES = [
@@ -152,8 +153,9 @@ describe("githubActionsPreviewDeploy", () => {
   // gp-api's dev and prod stacks share the project prefix, and their older
   // copies hold the Aurora master passwords under the shared passphrase.
   // Every write on the state bucket has to stop at the preview stack prefix,
-  // and the diff reads the two current checkpoints by exact name.
-  it("reaches gp-api's preview stacks in the state bucket, and reads two checkpoints", () => {
+  // and the diff reads the two current checkpoints by exact name, beside
+  // vercel-config's one.
+  it("reaches gp-api's preview stacks in the state bucket, and reads three checkpoints", () => {
     const objects = allows()
       .flatMap((s) => asList(s.Resource))
       .filter((r) => r.startsWith("arn:aws:s3:::goodparty-iac-state/"));

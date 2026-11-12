@@ -22,6 +22,8 @@ import {
   gpApiPreviewRoleBoundary,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
+  githubActionsVercelConfigDeploy,
+  githubActionsVercelConfigDeployTrust,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -317,8 +319,25 @@ export const createCiRoles = () => {
     policy: JSON.stringify(githubActionsPreviewDeploy),
   });
 
+  // omni's vercel-config apply. Pulumi state for that one project and the
+  // passphrase, nothing else in AWS. No protect, like the scoped roles above.
+  const vercelConfigDeployRole = new aws.iam.Role("githubActionsVercelConfigDeploy", {
+    name: "github-actions-vercel-config-deploy",
+    description:
+      "Pulumi state for omni's packages/vercel-config. Assumed only by vercel-config.yml on thegoodparty/omni main, in the production environment.",
+    assumeRolePolicy: JSON.stringify(githubActionsVercelConfigDeployTrust),
+    maxSessionDuration: 3600,
+  });
+
+  new aws.iam.RolePolicy("githubActionsVercelConfigDeployPolicy", {
+    name: "VercelConfigDeploy",
+    role: vercelConfigDeployRole.id,
+    policy: JSON.stringify(githubActionsVercelConfigDeploy),
+  });
+
   return {
     gpApiPreviewBoundary,
+    vercelConfigDeployRole,
     previewDeployRole,
     deployRole,
     deployPolicy,
