@@ -525,6 +525,18 @@ policy grants the other half.
   seems stuck. It sends with `allowDuplicate: true` because two
   waves posted together read as near-copies to the duplicate check.
 
+`clickup-comment-target` (`payload`, a ClickUp `taskCommentPosted` body)
+decides whether a comment mention needs an answer and where the answer goes,
+returning `{answer, reason, taskId, commentId, threadRootId, replyToId,
+authorId}`. It takes no token and makes no call, so a workflow hands it the
+webhook body and posts to whatever comes back, and our own comments and
+mentions that are only in a parent comment are not answered. ClickUp exposes
+one level of replies per comment thread, so an answer posted on the reply that
+mentioned us renders one level too deep and its author never sees it; the
+answer goes on the thread root, which is the comment itself when the mention
+was a top-level one. Its source is this file and the swarm's copy is the live
+one, like the hand-offs above.
+
 ### KV states
 
 `handoff:<outreachId>` is shared by the scripts and the skill:
