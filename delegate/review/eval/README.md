@@ -171,6 +171,11 @@ Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (re
 The dispatched hill-climb run only accepts prompt text. A change with new structure (a subagent, context injected into the bundle, a new tool) is measured locally instead: `review:expect` already replays whatever agent code is in the checkout it runs from, so each variant is a worktree on its own branch.
 
 ```sh
+# one worktree per arm, each with its own install, since review:arms runs tsx inside it
+git worktree add ../ops-arms/architect -b arm/architect origin/main
+(cd ../ops-arms/architect && npm ci)
+# ...make the structural change there and commit it
+
 # a real PR as a case, from GitHub alone (no S3), as production would have seen it at that sha
 npm run review:from-pr -- --pr 2977 --sha <reviewed sha> --out ./lab/bundles/omni-2977.bundle.json --mirror-dir ./lab/mirrors
 

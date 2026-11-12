@@ -35,7 +35,9 @@ full once; it defines the suites, the gate and the budget.
 - In the editable files, change only prompt text: the contents of string and template literals.
   Never add or change code, imports or `${...}` expressions. The candidate's code runs in the same
   process that writes its results, so code changes can corrupt the measurement. A change that
-  needs new structure (a new subagent, a tool list shape) goes to a human as a proposal.
+  needs new structure (a new subagent, a tool list shape) goes to a human as a proposal. Measure
+  it first with `review:arms` against main ("Local arms" in the `readme`) and put that table in
+  the proposal. It ships as an ordinary PR, never as a hill-climb PR.
 - One idea per branch and per PR. Change one thing at a time.
 - Never open a PR from a run that failed the gate. Never merge. A human approves and merges.
 - Stop at the budget. The default is the config's `budgetUsd`; a user-given budget replaces it. A
