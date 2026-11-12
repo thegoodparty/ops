@@ -37,6 +37,14 @@ const main = async () => {
   const runs = Number(flags.runs ?? 3);
   const concurrency = Number(flags.concurrency ?? 2);
   const parallelArms = Number(flags["parallel-arms"] ?? 3);
+  // Each arm replays with its own copy of the eval code and writes the
+  // results this checkout scores, so an arm that differs from it in the eval
+  // harness, the review pipeline or the dependencies could grade itself.
+  const scorer = resolve(__dirname, "..", "..", "..");
+  const scorerSha = execFileSync("git", ["-C", scorer, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+  const { neverTouch } = JSON.parse(
+    readFileSync(join(scorer, ".claude", "skills", "hill-climb", "targets", "delegate-pr-reviewer.json"), "utf-8"),
+  ) as { neverTouch: string[] };
   const arms = (flags.arms ?? "")
     .split(",")
     .filter(Boolean)
@@ -50,6 +58,17 @@ const main = async () => {
         throw new Error(`arm "${name}" has uncommitted changes under delegate/; commit them first`);
       }
       const sha = git("rev-parse", "HEAD");
+      let touched: string;
+      try {
+        touched = git("diff", "--name-only", scorerSha, sha, "--", ...neverTouch);
+      } catch {
+        throw new Error(`arm "${name}" cannot see the scorer's commit ${scorerSha.slice(0, 7)}; fetch it into the arm`);
+      }
+      if (touched) {
+        throw new Error(
+          `arm "${name}" differs from the scorer (${scorerSha.slice(0, 7)}) in paths an arm may not change:\n${touched}\nRebase the arm onto the scorer's commit, or keep the change out of those paths`,
+        );
+      }
       return { name, path: resolve(path), sha, dir: join(out, "runs", sha) };
     });
   if (arms.length === 0) throw new Error("--arms name=path[,name=path...] is required");

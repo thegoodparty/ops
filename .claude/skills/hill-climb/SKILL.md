@@ -12,10 +12,14 @@ smallest change). You never measure by opinion, and you never grade your own wor
 There are two ways to measure, with the same loop:
 
 - **Local (the default).** `review:arms` on this machine. Any change to the reviewer, prompt text or
-  structure. Use it whenever you have local credentials: `ANTHROPIC_API_KEY` or a Claude Code login,
+  structure. Use it when you have local credentials: `ANTHROPIC_API_KEY` or a Claude Code login,
   `gh` auth, and S3 read access to `REVIEW_BUCKET`.
 - **Dispatched.** The `delegate-eval-run.yml` workflow, with a per-run budget. Prompt text only. Use
-  it in the Delegate swarm, or when you have no local credentials.
+  it when you have no local credentials.
+
+In the Delegate swarm, always use the dispatched loop, even when local credentials are available.
+Only the workflow enforces the `editable` allowlist and the budget.
+
 
 ## Load the target config first
 
@@ -27,8 +31,10 @@ name another). Everything below uses its fields, never prose from memory: `edita
 
 ## Rules
 
-- Never touch `neverTouch` or anything in `frozen` in the checkout that scores. If the idea needs
-  such a change, stop and tell the human; it is not yours to make.
+- Never touch `neverTouch` or anything in `frozen`, in the checkout that scores or in an arm. If the
+  idea needs such a change, stop and tell the human; it is not yours to make. `review:arms` refuses
+  an arm whose commit differs from the scorer's in a `neverTouch` path, because each arm replays
+  with its own eval code.
 - The expected-result suite is the hard gate. Pairwise judging only ranks candidates. The judge model
   and rubric are frozen.
 - Never read holdout per-case outputs, and never try to infer them. Locally, holdout cases never run.
@@ -50,7 +56,8 @@ name another). Everything below uses its fields, never prose from memory: `edita
 3. The scorer is a clean worktree of `ref`, and it is also the `main` arm. Run every `arms` command
    from it. Its cases and scoring are what every arm is graded on, so never edit them.
 4. Each idea is an arm: a worktree at `armsDir` (with `{run_id}` and `n` filled) on a branch named by
-   `branchPattern`, made from the current best arm, with `npm ci` run inside it.
+   `branchPattern`, made from the current best arm, with `npm ci` run inside it. Its changes stay
+   out of `neverTouch` paths; structural changes under `delegate/agents/` are fine.
 5. Use `armsOut` (with `{run_id}` filled) as `--out` for the whole run. Results are kept per commit,
    so the best arm's runs carry over between rounds, and changed code always replays.
 6. Keep the load low: the defaults of `review:arms` are sized for a shared laptop.
@@ -97,7 +104,7 @@ name another). Everything below uses its fields, never prose from memory: `edita
 
 ## Dispatched loop
 
-For the Delegate swarm, or when you have no local credentials. These extra rules apply:
+Always in the Delegate swarm, and anywhere you have no local credentials. These extra rules apply:
 
 - Edit only files in `editable`, and change only prompt text: the contents of string and template
   literals. Never add or change code, imports or `${...}` expressions. The candidate's code runs in

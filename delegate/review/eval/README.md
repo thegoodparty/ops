@@ -16,6 +16,7 @@ npm run review:arms -- --arms main=.,idea=../ops-arms/idea --base main --out ~/d
 ```
 
 - **Results are kept per commit**, under `<out>/runs/<sha>`. An arm whose commit already has runs reuses them under any name, and changed code always replays. So keep one `--out` for a whole session. Uncommitted changes under `delegate/` are refused, because they would be filed under a commit that doesn't contain them.
+- **An arm may not differ from the scorer's commit in the hill-climb `neverTouch` paths** (`delegate/review/`, `delegate/framework/`, `.github/`, `package.json`, `package-lock.json`; the list is in `.claude/skills/hill-climb/targets/delegate-pr-reviewer.json`). Each arm replays with its own eval code and writes the results the scorer reads, so a change there could grade itself. Structural changes under `delegate/agents/` are fine. An arm made from an older main has to be rebased onto the scorer's commit.
 - **`--base <arm>` gates every other arm against that one.** A case the base passed on every run must not get worse. An arm that drops it gets `--runs` more runs and needs 5 of 6, so one unlucky run isn't a regression. `--targets a,b` names cases an arm must pass on every run. The verdict is printed under the table and written to `<out>/gate.json`.
 - `--case a,b` narrows to some tune cases. `--runs` (default 3), `--concurrency` (replays per arm, default 2) and `--parallel-arms` (default 3) set the load. Keep them low on a shared laptop.
 - `--mode score` re-renders the table and the gate from results already on disk, without replaying.
@@ -37,7 +38,7 @@ The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of th
 ## Other ways to run it
 
 - **`delegate eval` on a PR** (next section): CI runs the full expected-result suite against main, holdout included, plus a pairwise judge on `scenarios.json`. Use it once, on the PR, as the final check.
-- **Dispatched run** (`delegate-eval-run.yml`, below): the same gate in CI on a branch without a PR, for prompt-text changes only, with a per-run budget. It is how an agent without local credentials hill-climbs.
+- **Dispatched run** (`delegate-eval-run.yml`, below): the same gate in CI on a branch without a PR, for prompt-text changes only, with a per-run budget. It is how the Delegate swarm hill-climbs, always, and how any agent without local credentials does.
 - **`review:expect`**: the replay and scoring engine under all of the above, for one checkout at a time.
 - **`review:eval replay` and `judge`**: pairwise comparison of two result sets by a model judge, on recorded production reviews.
 
