@@ -37,12 +37,11 @@ x-agent-entrypoint: &agent-entrypoint
 x-worker-env: &worker-env
   ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
-  # No ANTHROPIC_API_KEY here, deliberately. Nothing a pi worker runs uses an
-  # Anthropic model, and the readiness check that used to be the one thing
-  # keeping the key here is now satisfied by the Bedrock probe instead (see
-  # BEDROCK_AUTH_MODE below). The api service still gets it, because the api's
-  # task auto-titles resolve their own credential chain; see the api service's
-  # environment block and "The Anthropic key" in agent-swarm/README.md.
+  # No ANTHROPIC_API_KEY, here or on any other service. Both things that used to
+  # read one are switched off below and on the api: pi session summaries in the
+  # worker, and task auto-titles in the api. internal-ai's CredentialKind is a
+  # closed union with no Bedrock member, so nothing this account holds could
+  # serve them; see "The Anthropic key" in agent-swarm/README.md.
   # The pi harness's own key for the ONE model it may run by default. render-env.sh
   # copies it from the secret; compose has to enumerate it or nothing passes it
   # into the container.
@@ -57,6 +56,15 @@ x-worker-env: &worker-env
   # key in swarm config on boot, so only the URL is set here.
   AGENT_FS_API_URL: http://agent-fs:7433
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
+  # Session summaries are off. The pi session_shutdown hook
+  # (src/providers/pi-mono-extension.ts) logs "session_summary skipped (pi):
+  # SKIP_SESSION_SUMMARY is set" and returns, so nothing is summarised and
+  # nothing is POSTed to /api/memory/index. That POST is what carried the
+  # MEMORY_RATERS ratings too, so ranking degrades for long sessions: nothing
+  # new is indexed to rank. This is the price of the Anthropic key going --
+  # internal-ai's credential kinds are openrouter|anthropic|openai|openai-codex|
+  # claude-cli, and this account holds none of them for a worker.
+  SKIP_SESSION_SUMMARY: ${SKIP_SESSION_SUMMARY:-1}
   # Git and gh authenticate as the GitHub App (delegate-gp[bot]) through the
   # gh-app-token helper that global-setup-script.sh installs.
   GITHUB_APP_ID: ${GITHUB_APP_ID:-}
@@ -263,14 +271,12 @@ services:
       - APP_URL=${APP_URL:-https://delegate-swarm.infra.goodparty.org}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - API_DRAIN_MAX_MS=${API_DRAIN_MAX_MS:-30000}
-      # Stays here and only here. The api server's own AI calls -- task
-      # auto-titles via internal-ai's resolveCredential -- run in this process
-      # and read this environment, not a worker's. It resolves the anthropic
-      # branch because this swarm sets no OpenRouter or OpenAI key. Removing it
-      # here silently disables generated task titles (titles fall back to the
-      # task prompt); it does not affect any agent, and it does not affect
-      # session summaries, which run in the worker.
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # No ANTHROPIC_API_KEY here: generated task titles are off instead. The
+      # listener (src/be/task-auto-title-listener.ts) reads this flag on every
+      # task.created event, so a reload applies without a restart. Titles fall
+      # back to the task prompt, which is what the sidebar and lists already
+      # show when a title is missing. Cosmetic, and the price of the key going.
+      - TASK_AUTO_TITLE_ENABLED=${TASK_AUTO_TITLE_ENABLED:-false}
       - EMBEDDING_API_BASE_URL=${EMBEDDING_API_BASE_URL:-http://tei:80/v1}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-local}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text-v1.5}

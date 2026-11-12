@@ -269,25 +269,33 @@ describe('agent-swarm inference residency', () => {
     const source = read(COMPOSE)
     assert.match(source, /^\s+FIREWORKS_API_KEY: \$\{FIREWORKS_API_KEY\}$/m)
     assert.match(source, /^\s+PI_CODING_AGENT_DIR: \$\{PI_CODING_AGENT_DIR:-\/workspace\/personal\/\.pi\}$/m)
-    // The worker carries no Anthropic key: pi's readiness check is satisfied
-    // by the Bedrock probe (BEDROCK_AUTH_MODE=sdk), which is the whole reason
-    // this is possible. The api service still gets it, for its own AI calls.
-    // See "The Anthropic key" in agent-swarm/README.md.
-    const workerEnv = source.split(/^x-worker-base:/m)[0]
-    assert.ok(workerEnv, 'docker-compose.yml no longer has an x-worker-env block')
-    // Match the key declaration, not the word: the comment above it names the
-    // variable on purpose, so a bare substring check would fail on prose.
+    // No Anthropic key anywhere: both features that read one are off, because
+    // internal-ai's CredentialKind has no Bedrock member and this account holds
+    // nothing else in that union. See "The Anthropic key" in agent-swarm/README.md.
+    // Match the key declaration, not the word: the comments name the variable
+    // on purpose, so a bare substring check would fail on prose.
     assert.ok(
-      !/^\s+ANTHROPIC_API_KEY:/m.test(workerEnv),
-      'the worker env must not carry ANTHROPIC_API_KEY; readiness comes from the Bedrock probe',
+      !/^\s+ANTHROPIC_API_KEY:/m.test(source) &&
+        !/^\s+- ANTHROPIC_API_KEY=/m.test(source),
+      'no service may carry ANTHROPIC_API_KEY; both consumers are switched off instead',
     )
-    // The probe is what provides that readiness, so it must stay set.
+    // Those off-switches are what make removing the key safe, so pin them.
+    // Session summaries POST to /api/memory/index and carry the MEMORY_RATERS
+    // ratings, so this one is the load-bearing loss.
+    assert.match(source, /^\s+SKIP_SESSION_SUMMARY: \$\{SKIP_SESSION_SUMMARY:-1\}$/m)
+    // Titles are cosmetic; tasks fall back to their prompt.
+    assert.match(source, /^\s+- TASK_AUTO_TITLE_ENABLED=\$\{TASK_AUTO_TITLE_ENABLED:-false\}$/m)
+    // The probe is what provides worker readiness, so it must stay set.
     assert.match(source, /^\s+BEDROCK_AUTH_MODE: \$\{BEDROCK_AUTH_MODE:-sdk\}$/m)
     // ...and AWS_REGION is load-bearing in that mode: without it the probe
     // returns ready:false with a set-region hint and the worker parks.
     assert.match(source, /^\s+AWS_REGION: \$\{AWS_REGION:-us-west-2\}$/m)
-    // The api service is the one caller that does use the key.
-    assert.match(source, /^\s+- ANTHROPIC_API_KEY=\$\{ANTHROPIC_API_KEY\}$/m)
+    // render-env.sh must not require the key from the secret either.
+    const required = read(RENDER_ENV)
+    assert.ok(
+      !/^\s+ANTHROPIC_API_KEY$/m.test(required),
+      'render-env.sh must not require ANTHROPIC_API_KEY from the secret',
+    )
   })
 
   it('marks the model as custom when sync-agent-config.sh writes it through the API', () => {

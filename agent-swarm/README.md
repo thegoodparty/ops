@@ -45,12 +45,11 @@ host; the next deploy overwrites them.
   before docker starts and formats it only if it is blank, so a replacement
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
-  with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
-  `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
-  `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
-  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login.
-  `ANTHROPIC_API_KEY` currently reaches only the api service, for task
-  auto-titles; see "The Anthropic key" under Models
+  with keys `API_KEY`, `CLICKUP_API_TOKEN`, `FIREWORKS_API_KEY`,
+  `GRAFANA_SERVICE_ACCOUNT_TOKEN`, `SECRETS_ENCRYPTION_KEY`,
+  `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and optionally the three
+  `OAUTH2_PROXY_*` keys that turn on Google login. No Anthropic key: see "The
+  Anthropic key" under Models for why it is gone and what is off instead
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -740,23 +739,59 @@ runs").
 
 ### The Anthropic key
 
-No agent runs an Anthropic model, and as of step 4 of `docs/swarm-bedrock.md`
-**the workers no longer receive `ANTHROPIC_API_KEY` at all**. It stays in the
-secret and in the api service's environment, where one caller still needs it.
+**There is no Anthropic key in the swarm, and no agent runs an Anthropic
+model** — the second part was already true and is now the reason for the first.
+`ANTHROPIC_API_KEY` is gone from every service, from `render-env.sh`, and from
+`fill-secrets.sh`. The two features that read it are switched off rather than
+re-pointed, because nothing this account holds can serve them.
 
-**What replaced it in the workers: the Bedrock readiness probe.** `pi`'s boot
+**Why off and not re-pointed at Bedrock.** agent-swarm's `internal-ai` layer
+resolves credentials from a closed set of kinds — `CredentialKind` in
+`src/utils/internal-ai/models.ts` is
+`openrouter | anthropic | openai | openai-codex | claude-cli`, with no Bedrock
+member. `register-bedrock.ts` is not a credential kind; it is a Bun
+`--compile` bundler workaround that wires pi-ai's Bedrock provider module
+statically so the compiled binary can resolve it. So the account's Bedrock
+credential — the only model credential the swarm holds — cannot satisfy
+`resolveCredential` at all. For this swarm the anthropic branch was the only one
+that ever resolved, and it is the branch being removed. Upstream would have to
+add a Bedrock credential kind before these features can come back on a
+credential this account actually has.
+
+**The two features, what turns them off, and what each costs:**
+
+- **Session summaries, in the worker — off via `SKIP_SESSION_SUMMARY=1`.** The
+  `session_shutdown` hook in `src/providers/pi-mono-extension.ts` checks the flag
+  first, logs `session_summary skipped (pi): SKIP_SESSION_SUMMARY is set` and
+  returns without summarising. The summariser POSTs its result to
+  `/api/memory/index`, and that same path carries the `MEMORY_RATERS` ratings.
+  So **this is the load-bearing loss**: nothing new is indexed as a
+  `session-summary` memory, and no ratings are posted, which degrades memory and
+  ranking over time — long sessions stop contributing what they learned. The
+  default `MEMORY_RATERS` does not include `llm`, so no LLM rating is lost
+  today, but enabling it would not work either.
+- **Task auto-titles, in the api — off via `TASK_AUTO_TITLE_ENABLED=false`.** The
+  listener (`src/be/task-auto-title-listener.ts`) reads the flag on every
+  `task.created` event, so a reload applies without a restart. A task then keeps
+  its prompt as its title, which is what the sidebar and task lists already show
+  when a title is missing. **This one is cosmetic.**
+
+Say a feature is wanted back: the switch is one variable, but the credential is
+the blocker, not the flag.
+
+**What did not change, and what replaced the key in the workers.** `pi`'s boot
 credential check (`checkPiMonoCredentials`, `src/providers/pi-mono-adapter.ts`)
-is what the key was actually holding up. With `BEDROCK_AUTH_MODE=sdk` set in
-`docker-compose.yml`, that function takes its Bedrock branch *before* the
-permissive "any one of ANTHROPIC/OPENROUTER/OPENAI" fallback, and a successful
-probe returns `ready: true` with `satisfiedBy: "sdk-delegated"`. That branch is
-taken whenever the variable is set, whatever `MODEL_OVERRIDE` says, so a worker
-running a `fireworks-us/...` model is still readied by the AWS credential. The
-permissive branch could never have done this job: it does not know
-`FIREWORKS_API_KEY`, which is the only model key a worker holds.
+used to be satisfied by `ANTHROPIC_API_KEY`, because its permissive branch
+accepts only `ANTHROPIC`/`OPENROUTER`/`OPENAI`/a registry key and does not know
+`FIREWORKS_API_KEY`. It is now satisfied by the Bedrock readiness probe: with
+`BEDROCK_AUTH_MODE=sdk` set in `docker-compose.yml`, that function takes its
+Bedrock branch *before* the permissive fallback, and a successful probe returns
+`ready: true` with `satisfiedBy: "sdk-delegated"`. The branch is taken whenever
+the variable is set, whatever `MODEL_OVERRIDE` says, so a worker running a
+`fireworks-us/...` model is still readied by the AWS credential.
 
-The probe calls `ListFoundationModels` and `ListInferenceProfiles`, which is
-why `delegate-swarm-bedrock` grants those two catalog reads
+The probe calls `ListFoundationModels` and `ListInferenceProfiles`, which is why
+`delegate-swarm-bedrock` grants those two catalog reads
 (`deploy-infrastructure/agent-swarm.ts`) on top of the invoke grant. The list it
 returns is also what makes the two Bedrock models pickable in the console.
 
@@ -765,42 +800,26 @@ probe parks the whole worker in credential-wait, Fireworks tasks included.**
 `BOOT_MAX_WAIT_SECONDS` defaults to waiting forever. A missing Marketplace
 agreement, a region that has not propagated, or an IAM edit that drops one of
 those reads takes every agent out of service even though `FIREWORKS_API_KEY` is
-fine. The rollback is to unset `BEDROCK_AUTH_MODE`, which restores the
-permissive branch — but that branch then needs a readiness satisfier again, and
-for a `fireworks-us/...` model that means `ANTHROPIC_API_KEY` back in the
-worker. The rollback is one variable, not a redeploy, but it is not free.
+fine.
 
 **`AWS_REGION` is load-bearing for the same reason.** The probe reads it and
 returns `ready: false` with a set-region hint rather than fabricating one, so
-without it the worker parks in exactly the state above. `render-env.sh` renders
-it and `docker-compose.yml` passes it into every worker.
+without it the worker parks exactly as above. `render-env.sh` renders it and
+`docker-compose.yml` passes it into every worker.
 
-**What still consumes the key, and what happens when it is gone:**
+**Rolling back is one variable, and it is no longer free.** Unsetting
+`BEDROCK_AUTH_MODE` restores the permissive branch, but that branch then needs a
+readiness satisfier again — and for a `fireworks-us/...` model that means putting
+`ANTHROPIC_API_KEY` back into the secret and the worker env, which is the state
+this change leaves. A worker that parks after a rollback is reporting exactly
+that.
 
-- **Task auto-titles, in the api.** `startTaskAutoTitleListener` runs in the api
-  server and resolves credentials from the api's own environment. With the key
-  there, titles are generated as before. This is the one live caller left, and
-  it is why the key stays in the secret and in the api service's environment.
-- **Session summaries and `llm` memory ratings, in the worker.** The
-  `session_shutdown` hook in `pi-mono-extension.ts` calls `summarizeSession`,
-  which goes through the same `resolveCredential` chain
-  (`openrouter → anthropic → openai → openai-codex → claude-cli`). A worker now
-  holds none of those credentials, so it returns `null` and the hook logs
-  "summarizer returned no result" and moves on. **Session summaries are
-  silently off for pi agents. So are `llm` memory ratings** — those are fetched
-  inside the same summarise path and gated on its result. The default
-  `MEMORY_RATERS` value is `implicit-citation,explicit-self`, which does not
-  include `llm`, so today this costs nothing; enabling `llm` would not work
-  until a credential is available in the worker. Upstream's own provider matrix
-  says so: "Bedrock session summaries and memory rating … Native Bedrock
-  support is not available yet."
-
-The ways back, which are the engineer's call and are recorded in
-`docs/swarm-bedrock.md`: keep an Anthropic key and the features, drop both the
-features and the key, or add an OpenRouter key (which `resolveCredential` would
-pick up first, in the worker and the api alike). This PR removes the key from
-the workers and leaves the secret, `fill-secrets.sh` and `deploy/delegate-secret.ts`
-alone.
+**Still true, and unrelated to the swarm:** the separate `DELEGATES` secret in
+the management account, which the `pr-reviewer` Fargate task uses, still holds
+and needs `ANTHROPIC_API_KEY`, because pr-reviewer runs Claude directly through
+the Anthropic Agent SDK (`delegate/agents/pr-reviewer.ts`, `model:
+"claude-opus-5-5"`). Do not remove it there. `deploy/delegate-secret.ts`
+describes that secret, not this one.
 
 ## MCP servers
 
@@ -882,7 +901,7 @@ The swarm starts with fresh state. In order:
    started.`
 2. **Fill the secret.** From this directory on a laptop:
    `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh`. It asks for the Slack,
-   Anthropic, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
+   Fireworks, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
    `SECRETS_ENCRYPTION_KEY` when the secret lacks them, and never prints
    either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
    stores. It ends by listing any required key still missing.
