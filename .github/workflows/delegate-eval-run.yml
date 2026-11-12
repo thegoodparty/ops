@@ -280,14 +280,18 @@ jobs:
         run: |
           gh auth setup-git
           args=(--mode replay --runs 3 --concurrency 5 --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main")
-          if [ "$MODE" = tune ]; then
-            npm run -s review:expect -- "${args[@]}" --split tune
-          else
-            # The replay prints each case id with its outcome, and gate mode
-            # runs holdout cases, so the log is withheld.
-            npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay.log" 2>&1 \
-              || { echo "::error::Main's replay failed; its log is withheld in gate mode."; exit 1; }
-          fi
+          # A second pass replays only the runs the first left incomplete, so
+          # a transient error does not cost a whole re-dispatch.
+          for pass in 1 2; do
+            if [ "$MODE" = tune ]; then
+              npm run -s review:expect -- "${args[@]}" --split tune
+            else
+              # The replay prints each case id with its outcome, and gate mode
+              # runs holdout cases, so the log is withheld.
+              npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay-$pass.log" 2>&1 \
+                || { echo "::error::Main's replay failed; its log is withheld in gate mode."; exit 1; }
+            fi
+          done
 
       # Three passes in a row are often luck, so a case main passed on every
       # run can regress only once main has 6 runs of it, here and earlier.
@@ -308,10 +312,12 @@ jobs:
             --base ./baseline --ids-out "$RUNNER_TEMP/main-short.txt"
           if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
             ids=$(cat "$RUNNER_TEMP/main-short.txt")
-            npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency 5 \
-              --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main-more" \
-              > "$RUNNER_TEMP/replay-more.log" 2>&1 \
-              || { echo "::error::Main's extra replay failed; its log is withheld."; exit 1; }
+            for pass in 1 2; do
+              npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency 5 \
+                --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main-more" \
+                > "$RUNNER_TEMP/replay-more-$pass.log" 2>&1 \
+                || { echo "::error::Main's extra replay failed; its log is withheld."; exit 1; }
+            done
           fi
 
       # Uploaded even when the replay failed, so the good runs still reach the
