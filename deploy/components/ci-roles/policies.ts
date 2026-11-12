@@ -35,10 +35,19 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
+// The deploy role. There is one deploy role, this one, for `main` and
+// production-environment runs, and one pull-request role,
+// `github-actions-preview-deploy`. A new workflow assumes one of the two. If
+// it needs more access, widen that role's policy, moving to a managed policy
+// when the inline one nears its size limit, rather than adding a role
+// (decided by swain, 2026-11-12). The other roles in ci-roles.ts predate the
+// rule; docs/deploy-role-trust.md, "One deploy role, one pull-request role",
+// lists them as consolidation candidates.
+//
 // Four repositories in two statements, and every subject is exact. Ops is
 // pinned to `main` and to one workflow file. omni, gp-terraform-dataplatform
-// and gpvpn share the second statement, pinned to `main`, with
-// gp-terraform-dataplatform's `production` environment beside its ref.
+// and gpvpn share the second statement, pinned to `main`, with omni's and
+// gp-terraform-dataplatform's `production` environments beside their refs.
 //
 // Why the ops statement pins `job_workflow_ref` too. `sub` is per-ref, not
 // per-workflow: every workflow on main presents the same subject, so a
@@ -62,8 +71,9 @@ export type TrustPolicyDocument = {
 // use `github-actions-preview-deploy` (gp-api previews, their teardown and
 // the infrastructure diff) and `github-actions-pulumi-plan`, and
 // dataplatform's plan uses the last. Every omni job left on this role runs on
-// `main`, by push, schedule or a dispatch from main, and declares no
-// environment, so it presents the main ref.
+// `main`, by push, schedule or a dispatch from main. Most declare no
+// environment and present the main ref; `vercel-config.yml` runs in
+// `production` and presents that environment.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -103,6 +113,11 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
           // statement holds them all.
           "token.actions.githubusercontent.com:sub": [
             "repo:thegoodparty/omni:ref:refs/heads/main",
+            // omni's `vercel-config.yml` applies in its `production`
+            // environment, which holds the Vercel token, so its job presents
+            // the environment instead of the ref. That environment admits
+            // only `main`, so this grants nothing beyond the main ref above.
+            "repo:thegoodparty/omni:environment:production",
             "repo:thegoodparty/gp-terraform-dataplatform:ref:refs/heads/main",
             // dataplatform's `tf-apply.yaml` runs in its `production`
             // environment, and a job in an environment presents the
@@ -1456,6 +1471,12 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // ---------------------------------------------------------------------------
 // The gp-api preview deploy role (step 6 of docs/deploy-role-trust.md)
 //
+// This is the one pull-request role. omni pull request runs that need AWS
+// assume it, and a new pull-request workflow does too: widen this policy, or
+// move part of it to a managed policy when the inline one is near its size
+// limit, rather than adding a role (decided by swain, 2026-11-12; see
+// `githubActionsPulumiDeployTrust` for the deploy half of the rule).
+//
 // Assumed by omni's `gp-api.yml` preview job and `gp-api-teardown-preview.yml`
 // on pull requests, which today assume the shared admin deploy role. Unlike
 // the plan and preview roles above, this one applies: a preview environment is
@@ -1978,12 +1999,19 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       // `stacks/gp-api/*`, whose `.json.bak` files still hold the Aurora
       // master passwords, and this role has no `s3:GetObjectVersion`
       // anywhere. A preview takes no state lock and writes no state.
+      //
+      // The third is omni's `vercel-config-diff.yml`, which previews the one
+      // vercel-config stack under this role. That stack holds no secret by
+      // design (packages/vercel-config/AGENTS.md in omni). In this statement
+      // rather than one of its own because a new statement does not fit the
+      // inline policy quota's headroom (ci-roles-preview-deploy.test.ts).
       Sid: "DiffCheckpoints",
       Effect: "Allow",
       Action: ["s3:GetObject"],
       Resource: [
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+        `${BUCKET}/.pulumi/stacks/vercel-config/prod.json`,
       ],
     },
     {
