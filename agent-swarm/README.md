@@ -45,10 +45,12 @@ host; the next deploy overwrites them.
   before docker starts and formats it only if it is blank, so a replacement
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
-  with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
+  with keys `API_KEY`, `CLICKUP_API_TOKEN`,
   `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
   `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
-  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login
+  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login. There
+  is no `ANTHROPIC_API_KEY` deliberately: every agent runs the Fireworks US
+  router and holds no Anthropic credential.
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -734,8 +736,11 @@ later date) is the same edit; there is no `-latest` US router to track it, which
 is why the dated id is pinned deliberately.
 
 `FIREWORKS_API_KEY` is a key in the `DELEGATE_SWARM` secret (see "Where it
-runs"). `ANTHROPIC_API_KEY` stays in the secret and in the worker env for the
-api service and as a fallback path, but no agent runs an Anthropic model.
+runs"). There is no `ANTHROPIC_API_KEY` in it: no agent runs an Anthropic
+model, and a task that pins one fails before its first turn instead of billing
+~9x. The older `delegate/` stack is a SEPARATE deployment in the serve account
+and still needs `ANTHROPIC_API_KEY` in its `DELEGATES` secret; the two secrets
+are not the same one.
 
 ## MCP servers
 
@@ -793,7 +798,7 @@ The swarm starts with fresh state. In order:
    started.`
 2. **Fill the secret.** From this directory on a laptop:
    `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh`. It asks for the Slack,
-   Anthropic, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
+   Fireworks, ClickUp and Grafana tokens, generates `API_KEY` and
    `SECRETS_ENCRYPTION_KEY` when the secret lacks them, and never prints
    either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
    stores. It ends by listing any required key still missing.
