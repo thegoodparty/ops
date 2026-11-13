@@ -77,21 +77,24 @@ describe("githubActionsPreviewDeployTrust", () => {
 
 describe("githubActionsPullRequestJobs", () => {
   const statements = githubActionsPullRequestJobs.Statement;
-  const actions = statements.flatMap((s) => ("Action" in s ? asList(s.Action) : []));
-  const resources = statements.flatMap((s) => asList(s.Resource));
+  const allowStatements = statements.filter((s) => s.Effect === "Allow");
+  const actions = allowStatements.flatMap((s) => ("Action" in s ? asList(s.Action) : []));
+  const resources = allowStatements.flatMap((s) => asList(s.Resource));
+  const deny = (sid: string) => {
+    const found = statements.find((s) => s.Sid === sid);
+    assert.ok(found, `no statement with Sid ${sid}`);
+    assert.equal(found.Effect, "Deny");
+    return found;
+  };
 
-  it("only allows", () => {
-    for (const s of statements) assert.equal(s.Effect, "Allow", s.Sid);
-  });
-
-  it("deletes nothing and receives nothing", () => {
+  it("allows no delete and no receive", () => {
     for (const action of actions) {
       assert.doesNotMatch(action, /Delete|Receive|\*/, action);
     }
   });
 
   it("writes E2E reports only under gp-webapp/", () => {
-    const writes = statements.filter(
+    const writes = allowStatements.filter(
       (s) =>
         "Action" in s &&
         asList(s.Action).includes("s3:PutObject") &&
@@ -103,11 +106,11 @@ describe("githubActionsPullRequestJobs", () => {
     );
   });
 
-  it("reaches only dev resources and the reports bucket", () => {
+  it("allows only dev resources, the reports bucket and dev Terraform state", () => {
     for (const r of resources) {
       assert.match(
         r,
-        /^arn:aws:s3:::gp-playwright-reports(\/gp-webapp\/\*)?$|-dev(\.fifo)?(\/|$)/,
+        /^arn:aws:s3:::gp-playwright-reports(\/gp-webapp\/\*)?$|-dev(\.fifo)?(\/|$)|^arn:aws:s3:::goodparty-terraform-state-us-west-2(\/\*\/dev\/terraform\.tfstate|\/shared\/slack-notifier\/terraform\.tfstate)?$/,
         r,
       );
     }
@@ -118,8 +121,56 @@ describe("githubActionsPullRequestJobs", () => {
     assert.deepEqual(sqs, ["sqs:GetQueueUrl", "sqs:SendMessage"]);
   });
 
-  it("puts nothing on *", () => {
+  it("allows nothing on *", () => {
     assert.ok(!resources.includes("*"));
+  });
+
+  // ReadOnlyAccess allows s3:GetObject on *. The deny's NotResource is the
+  // real list of what the role can read, so it has to hold every object an
+  // allow names, or that read breaks, and nothing else.
+  it("denies every object read but the ones the role's allows name", () => {
+    const allowed = [...githubActionsPreviewDeploy.Statement, ...statements]
+      .filter((s) => s.Effect === "Allow" && "Action" in s && asList(s.Action).includes("s3:GetObject"))
+      .flatMap((s) => asList(s.Resource))
+      .sort();
+    const objects = deny("DenyOtherObjects");
+    assert.deepEqual("Action" in objects ? objects.Action : undefined, ["s3:GetObject"]);
+    assert.deepEqual(asList(objects.NotResource).sort(), allowed);
+  });
+
+  it("keeps prod Terraform state and other projects' Pulumi state out of reach", () => {
+    const readable = asList(deny("DenyOtherObjects").NotResource);
+    for (const r of readable) {
+      assert.doesNotMatch(r, /\/prod\/terraform\.tfstate|dataplatform/, r);
+      if (r.startsWith("arn:aws:s3:::goodparty-iac-state/.pulumi/")) {
+        assert.match(
+          r,
+          /\/gp-api\/gp-api-pr-\*$|\/meta\.yaml$|\/gp-api-(dev|prod)\.json$|\/vercel-config\/prod\.json$/,
+          r,
+        );
+      }
+    }
+  });
+
+  it("denies every object version", () => {
+    assert.deepEqual(asList(deny("DenyObjectVersions").Resource), ["*"]);
+  });
+
+  it("reads one secret value, GP_API_DEV, even with ReadOnlyAccess", () => {
+    assert.deepEqual(asList(deny("DenyOtherSecretValues").NotResource), [
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    ]);
+  });
+
+  it("reads three SSM parameters, and no history or path", () => {
+    assert.equal(asList(deny("DenyOtherParameters").NotResource).length, 3);
+    assert.deepEqual(asList(deny("DenyParameterPathsAndHistory").Resource), ["*"]);
+  });
+
+  // Managed policies are capped at 6,144 characters, counted without
+  // whitespace. JSON.stringify emits none.
+  it("fits the managed policy quota", () => {
+    assert.ok(JSON.stringify(githubActionsPullRequestJobs).length < 6144);
   });
 });
 

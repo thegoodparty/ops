@@ -59,9 +59,9 @@ two. None is consolidated yet; each is its own change.
   `main`, chaining into the infrastructure account.
 - `github-actions-pulumi-preview`: ops `pull_request` runs, `pulumi-preview.yml`
   and the ECR Public login in `deploy.yml`.
-- `github-actions-pulumi-plan`: omni `gp-ai.yml`'s pull request Terraform
-  plan and gp-terraform-dataplatform's pull request plan. omni's pull request
-  ECR Public logins move to the pull-request role (below).
+- `github-actions-pulumi-plan`: gp-terraform-dataplatform's pull request
+  plan. omni's pull request Terraform plan and ECR Public logins move to the
+  pull-request role (below).
 - `github-actions-delegate-eval`: ops `delegate-eval.yml` and
   `delegate-eval-run.yml`.
 - `github-actions-delegate-eval-cache-push`: ops
@@ -99,6 +99,19 @@ pull-request role trusts omni's main ref as well, pinned by
 `job_workflow_ref` to `judge.yml` on main, and allows a four-hour session,
 which the sweep asks for so its credentials outlast the background runs it
 polls.
+
+**gp-ai's Terraform plan follows, the same three steps.** The plan reads
+whatever gp-ai's dev roots manage, which is why the plan role was built on
+`ReadOnlyAccess` rather than an enumerated list, and the pull-request role
+now carries it too. The plan role's denies come with it, adjusted for a role
+that also runs Pulumi previews. Each takes back what `ReadOnlyAccess` adds
+and the role's own allows do not grant: object reads outside a list derived
+from the allows, every object version, every secret value but GP_API_DEV,
+and every parameter but the passphrase and the diff's two Grafana tokens.
+Any omni pull request could already assume both roles, so the combined role
+reads no more than the two did between them. The plan role keeps
+gp-terraform-dataplatform, which is not an omni workflow, and loses omni's
+subject and state keys once omni has switched.
 
 ## Progress
 
