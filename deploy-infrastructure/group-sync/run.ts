@@ -37,10 +37,15 @@ import {
   isReservedTarget,
   type RemovalCapEvaluation,
 } from "./guards";
-import type { IdentityDirectory } from "./identity";
+import { resolveCreateUserName, type IdentityDirectory } from "./identity";
 import { emailRef, type Logger } from "./log";
 import { METRIC_NAMES, type Metrics } from "./metrics";
-import { SourceReadError, fetchSourceMembers, type DirectoryClient } from "./source";
+import {
+  SourceReadError,
+  fetchSourceMembers,
+  type DirectoryClient,
+  type DirectoryUserName,
+} from "./source";
 
 /**
  * A syntactically valid address. Deliberately not RFC 5322: the check is there
@@ -334,15 +339,38 @@ export const runPair = async (
 
     for (const email of result.toCreate) {
       try {
+        // The real name comes from the user's Google public profile, and only
+        // for users this run is about to create, so a converged pair makes no
+        // profile calls at all. Every failure is swallowed into "no name": the
+        // name is cosmetic, and a lookup that cannot read a profile must not be
+        // able to stop the add and remove passes below (see "Ordering" in
+        // docs/google-group-sync.md). The fallback in `createUser` keeps the
+        // request valid.
+        let name: DirectoryUserName | undefined;
+        try {
+          name = await directory.getUser({ userKey: email });
+        } catch (err) {
+          log("member.skipped", {
+            pairId: pair.id,
+            groupId: pair.targetGroupId,
+            memberType: "USER",
+            reason: "profile-lookup-failed",
+            domain: email.split("@")[1] ?? "",
+            error: errorDetail(err),
+          });
+        }
         // `createUser` re-resolves immediately before creating, and treats a
         // conflict-plus-resolve as success (see ./identity).
-        const userId = await identity.createUser(email);
+        const userId = await identity.createUser(email, name);
         userIds.set(email, userId);
         log("user.created", {
           pairId: pair.id,
           groupId: pair.targetGroupId,
           userId,
           emailRef: emailRef(email),
+          // Which path named this user, never the name itself: membership is
+          // personal data and the logs carry the domain only.
+          nameSource: resolveCreateUserName(email, name).source,
         });
       } catch (err) {
         counts.failed += 1;

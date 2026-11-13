@@ -119,7 +119,10 @@ delegation runs as a person.
 It is not a Super Admin. Its only role is **Groups Reader**: Directory → Users →
 the user → Admin roles and privileges → Assign roles → Groups Reader. Groups
 Reader can read groups and group membership and can change nothing, which is
-exactly the two read-only scopes. If the role is assigned with a condition
+exactly the two read-only *group* scopes. The public-profile scope added on
+2026-11-13 does **not** change this: `users.get` with `viewType=domain_public`
+is the non-administrator path, so the account still needs no user-management
+privilege. If the role is assigned with a condition
 limiting it to particular group types, check that the source group is one of the
 types it covers; an unconditioned role is what the plan assumes.
 
@@ -149,21 +152,44 @@ account; the impersonation admin cannot grant it to itself.
 
 Admin console → Security → Access and data control → API controls → Manage
 Domain Wide Delegation → Add new. The client ID is the numeric `oauth2ClientId`
-from step 1. The OAuth scopes are exactly these two, comma-separated, with no
+from step 1. The OAuth scopes are exactly these three, comma-separated, with no
 spaces and no trailing comma:
 
 ```
-https://www.googleapis.com/auth/admin.directory.group.readonly,https://www.googleapis.com/auth/admin.directory.group.member.readonly
+https://www.googleapis.com/auth/admin.directory.group.readonly,https://www.googleapis.com/auth/admin.directory.group.member.readonly,https://www.googleapis.com/auth/admin.directory.user.readonly
 ```
+
+The third scope was added on 2026-11-13 with open question 3: the job reads a
+new member's public profile name instead of guessing it from the address. Adding
+a scope is not the same as adding privilege here, and that is the whole reason
+this particular one was chosen. `users.get` is called with
+`viewType=domain_public`, which Google documents as the non-administrator path
+("any user on the domain can read user profiles"), so the impersonation admin
+**stays a Groups Reader**. Do not "fix" a `viewType` problem by assigning it a
+user-management role: that would be a real escalation, and the code does not
+need it.
+
+One precondition for `domain_public`: contact sharing is on for the domain
+(Admin console → Directory → Directory settings → Sharing settings → Contact
+sharing → Enable contact sharing). With it off, a lookup returns no profile,
+the job quietly falls back to a name derived from the address, and the only
+visible sign is `nameSource: "derived"` in the `user.created` audit line. It is
+not an error and it does not abort a run, so check that setting before
+debugging anything else.
 
 Four traps:
 
-- Adding a third scope "to be safe" is a wider grant, and it is the one thing
-  this design deliberately avoided. The two scopes are the whole of the job's
-  Google access; a write scope here means the credential can do things the code
-  never does, and the read-only decision is only as strong as this field.
+- **Adding a third scope "to be safe" is still a wider grant**, and it is the
+  one thing this design deliberately avoided. All three scopes above are the
+  whole of the job's Google access, and each one is there because a call needs
+  it. A *write* scope here means the credential can do things the code never
+  does, and the read-only decision is only as strong as this field.
 - Editing the entry later replaces the whole scope list rather than merging into
-  it. Re-paste both.
+  it. Re-paste all three.
+- **Widen this before deploying code that requests it.** The delegation field
+  is what gates the token exchange, so a function asking for a scope the entry
+  does not grant aborts every pair with `source-read-failed`. Widening the entry
+  ahead of the merge is safe: a scope the code does not request is inert.
 - Propagation takes a few minutes, so a token exchange immediately after Add new
   can still fail.
 - Do not delete and recreate the service account to fix a mistake. A new service
@@ -465,7 +491,7 @@ Four notes for when this is done in a hurry:
 **Workload Identity Federation is the documented future option**, and it removes
 the static key entirely: GCP trusts the Lambda's AWS IAM role and mints a
 short-lived credential, which then impersonates the service account. It changes
-neither the delegation nor the two scopes, and it is not v1 because it adds a
+neither the delegation nor the three scopes, and it is not v1 because it adds a
 second identity provider and an impersonation chain to debug. When it is built,
 this whole section collapses to checking the pool's trust of the execution role.
 
@@ -489,12 +515,18 @@ Every credential failure is a per-pair `sync.aborted` with
   `get-function-configuration` is what to read.
 - `Google token exchange failed with HTTP 400` — the delegation entry does not
   match. The usual causes are the wrong numeric ID (the email or the unique ID
-  instead of the client ID), a scope list that is not exactly the two above, an
+  instead of the client ID), a scope list that is not exactly the three above, an
   impersonation address that is an alias or not a licensed active user, or a
   delegation added seconds ago.
 - `Google Directory request failed with HTTP 403` — the API is not enabled in the
-  project the key belongs to, is still propagating, or the impersonated user
-  cannot see the group.
+  project the key belongs to, is still propagating, the impersonated user
+  cannot see the group, or the delegation entry does not grant the user-profile
+  scope the token asked for.
+- `Google Directory request failed with HTTP 404` on `/users/<address>` — a
+  profile is not readable. Contact sharing is off for the domain, or the member
+  has no public profile. This does **not** abort the run: the create falls back
+  to a derived name and `user.created` shows `nameSource: "derived"`. Check the
+  contact-sharing setting first.
 - `Google Directory request failed with HTTP 404` — the source group address in
   the config does not exist. `groups.get` is the check the plan relies on so a
   typo cannot read as an empty group.
@@ -514,7 +546,7 @@ why.
 **Which API the org's edition serves group membership from** is open question 1
 in the plan. This runbook assumes the Admin SDK Directory API. If the answer is
 the Cloud Identity API, `deploy-infrastructure/group-sync/google.ts` changes, the
-two scopes change with it, and steps 1 and 3 change to match.
+three scopes change with it, and steps 1 and 3 change to match.
 
 **Whether the impersonation address is the right mailbox** is not something this
 repository can check. The address the deploy intends is in

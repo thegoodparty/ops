@@ -57,6 +57,12 @@ const fakeDirectory = (options: {
       if (page instanceof Error) throw page;
       return page;
     },
+    // This file is the source-read and diff suite: it never reaches the create
+    // path, so there are no profiles to answer with.
+    async getUser(request) {
+      calls.push(`getUser:${request.userKey}`);
+      return {};
+    },
   };
 };
 

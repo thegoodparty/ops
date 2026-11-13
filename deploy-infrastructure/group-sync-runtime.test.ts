@@ -26,6 +26,7 @@ import { SyncAbortError } from "./group-sync/errors";
 import {
   deriveDisplayName,
   createIdentityDirectory,
+  resolveCreateUserName,
   withRetry,
   type IdentityDirectory,
   type IdentityStoreClientLike,
@@ -50,6 +51,7 @@ import {
   type DirectoryClient,
   type DirectoryMember,
   type DirectoryMemberPage,
+  type DirectoryUserName,
 } from "./group-sync/source";
 import { handle, parseOverride } from "./group-sync/handler";
 import {
@@ -318,6 +320,9 @@ const fakeDirectory = (options: {
   pages: Array<DirectoryMemberPage | Error>;
   groupError?: Error;
   calls?: string[];
+  /** Profile names by userKey, for the create path. Absent means "no name". */
+  profileNames?: Record<string, DirectoryUserName>;
+  profileError?: Error;
 }): DirectoryClient => {
   const calls = options.calls ?? [];
   let pageIndex = 0;
@@ -332,6 +337,11 @@ const fakeDirectory = (options: {
       const page = options.pages[pageIndex++] ?? { members: [] };
       if (page instanceof Error) throw page;
       return page;
+    },
+    async getUser(request) {
+      calls.push(`getUser:${request.userKey}`);
+      if (options.profileError) throw options.profileError;
+      return options.profileNames?.[request.userKey] ?? {};
     },
   };
 };
@@ -353,9 +363,14 @@ const fakeIdentity = (options: {
       calls.push(`GetUserId:${email}`);
       return users[email] ?? null;
     },
-    async createUser(email) {
+    async createUser(email, name) {
       calls.push(`CreateUser:${email}`);
       if (options.onCreateUser) return options.onCreateUser(email);
+      // The name the run resolved is recorded so a test can assert on which
+      // path named the user, the way the real adapter logs `nameSource`.
+      if (name?.givenName || name?.familyName) {
+        calls.push(`CreateUser-name:${name.givenName}/${name.familyName}`);
+      }
       const userId = `u-${email.split("@")[0]}`;
       users[email] = userId;
       return userId;
@@ -682,15 +697,80 @@ describe("apply", () => {
     assert.deepEqual(calls, [
       "getGroup:engineering@goodparty.org",
       "listMembers:engineering@goodparty.org:",
-      // Step 3's resolution pass, then the target, then the create.
+      // Step 3's resolution pass, then the target, then the profile that names
+      // the new user, then the create.
       "GetUserId:alice@goodparty.org",
       "ListGroupMemberships",
       // Create, then add, then remove: the group is never briefly smaller
       // than the union of source and target.
+      "getUser:alice@goodparty.org",
       "CreateUser:alice@goodparty.org",
       "CreateGroupMembership:u-alice",
       "DeleteGroupMembership:m-gone",
     ]);
+  });
+
+  it("names a new user from their Google profile, not from the address", async () => {
+    const calls: string[] = [];
+    const { outcome } = await runWith({
+      syncPair: pair(),
+      directory: fakeDirectory({
+        pages: [{ members: [member("swain@goodparty.org", "USER")] }],
+        calls,
+        profileNames: {
+          "swain@goodparty.org": { givenName: "Robin", familyName: "Swain" },
+        },
+      }),
+      identity: fakeIdentity({ users: {}, memberships: [], calls }),
+    });
+
+    assert.equal(outcome.aborted, null);
+    // The profile wins over the derived placeholder, which for this address
+    // would have been "Swain" / "Swain".
+    assert.ok(calls.includes("CreateUser-name:Robin/Swain"));
+  });
+
+  it("falls back to the derived name when the profile lookup fails", async () => {
+    const calls: string[] = [];
+    const { outcome } = await runWith({
+      syncPair: pair(),
+      directory: fakeDirectory({
+        pages: [{ members: [member("swain@goodparty.org", "USER")] }],
+        calls,
+        profileError: new Error("HTTP 403"),
+      }),
+      identity: fakeIdentity({ users: {}, memberships: [], calls }),
+    });
+
+    // A cosmetic lookup must never fail the pair: the create still happens,
+    // and `createUser` derives a valid name for it.
+    assert.equal(outcome.aborted, null);
+    assert.equal(outcome.counts.added, 1);
+    assert.ok(calls.includes("CreateUser:swain@goodparty.org"));
+    assert.ok(!calls.some((call) => call.startsWith("CreateUser-name:")));
+  });
+
+  it("still removes members when every profile lookup fails", async () => {
+    // The ordering decision: the profile read is part of the create pass and
+    // cannot gate the access-reducing pass behind it.
+    const calls: string[] = [];
+    const { outcome } = await runWith({
+      syncPair: pair(),
+      directory: fakeDirectory({
+        pages: [{ members: [member("swain@goodparty.org", "USER")] }],
+        calls,
+        profileError: new Error("HTTP 403"),
+      }),
+      identity: fakeIdentity({
+        users: {},
+        memberships: [{ userId: "u-gone", membershipId: "m-gone" }],
+        calls,
+      }),
+    });
+
+    assert.equal(outcome.aborted, null);
+    assert.equal(outcome.counts.removed, 1);
+    assert.ok(calls.includes("DeleteGroupMembership:m-gone"));
   });
 
   it("reuses an existing user instead of creating one", async () => {
@@ -1212,6 +1292,37 @@ describe("identity adapter", () => {
     assert.equal(attempts, 1);
   });
 
+  it("prefers the Google profile name and falls back to the derived one", () => {
+    // The profile is used only when it supplies both halves, because the store
+    // rejects a `Name` without `FamilyName`.
+    assert.deepEqual(
+      resolveCreateUserName("swain@goodparty.org", {
+        givenName: "Robin",
+        familyName: "Swain",
+      }),
+      {
+        displayName: "Robin Swain",
+        givenName: "Robin",
+        familyName: "Swain",
+        source: "google",
+      },
+    );
+    // A profile with only a given name is not a name the store accepts, so the
+    // derived placeholder is used instead of a half-empty request.
+    for (const half of [
+      { givenName: "Robin", familyName: null },
+      { givenName: "Robin", familyName: "   " },
+      { givenName: null, familyName: "Swain" },
+      {},
+      undefined,
+    ]) {
+      const resolved = resolveCreateUserName("swain@goodparty.org", half as never);
+      assert.equal(resolved.source, "derived");
+      assert.equal(resolved.givenName, "Swain");
+      assert.equal(resolved.familyName, "Swain");
+    }
+  });
+
   it("derives a display name from the local part", () => {
     // Open question 3 keeps the Google scope to group reads, so the name comes
     // from the address and a human corrects it later.
@@ -1220,10 +1331,66 @@ describe("identity adapter", () => {
       givenName: "Jeff",
       familyName: "Jagoda",
     });
+    // A single-token local part duplicates the token: the store requires a
+    // non-empty `FamilyName`, and omitting it failed the create outright.
     assert.deepEqual(deriveDisplayName("swain@goodparty.org"), {
       displayName: "Swain",
       givenName: "Swain",
+      familyName: "Swain",
     });
+  });
+
+  it("creates a single-token user with a family name the store accepts", async () => {
+    // The regression this pins: a member whose local part has no separator used
+    // to reach `CreateUser` without `Name.FamilyName`, and the live store
+    // aborted the run with a `ValidationException`. Run the real adapter against
+    // a fake client and assert on the command it actually sends.
+    const sent: CreateUserCommand[] = [];
+    const directory = createIdentityDirectory({
+      groupId: ENGINEERS_GROUP_ID,
+      client: sdkClient(async (command) => {
+        if (command instanceof GetUserIdCommand) {
+          throw new ResourceNotFoundException({ message: "", $metadata: {} });
+        }
+        if (command instanceof CreateUserCommand) {
+          sent.push(command);
+          return { UserId: "u-swain" };
+        }
+        throw new Error("unexpected command");
+      }),
+    });
+    assert.equal(await directory.createUser("Swain@GoodParty.org"), "u-swain");
+    assert.equal(sent.length, 1);
+    const input = sent[0]!.input;
+    assert.equal(input.UserName, "swain@goodparty.org");
+    assert.equal(input.DisplayName, "Swain");
+    assert.equal(input.Name?.GivenName, "Swain");
+    assert.equal(input.Name?.FamilyName, "Swain");
+  });
+
+  it("creates a multi-token user with both name fields split from the local part", async () => {
+    const sent: CreateUserCommand[] = [];
+    const directory = createIdentityDirectory({
+      groupId: ENGINEERS_GROUP_ID,
+      client: sdkClient(async (command) => {
+        if (command instanceof GetUserIdCommand) {
+          throw new ResourceNotFoundException({ message: "", $metadata: {} });
+        }
+        if (command instanceof CreateUserCommand) {
+          sent.push(command);
+          return { UserId: "u-jeff" };
+        }
+        throw new Error("unexpected command");
+      }),
+    });
+    assert.equal(
+      await directory.createUser("jeff.jagoda@goodparty.org"),
+      "u-jeff",
+    );
+    const input = sent[0]!.input;
+    assert.equal(input.DisplayName, "Jeff Jagoda");
+    assert.equal(input.Name?.GivenName, "Jeff");
+    assert.equal(input.Name?.FamilyName, "Jagoda");
   });
 });
 
@@ -1280,7 +1447,7 @@ const response = (status: number, body: unknown) => ({
 });
 
 describe("google adapter", () => {
-  it("signs a delegated assertion for exactly the two read scopes", () => {
+  it("signs a delegated assertion for exactly the three read scopes", () => {
     const { json, publicKey } = serviceAccountKey();
     const key = parseServiceAccountKey(json);
     const assertion = buildAssertion({
@@ -1305,7 +1472,7 @@ describe("google adapter", () => {
     assert.equal(decoded.sub, "group-sync-admin@goodparty.org");
     assert.equal(
       decoded.scope,
-      "https://www.googleapis.com/auth/admin.directory.group.readonly https://www.googleapis.com/auth/admin.directory.group.member.readonly",
+      "https://www.googleapis.com/auth/admin.directory.group.readonly https://www.googleapis.com/auth/admin.directory.group.member.readonly https://www.googleapis.com/auth/admin.directory.user.readonly",
     );
     assert.equal(decoded.aud, "https://oauth2.googleapis.com/token");
     assert.equal(decoded.exp - decoded.iat, 3600);
@@ -1367,6 +1534,52 @@ describe("google adapter", () => {
     // One token exchange for the run, then the group and two member pages.
     assert.equal(urls.filter((url) => url.includes("oauth2")).length, 1);
     assert.equal(urls.length, 4);
+  });
+
+  it("reads a user's public profile name, and asks for the public view", async () => {
+    // `viewType=domain_public` is the whole reason this is a non-administrator
+    // read: it is what lets the impersonated Groups Reader call `users.get`
+    // without a user-management privilege. Pin the query, not just the parse.
+    const { json } = serviceAccountKey();
+    const urls: string[] = [];
+    const fetchImpl: FetchLike = async (url) => {
+      urls.push(url);
+      if (url.includes("oauth2")) return response(200, { access_token: "t" });
+      return response(200, {
+        name: { givenName: "Robin", familyName: "Swain" },
+      });
+    };
+    const client = await createDirectoryClient({
+      keyJson: json,
+      impersonationEmail: "group-sync-admin@goodparty.org",
+      fetchImpl,
+    });
+
+    assert.deepEqual(await client.getUser({ userKey: "swain@goodparty.org" }), {
+      givenName: "Robin",
+      familyName: "Swain",
+    });
+    const userUrl = urls.find((url) => url.includes("/users/"));
+    assert.ok(userUrl);
+    assert.match(userUrl, /\/users\/swain%40goodparty\.org\?/);
+    assert.match(userUrl, /viewType=domain_public/);
+  });
+
+  it("reports an absent name field as null rather than inventing one", async () => {
+    const { json } = serviceAccountKey();
+    const fetchImpl: FetchLike = async (url) => {
+      if (url.includes("oauth2")) return response(200, { access_token: "t" });
+      return response(200, { name: { givenName: "Robin" } });
+    };
+    const client = await createDirectoryClient({
+      keyJson: json,
+      impersonationEmail: "group-sync-admin@goodparty.org",
+      fetchImpl,
+    });
+    assert.deepEqual(await client.getUser({ userKey: "swain@goodparty.org" }), {
+      givenName: "Robin",
+      familyName: null,
+    });
   });
 
   it("aborts when a later member page returns a non-2xx", async () => {

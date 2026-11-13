@@ -19,8 +19,9 @@
  * never runs by default, because it needs:
  *
  * - **Real Google domain-wide delegation.** A service-account key JSON at
- *   `GROUP_SYNC_GOOGLE_KEY_FILE` whose client id is delegated the two
- *   read-only group scopes, and an impersonation admin at
+ *   `GROUP_SYNC_GOOGLE_KEY_FILE` whose client id is delegated the three
+ *   read-only scopes (two group, one user public profile), and an
+ *   impersonation admin at
  *   `GOOGLE_IMPERSONATION_EMAIL` (default
  *   `svc-identity-group-sync@goodparty.org`, the address the infrastructure
  *   stack now configures). CI has neither.
@@ -440,6 +441,10 @@ describe(
         async listMembers() {
           directoryCalls += 1;
           return { members: [] };
+        },
+        async getUser() {
+          directoryCalls += 1;
+          return {};
         },
       };
 

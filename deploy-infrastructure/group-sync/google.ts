@@ -6,8 +6,9 @@
  * open question 1 (Admin SDK Directory vs Cloud Identity) is a one-file
  * change. This is that file. `fetchSourceMembers` in `./source` only needs the
  * structural `DirectoryClient` (`getGroup`, `listMembers`, with the
- * `pageToken` chain), so everything below is transport: a service-account JWT,
- * a domain-wide-delegation token exchange, and two GETs.
+ * `pageToken` chain), and the create path needs `getUser` for a new member's
+ * name, so everything below is transport: a service-account JWT, a
+ * domain-wide-delegation token exchange, and three GETs.
  *
  * **No `googleapis` dependency.** The official client is a very large tree, and
  * this repo builds every image from one `package.json`
@@ -20,9 +21,9 @@
  * **The credentials.** The service account key (the JSON file Google hands
  * out) is in Secrets Manager, and the TwoLeggedOAuth flow below impersonates a
  * dedicated admin account (`sub`). Both the scopes and the impersonation are
- * fixed by "IAM -> Google access, read-only" in the plan: exactly the two
- * group read scopes, nothing else. There is no write path here and no scope
- * that could become one.
+ * fixed by "IAM -> Google access, read-only" in the plan: two group read
+ * scopes and the public user profile, nothing else. There is no write path here
+ * and no scope that could become one.
  *
  * Until the manual Google setup is done (service account, Admin SDK enablement,
  * domain-wide delegation, impersonation admin, key into the secret), a run
@@ -35,11 +36,33 @@ import { createSign } from "node:crypto";
 import { SyncAbortError } from "./errors";
 import type { DirectoryClient } from "./source";
 
-/** The two delegated scopes, and the whole of the job's Google access. */
+/**
+ * The three delegated scopes, and the whole of the job's Google access.
+ *
+ * The first two are the group read. The third is `users.get`, and it is the one
+ * thing here that is not a group read: `CreateUser` needs a real given and
+ * family name, and `members.list` carries no name field at all (open question
+ * 3, resolved 2026-11-13 in favour of reading the name).
+ *
+ * It is deliberately the *public* profile of the user and nothing more: the
+ * call passes `viewType=domain_public`, which is the path Google documents for
+ * a non-administrator, so the impersonated account stays a Groups Reader with
+ * no user-management privilege. `users.get` with `domain_public` needs contact
+ * sharing to be enabled for the domain; when it is not, the profile is not
+ * returned and `./run` falls back to a derived name rather than failing.
+ */
 export const GOOGLE_SCOPES: readonly string[] = [
   "https://www.googleapis.com/auth/admin.directory.group.readonly",
   "https://www.googleapis.com/auth/admin.directory.group.member.readonly",
+  "https://www.googleapis.com/auth/admin.directory.user.readonly",
 ];
+
+/**
+ * The public view of a user, which is what a non-administrator may read and all
+ * this job needs: `admin_view` would return administrator-only fields the job
+ * has no use for and would require a user-management privilege it does not have.
+ */
+export const GOOGLE_USER_VIEW_TYPE = "domain_public";
 
 export const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const DIRECTORY_ROOT = "https://admin.googleapis.com/admin/directory/v1";
@@ -147,6 +170,13 @@ type MemberPage = {
   nextPageToken?: string | null;
 };
 
+type UserResource = {
+  name?: {
+    givenName?: string | null;
+    familyName?: string | null;
+  } | null;
+};
+
 /**
  * Builds the Directory client over an access token obtained once per client
  * (one per invocation, which is one run of every pair).
@@ -245,6 +275,22 @@ export const createDirectoryClient = async (options: {
           type: member.type ?? null,
         })),
         nextPageToken: body.nextPageToken ?? null,
+      };
+    },
+
+    async getUser({ userKey }) {
+      // `viewType=domain_public` is what makes this a non-administrator read:
+      // the impersonated account stays a Groups Reader and sees only public
+      // profile fields. A missing profile or an absent name field is a real
+      // answer ("no name to use"), and `./run` falls back for it, but any
+      // non-2xx still throws here rather than being read as "no such user".
+      const query = new URLSearchParams({ viewType: GOOGLE_USER_VIEW_TYPE });
+      const body = (await getJson(
+        `/users/${encodeURIComponent(userKey)}?${query.toString()}`,
+      )) as UserResource;
+      return {
+        givenName: body.name?.givenName ?? null,
+        familyName: body.name?.familyName ?? null,
       };
     },
   };
