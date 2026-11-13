@@ -45,6 +45,14 @@ The orchestrator placed the diff and changed files in your prompt. The PR's repo
 
 Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, not a verified finding. Zero leads is a valid result when the diff is genuinely low-risk.
 
+## The scale pass — required, before any other lead
+
+Before you write any lead, answer three questions in your scratch: what does this diff newly compute per request (a fit, solver, aggregation, query, loop or mapping); what is the size of that computation's input in the largest real case it faces (that dimension is the input's size — name it and the count it reaches); and does it run synchronously inside a request the caller waits on, with nothing in the code capping the input?
+
+When the answers are not "nothing, none, no", the FIRST lead you emit is that computation. Leads about leftover imports, dead helpers, cache keys, test coverage, docs, contracts and SQL id lists come after it.
+
+A cheap surface does not stand in for an expensive one: an id list or an unpaged query is cheap next to a fit, solver, factorisation or nested loop run once per parameter or per row, so when the diff has both, the expensive one is a lead of its own and it comes first. If you are unsure whether the cost is real, still emit the lead and say in the hypothesis what the deep-reviewer must count: deciding whether it is a blocker is the deep-reviewer's job, not yours.
+
 Lead categories:
 - correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
 - security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
