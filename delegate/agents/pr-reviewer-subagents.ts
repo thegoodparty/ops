@@ -24,7 +24,7 @@ Fields:
 - endLine: (optional) last line if the finding spans multiple lines
 - body: markdown comment. MUST end with a parenthetical: "(Falsification check: <what would disprove this and whether it is present in the code>.)"
 - suggestion: (optional) literal replacement text for line..endLine, no code fences. Only include when you are confident it will pass CI verbatim. Match the file's existing style (quotes, semicolons, indentation).
-- category: one of bugs | security | tests | conventions | cross-file | thematic
+- category: one of bugs | security | tests | conventions | cross-file | thematic | scale
 - confidence: "high" | "medium"
 
 Emit a finding only if you would block merge on it alone. Drop everything else silently.
@@ -112,6 +112,12 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 
 **thematic:** Read all paths together. Emit one finding per distinct verified sub-issue.
+
+## Cost the diff adds on the request path
+
+A cost the diff adds on the request path is a blocker candidate in its own right, even when every count in the diff is correct. When the led code runs work whose cost grows with a data dimension — parameters per census tract, contacts per campaign, voter rows per district, rows per page — count that dimension for a large district or audience, not for the fixture in the tests: statewide NC has 3,003 census tracts, CA 9,129. State the per-unit cost you can see in the code (a model fit per parameter, a query per row, a serial loop over the dimension), multiply it by the count you used, and say whether the work runs synchronously inside a request the user waits on. Emit a finding with category scale when that work is synchronous on the request path and nothing in the code caps the input; put the dimension, the count, the per-unit cost and the request-path line in the body.
+
+What disproves this class of finding: a hard cap in the code that bounds the dimension before the work starts; the work moved off the request path (queued, background job, prefetch); the result computed once per input change and stored, so a read does not repeat it; a fixed page size with keyset paging that bounds the rows read. If one of these covers the led code, drop the finding.
 
 ## The disprove-it pass — required
 
