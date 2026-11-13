@@ -1,7 +1,7 @@
 # Replacing Claude Code with pi in `delegate`
 
-> **Status: proposal.** This changes no code. It records the decision to remove the Claude Agent SDK
-> and the `claude-code` CLI from `delegate/` and run the reviewer on
+> This changes no code. It records the decision to remove the Claude Agent SDK and the `claude-code`
+> CLI from `delegate/` and run the reviewer on
 > [`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi-coding-agent) (pi,
 > **pinned 1.5.2**), the steps that do it, and the evidence each needs. Where it makes a call of its
 > own it says **decided here** and gives the reasoning, so review can argue with the reasoning.
@@ -71,12 +71,12 @@ integration point gives that for free: **`RpcClient` cannot express an allowlist
 over the documented protocol — and **`bash` inherits the child env wholesale**, since `getShellEnv()`
 returns `{ ...process.env, ... }` (`dist/utils/shell.js:147`), which makes the child's env the exact
 blast radius of a bash call. Two mechanics follow. **The JSONL framing helper is not exported**:
-`attachJsonlLineReader` / `serializeJsonLine` live in `dist/modes/rpc/jsonl.js` but off the package
-export map, so the client reimplements an **LF-only** splitter — Node's `readline` splits on
-U+2028/U+2029, which occur inside payload strings. And **the agent directory must be writable**: on a
-read-only `PI_CODING_AGENT_DIR` pi fails at startup with `EACCES` on `mkdir` of `trust.json.lock`,
-writing `auth.json`, `models-store.json`, `trust.json*` — so an image directory with no `auth.json`
-and no `mcp.json` is right in intent and needs a writable copy or tmpfs.
+`attachJsonlLineReader` / `serializeJsonLine` are off the package export map, so the client
+reimplements an **LF-only** splitter — Node's `readline` splits on U+2028/U+2029, which occur inside
+payload strings. And **the agent directory must be writable**: on a read-only
+`PI_CODING_AGENT_DIR` pi fails at startup with `EACCES` on `mkdir` of `trust.json.lock`, writing
+`auth.json`, `models-store.json`, `trust.json*` — so an image directory with no `auth.json` and no
+`mcp.json` is right in intent and needs a writable copy or tmpfs.
 
 The allowlist test (`delegate/review/run.test.ts:176-209`) is **rewritten, not deleted** — it is the
 only thing that fails when someone widens the list.
@@ -101,39 +101,80 @@ top-level union, and `ReviewOutputSchema` stays the authority. `toSupportedDiale
 the four `draft-07` tests (`pr-reviewer.test.ts:286-346`), replaced by a test that the tool accepts
 the flat object and the union validates the result.
 
+**Prior art, and why delegate does not install it.** Three exist, and this is the one place the
+build-versus-buy answer is "copy a 65-line official example" rather than "install a package":
+`structured-output.ts` in pi's own `examples/extensions/` (the canonical `terminate: true` tool),
+`@nqbao/pi-json-schema` (0.1.1 — a `json_output` tool, `ajv` validation, a `--json-schema` flag and
+a fallback pass), and `pi-structured-output` (0.2.2). The two packages are general-purpose: they take
+a schema as a flag and hand the payload back as **a file on disk**, which is the wrong shape for a
+caller that already has `ReviewOutputSchema` in zod and needs the parsed object, the tool's `details`
+and its `usage` in-process for the repair turn and the cost ledger. They also add `ajv` beside a zod
+schema that is already the authority — a second validator that can disagree with the first. So: copy
+the official example's shape, give it `ReviewOutputSchema` and delegate's own validation, keep the
+dependency count flat. If this later becomes generic, upstream it to pi's package registry rather
+than keeping a private copy of someone else's extension.
+
 The bounded repair turn (`run.ts:672-713`) survives, with one caveat: **`--session-id` resume is
 cwd-scoped.** A session created at one cwd is not found from another with the same `--session-dir`;
 pi creates a second file with the same id. The repair turn must run at the same cwd, and a session
 that never received a message leaves no `.jsonl`, so "resumed" and "new" are indistinguishable
 until the first prompt. Test it.
 
-### 3. Budgets do not exist, so they are built — and cost is the sharp edge
+### 3. Budgets and spend are not built in, so they are bought — and cost is the sharp edge
 
 `agent.ts:82-83` sets `maxTurns: 50` / `maxBudgetUsd: 5`; `pr-reviewer.ts:216-217` raises them to
-80 / $10; exhaustion arrives as `error_max_turns` / `error_max_budget_usd`, which
-`run.ts:663-666` turns into a failed review. pi 1.5.2 has neither — searched in the CLI, the
-settings schema and the extension API. `agent_before_settle` is a settle-time boundary that can
-append entries and request one continuation, so a budget extension has a hook, but nothing caps
-spend. The surviving outer bound is the worker's 45-minute deadline (`entrypoint.ts:56-64`).
+80 / $10; exhaustion arrives as `error_max_turns` / `error_max_budget_usd`, which `run.ts:663-666`
+turns into a failed review. pi 1.5.2 has neither — searched in the CLI, the settings schema and the
+extension API. The surviving outer bound is the worker's 45-minute deadline (`entrypoint.ts:56-64`).
 
-A turn cap is a counter over the event stream. A **spend** cap needs a price, and pi computes cost
-by catalog arithmetic — `cost.totalFromProvider` is only ever true for OpenRouter — defaulting a
-missing row to `0` silently. This repo has been bitten by that twice. **Decided here:** cost is an
-estimate from a price committed in the repo, never from pi's catalog, and **a replay whose
-`costUsd` is `0` while it reported tokens is a failure, not a zero-cost win.** That one assertion
-is what makes the migration's own success criterion unfoolable. The SDK's failure `subtype`
-vocabulary has no pi equivalent either, so a small closed `RunnerError` enum is needed or every
-timeout becomes a red `error` status; and `num_turns` and pi's `turn_end` are different
-definitions (one assistant response plus its tool calls), so the caps are re-tuned from
+**Prior art exists, and buying it beats building it.** `@aantenore/pi-budget` (0.1.0, MIT) enforces
+`usd`, `tokens`, `turns`, `toolCalls` and `minutes` via `--budget-*` flags or `PI_BUDGET_*`, hooks
+exactly the events this design would (`turn_end` and `agent_settled` to end a run, `tool_call` to
+block further calls, `session_start` to rebuild totals), and appends an audit entry on every stop.
+It also has the property the plan would otherwise have to add: a **project** `.pi/budget.json` may
+only *tighten* a budget, never relax it, and is read without the project-trust check — so a PR
+checkout cannot switch the cap off.
+
+**Decided here: install `pi-budget`, pinned to an exact version and loaded from an image path (never
+from the checkout), and keep two things delegate's:**
+
+1. **The price is still delegate's.** `pi-budget` spends the USD number pi computes from its own
+   price table, so it inherits the catalog-arithmetic problem rather than fixing it.
+   `cost.totalFromProvider` is only ever true for OpenRouter; a missing row defaults to `0`
+   silently, and this repo has been bitten by that twice. The committed `delegate/pi/models.json` is
+   what makes the number right, and **a replay whose `costUsd` is `0` while it reported tokens is a
+   failure, not a zero-cost win.** A cap that reads $0 can never fire — precisely the failure
+   `pi-budget` warns about for unpriced local models.
+2. **The zero-cost assertion is a separate test from the cap**, because a correct cap and a correct
+   ledger are not the same instrument.
+
+The risk to accept: it is a young, single-maintainer package running in-process in the worker, so it
+is a supply-chain surface next to `REVIEWER_APP_PRIVATE_KEY`. Pin it, read it before the pin lands,
+and keep the 45-minute deadline as the outer bound that depends on no extension loading at all. The
+SDK's failure `subtype` vocabulary also has no pi equivalent, so a small closed `RunnerError` enum is
+needed or every timeout becomes a red `error` status; and `num_turns` and pi's `turn_end` are
+different definitions (one assistant response plus its tool calls), so the caps are re-tuned from
 measurement.
 
 ## Provider and model: settled
 
-**Fireworks US-only direct, mirroring `agent-swarm/`.** `FIREWORKS_API_KEY` replaces
-`ANTHROPIC_API_KEY`. This touches **one** human-owned file, `deploy/delegate-secret.ts:16`, and
-**no** change to `deploy/components/worker.ts`: the task already runs in public subnets
-(`deploy/index.ts:38`), so any HTTPS endpoint is reachable and no IAM or egress change is
-needed — which answers open questions 1 and 7 of the old plan.
+**The harness swap does not need the provider swap first, and doing them separately is the better
+plan.** pi ships a built-in `anthropic` provider, and `claude-opus-5-5` and `claude-sonnet-5-5` — the
+exact models `pr-reviewer.ts:214` and `pr-reviewer-subagents.ts:81,139` name today — are already in
+its catalog (`cost: {input: 4, output: 20}` and `{2, 10}` per 1M). So the reviewer can move to pi
+while still calling Anthropic, with the same two models, and the first A/B then changes **one**
+variable: the harness. That is why the plan below puts the runner swap before the provider work
+rather than behind it, and it is the difference between "the reviewer got worse" and "the reviewer
+got worse *and* we cannot tell whether it was the harness or the model".
+
+The cost of the split is one extra eval round (below). The benefit is that a failure at each stage
+has exactly one candidate cause.
+
+**Fireworks US-only direct, mirroring `agent-swarm/`, is the destination.** `FIREWORKS_API_KEY`
+replaces `ANTHROPIC_API_KEY`. This touches **one** human-owned file,
+`deploy/delegate-secret.ts:16`, and **no** change to `deploy/components/worker.ts`: the task already
+runs in public subnets (`deploy/index.ts:38`), so any HTTPS endpoint is reachable and no IAM or
+egress change is needed — which answers open questions 1 and 7 of the old plan.
 
 **Bedrock: rejected, and not on cost.** It is the only option that puts a model-invoke grant in the
 production account, on the task role of the container that parses untrusted PR content, with
@@ -144,19 +185,21 @@ agreements (`aws-marketplace:Subscribe`), i.e. `/breakglass`.
 
 **Bifrost: rejected for this worker, though it is the gp-pi path.**
 `docs/bifrost-virtual-keys.md` §"Non-human callers" calls a shared worker key "a separate
-decision with its own attribution story": worse attribution (one bucket, no per-review split)
-for a wider credential (eight frontier models usable as `x-bf-vk` / `Bearer` / `x-api-key`).
-Blast radius is the deciding argument, not convenience: a Fireworks key is a billing credential,
-and leaked it costs money and is rotatable — it cannot read a bucket, a secret or a repo.
+decision with its own attribution story": worse attribution (one bucket, no per-review split) for a
+wider credential (eight frontier models usable as `x-bf-vk` / `Bearer` / `x-api-key`). Blast radius
+is the deciding argument, not convenience: a Fireworks key is a billing credential, and leaked it
+costs money and is rotatable — it cannot read a bucket, a secret or a repo.
 `DELEGATE_GATING_MODE=enforce` is deployed (`deploy/components/worker.ts:159`), four Pulumi trees
 are unowned in `CODEOWNERS`, and so the reviewer merges code.
 
-**The quality fallback is named now, not mid-migration.** Fireworks US-only serves one model family
-— DeepSeek V4.1 Flash 1017 US — while the reviewer is `claude-opus-5-5` plus `claude-sonnet-5-5`
-specialists, so the provider choice *is* the model choice *is* a quality gate: can Flash approve and
-merge? If stage A below says no, **the fallback is a Bifrost service key**, keeping Opus and Sonnet
-reachable at zero `worker.ts` cost and one more line in `delegate-secret.ts`. A failed quality gate
-is a provider pivot of about a day, not a plan restart.
+**The quality fallback is named now, not mid-migration.** Fireworks US-only serves one model family —
+DeepSeek V4.1 Flash 1017 US — so the provider choice *is* the model choice *is* a quality gate: can
+Flash approve and merge where Opus did? That question is asked **after** the harness is already
+proven at parity on Anthropic, which is what makes the answer interpretable. If it says no, **the
+fallback is a Bifrost service key**, keeping Opus and Sonnet reachable at zero `worker.ts` cost and
+one more line in `delegate-secret.ts`; the reviewer then runs on pi with the models it has today and
+the migration still lands its actual goal. A failed model gate is a provider pivot of about a day,
+not a plan restart, and a smaller setback than it was before: by then the harness is settled.
 
 **Cost is pinned in the repo:** `delegate/pi/models.json` at the US 1.5× rate — `input: 0.45,
 output: 1.8, cacheRead: 0.009, cacheWrite: 0`, the numbers in
@@ -179,66 +222,69 @@ key for CI, so judging spend is separable and deleting the worker's old key is n
 The first version of this document did not see this, and it is the largest decision in it.
 
 - **`pi --mode rpc`** — a spawned child speaking JSONL over stdin/stdout. Stable, documented, and
-  where the credential argument already lands. It gives no turn cap, no scheduler, no
-  per-conversation cost ledger and no subagent primitive; delegate builds those.
-- **`@earendil-works/pi-durable` 1.5.2** — commits every turn and tool call to storage before it
-  is shown, so a dead process resumes. It ships `maxTurns`, a durable scheduler, per-conversation
-  usage/cost (`harness.usage()`), an owned-conversation subagent pattern and `beforeTool` hooks
-  that block or rewrite arguments. `ops` PR #530 prototypes it at ~1.5k lines. It is marked
+  where the credential argument already lands. It gives no scheduler, no per-conversation cost
+  ledger and no subagent primitive; delegate builds those.
+- **`@earendil-works/pi-durable` 1.5.2** — commits every turn and tool call to storage before it is
+  shown, so a dead process resumes. It ships `maxTurns`, a durable scheduler, per-conversation
+  usage/cost (`harness.usage()`), an owned-conversation subagent pattern and `beforeTool` hooks that
+  block or rewrite arguments. `ops` PR #530 prototypes it at ~1.5k lines. It is marked
   **Experimental — "the API changes without notice between releases"** — and it replaces
-  `pi --mode rpc` as the runner shape.
+  `pi --mode rpc` as the runner shape, rather than adding to it.
 
-**Recommendation: `pi --mode rpc`, hand-rolled client, `runAgent` kept as the only seam.**
-Ordered by what it would cost to be wrong:
+**Recommendation: `pi --mode rpc`, hand-rolled client, `runAgent` kept as the only seam.** Ordered by
+what it would cost to be wrong:
 
 1. **Credential isolation is the reviewer's security control and is cheapest where it already
    works.** rpc's child with an explicit `env` *is* the control. pi-durable runs in-process: its
    `NodeExecutionEnv` spawns shells with `getShellEnv(baseEnv, extraEnv, inheritEnv = true)`, which
-   spreads `process.env`, so adopting it means re-earning the isolation argument inside a
-   dependency via a custom `ExecutionEnv` — more security-critical code than the client rpc needs.
+   spreads `process.env`, so adopting it means re-earning the isolation argument inside a dependency
+   via a custom `ExecutionEnv` — more security-critical code than the client rpc needs.
 2. **Durability buys nothing for this workload.** One Fargate task per job, one PR, a 45-minute
    deadline, a record keyed by `(pr, sha)` — ECS *is* the restart boundary, and a resumed
    conversation has nowhere to resume to once the task is gone. #530 needed durability because it
    replaced a long-lived Slack swarm; the reviewer is a single-shot batch job.
-3. **The one thing it gives that delegate wants is the turn cap**, and that is a counter, not an
-   architecture. Its experimental flag is a real cost here specifically: the reviewer is the merge
-   authority, and an API change under it during an eval campaign is a rewrite scheduled by someone
-   else's release.
+3. **Its two other gifts are now cheaper elsewhere.** `maxTurns` comes from `pi-budget` (above), and
+   the subagent pattern is what S4 builds either way. What remains is a scheduler this workload does
+   not want, bought with an unstable API under the merge authority.
 
 **What being wrong costs.** If rpc is chosen and durability is later wanted, the neutral contract in
 `delegate/framework/types.ts` plus one `runAgent` file makes the driver swappable and #530 is the
 reference: a rewrite behind an interface that already exists. If pi-durable is chosen and its API
 moves, the bill is the same rewrite *plus* a security control re-established inside a dependency's
-execution environment — strictly worse, which is why the asymmetric choice is the right one.
-Revisit if pi-durable stabilises *and* delegate grows a long-lived surface; neither is in this plan.
+execution environment — strictly worse. Revisit if pi-durable stabilises *and* delegate grows a
+long-lived surface; neither is in this plan.
 
 ## The plan
 
-One PR per step, in this order, each independently revertible. The ordering is forced twice:
-`runAgent` (`agent.ts:40-93`) *is* the SDK, so the seam is neutralised before anything moves; and
-`deploy/check-secret-keys.ts:43-57` makes an extra key a warning but a *missing declared* key a hard
-exit 1, so the credential swap is last.
+One PR per step, in this order, each independently revertible. The ordering is forced three ways:
+`runAgent` (`agent.ts:40-93`) *is* the SDK, so the seam is neutralised before anything moves; the
+harness swap goes **before** the provider swap, so each gets a clean A/B (see the previous section);
+and `deploy/check-secret-keys.ts:43-57` makes an extra key a warning but a *missing declared* key a
+hard exit 1, so the credential swap is last.
 
 | # | Step | Reversible? | Evidence gate |
 |---|---|---|---|
 | **S1** | **Delete the dead CLI install.** `delegate/worker/Dockerfile:4` is proven dead: nothing sets `pathToClaudeCodeExecutable` (0 hits repo-wide) and the SDK resolves its own platform binary by `require.resolve`, never `PATH`. ~346 MB, no behavioural risk. | revert + rebuild | `deploy.yml` builds and pushes; **one real review posted end to end** from the new image; image size recorded before/after. |
-| **S2** | **Provider wiring, no behaviour change.** Put `FIREWORKS_API_KEY` in the live `DELEGATES` secret out of band first, then commit `delegate/pi/models.json` at the US price. `ANTHROPIC_API_KEY` stays declared. | yes (unused) | `npm run build` and `npm test`; one smoke prompt inside the image's env records nonzero tokens **and nonzero cost**. Zero cost fails the step. |
-| **S3** | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` replacing `HookCallback`, a structured-output ask, a session handle — six SDK-derived fields leave `types.ts` (`:3,13,14,15,16,24`); split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green. |
-| **S4** | **The security seam.** Both guards on the new handler type (`run.ts:77-110`, `replay.ts:353-367`) with pi's own path normalisation. **The `@`-strip bypass is fixed here.** | yes | The adversarial table below passes; every existing denial assertion kept; `run.test.ts:176-209,222-238` and `replay.test.ts:694-712` rewritten, never deleted. |
-| **S5** | **The runner swap, atomic.** `runAgent` over a spawned `pi --mode rpc` child with the explicit allowlist env; structured output as a terminating tool; subagents as child processes returning usage to the parent; turn and cost caps; `git-tool` as an extension (`tool()`/`createSdkMcpServer` at `git-tool.ts:48,67,82,101,120`) keeping `isSafeRef`/`isSafePath`/truncation verbatim; `replayKey` gains `delegate/pi/`; `agentEnv` gains pi's knobs and drops `CLAUDE_`/`DISABLE_`. | revert + deploy (image tag retained) | The two-stage gate below, then a shadow canary. |
-| **S6** | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
+| **S2** | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` replacing `HookCallback`, a structured-output ask, a session handle — six SDK-derived fields leave `types.ts` (`:3,13,14,15,16,24`); split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green. |
+| **S3** | **The security seam.** Both guards on the new handler type (`run.ts:77-110`, `replay.ts:353-367`) with pi's own path normalisation. **The `@`-strip bypass is fixed here.** | yes | The adversarial table below passes; every existing denial assertion kept; `run.test.ts:176-209,222-238` and `replay.test.ts:694-712` rewritten, never deleted. |
+| **S4** | **The harness swap, on Anthropic.** `runAgent` over a spawned `pi --mode rpc` child with the explicit allowlist env, still calling `claude-opus-5-5` / `claude-sonnet-5-5` through pi's built-in `anthropic` provider — **the model does not change**. Structured output as a terminating tool; subagents as child processes returning usage to the parent; the cap (`pi-budget`, pinned); `git-tool` as an extension (`tool()`/`createSdkMcpServer` at `git-tool.ts:48,67,82,101,120`) keeping `isSafeRef`/`isSafePath`/truncation verbatim; `agentEnv` gains pi's knobs and drops `CLAUDE_`/`DISABLE_`. | revert + deploy (image tag retained) | **Stage A only** of the gate below: harness parity at one provider, with `costRatio` gated because both sides price the same models. The canary waits for S6, since it measures the shipped configuration. |
+| **S5** | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
+| **S6** | **Provider move to Fireworks.** Create `FIREWORKS_API_KEY` out of band, commit `delegate/pi/models.json` at the US price, point the agent at the `fireworks-us` provider. No harness change. | yes (flip back to the Anthropic provider) | `npm run build` and `npm test`; one smoke prompt inside the image's env records nonzero tokens **and nonzero cost** (zero cost fails the step); **Stage B** of the gate below, which is now a pure model comparison. |
 | **S7** | **Infra.** `deploy/delegate-secret.ts:16`: add `FIREWORKS_API_KEY`, drop `ANTHROPIC_API_KEY` — **the same PR as the deploy, never before it.** Human-owned carve-out, its own PR, no agent work riding along. | yes, until the value is deleted | `pulumi preview` shows exactly the expected `secrets` delta and nothing else; the deploy lands; a real review posts with nonzero `costUsd`; then soak. |
 | **S8** | **Docs and the plan amendment.** `CLAUDE.md:14,145`, `delegate/README.md:3,26,30`, `eval/README.md`, `docs/pr-previews.md:123` (also `getSecretVersion`→`getSecret`), and `docs/plan-gated-merges.md:378` as a **plan amendment, not a checklist edit**, because its "`anyOf` … because that is the keyword Anthropic's structured-output dialect supports" becomes false. | yes | Docs only; the amendment PR names its plan and step. |
 
-**Effort: ~11 engineering days** (S1 0.5, S2 1, S3 2, S4 1.5, S5 4, S6 1, S7 0.5, S8 0.5) plus
-~25% contingency, so ~14 days, plus one eval round at roughly **$420** and its wall time. S5 is the
-only step that is not mostly mechanical, and most of it is the measurement queue.
+**Effort: ~12 engineering days** (S1 0.5, S2 2, S3 1.5, S4 4, S5 1, S6 1.5, S7 0.5, S8 0.5)
+plus ~25% contingency, so ~15 days, plus **two** eval rounds at roughly **$420 each** and their
+wall time. The second round is the price of separating the two variables, and it is the cheapest
+insurance in the plan: one round that fails tells you which of two things failed.
 
 **One one-way door, and it is not in this plan.** Deleting the `ANTHROPIC_API_KEY` *value* is
 irreversible, so it happens weeks after S7, on its own, once `costUsd` has been nonzero for a while.
 Undeclaring a key is what makes it inert — the task definition injects only declared keys — so "no
-Anthropic spend from the worker" is achieved without it. (`.claude/skills/hill-climb/SKILL.md:15`'s
-credential line is stale for #488's loop and should be fixed where it is, not moved.)
+Anthropic spend from the worker" is achieved without it. And the judge stays on Anthropic forever
+(above), so this key never fully goes away; only the worker's copy does.
+(`.claude/skills/hill-climb/SKILL.md:15`'s credential line is stale for #488's loop and should be
+fixed where it is, not moved.)
 
 **Two things deliberately not done.** `ReviewRecord` does not change (above). And
 `.claude/skills/hill-climb/` does not move: `eval/arms.ts:45-47` reads its `targets/*.json` at
@@ -285,47 +331,54 @@ a fail-closed assertion in the same PR.
 
 ## The evidence gate, and why the old one did not work
 
-**The hole.** `eval/arms.ts:63` refuses an arm that differs from the scorer in the `neverTouch`
-paths, which `.claude/skills/hill-climb/targets/delegate-pr-reviewer.json:7-13` defines as
+**The hole.** `eval/arms.ts:63` refuses an arm that differs from the scorer in the `neverTouch` paths,
+which `.claude/skills/hill-climb/targets/delegate-pr-reviewer.json:7-13` defines as
 `delegate/review/eval/`, `delegate/review/`, `delegate/framework/`, `.github/`, `package.json`,
 `package-lock.json`. The harness seam lives in exactly those paths, so **the arms harness cannot
-grade a harness swap in either direction** — an arm carrying the new runner differs in
-`delegate/framework/`, and so does one carrying the old. `delegate eval` has the same problem
-from another angle: `eval/dispatch.ts:10` limits a candidate branch to two literal-only files.
-Widening either list would let a candidate grade itself, which is the one property they exist to
-guarantee. **Decided here: neither is widened, and the swap is not measured by either.**
+grade a harness swap in either direction**. `delegate eval` has the same problem from another angle:
+`eval/dispatch.ts:10` limits a candidate branch to two literal-only files. Widening either list would
+let a candidate grade itself, which is the one property they exist to guarantee. **Decided here:
+neither is widened, and the swap is not measured by either.**
 
-**The gate instead: one cold A/B, human-assembled, on both harnesses.** The eval already takes a
-results directory as its baseline (`--mode gate --base <dir>`), which is all a harness comparison
-needs if a human assembles the pair.
+**The gate instead: two cold A/Bs, human-assembled, one variable each.** The eval already takes a
+results directory as its baseline (`--mode gate --base <dir>`), which is all a comparison needs if a
+human assembles the pair. Both rounds **freeze the cases** at the current manifest (36 cases: 20
+tune, 16 holdout) — editing a case invalidates its cached answer, and both rounds are structural
+questions, not prompt questions.
 
-1. **Freeze the cases** — the current manifest (36 cases: 20 tune, 16 holdout). Editing a case
-   invalidates its cached answer, and this is a harness question, not a prompt question.
-2. **Stage A — can Flash review at all?** `--mode inner` over the tune cases, one run each, from the
-   branch. ~$80 and ~20 minutes, and it answers the model question separately and cheaper than the
-   gate does: if it fails, the answer is the named Bifrost fallback, not another harness iteration.
-   Gate: valid `ReviewOutput` at all, repair-turn rate recorded, a human reads three.
-3. **Stage B — the swap, both sides.** Two worktrees a human names: `results-old` (old harness, old
-   model) and `results-new` (new harness, Fireworks). Three runs per case, both sides scored by
-   **one** checkout — the branch's `expect.ts`, so neither side grades itself. ~$330.
-4. **Gate on:** no case main passed on every run regresses; holdout counts only, never holdout ids;
-   the judge's pairwise verdict not-worse; `--final true` so a rerun that never happened cannot
-   pass. `costRatio` is **recorded, not gated** — across the swap it compares an SDK-reported total
-   to a locally estimated one, which is exactly the comparison the old plan would have trusted. A
-   human reads the first three production `costUsd` values against a billing line instead, and the
-   zero-cost-with-tokens assertion runs automatically.
-5. **Then the canary.** 10–20 production reviews with `DELEGATE_GATING_MODE=shadow` — one line in a
-   human-owned file, no merge outcome changed by construction — requiring zero false approves and
-   `review_failed` at or below baseline, then a flip back to `enforce` in its own PR.
+**Stage A — the harness, at constant model** (gates S4). Both sides on `claude-opus-5-5` and
+`claude-sonnet-5-5`: `results-old` (SDK) and `results-new` (pi), three runs per case, scored by
+**one** checkout — the branch's `expect.ts`, so neither side grades itself. ~$330. This is the round
+that can be trusted, because the prompt, `REVIEW_OUTPUT_JSON_SCHEMA` and both models are held fixed.
+A regression here is the harness, full stop.
+
+**Stage B — the model** (gates S6). `results-pi-anthropic` (S4's new side, reused) against
+`results-pi-fireworks`, one variable changed: ~$90–170, since only the model differs. If it fails,
+the named Bifrost fallback applies and S4's parity stands.
+
+**What both rounds gate on:** no case main passed on every run regresses; holdout counts only, never
+holdout ids; the judge's pairwise verdict not-worse; `--final true` so a rerun that never happened
+cannot pass. **`costRatio` is gated in Stage A and only recorded in Stage B.** In Stage A both sides
+are priced from the same tables, so `COST_LIMIT = 1.1` (`eval/expect.ts:342`) is a real comparison of
+the two harnesses' token use. In Stage B it would compare a locally estimated Fireworks total to an
+Anthropic one — exactly the cross-vendor arithmetic the old plan would have trusted — so a human
+reads the first three production `costUsd` values against a billing line instead. The
+zero-cost-with-tokens assertion runs automatically in both.
+
+**Then the canary, once, after Stage B.** 10–20 production reviews with `DELEGATE_GATING_MODE=shadow`
+— one line in a human-owned file, no merge outcome changed by construction — requiring zero false
+approves and `review_failed` at or below baseline, then a flip back to `enforce` in its own PR. After
+both rounds because a canary measures the shipped configuration, not an intermediate one.
 
 `replayKey` (`eval/cache.ts:26-33`) hashes `delegate/agents`, `delegate/framework`, `delegate/review`
-and the lockfile, so S3, S5 and S6 each re-key the cache: budget both cold sides in one calendar
-window, which the ~$330 above already assumes.
+and the lockfile, so S2, S4 and S5 each re-key the cache. Budget the cold sides in one calendar
+window — and note the split makes this cheaper, not dearer: Stage B reuses Stage A's new side, so
+only one round pays for a full cold pair.
 
 ## Load-bearing surface, and how to regenerate it
 
-The old appendix listed 200 lines of `path:line` and was wrong within a week. What follows is only
-what *carries* the dependency.
+The old appendix listed 200 lines of `path:line` and was wrong within a week. This is only what
+*carries* the dependency.
 
 **Imports the SDK** (8 files / 9 lines at `8d33889`): `delegate/framework/agent.ts:1` (`query()`),
 `delegate/framework/types.ts:1` (`HookCallback`, `Options`), `delegate/review/git-tool.ts:2`
@@ -351,27 +404,27 @@ git grep -n '@anthropic-ai/claude-agent-sdk' -- ':!package-lock.json'
 git grep -n 'claude-code' -- ':!package-lock.json'
 # The whole named surface, code only: 56 files / 177 lines at 8d33889.
 git grep -il -e claude -e anthropic -- ':!package-lock.json' ':!*.md'
-# The workflow lines that can go independently of everything else.
+# The workflow lines that can go independently.
 git grep -c 'CLAUDE_CODE_DISABLE' -- .github/workflows/
 git grep -n 'ANTHROPIC_API_KEY' -- .github/workflows/
-# After the swap, these must be empty: the definition of done.
+# After the swap these must be empty: the definition of done.
 git grep -n '@anthropic-ai/claude-agent-sdk' -- ':!package-lock.json' ':!*.test.ts'
 git grep -n 'claude-code' -- ':!package-lock.json'
 ```
 
 At `8d33889`, `claude|anthropic` matches 70 files / 253 lines including docs and 56 / 177 in code.
-The count moves weekly; the commands do not. **Do not touch** (`claude`/`anthropic` that is a
-different system): `utils/bedrock-models.ts` and its tests,
+The count moves weekly; the commands do not.
+
+**Two things that look in scope and are not.** `delegate`'s `claude|anthropic` matches that belong to
+a different system: `utils/bedrock-models.ts` and its tests,
 `deploy/bedrock-invoke-principals.test.ts`, `deploy-workbench/bifrost/*`, `docs/bifrost-*.md`,
 `docs/workbench-account.md`, the `/anthropic/*` prefix in `deploy-workbench/ingress.ts`,
-`gating.ts:247-248` and `codeowners.test.ts:87` (a `CODEOWNERS` glob), and the `CLAUDE.md` string
-inside `eval/expected/ops-plan-amends-itself.bundle.json:18` — a replayed plan's text, where
-editing it changes an eval case.
-
-**Struck from the old inventory:** the `@modelcontextprotocol/sdk` "dependency ordering" item. It
-is not in `package.json` and nothing imports it, and `delegate/framework/mcp.ts` — the file the old
-plan feared would "lose its SDK" — **does not exist**. The only MCP server in `delegate/` is the
-git tool `run.ts` and `replay.ts` construct.
+`gating.ts:247-248` and `codeowners.test.ts:87` (a `CODEOWNERS` glob), and the `CLAUDE.md` string in
+`eval/expected/ops-plan-amends-itself.bundle.json:18`, where editing it changes an eval case. And
+the `@modelcontextprotocol/sdk` "dependency ordering" item struck from the old inventory: it is not
+in `package.json`, nothing imports it, and `delegate/framework/mcp.ts` — the file the old plan feared
+would "lose its SDK" — **does not exist**. The only MCP server in `delegate/` is the git tool `run.ts`
+and `replay.ts` construct.
 
 ## PR discipline, because every path here is human-owned
 
@@ -393,5 +446,5 @@ marked verified above, and **four of its behaviours need a spike in the step tha
 subagent result handoff and child usage reaching the parent, a `tool_call` handler mutating
 arguments (the `forceSynchronousTaskHook` equivalent), session resume at a fixed cwd for the repair
 turn, and whether a throw from a start-up handler is reliable fail-closed. **Whether Flash can carry
-the review is unmeasured by design** — that is stage A, and the fallback is named. And **the arms
+the review is unmeasured by design** — that is Stage B, and the fallback is named. And **the arms
 harness's refusal was read from source**, not reproduced.
