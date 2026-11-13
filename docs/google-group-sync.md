@@ -576,6 +576,20 @@ The ordering is also why the user creation happens before the add even though
 the diff does not need it: a member cannot be added before their user object
 exists, and the create is the step that can race SCIM.
 
+A failed create does not stop the pair. The three passes run in that order, and
+a per-member create failure is caught and counted rather than thrown: that
+member is skipped in the add pass, because there is no user id to add, and the
+remove pass still runs in full. Only after all three passes does the pair abort
+with `apply-failed` when any write failed, so it still fails loudly: the run
+emits `sync.aborted` and `Aborted` and withholds the heartbeat, and the
+removals it made stand. That is deliberate. Removals are the direction that
+reduces access, so gating them on an unrelated create failure would leave
+stale access in a group that gates admin approvals, and every step is
+idempotent, so the next interval retries the failed create anyway. A
+`ConflictException` that re-resolves to nothing is the one exception: it aborts
+with `ambiguous-user` immediately, because continuing could duplicate a person
+(step 1).
+
 ### 8. Record the run
 
 On success, emit the per-pair metrics (including zeros), the `sync.completed`
@@ -1011,8 +1025,9 @@ above.
    and the request is not otherwise widened. `createUser` now always sends
    `Name.GivenName` and `Name.FamilyName`, both non-empty, in every case; a
    local part that is empty or only separators falls back to the whole address
-   so neither field can be blank. `deploy-infrastructure/group-sync-runtime.test.ts`
-   pins the single-token request shape.
+   so neither field can be blank.
+   `deploy-infrastructure/group-sync-runtime.test.ts` pins the single-token
+   request shape.
 4. **The integration-test environment.** **Resolved:** a scratch group in the
    existing identity store, plus a scratch Google group -- the cheap option,
    not a dedicated test account. A truly separate identity store needs a
