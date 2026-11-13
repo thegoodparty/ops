@@ -1,0 +1,19 @@
+[Unit]
+Description=Delegate on Pi Durable (prototype)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/opt/delegate-durable/delegate-durable
+EnvironmentFile=/etc/delegate-durable.env
+ExecStart=/opt/delegate-durable/delegate-durable/node_modules/.bin/tsx src/main.ts
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
