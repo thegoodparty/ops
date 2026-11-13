@@ -295,7 +295,7 @@ Finding fields:
 - endLine: last line of a multi-line span (optional). Keep spans short and inside one hunk; a span that leaves the hunk is clamped to its start line and loses its suggestion.
 - body: markdown; must include a falsification-check sentence (required)
 - suggestion: literal replacement text for line..endLine, no code fences (optional)
-- category: one of bugs | security | tests | conventions | cross-file | thematic (required)
+- category: one of bugs | security | tests | conventions | cross-file | thematic | scale (required)
 - confidence: "high" | "medium" (required)
 
 summary is posted as the review body and is the reasoning behind the verdict, written for a human reviewer who will check that the PR description, this review, and the code agree. 3–6 sentences: what the change does as you read it from the diff (and whether that matches the PR description), which areas the scout flagged and what the deep-reviewers verified or falsified in each, and anything the human should confirm that you could not (migrations against real data, external behavior). Never put a finding in the summary: findings are inline comments and nothing else. A summary that says "no issues found" without saying what was checked is not acceptable.
