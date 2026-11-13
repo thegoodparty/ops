@@ -120,41 +120,53 @@ pi creates a second file with the same id. The repair turn must run at the same 
 that never received a message leaves no `.jsonl`, so "resumed" and "new" are indistinguishable
 until the first prompt. Test it.
 
-### 3. Budgets and spend are not built in, so they are bought — and cost is the sharp edge
+### 3. Budgets and spend are not built in — and the cap is delegate's own, not a dependency
 
 `agent.ts:82-83` sets `maxTurns: 50` / `maxBudgetUsd: 5`; `pr-reviewer.ts:216-217` raises them to
 80 / $10; exhaustion arrives as `error_max_turns` / `error_max_budget_usd`, which `run.ts:663-666`
 turns into a failed review. pi 1.5.2 has neither — searched in the CLI, the settings schema and the
 extension API. The surviving outer bound is the worker's 45-minute deadline (`entrypoint.ts:56-64`).
 
-**Prior art exists, and buying it beats building it.** `@aantenore/pi-budget` (0.1.0, MIT) enforces
-`usd`, `tokens`, `turns`, `toolCalls` and `minutes` via `--budget-*` flags or `PI_BUDGET_*`, hooks
-exactly the events this design would (`turn_end` and `agent_settled` to end a run, `tool_call` to
-block further calls, `session_start` to rebuild totals), and appends an audit entry on every stop.
-It also has the property the plan would otherwise have to add: a **project** `.pi/budget.json` may
-only *tighten* a budget, never relax it, and is read without the project-trust check — so a PR
-checkout cannot switch the cap off.
+**Prior art exists and is worth reading, and `@aantenore/pi-budget` 0.1.0 is the best of it** — it
+enforces `usd`, `tokens`, `turns`, `toolCalls` and `minutes`, and its policy is the one this design
+would pick: `ctx.abort()` at a limit, `{ block: true, terminate: true }` on further tool calls, and
+totals rebuilt from the entries pi already wrote. Use it as the reference. **But the recommendation
+is not to depend on it**, because two facts measured after the first draft of this section:
 
-**Decided here: install `pi-budget`, pinned to an exact version and loaded from an image path (never
-from the checkout), and keep two things delegate's:**
+- **Its supply-chain and maintenance posture does not match what it would sit next to.** Created
+  2026-10-20, last pushed 2026-10-23, one npm publish, one star, one contributor, no release tags.
+  In the worker it runs in-process beside `REVIEWER_APP_PRIVATE_KEY`, and on the reliability side
+  nothing in this repo would notice if it stopped tracking pi's event API.
+- **There is almost nothing to buy.** Its enforcement policy is the `turn_end`, `tool_call` and
+  `agent_settled` handlers (**27 non-blank lines** of the 1,059 it ships) plus `addUsage`,
+  `countsAsTurn` and `exceededLimits` in its tracker (**20**). The remaining ~1,000 are config-layer
+  merging, limit formatting, a `/budget` TUI command this headless worker cannot use, and an SDK
+  adapter for `pi-agent-core` — the one integration this plan explicitly does not take. And
+  `agent.ts` **already** counts `turnCount` (`:115`) and reads `total_cost_usd` (`:203`) off the
+  message stream; the rpc side has `get_session_stats` for cumulative session totals.
 
-1. **The price is still delegate's.** `pi-budget` spends the USD number pi computes from its own
-   price table, so it inherits the catalog-arithmetic problem rather than fixing it.
-   `cost.totalFromProvider` is only ever true for OpenRouter; a missing row defaults to `0`
-   silently, and this repo has been bitten by that twice. The committed `delegate/pi/models.json` is
-   what makes the number right, and **a replay whose `costUsd` is `0` while it reported tokens is a
-   failure, not a zero-cost win.** A cap that reads $0 can never fire — precisely the failure
-   `pi-budget` warns about for unpriced local models.
-2. **The zero-cost assertion is a separate test from the cap**, because a correct cap and a correct
-   ledger are not the same instrument.
+**Decided here: delegate owns two counters and an abort, in `runAgent`.** A turn counter over the
+event stream, a spend counter from the cumulative totals the child reports, and one `ctx.abort()`
+past either limit — the same three decisions `pi-budget` makes, in code this repo can test and whose
+next pi upgrade will break loudly in CI rather than silently in production. A test asserts the abort
+fires at N and the failed review carries a reason.
 
-The risk to accept: it is a young, single-maintainer package running in-process in the worker, so it
-is a supply-chain surface next to `REVIEWER_APP_PRIVATE_KEY`. Pin it, read it before the pin lands,
-and keep the 45-minute deadline as the outer bound that depends on no extension loading at all. The
-SDK's failure `subtype` vocabulary also has no pi equivalent, so a small closed `RunnerError` enum is
-needed or every timeout becomes a red `error` status; and `num_turns` and pi's `turn_end` are
-different definitions (one assistant response plus its tool calls), so the caps are re-tuned from
-measurement.
+What that keeps from the prior art, deliberately: the price is delegate's, because pi derives USD
+from its own catalog — `cost.totalFromProvider` is only ever true for OpenRouter, and a missing row
+defaults to `0` silently. That has bitten this repo twice, so `delegate/pi/models.json` carries the
+committed rate and **a replay whose `costUsd` is `0` while it reported tokens is a failure, not a
+zero-cost win.** A cap that reads $0 can never fire. What it drops is the project-`.pi/budget.json`
+can-only-tighten rule — real, but it defends against a PR checkout loosening a cap, and the worker
+passes its limits as explicit arguments from the image, which a checkout cannot influence at all.
+
+The SDK's failure `subtype` vocabulary also has no pi equivalent, so a small closed `RunnerError`
+enum is needed or every timeout becomes a red `error` status; and `num_turns` and pi's `turn_end`
+are different definitions (one assistant response plus its tool calls), so the caps are re-tuned
+from measurement rather than assumed equivalent.
+
+**Revisit if** `pi-budget` grows maintainers, release tags and a second consumer of note. At that
+point adopting it is deleting ~50 lines and adding a pin — a cheap reversal, which is the right
+shape for this decision.
 
 ## Provider and model: settled
 
@@ -243,9 +255,10 @@ what it would cost to be wrong:
    deadline, a record keyed by `(pr, sha)` — ECS *is* the restart boundary, and a resumed
    conversation has nowhere to resume to once the task is gone. #530 needed durability because it
    replaced a long-lived Slack swarm; the reviewer is a single-shot batch job.
-3. **Its two other gifts are now cheaper elsewhere.** `maxTurns` comes from `pi-budget` (above), and
-   the subagent pattern is what S4 builds either way. What remains is a scheduler this workload does
-   not want, bought with an unstable API under the merge authority.
+3. **Its other gifts are cheaper elsewhere.** `maxTurns` is two counters and an abort in `runAgent`
+   (above) — less code than adopting the dependency would need, and no supply-chain surface. The
+   subagent pattern is what S4 builds either way. What remains is a scheduler this workload does not
+   want, bought with an unstable API under the merge authority.
 
 **What being wrong costs.** If rpc is chosen and durability is later wanted, the neutral contract in
 `delegate/framework/types.ts` plus one `runAgent` file makes the driver swappable and #530 is the
@@ -267,7 +280,7 @@ hard exit 1, so the credential swap is last.
 | **S1** | **Delete the dead CLI install.** `delegate/worker/Dockerfile:4` is proven dead: nothing sets `pathToClaudeCodeExecutable` (0 hits repo-wide) and the SDK resolves its own platform binary by `require.resolve`, never `PATH`. ~346 MB, no behavioural risk. | revert + rebuild | `deploy.yml` builds and pushes; **one real review posted end to end** from the new image; image size recorded before/after. |
 | **S2** | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` replacing `HookCallback`, a structured-output ask, a session handle — six SDK-derived fields leave `types.ts` (`:3,13,14,15,16,24`); split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green. |
 | **S3** | **The security seam.** Both guards on the new handler type (`run.ts:77-110`, `replay.ts:353-367`) with pi's own path normalisation. **The `@`-strip bypass is fixed here.** | yes | The adversarial table below passes; every existing denial assertion kept; `run.test.ts:176-209,222-238` and `replay.test.ts:694-712` rewritten, never deleted. |
-| **S4** | **The harness swap, on Anthropic.** `runAgent` over a spawned `pi --mode rpc` child with the explicit allowlist env, still calling `claude-opus-5-5` / `claude-sonnet-5-5` through pi's built-in `anthropic` provider — **the model does not change**. Structured output as a terminating tool; subagents as child processes returning usage to the parent; the cap (`pi-budget`, pinned); `git-tool` as an extension (`tool()`/`createSdkMcpServer` at `git-tool.ts:48,67,82,101,120`) keeping `isSafeRef`/`isSafePath`/truncation verbatim; `agentEnv` gains pi's knobs and drops `CLAUDE_`/`DISABLE_`. | revert + deploy (image tag retained) | **Stage A only** of the gate below: harness parity at one provider, with `costRatio` gated because both sides price the same models. The canary waits for S6, since it measures the shipped configuration. |
+| **S4** | **The harness swap, on Anthropic.** `runAgent` over a spawned `pi --mode rpc` child with the explicit allowlist env, still calling `claude-opus-5-5` / `claude-sonnet-5-5` through pi's built-in `anthropic` provider — **the model does not change**. Structured output as a terminating tool; subagents as child processes returning usage to the parent; **the turn and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` as an extension (`tool()`/`createSdkMcpServer` at `git-tool.ts:48,67,82,101,120`) keeping `isSafeRef`/`isSafePath`/truncation verbatim; `agentEnv` gains pi's knobs and drops `CLAUDE_`/`DISABLE_`. | revert + deploy (image tag retained) | **Stage A only** of the gate below: harness parity at one provider, with `costRatio` gated because both sides price the same models. The canary waits for S6, since it measures the shipped configuration. |
 | **S5** | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
 | **S6** | **Provider move to Fireworks.** Create `FIREWORKS_API_KEY` out of band, commit `delegate/pi/models.json` at the US price, point the agent at the `fireworks-us` provider. No harness change. | yes (flip back to the Anthropic provider) | `npm run build` and `npm test`; one smoke prompt inside the image's env records nonzero tokens **and nonzero cost** (zero cost fails the step); **Stage B** of the gate below, which is now a pure model comparison. |
 | **S7** | **Infra.** `deploy/delegate-secret.ts:16`: add `FIREWORKS_API_KEY`, drop `ANTHROPIC_API_KEY` — **the same PR as the deploy, never before it.** Human-owned carve-out, its own PR, no agent work riding along. | yes, until the value is deleted | `pulumi preview` shows exactly the expected `secrets` delta and nothing else; the deploy lands; a real review posts with nonzero `costUsd`; then soak. |
