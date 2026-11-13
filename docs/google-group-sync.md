@@ -12,6 +12,16 @@
 > things still genuinely open are in "Open questions" at the end and are marked
 > **open**. The steps in "Implementation plan" carry their own status, and
 > steps 1 to 4 are `done`.
+>
+> **Two later amendments, 2026-11-13.** A single-token local part used to make
+> `CreateUser` omit `Name.FamilyName`, which the live store rejects, so those
+> runs aborted; the create request now always carries both name fields. And open
+> question 3 was settled in favour of *reading* the name from the member's
+> Google public profile rather than deriving it, which adds one read-only OAuth
+> scope (`admin.directory.user.readonly`) and one `users.get` call on the create
+> path only. Both are recorded in full where they belong: the scope reasoning in
+> "Google access, read-only", and the decision, its cost and its fallback in
+> open question 3.
 
 The job is small on purpose: one Lambda, on a schedule, that makes one IAM
 Identity Center group a strict mirror of one Google Workspace group. It adds
@@ -180,8 +190,9 @@ endpoint; that is the value this job uses too. The home region is `us-west-2`
 one constant (`deploy-infrastructure/group-sync/identity.ts`).
 
 **Google API.** The plan is written against the Admin SDK Directory API
-(`admin.directory.group.member.readonly` and `admin.directory.group.readonly`,
-delegated), because it is the API whose group-member listing carries the
+(`admin.directory.group.member.readonly`, `admin.directory.group.readonly` and
+`admin.directory.user.readonly`, delegated), because it is the API whose
+group-member listing carries the
 `type` field this job filters on and it is the one most Workspace tenants
 have enabled. If the organization's Workspace/Cloud Identity edition serves
 group membership only through the Cloud Identity API, the fetch layer changes
@@ -672,15 +683,34 @@ pair" lists two changes rather than one: the config cannot widen the grant.
 The service account's scopes are exactly:
 
 - `https://www.googleapis.com/auth/admin.directory.group.readonly` (resolve
-  the source group), and
+  the source group),
 - `https://www.googleapis.com/auth/admin.directory.group.member.readonly`
-  (list its members).
+  (list its members), and
+- `https://www.googleapis.com/auth/admin.directory.user.readonly` (read a
+  new member's public profile name, added 2026-11-13 with open question 3).
 
-Both are delegated to a dedicated impersonation admin account, and the
+All three are delegated to a dedicated impersonation admin account, and the
 domain-wide delegation entry in the Google Admin console names the service
-account's client id and exactly these two scopes. There is no Google write
+account's client id and exactly these three scopes. There is no Google write
 scope anywhere in the job; if a future change needs one, it is a separate PR
 and a separate consent decision.
+
+The third scope is the one to scrutinise, and it was chosen to add a scope
+without adding privilege. `users.get` is called with `viewType=domain_public`,
+which is the path Google documents for a non-administrator: "any user on the
+domain can read user profiles". It needs no user-management admin role, so the
+impersonation account **stays a Groups Reader** and gains no ability to read
+administrator-only fields, and certainly none to change a user. The whole of
+the privilege the job holds is still "read groups and read public profile
+fields".
+
+One precondition: `domain_public` requires contact sharing to be enabled for
+the domain (Admin console -> Directory -> Directory settings -> Sharing
+settings -> Contact sharing). If it is off, the lookup returns nothing, the job
+falls back to a derived placeholder name, and nothing else about the run
+changes. The `viewType=admin_view` alternative would need a custom admin role
+carrying `Users -> Read`, which is more privilege for a field the job only
+needs at create time; it is not used.
 
 ### The manual Google setup, which is not a PR
 
@@ -692,7 +722,11 @@ cannot be code:
 2. Enable the Admin SDK Directory API (or the Cloud Identity API, per the open
    question).
 3. In the Google Admin console, grant the service account's client id
-   domain-wide delegation for the two read-only scopes above.
+   domain-wide delegation for the three read-only scopes above. **The field
+   replaces the whole list rather than merging**, so all three must be pasted
+   together, and this has to be done before the code that asks for all three
+   is deployed: a delegation entry narrower than the requested scope makes
+   every pair abort with `source-read-failed`. Widening it first is safe.
 4. Create a dedicated impersonation admin account (not a personal admin
    account) whose only purpose is this delegation, so revoking it is one
    account. Its address is deployment state, not policy: the Lambda reads it
@@ -1000,34 +1034,48 @@ above.
    the Identity Store API in the wrong region fails in a way that reads as a
    permissions problem. **Resolved:** the engineer confirmed `us-west-2` when
    step 3 was built, and the runtime names it in one constant.
-3. **User display names.** The job only reads group membership, so it has the
-   email and not the person's name. Identity Store `CreateUser` needs a
-   `DisplayName` and a `Name`. The default is to derive both from the email
-   local part and let a human correct them later, which keeps the Google scope
-   to group reads only. The alternative is to add
-   `admin.directory.user.readonly` and enrich from the Google profile, which
-   is a wider scope for a cosmetic field. Which way is a decision, not a
-   default. Step 3 implements the derived default
+3. **User display names.** **Resolved 2026-11-13: the name is read from the
+   Google public profile, not derived.**
+   The job needs a `DisplayName` and a `Name` for `CreateUser`, and it used to
+   have only an email address. Step 3 derived both from the local part
    (`deriveDisplayName` in `deploy-infrastructure/group-sync/identity.ts`):
-   tokens split on `.`, `_` and `-`, capitalized, and a multi-token local part
-   becomes `GivenName` plus the rest as `FamilyName`.
-   **Amended 2026-11-13, after the first applies.** This section used to say
-   `FamilyName` was omitted when the local part is a single token. That is
-   unimplementable: the live identity store rejects a `CreateUser` whose
-   `Name` has no `FamilyName` with a `ValidationException`, so every run that
-   reached a single-token member (`swain@goodparty.org`) aborted, the pair
+   tokens split on `.`, `_` and `-`, capitalized, with a multi-token local
+   part becoming `GivenName` plus the rest as `FamilyName`.
+   **First amendment, 2026-11-13, before the decision changed.** This section
+   used to say `FamilyName` was omitted when the local part is a single token.
+   That is unimplementable: the live identity store rejects a `CreateUser`
+   whose `Name` has no `FamilyName` with a `ValidationException`, so every run
+   that reached a single-token member (`swain@goodparty.org`) aborted, the pair
    never converged, both the failures and the dead-man's alarms stayed red,
-   and the member never landed in the mirrored group. What is done instead is
-   to duplicate the one token into both fields -- `Swain` / `Swain` -- which is
-   a syntactically valid placeholder the store accepts and a human corrects
-   later if it matters. The narrow-scope decision is unchanged: the name is
-   still derived from the address and nothing is read from the Google profile,
-   and the request is not otherwise widened. `createUser` now always sends
-   `Name.GivenName` and `Name.FamilyName`, both non-empty, in every case; a
-   local part that is empty or only separators falls back to the whole address
-   so neither field can be blank.
+   and the member never landed in the mirrored group. The fix was to duplicate
+   the one token into both fields (`Swain` / `Swain`), a syntactically valid
+   placeholder the store accepts. `createUser` always sends `Name.GivenName`
+   and `Name.FamilyName`, both non-empty, in every case, and a local part that
+   is empty or only separators falls back to the whole address so neither
+   field can be blank.
+   **Second amendment, 2026-11-13: the placeholder is no longer the design.**
+   A duplicated token is a guess, and the engineer decided against shipping a
+   guess when the real name was two calls away. The job now calls
+   `directory.users.get` on the member it is about to create, with
+   `viewType=domain_public`, and uses `name.givenName` / `name.familyName`. The
+   cost is one more read-only scope
+   (`admin.directory.user.readonly`), and the compensating control is what
+   keeps it from being an escalation: `domain_public` is the
+   non-administrator path, so the impersonation account stays a **Groups
+   Reader** with no user-management privilege and no administrator-only
+   fields. The scope list and that reasoning are in "Google access, read-only"
+   above.
+   What is deliberately unchanged: the read is confined to the create path, so
+   a converged pair makes no profile calls at all, and the lookup can never
+   fail the run -- every error, an absent profile or a missing half of the name
+   falls back to the derived placeholder, which is why the first amendment's
+   guarantee (both fields always non-empty) still holds and still matters.
+   `resolveCreateUserName` in `identity.ts` is the one place that decides
+   between the two. The audit log records `nameSource` (`google` or `derived`)
+   and never the name, per the logging rule that membership is personal data.
    `deploy-infrastructure/group-sync-runtime.test.ts` pins the single-token
-   request shape.
+   request shape, the profile-named create, and the fallback on a failed
+   lookup.
 4. **The integration-test environment.** **Resolved:** a scratch group in the
    existing identity store, plus a scratch Google group -- the cheap option,
    not a dedicated test account. A truly separate identity store needs a
