@@ -1442,6 +1442,22 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
       Resource: PREVIEW_QUEUES,
     },
     {
+      // gp-api's agent web tools drive one AgentCore Browser session per run
+      // over its automation stream. Only the AWS-managed browser: a custom
+      // browser is account-owned and could carry its own execution role and
+      // network settings.
+      Sid: "AgentCoreManagedBrowser",
+      Effect: "Allow",
+      Action: [
+        "bedrock-agentcore:StartBrowserSession",
+        "bedrock-agentcore:GetBrowserSession",
+        "bedrock-agentcore:ListBrowserSessions",
+        "bedrock-agentcore:StopBrowserSession",
+        "bedrock-agentcore:ConnectBrowserAutomationStream",
+      ],
+      Resource: "arn:aws:bedrock-agentcore:us-west-2:aws:browser/aws.browser.v1",
+    },
+    {
       // Actions that take no resource, copied from the task role's preview
       // statements as they stand. ssmmessages is ECS Exec's channel into the
       // container, not SSM parameter access.
