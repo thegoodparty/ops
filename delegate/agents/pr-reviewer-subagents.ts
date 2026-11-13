@@ -47,6 +47,7 @@ Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, n
 
 Lead categories:
 - correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
+- correctness, when the count comes from the data: when the diff adds a loop, fit, query or mapping whose count comes from data (one parameter per census tract, one query per contact, one row per voter), the hypothesis must name that dimension, the size it reaches in a large district or audience, and whether the work runs synchronously on the request path with no cap.
 - security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
 - tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
