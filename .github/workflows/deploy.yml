@@ -48,8 +48,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v6.1.0
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -70,9 +70,9 @@ jobs:
           echo "test job result: ${{ needs.test.result }}"
           exit 1
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -100,29 +100,29 @@ jobs:
       # can already assume and which can mint the ECR Public login token.
       - name: Configure AWS Credentials (ECR Public login)
         if: ${{ github.event_name == 'pull_request' }}
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-pulumi-preview
           aws-region: us-west-2
 
       - name: Configure AWS Credentials
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-pulumi-deploy
           aws-region: us-west-2
 
       - name: Login to Amazon ECR Public
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@v2.1.7
         with:
           registry-type: public
 
       - name: Login to Amazon ECR
         if: ${{ github.event_name != 'pull_request' }}
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@v2.1.7
 
       - name: Install Pulumi
-        uses: pulumi/actions@v6
+        uses: pulumi/actions@v6.6.1
         with:
           pulumi-version: "^3"
 
