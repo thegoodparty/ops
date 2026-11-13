@@ -3,7 +3,7 @@
 ## What this is
 
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
-v2.10.0 that shows up in Slack as **Delegate** and serves its dashboard at
+v2.13.0 that shows up in Slack as **Delegate** and serves its dashboard at
 https://delegate-swarm.infra.goodparty.org. One EC2 host in the infrastructure
 account runs the whole stack in Docker Compose. This file is how to operate it.
 
