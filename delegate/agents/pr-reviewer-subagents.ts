@@ -24,7 +24,7 @@ Fields:
 - endLine: (optional) last line if the finding spans multiple lines
 - body: markdown comment. MUST end with a parenthetical: "(Falsification check: <what would disprove this and whether it is present in the code>.)"
 - suggestion: (optional) literal replacement text for line..endLine, no code fences. Only include when you are confident it will pass CI verbatim. Match the file's existing style (quotes, semicolons, indentation).
-- category: one of bugs | security | tests | conventions | cross-file | thematic
+- category: one of bugs | security | tests | conventions | cross-file | thematic | scale
 - confidence: "high" | "medium"
 
 Emit a finding only if you would block merge on it alone. Drop everything else silently.
@@ -52,6 +52,7 @@ Lead categories:
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
 - thematic: multiple files touching the same risk surface (all timezone code, all new validation paths)
+- scale: the data dimension the new work iterates over (one model parameter per census tract, one query per contact, one row per voter), the size that dimension reaches in a real district or audience, and whether that work runs synchronously on the request path with nothing capping it. Naming the dimension and its size is a lead, not a verified claim: name them and let the deep-reviewer check them.
 
 Do NOT lead on: fabricated findings, pre-existing code the diff does not touch, theoretical risks requiring unlikely preconditions, or style preferences where the diff already matches surrounding code.
 
@@ -112,6 +113,8 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 
 **thematic:** Read all paths together. Emit one finding per distinct verified sub-issue.
+
+**scale:** Work placed on the request path whose cost grows with a data dimension the caller controls, with nothing that caps it. Blocker only when you can name the dimension, a realistic size for it, and the per-unit cost from the code. Read the repo's \`docs/scale.md\` when the checkout has one; when it does not, say in the body where the dimension comes from in the diff. Do NOT block when the work is off the request path (queued or background), capped or refused above a limit that is in the code, computed when its inputs change and stored, or paged with a fixed page size.
 
 ## The disprove-it pass — required
 
