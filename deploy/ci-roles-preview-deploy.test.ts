@@ -4,6 +4,7 @@ import {
   GP_API_PREVIEW_ROLE_BOUNDARY_ARN,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
+  githubActionsPullRequestJobs,
 } from "./components/ci-roles/policies";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
@@ -44,15 +45,81 @@ const DIFF_PROD_READS = [
 ];
 
 describe("githubActionsPreviewDeployTrust", () => {
-  it("is assumed by omni pull_request runs alone, under StringEquals", () => {
-    assert.equal(githubActionsPreviewDeployTrust.Statement.length, 1);
-    const [s] = githubActionsPreviewDeployTrust.Statement;
-    assert.equal(s.Action, "sts:AssumeRoleWithWebIdentity");
-    assert.equal(s.Condition.StringLike, undefined);
-    assert.deepEqual(s.Condition.StringEquals, {
+  const [pullRequest, judge] = githubActionsPreviewDeployTrust.Statement;
+
+  it("has two statements, both under StringEquals", () => {
+    assert.equal(githubActionsPreviewDeployTrust.Statement.length, 2);
+    for (const s of githubActionsPreviewDeployTrust.Statement) {
+      assert.equal(s.Action, "sts:AssumeRoleWithWebIdentity");
+      assert.deepEqual(Object.keys(s.Condition), ["StringEquals"]);
+    }
+  });
+
+  it("is assumed by omni pull_request runs", () => {
+    assert.deepEqual(pullRequest.Condition.StringEquals, {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
       [SUBJECT_KEY]: "repo:thegoodparty/omni:pull_request",
     });
+  });
+
+  // The judge runs pull request code from a main-ref workflow. Without the
+  // workflow pin every main job could assume this role; with it, only
+  // judge.yml as it is on main.
+  it("is assumed on main by judge.yml alone", () => {
+    assert.deepEqual(judge.Condition.StringEquals, {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      [SUBJECT_KEY]: "repo:thegoodparty/omni:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:job_workflow_ref":
+        "thegoodparty/omni/.github/workflows/judge.yml@refs/heads/main",
+    });
+  });
+});
+
+describe("githubActionsPullRequestJobs", () => {
+  const statements = githubActionsPullRequestJobs.Statement;
+  const actions = statements.flatMap((s) => ("Action" in s ? asList(s.Action) : []));
+  const resources = statements.flatMap((s) => asList(s.Resource));
+
+  it("only allows", () => {
+    for (const s of statements) assert.equal(s.Effect, "Allow", s.Sid);
+  });
+
+  it("deletes nothing and receives nothing", () => {
+    for (const action of actions) {
+      assert.doesNotMatch(action, /Delete|Receive|\*/, action);
+    }
+  });
+
+  it("writes E2E reports only under gp-webapp/", () => {
+    const writes = statements.filter(
+      (s) =>
+        "Action" in s &&
+        asList(s.Action).includes("s3:PutObject") &&
+        asList(s.Resource).some((r) => r.includes("gp-playwright-reports")),
+    );
+    assert.deepEqual(
+      writes.flatMap((s) => asList(s.Resource)),
+      ["arn:aws:s3:::gp-playwright-reports/gp-webapp/*"],
+    );
+  });
+
+  it("reaches only dev resources and the reports bucket", () => {
+    for (const r of resources) {
+      assert.match(
+        r,
+        /^arn:aws:s3:::gp-playwright-reports(\/gp-webapp\/\*)?$|-dev(\.fifo)?(\/|$)/,
+        r,
+      );
+    }
+  });
+
+  it("sends to the dispatch queue and looks it up, nothing else", () => {
+    const sqs = actions.filter((a) => a.startsWith("sqs:")).sort();
+    assert.deepEqual(sqs, ["sqs:GetQueueUrl", "sqs:SendMessage"]);
+  });
+
+  it("puts nothing on *", () => {
+    assert.ok(!resources.includes("*"));
   });
 });
 
