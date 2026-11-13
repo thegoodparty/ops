@@ -995,9 +995,24 @@ above.
    is a wider scope for a cosmetic field. Which way is a decision, not a
    default. Step 3 implements the derived default
    (`deriveDisplayName` in `deploy-infrastructure/group-sync/identity.ts`):
-   tokens split on `.`, `_` and `-`, capitalized, with `FamilyName` omitted
-   when the local part is a single token. Nothing is created while the pair is
-   `dry-run`, so the decision can still be revisited before the first apply.
+   tokens split on `.`, `_` and `-`, capitalized, and a multi-token local part
+   becomes `GivenName` plus the rest as `FamilyName`.
+   **Amended 2026-11-13, after the first applies.** This section used to say
+   `FamilyName` was omitted when the local part is a single token. That is
+   unimplementable: the live identity store rejects a `CreateUser` whose
+   `Name` has no `FamilyName` with a `ValidationException`, so every run that
+   reached a single-token member (`swain@goodparty.org`) aborted, the pair
+   never converged, both the failures and the dead-man's alarms stayed red,
+   and the member never landed in the mirrored group. What is done instead is
+   to duplicate the one token into both fields -- `Swain` / `Swain` -- which is
+   a syntactically valid placeholder the store accepts and a human corrects
+   later if it matters. The narrow-scope decision is unchanged: the name is
+   still derived from the address and nothing is read from the Google profile,
+   and the request is not otherwise widened. `createUser` now always sends
+   `Name.GivenName` and `Name.FamilyName`, both non-empty, in every case; a
+   local part that is empty or only separators falls back to the whole address
+   so neither field can be blank. `deploy-infrastructure/group-sync-runtime.test.ts`
+   pins the single-token request shape.
 4. **The integration-test environment.** **Resolved:** a scratch group in the
    existing identity store, plus a scratch Google group -- the cheap option,
    not a dedicated test account. A truly separate identity store needs a

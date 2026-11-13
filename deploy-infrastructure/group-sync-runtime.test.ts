@@ -1220,10 +1220,66 @@ describe("identity adapter", () => {
       givenName: "Jeff",
       familyName: "Jagoda",
     });
+    // A single-token local part duplicates the token: the store requires a
+    // non-empty `FamilyName`, and omitting it failed the create outright.
     assert.deepEqual(deriveDisplayName("swain@goodparty.org"), {
       displayName: "Swain",
       givenName: "Swain",
+      familyName: "Swain",
     });
+  });
+
+  it("creates a single-token user with a family name the store accepts", async () => {
+    // The regression this pins: a member whose local part has no separator used
+    // to reach `CreateUser` without `Name.FamilyName`, and the live store
+    // aborted the run with a `ValidationException`. Run the real adapter against
+    // a fake client and assert on the command it actually sends.
+    const sent: CreateUserCommand[] = [];
+    const directory = createIdentityDirectory({
+      groupId: ENGINEERS_GROUP_ID,
+      client: sdkClient(async (command) => {
+        if (command instanceof GetUserIdCommand) {
+          throw new ResourceNotFoundException({ message: "", $metadata: {} });
+        }
+        if (command instanceof CreateUserCommand) {
+          sent.push(command);
+          return { UserId: "u-swain" };
+        }
+        throw new Error("unexpected command");
+      }),
+    });
+    assert.equal(await directory.createUser("Swain@GoodParty.org"), "u-swain");
+    assert.equal(sent.length, 1);
+    const input = sent[0]!.input;
+    assert.equal(input.UserName, "swain@goodparty.org");
+    assert.equal(input.DisplayName, "Swain");
+    assert.equal(input.Name?.GivenName, "Swain");
+    assert.equal(input.Name?.FamilyName, "Swain");
+  });
+
+  it("creates a multi-token user with both name fields split from the local part", async () => {
+    const sent: CreateUserCommand[] = [];
+    const directory = createIdentityDirectory({
+      groupId: ENGINEERS_GROUP_ID,
+      client: sdkClient(async (command) => {
+        if (command instanceof GetUserIdCommand) {
+          throw new ResourceNotFoundException({ message: "", $metadata: {} });
+        }
+        if (command instanceof CreateUserCommand) {
+          sent.push(command);
+          return { UserId: "u-jeff" };
+        }
+        throw new Error("unexpected command");
+      }),
+    });
+    assert.equal(
+      await directory.createUser("jeff.jagoda@goodparty.org"),
+      "u-jeff",
+    );
+    const input = sent[0]!.input;
+    assert.equal(input.DisplayName, "Jeff Jagoda");
+    assert.equal(input.Name?.GivenName, "Jeff");
+    assert.equal(input.Name?.FamilyName, "Jagoda");
   });
 });
 

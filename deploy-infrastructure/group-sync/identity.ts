@@ -166,20 +166,32 @@ export const assumeGrantRole = async (
  * local part and let a human correct it later -- keeps the Google scope to the
  * two group reads; enriching from the profile would need
  * `admin.directory.user.readonly` for a cosmetic field.
+ *
+ * `givenName` and `familyName` are both always non-empty, because the live
+ * identity store rejects a `CreateUser` whose `Name` omits `FamilyName` with a
+ * `ValidationException`, which aborted every run that reached a member with a
+ * single-token local part (`swain@goodparty.org`). A single token is therefore
+ * duplicated into both fields: a syntactically valid placeholder the store
+ * accepts, which a human corrects later if it matters. The fallback to the
+ * address covers a local part that is empty or only separators (`...@`), which
+ * would otherwise leave the token list empty and both fields blank.
  */
 export const deriveDisplayName = (
   email: string,
-): { displayName: string; givenName: string; familyName?: string } => {
+): { displayName: string; givenName: string; familyName: string } => {
   const local = email.split("@")[0] ?? "";
   const tokens = local.split(/[._-]+/).filter(Boolean);
   const capitalized = tokens.map(
     (token) => token.charAt(0).toUpperCase() + token.slice(1).toLowerCase(),
   );
-  const displayName = capitalized.join(" ") || local;
-  const givenName = capitalized[0] ?? local;
+  // A local part that is empty or only separators yields no tokens at all, so
+  // the whole address becomes the placeholder rather than an empty `Name`.
+  const fallback = local || email;
+  const displayName = capitalized.join(" ") || fallback;
+  const givenName = capitalized[0] ?? fallback;
   const familyName =
-    capitalized.length > 1 ? capitalized.slice(1).join(" ") : undefined;
-  return { displayName, givenName, ...(familyName ? { familyName } : {}) };
+    capitalized.length > 1 ? capitalized.slice(1).join(" ") : givenName;
+  return { displayName, givenName, familyName };
 };
 
 const normalizeEmail = (email: string): string => email.trim().toLowerCase();
@@ -241,9 +253,12 @@ export const createIdentityDirectory = (options: {
                 IdentityStoreId: identityStoreId,
                 UserName: normalized,
                 DisplayName: displayName,
+                // Both are always set: the store requires `FamilyName`, and
+                // a create that omits it is a `ValidationException` that aborts
+                // the whole run.
                 Name: {
                   GivenName: givenName,
-                  ...(familyName ? { FamilyName: familyName } : {}),
+                  FamilyName: familyName,
                 },
                 Emails: [{ Value: normalized, Primary: true, Type: "work" }],
               }),
