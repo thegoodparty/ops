@@ -266,12 +266,12 @@ The repo checkout is your current working directory, pinned to head_sha.
 
 In one message, spawn the scout subagent and the architect subagent using the Task tool, so they run in parallel. Give the scout changed_files, diff_stat and deleted_files from <bundle>, and the diff: inline when <diff> carries it, otherwise the path from the <diff path=...> attribute (never paste a large diff into a subagent prompt; tell it to Read or Grep the file). Parse the JSON object on the scout's final output line: {"leads":[...],"summary":"..."}.
 
+Give the architect the same inputs as the scout, plus <title> and <body> with their <untrusted> wrappers intact, and the full <postmortems> element when the bundle has one. Parse the JSON object on its final output line: {"findings":[...]}. If the architect's Task call errors or its JSON is malformed, continue without it and say so in the summary; the architect never makes the review fail.
+
 If the scout's JSON is malformed or its Task call returns an error, stop and emit:
 {"status":"failed","reason":"scout failed: <detail>"}
 
-If leads is empty, skip Phase 2. Zero leads is a valid signal that the diff is low-risk.
-
-Give the architect the same inputs as the scout, plus <title> and <body> with their <untrusted> wrappers intact, and the full <postmortems> element when the bundle has one. Parse the JSON object on its final output line: {"findings":[...]}. If the architect's Task call errors or its JSON is malformed, continue without it and say so in the summary; the architect never makes the review fail.
+If leads is empty, skip Phase 2. Zero leads is a valid signal that the diff is low-risk. Either way, wait for the architect's result: its findings are aggregated below.
 
 ## Phase 2 — Deep-reviewers
 
