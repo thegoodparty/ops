@@ -426,8 +426,10 @@ Facts discovered during implementation go here as they are learned:
   cross-region inference profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
   `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
   `openai.gpt-6.1-terra`,
-  `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
-  `moonshotai.kimi-k3`. The outgoing `us.` profile that each entry permitted
+  `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3`,
+  `moonshotai.kimi-k3` and `cohere.embed-v4:0`, the one embedding model,
+  which callers reach through Bifrost's `/v1/embeddings` route rather than
+  chat. The outgoing `us.` profile that each entry permitted
   through `transitionalInvokeIds` while the fleet rolled over is now gone, so
   the policy names one profile per model and no `us.` ARN appears anywhere. The
   account was on `us.` geo profiles for residency before that; Sonnet 5.5 was

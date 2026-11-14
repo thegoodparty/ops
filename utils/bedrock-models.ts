@@ -141,6 +141,12 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     crossRegion: true,
     note: "global. and us. profiles both exist; access in this account is unverified when granted; replaced glm-5",
   },
+  {
+    id: "cohere.embed-v4:0",
+    invokeId: "global.cohere.embed-v4:0",
+    crossRegion: true,
+    note: "embedding model, not a chat model: served through Bifrost's /v1/embeddings route; AWS enabled the global. profile on 2025-10-02",
+  },
 ];
 
 /**

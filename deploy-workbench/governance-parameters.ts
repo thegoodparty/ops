@@ -32,7 +32,7 @@ import {
  * ## Why two parameters and not one
  *
  * The `String` standard tier holds 4 KiB. `bifrost/config.json` is already
- * 3,604 bytes against that ceiling (`ecs.ts`'s
+ * 3,644 bytes against that ceiling (`ecs.ts`'s
  * `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES`), so a combined governance
  * document would grow into the same wall from the far side. Split, the
  * 704-byte template has room and the overrides document gets the rest; the

@@ -1858,9 +1858,10 @@ describe("bifrost ecs", () => {
   });
 
   it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
-    // 3,604 bytes against the standard tier's 4 KiB, measured on 2026-11-10
+    // 3,644 bytes against the standard tier's 4 KiB: 3,604 on 2026-11-10
     // after the three Fireworks alias descriptions moved into
-    // `docs/bifrost-fireworks-model-metadata.md`: 492 bytes of headroom, not the
+    // `docs/bifrost-fireworks-model-metadata.md`, plus 40 for Cohere Embed v4 in
+    // the Bedrock allowlist. 452 bytes of headroom, not the
     // 11 the file had while those descriptions were in it and not the couple of
     // kilobytes a comment in `ecs.ts` and one in `bifrost/README.md` used to
     // claim. The number is asserted rather than left to a comment, because the
@@ -1876,8 +1877,8 @@ describe("bifrost ecs", () => {
     // does. If this fails the comment is the stale part.
     assert.equal(
       BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
-      492,
-      "the 492-byte headroom in the ecs.ts comment block must be the measured one",
+      452,
+      "the 452-byte headroom in the ecs.ts comment block must be the measured one",
     );
   });
 
