@@ -2125,11 +2125,12 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
 //   config, sends one dispatch, polls for the artifact and keeps its records.
 //   dev only: the broker and the dispatch Lambda refuse a judge override
 //   anywhere else.
+// - `TerraformDevState` and `TerraformStateBucket`, and the denies at the
+//   end, from `github-actions-pulumi-plan`, for gp-ai.yml's pull request
+//   Terraform plan.
 export const PULL_REQUEST_JOBS_POLICY_NAME = "GitHubActionsPullRequestJobs";
 
-export const githubActionsPullRequestJobs: PolicyDocument = {
-  Version: "2012-10-17",
-  Statement: [
+const PULL_REQUEST_JOBS_ALLOWS: PolicyStatement[] = [
     {
       Sid: "E2eReports",
       Effect: "Allow",
@@ -2184,6 +2185,97 @@ export const githubActionsPullRequestJobs: PolicyDocument = {
       Effect: "Allow",
       Action: ["sqs:SendMessage", "sqs:GetQueueUrl"],
       Resource: "arn:aws:sqs:us-west-2:333022194791:agent-dispatch-dev.fifo",
+    },
+    {
+      // gp-ai.yml's `terraform-plan` job, moved here from
+      // `github-actions-pulumi-plan`. The same state objects that role reads
+      // for omni: every dev root's own state, and `shared/slack-notifier`,
+      // which the dev roots read through `terraform_remote_state`. gp-ai plans
+      // with `-lock=false`, so no lock object.
+      Sid: "TerraformDevState",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [
+        `${TF_BUCKET}/*/dev/terraform.tfstate`,
+        `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
+      ],
+    },
+    {
+      Sid: "TerraformStateBucket",
+      Effect: "Allow",
+      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+      Resource: TF_BUCKET,
+    },
+  ];
+
+const asList = (value: string | string[] | undefined): string[] =>
+  value === undefined ? [] : Array.isArray(value) ? value : [value];
+
+// Every object the role reads on purpose: the gp-api preview path's Pulumi
+// state, the diff's checkpoints, the judge's prefixes and the dev Terraform
+// state. Read off the allow statements rather than restated, so a new read
+// granted above is not silently denied below.
+const PULL_REQUEST_READABLE_OBJECTS = [
+  ...githubActionsPreviewDeploy.Statement,
+  ...PULL_REQUEST_JOBS_ALLOWS,
+]
+  .filter((s) => s.Effect === "Allow" && "Action" in s && asList(s.Action).includes("s3:GetObject"))
+  .flatMap((s) => asList(s.Resource));
+
+export const githubActionsPullRequestJobs: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    ...PULL_REQUEST_JOBS_ALLOWS,
+    // The role also carries `ReadOnlyAccess`, attached in ci-roles.ts, for
+    // the Terraform plan: it reads whatever gp-ai's dev roots manage, the
+    // reason the plan role was built on it. These four denies are the plan
+    // role's, adjusted for a role that also runs Pulumi previews: they take
+    // back what `ReadOnlyAccess` adds and the role's own allows do not
+    // grant, so the role reads no more than the plan role and the preview
+    // role between them already let an omni pull request read.
+    {
+      // Without this, `ReadOnlyAccess` reads every object in the account:
+      // every project's Pulumi state, the old copies of gp-api's dev and prod
+      // checkpoints that hold Aurora passwords, and gp-ai's prod Terraform
+      // state, which holds values derived from AI_SECRETS_PROD.
+      Sid: "DenyOtherObjects",
+      Effect: "Deny",
+      Action: ["s3:GetObject"],
+      NotResource: PULL_REQUEST_READABLE_OBJECTS,
+    },
+    {
+      // Content by `versionId`, a separate action. Nothing on the role passes
+      // one, and old versions of the diff's checkpoints hold the passwords.
+      Sid: "DenyObjectVersions",
+      Effect: "Deny",
+      Action: ["s3:GetObjectVersion"],
+      Resource: "*",
+    },
+    {
+      // GP_API_DEV, which the preview program reads, and no other value.
+      Sid: "DenyOtherSecretValues",
+      Effect: "Deny",
+      Action: ["secretsmanager:GetSecretValue"],
+      NotResource: "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    },
+    {
+      // The passphrase and the diff's two Grafana tokens, and no other
+      // parameter. By path and by history are denied outright: history
+      // returns current SecureString values in plaintext.
+      Sid: "DenyOtherParameters",
+      Effect: "Deny",
+      Action: ["ssm:GetParameter", "ssm:GetParameters"],
+      NotResource: [
+        "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      ],
+    },
+    {
+      Sid: "DenyParameterPathsAndHistory",
+      Effect: "Deny",
+      Action: ["ssm:GetParametersByPath", "ssm:GetParameterHistory"],
+      Resource: "*",
     },
   ],
 };
