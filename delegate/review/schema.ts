@@ -265,6 +265,12 @@ export const ReviewRecordSchema = z.object({
   // or a repo that has not adopted gating. Presence is what tells a reader the
   // verdict was gated at all.
   gating: GatingSchema.optional(),
+  // The post-mortems the review was shown and the lesson ids that chose each,
+  // so a verdict can be traced to them. Absent on records written before
+  // post-mortem selection existed.
+  postmortems: z
+    .array(z.object({ file: z.string(), lessons: z.array(z.string()) }))
+    .optional(),
   findings: z.array(PostedFindingSchema),
   droppedFindings: z.array(FindingSchema).default([]),
   reviewId: z.number().int().optional(),

@@ -7,6 +7,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY dist/delegate/ ./dist/delegate/
+COPY delegate/review/postmortems/ ./dist/delegate/review/postmortems/
 
 RUN adduser -D -s /bin/bash agent && chown -R agent:agent /app
 USER agent

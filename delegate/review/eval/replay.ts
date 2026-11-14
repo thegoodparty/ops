@@ -12,6 +12,7 @@ import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
 import { GIT_TOOL_NAMES, createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
+import { POSTMORTEM_SELECTOR, selectPostmortems, type SelectedPostmortem } from "../postmortems";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
@@ -70,6 +71,8 @@ export interface Result {
   // Kept so lead tracing can be checked and re-run offline against the
   // prompts the orchestrator actually wrote, without paying for a replay.
   subagentCalls?: SubagentCall[];
+  // The post-mortems the replay was shown, as on a production record.
+  postmortems?: { file: string; lessons: string[] }[];
 }
 
 // caseId -> replay number -> result.
@@ -377,6 +380,7 @@ export const replayCase = async (
   const repoDir = join(workDir, caseId);
   const startMs = Date.now();
   let subagentCalls: SubagentCall[] | undefined;
+  let postmortems: SelectedPostmortem[] = [];
 
   const makeResult = (
     output: ReviewOutput | null,
@@ -397,6 +401,7 @@ export const replayCase = async (
     ...(leads ? { leads } : {}),
     ...(gating !== undefined ? { gating } : {}),
     ...(subagentCalls ? { subagentCalls } : {}),
+    ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
   });
 
   try {
@@ -417,9 +422,30 @@ export const replayCase = async (
     writeFileSync(diffPath, promptDiff(bundle.diff).inline);
   }
 
+  // A case is never graded with a post-mortem written after it was reviewed,
+  // so selection reads only those dated before the record's review. A
+  // simulated case is a bundle with no record behind it and no date, so it
+  // gets no post-mortems at all.
+  const reviewedAt = typeof record.startedAt === "string" ? new Date(record.startedAt) : undefined;
+  if (reviewedAt && !Number.isNaN(reviewedAt.getTime())) {
+    postmortems = await selectPostmortems(bundle, {
+      before: reviewedAt,
+      ask: async (prompt) => {
+        const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
+          cwd: repoDir,
+          mcpServers: {},
+          env: agentEnv(),
+          preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
+        });
+        if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
+        return selection.output;
+      },
+    });
+  }
+
   let agentResult: AgentResult;
   try {
-    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath }), {
+    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: repoDir,
       mcpServers: { git: createGitTool(repoDir) },
       env: agentEnv(),
