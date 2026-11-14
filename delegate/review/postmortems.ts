@@ -10,7 +10,7 @@ export type Postmortem = {
   date: string;
   source: string;
   lessons: string[];
-  whatHappened: string;
+  postmortem: string;
   text: string;
 };
 
@@ -44,15 +44,15 @@ export const loadPostmortems = (options: { dir?: string; before?: Date } = {}): 
       const text = readFileSync(join(dir, file), "utf-8");
       const front = /^---\ntitle: (.+)\ndate: (\d{4}-\d{2}-\d{2})\nsource: (\S+)\n---\n/.exec(text);
       const lessons = /\n## Lessons\n\n((?:- .+\n)+)/.exec(text);
-      const happened = /\n## What happened\n\n([\s\S]+)$/.exec(text);
-      if (!front || !lessons || !happened) throw new Error(`post-mortem ${file} does not follow the format in README.md`);
+      const body = /\n## Post-mortem\n\n([\s\S]+)$/.exec(text);
+      if (!front || !lessons || !body) throw new Error(`post-mortem ${file} does not follow the format in README.md`);
       return {
         file,
         title: front[1],
         date: front[2],
         source: front[3],
         lessons: lessons[1].trim().split("\n").map((line) => line.slice(2)),
-        whatHappened: happened[1].trim(),
+        postmortem: body[1].trim(),
         text,
       };
     })

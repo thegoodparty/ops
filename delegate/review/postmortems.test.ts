@@ -18,7 +18,7 @@ source: https://goodparty.clickup.com/x
 
 ${lessons.map((l) => `- ${l}`).join("\n")}
 
-## What happened
+## Post-mortem
 
 ${title} happened.
 `;
@@ -58,7 +58,7 @@ const answers = (...replies: (string | Error)[]) => {
 };
 
 describe("loadPostmortems", () => {
-  it("parses front matter, lessons and What happened, and skips the README", () => {
+  it("parses front matter, lessons and the post-mortem, and skips the README", () => {
     const loaded = loadPostmortems({ dir: fixtures() });
     assert.deepEqual(
       loaded.map(({ text: _text, ...rest }) => rest),
@@ -69,7 +69,7 @@ describe("loadPostmortems", () => {
           date: "2026-11-04",
           source: "https://goodparty.clickup.com/x",
           lessons: ["CPU work on the request thread (gp-api).", "A per-task cache behind a load balancer."],
-          whatHappened: "Read freeze happened.",
+          postmortem: "Read freeze happened.",
         },
         {
           file: "2026-11-06-attributes.md",
@@ -77,7 +77,7 @@ describe("loadPostmortems", () => {
           date: "2026-11-06",
           source: "https://goodparty.clickup.com/x",
           lessons: ["A field read before it is written."],
-          whatHappened: "Attributes happened.",
+          postmortem: "Attributes happened.",
         },
       ],
     );
@@ -116,7 +116,7 @@ describe("selectPostmortems", () => {
     assert.deepEqual(selected.map(({ file, lessons }) => ({ file, lessons })), [
       { file: "2026-11-04-read-freeze.md", lessons: ["2026-11-04-read-freeze.md#2", "2026-11-04-read-freeze.md#1"] },
     ]);
-    assert.ok(selected[0].text.includes("## What happened"));
+    assert.ok(selected[0].text.includes("## Post-mortem"));
 
     assert.equal(prompts.length, 2);
     assert.ok(prompts[0].includes('<lesson id="2026-11-04-read-freeze.md#1">Read freeze: CPU work on the request thread (gp-api).</lesson>'));
