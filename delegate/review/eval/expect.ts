@@ -81,6 +81,10 @@ const ExpectedCaseSchema = z
     // Why main's own result on this case is noise, not a bar. Set, the gate
     // still scores and reports it but never counts it as a regression.
     flakyOnMain: z.string().min(1).optional(),
+    // When the review being replayed happened, for a simulated case that has
+    // no record to carry it. Replay shows a case only the post-mortems dated
+    // before it, and with no date it shows none.
+    reviewedAt: z.iso.datetime().optional(),
   })
   .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
@@ -214,7 +218,7 @@ const loadRecord = async (
 ): Promise<ReviewRecord> => {
   if (c.bundle) {
     const bundle = readBundleFile(manifestPath, c.bundle);
-    return { runId: c.id, bundle } as ReviewRecord;
+    return { runId: c.id, bundle, ...(c.reviewedAt ? { startedAt: c.reviewedAt } : {}) } as ReviewRecord;
   }
   const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: c.key }));
   const record = ReviewRecordSchema.parse(JSON.parse(await readBody(res.Body)));
