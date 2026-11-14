@@ -250,14 +250,16 @@ Your user message is a <bundle> containing:
 
 The repo checkout is your current working directory, pinned to head_sha.
 
-## Phase 1 — Scout
+## Phase 1 — Scout and architect
 
-Spawn a single scout subagent using the Task tool. Give it changed_files, diff_stat and deleted_files from <bundle>, and the diff: inline when <diff> carries it, otherwise the path from the <diff path=...> attribute (never paste a large diff into a subagent prompt; tell it to Read or Grep the file). Parse the JSON object on the scout's final output line: {"leads":[...],"summary":"..."}.
+In one message, spawn the scout subagent and the architect subagent using the Task tool, so they run in parallel. Give the scout changed_files, diff_stat and deleted_files from <bundle>, and the diff: inline when <diff> carries it, otherwise the path from the <diff path=...> attribute (never paste a large diff into a subagent prompt; tell it to Read or Grep the file). Parse the JSON object on the scout's final output line: {"leads":[...],"summary":"..."}.
 
 If the scout's JSON is malformed or its Task call returns an error, stop and emit:
 {"status":"failed","reason":"scout failed: <detail>"}
 
 If leads is empty, skip Phase 2. Zero leads is a valid signal that the diff is low-risk.
+
+Give the architect the same inputs as the scout, plus <title> and <body> with their <untrusted> wrappers intact. Parse the JSON object on its final output line: {"findings":[...]}. If the architect's Task call errors or its JSON is malformed, continue without it and say so in the summary; the architect never makes the review fail.
 
 ## Phase 2 — Deep-reviewers
 
@@ -267,7 +269,7 @@ Wait for ALL deep-reviewers before proceeding. The Task tool's completion signal
 
 ## Aggregating findings
 
-Collect all findings from every deep-reviewer. A finding is a blocker by definition; drop anything the deep-reviewer flagged that is not a blocker candidate (they should already have done this, but filter again if needed). Deduplicate overlapping findings: prefer the one with a suggestion block.
+Collect all findings from every deep-reviewer and from the architect. A finding is a blocker by definition; drop anything the deep-reviewer flagged that is not a blocker candidate (they should already have done this, but filter again if needed). Deduplicate overlapping findings: prefer the one with a suggestion block.
 
 ## Prior findings
 
@@ -295,10 +297,10 @@ Finding fields:
 - endLine: last line of a multi-line span (optional). Keep spans short and inside one hunk; a span that leaves the hunk is clamped to its start line and loses its suggestion.
 - body: markdown; must include a falsification-check sentence (required)
 - suggestion: literal replacement text for line..endLine, no code fences (optional)
-- category: one of bugs | security | tests | conventions | cross-file | thematic (required)
+- category: one of bugs | security | tests | conventions | cross-file | thematic | architecture (required)
 - confidence: "high" | "medium" (required)
 
-summary is posted as the review body and is the reasoning behind the verdict, written for a human reviewer who will check that the PR description, this review, and the code agree. 3–6 sentences: what the change does as you read it from the diff (and whether that matches the PR description), which areas the scout flagged and what the deep-reviewers verified or falsified in each, and anything the human should confirm that you could not (migrations against real data, external behavior). Never put a finding in the summary: findings are inline comments and nothing else. A summary that says "no issues found" without saying what was checked is not acceptable.
+summary is posted as the review body and is the reasoning behind the verdict, written for a human reviewer who will check that the PR description, this review, and the code agree. 3–6 sentences: what the change does as you read it from the diff (and whether that matches the PR description), which areas the scout flagged and what the deep-reviewers verified or falsified in each, what the architect concluded about the design, and anything the human should confirm that you could not (migrations against real data, external behavior). Never put a finding in the summary: findings are inline comments and nothing else. A summary that says "no issues found" without saying what was checked is not acceptable.
 
 Never guess around a missing subagent result. If a deep-reviewer returned malformed JSON, emit status "failed" with the reason.`,
 });

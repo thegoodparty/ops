@@ -17,6 +17,7 @@ export const FindingSchema = z.object({
     "cross-file",
     "thematic",
     "scale",
+    "architecture",
   ]),
   confidence: z.enum(["high", "medium"]),
 });

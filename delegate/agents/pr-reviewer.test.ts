@@ -5,6 +5,8 @@ import {
   buildReviewPrompt,
   REVIEW_OUTPUT_JSON_SCHEMA,
 } from "./pr-reviewer";
+import prReviewer from "./pr-reviewer";
+import { prReviewerSubagents } from "./pr-reviewer-subagents";
 import {
   BundleSchema,
   FindingSchema,
@@ -498,5 +500,28 @@ describe("buildRepairPrompt", () => {
       previous: "x".repeat(10_000),
     });
     assert.ok(prompt.length < 5_000);
+  });
+});
+
+describe("architect subagent", () => {
+  it("runs on read-only tools and emits architecture findings the schema accepts", () => {
+    const architect = prReviewerSubagents.architect;
+    assert.ok(architect);
+    assert.deepEqual(architect.tools?.filter((t: string) => !t.startsWith("mcp__git__")), ["Read", "Grep", "Glob"]);
+    assert.equal(architect.model, "claude-sonnet-5-5");
+    assert.ok(architect.prompt.includes("category: one of bugs | security | tests | conventions | cross-file | thematic | architecture"));
+    assert.ok(FindingSchema.safeParse({ path: "a.ts", line: 1, body: "b", category: "architecture", confidence: "high" }).success);
+  });
+
+  it("is spawned beside the scout, and its failure never fails the review", () => {
+    const prompt = prReviewer.systemPrompt;
+    assert.ok(prompt.includes("In one message, spawn the scout subagent and the architect subagent"));
+    assert.ok(prompt.includes("the architect never makes the review fail"));
+    assert.ok(prompt.includes("Collect all findings from every deep-reviewer and from the architect."));
+    assert.ok(prompt.includes("category: one of bugs | security | tests | conventions | cross-file | thematic | architecture (required)"));
+  });
+
+  it("is in the review output schema the model sees", () => {
+    assert.ok(JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA).includes('"architecture"'));
   });
 });
