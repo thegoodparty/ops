@@ -170,6 +170,10 @@ const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
  * Fable/Astra class to sit behind a tier of its own rather than in the default
  * eight, so Grok 4.7 also stays. The class stays at eight either way, which is
  * the size the weekly review aims for.
+ *
+ * Cohere Embed v4 is a ninth Bedrock entry and not a ninth chat class: it is an
+ * embedding model, reached through `/v1/embeddings` and never offered as a chat
+ * default, so it does not count against the eight.
  */
 const SERVED_MODEL_CLASSES: Record<string, string[]> = {
   bedrock: [
@@ -181,6 +185,7 @@ const SERVED_MODEL_CLASSES: Record<string, string[]> = {
     "global.anthropic.claude-haiku-5-5",
     "global.xai.grok-4.7",
     "global.zai.glm-5.3",
+    "global.cohere.embed-v4:0",
   ],
   fireworks: [
     // Fireworks' documented US-only ids are
@@ -608,7 +613,7 @@ describe("bifrost config.json", () => {
       assert.deepEqual(
         [...configured].sort(),
         [...expected].sort(),
-        `${name}'s classes drifted from the agreed eight; a class added is a residency and cost decision and one removed is a class the fleet loses`,
+        `${name}'s classes drifted from the agreed list; a class added is a residency and cost decision and one removed is a class the fleet loses`,
       );
     }
     // And no provider outside that set: a third provider would be a model class

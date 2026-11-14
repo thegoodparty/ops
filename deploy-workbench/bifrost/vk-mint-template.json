@@ -12,7 +12,8 @@
         "global.openai.gpt-6.1-terra",
         "global.anthropic.claude-haiku-5-5",
         "global.xai.grok-4.7",
-        "global.zai.glm-5.3"
+        "global.zai.glm-5.3",
+        "global.cohere.embed-v4:0"
       ],
       "key_ids": ["*"]
     },
