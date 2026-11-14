@@ -37,7 +37,7 @@ source: <ClickUp page URL>
   incident. The general wording is what lets a lesson match a different feature
   that makes the same mistake; the part in parentheses is what lets it match the
   same feature. The reviewer's first pass reads only these lines.
-- **What happened** is what the reviewer reads when a lesson matched, to decide
+- **What happened** (at most 300 words) is what the reviewer reads when a lesson matched, to decide
   whether the pull request really repeats the incident.
 - The file name is `<date>-<slug>.md`.
 

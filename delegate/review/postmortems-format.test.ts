@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const dir = __dirname;
+// Lives beside the folder, not in it, so the `delegate/review/*.test.ts` glob in `npm test` runs it.
+const dir = join(__dirname, "postmortems");
 const files = readdirSync(dir).filter((f) => f.endsWith(".md") && f !== "README.md");
 
 describe("post-mortems", () => {
@@ -19,7 +20,10 @@ describe("post-mortems", () => {
       assert.ok(lessons, "a Lessons section of bullet lines");
       const count = lessons![1].trim().split("\n").length;
       assert.ok(count >= 1 && count <= 6, `1 to 6 lessons, found ${count}`);
-      assert.match(text, /\n## What happened\n\n\S/, "a What happened section");
+      const happened = /\n## What happened\n\n([\s\S]+)$/.exec(text);
+      assert.ok(happened, "a What happened section");
+      const words = happened![1].trim().split(/\s+/).length;
+      assert.ok(words >= 100 && words <= 300, `What happened is 150 to 300 words (100 allowed), found ${words}`);
     });
 
     it(`${f} has no contact details`, () => {
