@@ -116,9 +116,11 @@ test("the ledger records every measured dispatch, with or without a cost file", 
   assert.match(job, /estimate-usd: \$\{\{ needs\.prepare\.outputs\.estimate \}\}/);
 });
 
-test("an incomplete main baseline fails the run instead of leaving cases ungated", () => {
+test("a missing main baseline run fails the run; one that still errored leaves its case not held", () => {
   const all = jobs(run);
-  assert.match(all.get("main-baseline") ?? "", /name: Require a complete baseline/);
+  assert.match(all.get("main-baseline") ?? "", /name: Require a baseline with no missing runs/);
+  assert.match(all.get("main-baseline") ?? "", /--mode baseline-check --runs 3/);
+  assert.doesNotMatch(all.get("main-baseline") ?? "", /missing or errored/);
   // With no status function, a job `if` implies success(), so the gate skips
   // when main-baseline or candidate fails, and score then skips too.
   const gateIf = /\n {4}if: (.*)\n/.exec(all.get("gate") ?? "")?.[1] ?? "";
