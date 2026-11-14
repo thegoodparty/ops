@@ -2251,7 +2251,7 @@ export const githubActionsPullRequestJobs: PolicyDocument = {
     },
     // The role also carries `ReadOnlyAccess`, attached in ci-roles.ts, for
     // the Terraform plan: it reads whatever gp-ai's dev roots manage, the
-    // reason the plan role was built on it. These four denies are the plan
+    // reason the plan role was built on it. The denies below are the plan
     // role's, adjusted for a role that also runs Pulumi previews: they take
     // back what `ReadOnlyAccess` adds and the role's own allows do not
     // grant, so the role reads no more than the plan role and the preview
