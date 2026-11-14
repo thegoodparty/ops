@@ -331,12 +331,6 @@ export const createCiRoles = () => {
     maxSessionDuration: 14400,
   });
 
-  new aws.iam.RolePolicy("githubActionsPreviewDeployPolicy", {
-    name: "PreviewDeploy",
-    role: previewDeployRole.id,
-    policy: JSON.stringify(githubActionsPreviewDeploy),
-  });
-
   // The pull-request role's grants for jobs other than the gp-api preview
   // path, which do not fit beside the inline document above.
   const pullRequestJobsPolicy = new aws.iam.Policy("githubActionsPullRequestJobs", {
@@ -352,6 +346,19 @@ export const createCiRoles = () => {
       role: previewDeployRole.name,
       policyArn: pullRequestJobsPolicy.arn,
     },
+  );
+
+  // After the managed policy, because the denies on prod-tagged resources
+  // moved there from this document: the role is never without them, not
+  // even for the length of one apply.
+  new aws.iam.RolePolicy(
+    "githubActionsPreviewDeployPolicy",
+    {
+      name: "PreviewDeploy",
+      role: previewDeployRole.id,
+      policy: JSON.stringify(githubActionsPreviewDeploy),
+    },
+    { dependsOn: [pullRequestJobsPolicy, pullRequestJobsAttachment] },
   );
 
   // For gp-ai's pull request Terraform plan, which reads whatever its dev

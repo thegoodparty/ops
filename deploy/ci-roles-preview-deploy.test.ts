@@ -393,32 +393,10 @@ describe("githubActionsPreviewDeploy", () => {
     });
   });
 
-  it("denies everything on a resource tagged Environment=prod, but the diff's two", () => {
-    const deny = statement("DenyProductionTagged");
-    assert.equal(deny.Effect, "Deny");
-    assert.ok("Action" in deny);
-    assert.equal(deny.Action, "*");
-    assert.equal(deny.Resource, undefined);
-    assert.deepEqual(deny.NotResource, DIFF_PROD_RESOURCES);
-    assert.deepEqual(deny.Condition, {
-      StringEquals: { "aws:ResourceTag/Environment": "prod" },
-    });
-  });
-
-  // The tag deny leaves those two out, so this is what holds them to reads.
-  it("denies everything but three reads on the diff's two prod resources", () => {
-    const deny = statement("DiffProdReadsOnly");
-    assert.equal(deny.Effect, "Deny");
-    assert.ok("NotAction" in deny);
-    assert.deepEqual(deny.NotAction, DIFF_PROD_READS);
-    assert.deepEqual(deny.Resource, DIFF_PROD_RESOURCES);
-    assert.equal(deny.Condition, undefined);
-    for (const s of allows()) {
-      if (!asList(s.Resource).some((r) => DIFF_PROD_RESOURCES.includes(r))) continue;
-      for (const action of asList(s.Action)) {
-        assert.ok(DIFF_PROD_READS.includes(action), `${s.Sid}: ${action}`);
-      }
-    }
+  it("holds no deny on prod-tagged resources; the managed policy does", () => {
+    const sids = githubActionsPreviewDeploy.Statement.map((s) => s.Sid);
+    assert.ok(!sids.includes("DenyProductionTagged"));
+    assert.ok(!sids.includes("DiffProdReadsOnly"));
   });
 
   // "*" is for the actions AWS defines no resource for. Anything that takes
@@ -457,5 +435,63 @@ describe("githubActionsPreviewDeploy", () => {
   // managed policy of their own, which does not count against it.
   it("fits the inline policy quota with room to widen", () => {
     assert.ok(JSON.stringify(githubActionsPreviewDeploy).length < 9800);
+  });
+});
+
+describe("githubActionsPullRequestJobs prod denies", () => {
+  const NETWORK = [
+    "arn:aws:ec2:us-west-2:333022194791:vpc/*",
+    "arn:aws:ec2:us-west-2:333022194791:subnet/*",
+    "arn:aws:ec2:us-west-2:333022194791:route-table/*",
+  ];
+  const statement = (sid: string) => {
+    const found = githubActionsPullRequestJobs.Statement.find((s) => s.Sid === sid);
+    assert.ok(found, `no statement with Sid ${sid}`);
+    return found;
+  };
+  const allows = () =>
+    [...githubActionsPreviewDeploy.Statement, ...githubActionsPullRequestJobs.Statement].filter(
+      (s) => s.Effect === "Allow",
+    );
+
+  it("denies everything on a resource tagged Environment=prod, but the diff's two and the network", () => {
+    const deny = statement("DenyProductionTagged");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("Action" in deny);
+    assert.equal(deny.Action, "*");
+    assert.equal(deny.Resource, undefined);
+    assert.deepEqual(deny.NotResource, [...DIFF_PROD_RESOURCES, ...NETWORK]);
+    assert.deepEqual(deny.Condition, {
+      StringEquals: { "aws:ResourceTag/Environment": "prod" },
+    });
+  });
+
+  it("denies everything but three reads on the diff's two prod resources", () => {
+    const deny = statement("DiffProdReadsOnly");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("NotAction" in deny);
+    assert.deepEqual(deny.NotAction, DIFF_PROD_READS);
+    assert.deepEqual(deny.Resource, DIFF_PROD_RESOURCES);
+    assert.equal(deny.Condition, undefined);
+    for (const s of allows()) {
+      if (!asList(s.Resource).some((r) => DIFF_PROD_RESOURCES.includes(r))) continue;
+      for (const action of asList("Action" in s ? s.Action : undefined)) {
+        assert.ok(DIFF_PROD_READS.includes(action), `${s.Sid}: ${action}`);
+      }
+    }
+  });
+
+  it("denies everything but describes on VPCs, subnets and route tables", () => {
+    const deny = statement("NetworkReadsOnly");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("NotAction" in deny);
+    assert.deepEqual(deny.NotAction, ["ec2:Describe*"]);
+    assert.deepEqual(deny.Resource, NETWORK);
+    for (const s of allows()) {
+      for (const r of asList(s.Resource)) {
+        assert.doesNotMatch(r, /:(vpc|subnet|route-table)\//, `${s.Sid}: ${r}`);
+      }
+    }
+    assert.equal(deny.Condition, undefined);
   });
 });
