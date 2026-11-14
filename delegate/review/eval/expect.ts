@@ -407,6 +407,36 @@ export const mainRunsShort = (baseline: Baseline, history: CaseReport[], minMain
     })
     .map((r) => r.c.id);
 
+// Main's baseline as the workflow sees it on disk, after both of its replay
+// passes. A run with no result file is a gap a re-dispatch can still replay.
+// A run that still errored, or a review that came back "failed", is never
+// cached: it recurs on every dispatch, and the gate already refuses to hold a
+// case main did not complete on every run, so it is not a gap.
+export interface BaselineGaps {
+  total: number;
+  missing: number;
+  errored: number;
+  gaveUp: number;
+}
+
+export const baselineGaps = (cases: ExpectedCase[], dir: string, runs: number): BaselineGaps => {
+  const gaps: BaselineGaps = { total: cases.length * runs, missing: 0, errored: 0, gaveUp: 0 };
+  for (const c of cases) {
+    for (let n = 1; n <= runs; n++) {
+      let r: Result;
+      try {
+        r = JSON.parse(readFileSync(join(dir, c.id, `run-${n}.json`), "utf-8")) as Result;
+      } catch {
+        gaps.missing++;
+        continue;
+      }
+      if (!r.error && r.output?.status === "failed") gaps.gaveUp++;
+      else if (!isCacheable(r)) gaps.errored++;
+    }
+  }
+  return gaps;
+};
+
 // A case main passes on every run, over at least `minMainRuns` runs, must not
 // regress. One that drops below 3/3 gets `runs` more runs and has to reach
 // 2*runs-1 of 2*runs, so a single unlucky run is not a regression. A case
@@ -654,6 +684,22 @@ const main = async () => {
     const ids = mainRunsShort(baseline, history, minMainRuns);
     writeFileSync(resolve(flags["ids-out"]), ids.join(","));
     console.log(`${ids.length} case(s) need more main runs to reach ${minMainRuns}`);
+    return;
+  }
+
+  // The baseline as the workflow's completeness step reads it, after both of
+  // its replay passes. Only a missing result fails the step; an errored run or
+  // a review that came back failed leaves its case not held and the run going.
+  // Prints counts, never ids, since gate mode includes holdout cases.
+  if (mode === "baseline-check") {
+    if (!flags.base) throw new Error("--mode baseline-check needs --base, main's baseline results");
+    const gaps = baselineGaps(cases, resolve(flags.base), runs);
+    console.log(`${gaps.total} main runs checked: ${gaps.errored} still errored, ${gaps.gaveUp} came back failed.`);
+    if (gaps.errored + gaps.gaveUp > 0) console.log("Those cases are not held, so the run goes on.");
+    if (gaps.missing) {
+      console.log(`::error::${gaps.missing} of ${gaps.total} main baseline runs have no result. Re-dispatch to replay only those.`);
+      process.exitCode = 1;
+    }
     return;
   }
 

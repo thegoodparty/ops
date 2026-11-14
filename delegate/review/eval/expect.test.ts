@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  baselineGaps,
   commitSyntheticHead,
   computeGate,
   mainRunsShort,
@@ -692,6 +693,25 @@ test("gate report flags cost over the limit", () => {
   const reports = [mkReport(tune, runsOf(true, true, true), 1.5)];
   const md = renderExpectReport(reports, "v", base, computeGate(reports, base, [], false));
   assert.match(md, /Cost vs main: 150%, needs justification in the PR body\./);
+});
+
+test("baselineGaps: a run still errored after both passes is not held, and only an absent result blocks", () => {
+  const { tune } = gateCases();
+  const out = mkdtempSync(join(tmpdir(), "eval-gaps-"));
+  const put = (n: number, r: Result) => {
+    mkdirSync(join(out, tune.id), { recursive: true });
+    writeFileSync(join(out, tune.id, `run-${n}.json`), JSON.stringify(r));
+  };
+  put(1, result({ caseId: tune.id }));
+  put(2, result({ caseId: tune.id, output: null, error: "API Error: Opus 5's safeguards flagged this message" }));
+  put(3, result({ caseId: tune.id, output: { status: "failed", reason: "gave up" } }));
+  assert.deepEqual(baselineGaps([tune], out, 3), { total: 3, missing: 0, errored: 1, gaveUp: 1 });
+
+  const base = { variant: "main-abc", runs: 3, reports: scoreDir([tune], out) };
+  const gate = computeGate([mkReport(tune, runsOf(true, true, true))], base, [], true);
+  assert.deepEqual([gate.cases[0].outcome, gate.regressions, gate.pass], ["not-held", [], true]);
+
+  assert.deepEqual(baselineGaps([tune], out, 4), { total: 4, missing: 1, errored: 1, gaveUp: 1 });
 });
 
 test("selectCases takes a comma-separated list of ids", () => {

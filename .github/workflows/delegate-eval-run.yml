@@ -331,47 +331,27 @@ jobs:
           path: ./baseline/
           include-hidden-files: true
 
-      # A replay that errors still exits 0, and the gate treats a case main did
-      # not finish as not gated, so a regression on it would pass. Fail the job
-      # instead; the good runs are cached, so a re-dispatch replays only the
-      # gaps. Prints a count, never case ids, since gate mode includes holdout.
-      # A review that came back "failed" is the reviewer giving up, not a gap:
-      # it is never cached, recurs on every dispatch, and shows main does not
-      # pass that case every run, so the gate already does not hold it.
-      - name: Require a complete baseline
+      # A replay that errors still exits 0. Only a run with no result file is a
+      # gap worth failing on: good runs are cached, so a re-dispatch replays it.
+      # A run that still errored after both passes, like a review that came
+      # back "failed" (the reviewer gave up), is never cached, so it recurs on
+      # every dispatch and no re-dispatch could close it. The gate already does
+      # not hold a case main did not complete on every run, so those cases are
+      # not gated and the run goes on. Prints counts, never case ids, since gate
+      # mode includes holdout.
+      - name: Require a baseline with no missing runs
         env:
           MODE: ${{ inputs.mode }}
         run: |
-          node -e '
-            const fs = require("fs");
-            const cases = require("./delegate/review/eval/expected/manifest.json")
-              .filter((c) => process.env.MODE !== "tune" || c.split === "tune");
-            let missing = 0;
-            let gaveUp = 0;
-            for (const c of cases) for (let r = 1; r <= 3; r++) {
-              let ok = false;
-              try {
-                const x = JSON.parse(fs.readFileSync(`./baseline/${c.id}/run-${r}.json`, "utf-8"));
-                ok = !x.error && (x.output?.status === "complete" || x.output?.status === "failed");
-                if (x.output?.status === "failed") gaveUp++;
-              } catch {}
-              if (!ok) missing++;
-            }
-            if (gaveUp) console.log(`${gaveUp} of ${cases.length * 3} main reviews came back failed; those cases are not held.`);
-            if (missing) {
-              console.log(`::error::${missing} of ${cases.length * 3} main baseline runs are missing or errored. Re-dispatch to replay only those.`);
-              process.exit(1);
-            }
-          '
-          # A case still short of 6 main runs after the extra replay had one
-          # error, and the gate would not hold it, so a regression would pass.
           split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
+          npm run -s review:expect -- --mode baseline-check --runs 3 "${split[@]}" --base ./baseline
+          # A case short of 6 main runs is short because a run errored, so it is
+          # reported and not failed, for the same reason.
           history=(); if [ -d ./history ]; then history=(--history ./history); fi
           npm run -s review:expect -- --mode main-short --runs 3 --min-main-runs 6 "${split[@]}" "${history[@]}" \
             --base ./baseline --ids-out "$RUNNER_TEMP/main-short.txt"
           if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
-            echo "::error::Some cases are still short of 6 main runs. Re-dispatch to replay only those."
-            exit 1
+            echo "Some cases are still short of 6 main runs; those cases are not held."
           fi
 
   # The only writer of the cache.
