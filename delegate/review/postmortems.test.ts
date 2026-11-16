@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { POSTMORTEMS_DIR, loadPostmortems, redactIdentifiers, selectPostmortems } from "./postmortems";
+import { focusDiff, POSTMORTEMS_DIR, loadPostmortems, redactIdentifiers, selectPostmortems } from "./postmortems";
 import { ReviewRecordSchema, type Bundle } from "./schema";
 
 const postmortem = (title: string, date: string, lessons: string[]) => `---
@@ -170,11 +170,16 @@ describe("selectPostmortems", () => {
     assert.equal(prompts.length, 1);
   });
 
-  it("cuts the diff at 40,000 characters", async () => {
-    const { prompts, ask } = answers('{"ids": []}');
-    await selectPostmortems({ ...bundle, diff: `${"x".repeat(40_000)}TAIL` }, { ask, dir: fixtures() });
-    assert.ok(!prompts[0].includes("TAIL"));
-    assert.ok(prompts[0].includes("\n[diff truncated]\n"));
+  it("keeps the hunks closest to the post-mortems when a diff is over 40,000 characters", () => {
+    const filler = Array.from({ length: 30 }, (_, i) =>
+      `diff --git a/f${i}.ts b/f${i}.ts\n@@ -1 +1 @@\n+${"const unrelated = renderButtonLabel(copy)\n+".repeat(40)}`,
+    ).join("\n");
+    const risky = "diff --git a/home.ts b/home.ts\n@@ -1 +1 @@\n+const fit = runModelFitPerTract(district) // cpu heavy on the request thread\n";
+    const focused = focusDiff(`${filler}\n${risky}`, ["Read freeze: CPU-heavy model fit per tract on the request thread."]);
+    assert.ok(focused.length <= 40_200);
+    assert.ok(focused.includes("runModelFitPerTract"));
+    assert.ok(focused.startsWith("[diff over 40,000 characters"));
+    assert.equal(focusDiff("+small", ["anything"]), "+small");
   });
 
   it("keeps a diff or file name from closing its own element", async () => {

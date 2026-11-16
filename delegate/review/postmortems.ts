@@ -31,7 +31,7 @@ export const POSTMORTEM_SELECTOR: AgentConfig = {
   tools: [],
   allowedTools: [],
   maxTurns: 2,
-  maxBudgetUsd: 1,
+  maxBudgetUsd: 3,
 };
 
 export const loadPostmortems = (options: { dir?: string } = {}): Postmortem[] => {
@@ -61,6 +61,32 @@ const REPOS = ["omni", "ops", "gp-api", "gp-webapp", "gp-admin", "gp-pi", "gp-ai
 
 // Replay strips what names the PRs and commits behind an incident, so a
 // post-mortem shown to a case cannot point the reviewer at that case's answer.
+const terms = (text: string) => text.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().match(/[a-z][a-z0-9]{2,}/g) ?? [];
+
+// A diff over 40,000 characters is cut to the hunks that share the most
+// words with the post-mortems, so a large PR's risky change is not lost past
+// an arbitrary cut. The first cut missed omni-3023's Home-load read entirely.
+export const focusDiff = (diff: string, postmortemTexts: string[]): string => {
+  if (diff.length <= 40_000) return diff;
+  const want = new Set(postmortemTexts.flatMap(terms));
+  let file = "";
+  const hunks = diff.split(/\n(?=diff --git |@@ )/).map((part) => {
+    const header = /^diff --git a\/\S+ b\/(\S+)/.exec(part);
+    if (header) file = header[1];
+    const added = new Set(terms(part.split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++")).join("\n")));
+    const score = [...added].filter((t) => want.has(t)).length / Math.sqrt(added.size + 1);
+    return { text: part.startsWith("diff --git") ? part : `--- ${file}\n${part}`, score };
+  });
+  const kept: string[] = [];
+  let size = 0;
+  for (const h of [...hunks].sort((a, b) => b.score - a.score)) {
+    if (size + h.text.length > 40_000) continue;
+    kept.push(h.text);
+    size += h.text.length;
+  }
+  return `[diff over 40,000 characters: the hunks closest to the post-mortems]\n${kept.join("\n")}`;
+};
+
 export const redactIdentifiers = (text: string): string =>
   text
     .replace(/https?:\/\/(?:www\.)?github\.com\/[\w.-]+\/[\w.-]+\/(?:pulls?|commits?|compare)\b[^\s)\]>"'`]*/gi, "(link)")
@@ -99,7 +125,7 @@ export const selectPostmortems = async (
       p.lessons.map((text, k) => ({ id: `${p.file}#${k + 1}`, file: p.file, title: p.title, text })),
     );
     if (lessons.length === 0) return [];
-    const diff = bundle.diff.length > 40_000 ? `${bundle.diff.slice(0, 40_000)}\n[diff truncated]` : bundle.diff;
+    const diff = focusDiff(bundle.diff, postmortems.map((p) => p.text));
     // Code cannot be escaped without changing it, so the diff is closed by a
     // tag carrying a per-run token, as in the review prompt; file names are
     // escaped like the title and body.
