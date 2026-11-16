@@ -1,12 +1,15 @@
 import { execFile } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
 import { ReviewRecordSchema, isLockKey } from "../schema";
-import type { ReviewRecord } from "../schema";
+import type { Bundle, ReviewRecord } from "../schema";
 
-// Proposes eval-case candidates from production reviews. A human confirms
-// each one; this tool only reads and never writes the scenario manifest.
+// Proposes eval-case candidates from production reviews. Mining reads
+// production, but a candidate becomes a bundle file in this repo: the record
+// it came from is only where the bundle was found. A human confirms each one;
+// this tool writes the bundle and the proposal, never the manifest.
 
 const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 const FIX_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
@@ -17,6 +20,13 @@ export interface MinedRecord {
   key: string;
   record: ReviewRecord;
 }
+
+// A bundle file is named after the candidate, so the proposal names a file a
+// human copies next to the manifest.
+export const bundleFileName = (id: string): string => `${id}.bundle.json`;
+
+const candidateId = (record: ReviewRecord, kind: string, sha: string): string =>
+  `${record.repo.split("/")[1]}-${record.prNumber}-${kind}-${sha.slice(0, 7)}`;
 
 export interface MergeInfo {
   mergedAt: string;
@@ -57,7 +67,8 @@ export interface Runners {
 
 export interface MissedCandidate {
   kind: "missed";
-  key: string;
+  id: string;
+  bundle: Bundle;
   repo: string;
   pr: number;
   fixCommit: string;
@@ -69,7 +80,8 @@ export interface MissedCandidate {
 
 export interface RefutedCandidate {
   kind: "refuted";
-  key: string;
+  id: string;
+  bundle: Bundle;
   repo: string;
   pr: number;
   findings: { path: string; line: number; body: string }[];
@@ -268,7 +280,8 @@ export const missedCandidates = (
     if (overlap.paths.length === 0) continue;
     out.push({
       kind: "missed",
-      key: mined.key,
+      id: candidateId(mined.record, "missed", commit.sha),
+      bundle: mined.record.bundle,
       repo: mined.record.repo,
       pr: mined.record.prNumber,
       fixCommit: commit.sha,
@@ -289,7 +302,7 @@ export const refutedCandidate = (
   comments: ReviewComment[],
   mergedSha: string,
 ): RefutedCandidate | null => {
-  const { record, key } = mined;
+  const { record } = mined;
   if (record.verdict !== "comment" || record.findings.length === 0) return null;
 
   const mergedAdded = new Map<string, Set<string>>();
@@ -325,7 +338,8 @@ export const refutedCandidate = (
 
   return {
     kind: "refuted",
-    key,
+    id: candidateId(record, "refuted", mergedSha),
+    bundle: record.bundle,
     repo: record.repo,
     pr: record.prNumber,
     findings: record.findings.map((f) => ({ path: f.path, line: f.line, body: f.body })),
@@ -506,7 +520,22 @@ const main = async () => {
     fixWords: flags["fix-words"]?.split(",").map((w) => w.trim()).filter(Boolean),
     limit: flags.limit ? Number(flags.limit) : undefined,
   });
-  const jsonl = candidates.map((c) => JSON.stringify(c)).join("\n");
+  if (candidates.length > 0 && !flags.bundles) {
+    throw new Error("mine: --bundles <dir> is required, so every proposal carries a bundle file");
+  }
+  if (flags.bundles) {
+    const dir = resolve(flags.bundles);
+    mkdirSync(dir, { recursive: true });
+    for (const c of candidates) {
+      writeFileSync(join(dir, bundleFileName(c.id)), JSON.stringify(c.bundle, null, 2));
+    }
+    console.error(`mine: wrote ${candidates.length} bundle(s) to ${dir}`);
+  }
+  // A proposal names its bundle file the way a manifest entry does, so a human
+  // copies the file in and pastes the entry without rewriting a key.
+  const jsonl = candidates
+    .map(({ bundle: _bundle, ...proposal }) => JSON.stringify({ ...proposal, bundle: bundleFileName(proposal.id) }))
+    .join("\n");
   if (flags.out) writeFileSync(flags.out, jsonl ? `${jsonl}\n` : "");
   else if (jsonl) console.log(jsonl);
   console.error(`mine: ${candidates.length} candidates`);

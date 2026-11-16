@@ -1,10 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
 import { GATING_FLAG_REASON, isGatedRepo, type GatingFlag } from "../gating";
-import { BundleSchema, FindingSchema, ReviewRecordSchema } from "../schema";
+import { BundleSchema, FindingSchema } from "../schema";
 import type { Bundle, ReviewRecord } from "../schema";
 import { isCacheable } from "./cache";
 import { replayCase } from "./replay";
@@ -14,7 +13,6 @@ import type { CheckoutFn, Result } from "./replay";
 // alone. The pairwise suite asks "better or worse than main"; this one asks
 // "did it block what must be blocked, and approve what must be approved".
 
-const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 const DEFAULT_MANIFEST = join(__dirname, "expected", "manifest.json");
 
 const ConsistencySchema = z.enum(["consistent", "inconsistent", "unclear"]);
@@ -65,28 +63,25 @@ export const SplitSchema = z.enum(["tune", "holdout"]);
 export const SourceSchema = z.enum(["simulated", "production-caught", "production-missed", "refuted"]);
 export const KindSchema = z.enum(["bug", "false-finding", "scale", "architecture"]);
 
-// A case is either a recorded production run (key, in S3) or a simulated PR
-// (bundle, a file next to the manifest) whose head commit is rebuilt locally
-// by applying its diff to the base.
-const ExpectedCaseSchema = z
-  .object({
-    id: z.string().regex(/^[a-z0-9-]+$/),
-    key: z.string().startsWith("reviews/").endsWith(".json").optional(),
-    bundle: z.string().endsWith(".json").optional(),
-    expect: ExpectSchema,
-    tests: z.string().min(1),
-    split: SplitSchema,
-    source: SourceSchema,
-    kind: KindSchema,
-    // Why main's own result on this case is noise, not a bar. Set, the gate
-    // still scores and reports it but never counts it as a regression.
-    flakyOnMain: z.string().min(1).optional(),
-    // When the review being replayed happened, for a simulated case that has
-    // no record to carry it. Replay shows a case only the post-mortems dated
-    // before it, and with no date it shows none.
-    reviewedAt: z.iso.datetime().optional(),
-  })
-  .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
+// A case is a bundle next to the manifest. A simulated PR's head commit is
+// rebuilt locally by applying its diff to the base; any other source is a real
+// PR whose head GitHub still serves.
+const ExpectedCaseSchema = z.object({
+  id: z.string().regex(/^[a-z0-9-]+$/),
+  bundle: z.string().endsWith(".json"),
+  expect: ExpectSchema,
+  tests: z.string().min(1),
+  split: SplitSchema,
+  source: SourceSchema,
+  kind: KindSchema,
+  // Why main's own result on this case is noise, not a bar. Set, the gate
+  // still scores and reports it but never counts it as a regression.
+  flakyOnMain: z.string().min(1).optional(),
+  // When the review being replayed happened, for a case whose bundle is not a
+  // record's. Replay shows a case only the post-mortems dated before it, and
+  // with no date it shows none.
+  reviewedAt: z.iso.datetime().optional(),
+});
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
 
 export const ManifestSchema = z
@@ -201,28 +196,11 @@ const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => 
   }
 };
 
-const readBody = async (body: unknown): Promise<string> => {
-  const chunks: Buffer[] = [];
-  for await (const chunk of body as AsyncIterable<Buffer>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-};
-
-// replayCase only reads runId and bundle, so a simulated case needs no more
-// than that. runId is set to the case id so results are named after the case.
-const loadRecord = async (
-  c: ExpectedCase,
-  manifestPath: string,
-  client: S3Client,
-): Promise<ReviewRecord> => {
-  if (c.bundle) {
-    const bundle = readBundleFile(manifestPath, c.bundle);
-    return { runId: c.id, bundle, ...(c.reviewedAt ? { startedAt: c.reviewedAt } : {}) } as ReviewRecord;
-  }
-  const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: c.key }));
-  const record = ReviewRecordSchema.parse(JSON.parse(await readBody(res.Body)));
-  return { ...record, runId: c.id };
+// replayCase only reads runId and bundle, so a case needs no more than that.
+// runId is set to the case id so results are named after the case.
+const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
+  const bundle = readBundleFile(manifestPath, c.bundle);
+  return { runId: c.id, bundle, ...(c.reviewedAt ? { startedAt: c.reviewedAt } : {}) } as ReviewRecord;
 };
 
 export interface RunScore {
@@ -725,13 +703,12 @@ const main = async () => {
   }
 
   if (mode === "replay" || mode === "all") {
-    const client = new S3Client({});
     const records = new Map<string, ReviewRecord>();
-    for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
+    for (const c of cases) records.set(c.id, loadRecord(c, manifestPath));
     // A bundle case is simulated unless its source says it is a real PR,
     // whose head commit GitHub still serves.
     const synthetic = new Set(
-      cases.filter((c) => c.bundle && c.source === "simulated").map((c) => records.get(c.id)!.bundle.headSha),
+      cases.filter((c) => c.source === "simulated").map((c) => records.get(c.id)!.bundle.headSha),
     );
     const checkout = checkoutFor(synthetic, flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined);
 

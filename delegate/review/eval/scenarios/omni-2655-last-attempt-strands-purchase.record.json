@@ -1,0 +1,64 @@
+{
+  "runId": "9f369914-b9f2-4ce7-9ef0-64641cd0af1f",
+  "repo": "thegoodparty/omni",
+  "prNumber": 2655,
+  "baseSha": "2a9b876edfd9cd303802fa08e17bb5c77d869320",
+  "headSha": "f2bc49315f79776fe6df218f70d190bbca08d6a4",
+  "trigger": "webhook",
+  "agentVersion": "b34a7b081c33e711a567cd23e5c36c59f686a804",
+  "model": "claude-opus-4-6",
+  "startedAt": "2026-10-09T18:16:25.614Z",
+  "finishedAt": "2026-10-09T18:20:12.927Z",
+  "wallTimeMs": 227313,
+  "costUsd": 0.7083066499999999,
+  "bundle": {
+    "repo": "thegoodparty/omni",
+    "prNumber": 2655,
+    "baseRef": "main",
+    "baseSha": "2a9b876edfd9cd303802fa08e17bb5c77d869320",
+    "headSha": "f2bc49315f79776fe6df218f70d190bbca08d6a4",
+    "author": "delegate-gp-bot",
+    "title": "ENG-11245: tolerate transient Vercel errors while polling registrar order",
+    "body": "Why: alert [Win] Route errors on POST /v1/domains/purchase (2026-10-09 ~18:05Z). The purchase succeeded at Vercel (order created), then the first getOrder poll returned a 502 from Vercel. assertRegistrarOrderCompleted threw, the domain was set inactive, and the user's retry hit 409 'no longer available' for the domain they had just bought.\n\nFix: while polling, a Vercel 5xx/429 is a non-terminal poll and is retried on the normal interval; the last attempt and non-transient errors still throw.\n\nUnrelated to the voter-density alert at the same minute: no election-api errors in the window; failure is a Vercel upstream 502.\n\n<!-- CURSOR_SUMMARY -->\n---\n\n> [!NOTE]\n> **Medium Risk**\n> Changes domain purchase completion behavior on Vercel API failures; incorrect classification could delay failure or mask real errors, but scope is limited to registrar order polling.\n> \n> **Overview**\n> Fixes a production failure where a successful Vercel registrar purchase could still fail registration when the first `getRegistrarOrder` poll returned a transient upstream error (e.g. 502), which marked the domain **inactive** and left the user unable to retry.\n> \n> Adds `isVercelTransientError` on `VercelService` (Vercel **5xx** and **429**). **`assertRegistrarOrderCompleted`** now catches those errors during polling, waits the existing interval, and retries instead of aborting\u2014non-transient errors and the final poll attempt still throw. A unit test covers retry-after-transient-error without setting the domain inactive.\n> \n> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit f2bc49315f79776fe6df218f70d190bbca08d6a4. Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>\n<!-- /CURSOR_SUMMARY -->",
+    "diff": "diff --git a/packages/gp-api/src/vendors/vercel/services/vercel.service.ts b/packages/gp-api/src/vendors/vercel/services/vercel.service.ts\nindex 74de1dab..583b2c1f 100644\n--- a/packages/gp-api/src/vendors/vercel/services/vercel.service.ts\n+++ b/packages/gp-api/src/vendors/vercel/services/vercel.service.ts\n@@ -88,6 +88,14 @@ export class VercelService {\n     )\n   }\n \n+  isVercelTransientError(e: unknown): boolean {\n+    return (\n+      e instanceof VercelError &&\n+      (e.statusCode >= 500 ||\n+        e.statusCode === Number(HttpStatus.TOO_MANY_REQUESTS))\n+    )\n+  }\n+\n   async getProjectDomain(domainName: string) {\n     const { client, projectId, teamId } = this.requireClient()\n     try {\ndiff --git a/packages/gp-api/src/websites/services/domains.service.test.ts b/packages/gp-api/src/websites/services/domains.service.test.ts\nindex 22a2d158..c60500b6 100644\n--- a/packages/gp-api/src/websites/services/domains.service.test.ts\n+++ b/packages/gp-api/src/websites/services/domains.service.test.ts\n@@ -84,6 +84,7 @@ describe('DomainsService', () => {\n     getDomainDetails: ReturnType<typeof vi.fn>\n     getDomainAuthCode: ReturnType<typeof vi.fn>\n     isVercelNotFoundError: ReturnType<typeof vi.fn>\n+    isVercelTransientError: ReturnType<typeof vi.fn>\n   }\n   let mockForwardEmail: {\n     getDomain: ReturnType<typeof vi.fn>\n@@ -135,6 +136,7 @@ describe('DomainsService', () => {\n       }),\n       getDomainAuthCode: vi.fn().mockResolvedValue('AuthC0de!'),\n       isVercelNotFoundError: vi.fn().mockReturnValue(false),\n+      isVercelTransientError: vi.fn().mockReturnValue(false),\n     }\n     mockForwardEmail = {\n       getDomain: vi.fn().mockResolvedValue(null),\n@@ -1945,6 +1947,49 @@ describe('DomainsService', () => {\n       )\n     })\n \n+    it('keeps polling when the registrar order lookup hits a transient Vercel error', async () => {\n+      vi.useFakeTimers()\n+      Object.assign(mockPrisma.domain, {\n+        findFirst: vi.fn(),\n+        findFirstOrThrow: vi.fn(),\n+        findUnique: vi.fn(),\n+        count: vi.fn(),\n+      })\n+      service.onModuleInit()\n+      vi.spyOn(service, 'shouldEnableDomainPurchase').mockReturnValue(true)\n+      const getRegistrarOrderMock = vi\n+        .fn()\n+        .mockRejectedValueOnce(new Error('502 Bad Gateway'))\n+        .mockResolvedValueOnce({ status: GetOrderStatus.Completed })\n+      Object.assign(mockVercel, {\n+        getDomainDetails: vi.fn().mockRejectedValue(new Error('not found')),\n+        isVercelNotFoundError: vi.fn().mockReturnValue(true),\n+        isVercelTransientError: vi.fn().mockReturnValue(true),\n+        purchaseDomain: vi.fn().mockResolvedValue({ orderId: 'order_123' }),\n+        getProjectDomain: vi.fn().mockRejectedValue(new Error('not found')),\n+        getRegistrarOrder: getRegistrarOrderMock,\n+        addDomainToProject: vi.fn().mockResolvedValue({}),\n+      })\n+      mockPrisma.domain.findUniqueOrThrow.mockResolvedValue({\n+        ...mockDomain,\n+        paymentId: null,\n+        price: new Decimal(12),\n+      })\n+\n+      const registration = service.completeDomainRegistration(10, contact, {\n+        skipPaymentVerification: true,\n+      })\n+      await vi.advanceTimersByTimeAsync(3_000)\n+      await registration\n+\n+      expect(getRegistrarOrderMock).toHaveBeenCalledTimes(2)\n+      expect(mockPrisma.domain.update).not.toHaveBeenCalledWith(\n+        expect.objectContaining({\n+          data: { status: DomainStatus.inactive },\n+        }),\n+      )\n+    })\n+\n     it('marks the domain inactive and throws when the registrar order fails', async () => {\n       Object.assign(mockPrisma.domain, {\n         findFirst: vi.fn(),\ndiff --git a/packages/gp-api/src/websites/services/domains.service.ts b/packages/gp-api/src/websites/services/domains.service.ts\nindex eb4fa919..8bd220b2 100644\n--- a/packages/gp-api/src/websites/services/domains.service.ts\n+++ b/packages/gp-api/src/websites/services/domains.service.ts\n@@ -1448,7 +1448,21 @@ export class DomainsService\n       attempt <= REGISTRAR_ORDER_POLL_MAX_ATTEMPTS;\n       attempt++\n     ) {\n-      const order = await this.vercel.getRegistrarOrder(orderId)\n+      let order: Awaited<ReturnType<VercelService['getRegistrarOrder']>>\n+      try {\n+        order = await this.vercel.getRegistrarOrder(orderId)\n+      } catch (error) {\n+        // The order is already placed and charged; a transient Vercel blip while\n+        // polling must not mark the domain inactive and strand the purchase.\n+        if (\n+          attempt < REGISTRAR_ORDER_POLL_MAX_ATTEMPTS &&\n+          this.vercel.isVercelTransientError(error)\n+        ) {\n+          await sleep(REGISTRAR_ORDER_POLL_INTERVAL_MS)\n+          continue\n+        }\n+        throw error\n+      }\n       if (order.status === GetOrderStatus.Completed) {\n         return\n       }\n",
+    "changedFiles": [
+      "packages/gp-api/src/vendors/vercel/services/vercel.service.ts",
+      "packages/gp-api/src/websites/services/domains.service.test.ts",
+      "packages/gp-api/src/websites/services/domains.service.ts"
+    ],
+    "priorFindings": []
+  },
+  "output": {
+    "status": "complete",
+    "findings": [
+      {
+        "path": "packages/gp-api/src/websites/services/domains.service.ts",
+        "line": 1457,
+        "endLine": 1464,
+        "body": "**Last-attempt transient error still strands the purchase.**\n\nWhen `attempt === REGISTRAR_ORDER_POLL_MAX_ATTEMPTS` and Vercel returns a transient 5xx, the guard `attempt < REGISTRAR_ORDER_POLL_MAX_ATTEMPTS` is false, so the raw `VercelError` is re-thrown. It propagates to the outer catch at line 1385, which unconditionally sets `status: DomainStatus.inactive` \u2014 the same stranded-purchase scenario the PR is designed to prevent.\n\nRemoving only the `attempt <` guard doesn't fully help either: the loop would exit and the timeout throw at line 1479 still reaches the same outer catch. The deeper fix is either (a) removing the attempt guard here **and** having the outer catch distinguish transient-poll-exhaustion from real failures (so it doesn't mark inactive when all polls were transient), or (b) accepting one extra retry by dropping the guard, which at least gives the final poll a chance to succeed rather than failing immediately on the transient error.\n\n(Falsification check: the outer catch at lines 1385\u20131397 has no transient-error guard \u2014 it calls `model.update({ status: DomainStatus.inactive })` unconditionally for all exceptions from `assertRegistrarOrderCompleted`.)",
+        "category": "bugs",
+        "confidence": "medium"
+      }
+    ],
+    "summary": "This PR adds transient-error tolerance (5xx/429) to the Vercel registrar-order polling loop in `assertRegistrarOrderCompleted`, preventing a confirmed production bug where a Vercel 502 on the first poll marked a successfully purchased domain as inactive. The scout flagged three areas: (1) the transient-error guard excludes the final poll attempt, (2) test coverage for `isVercelTransientError` itself, and (3) non-`VercelError` network failures. Deep review confirmed that items 2 and 3 are not blockers \u2014 the test correctly isolates the retry logic with standard mocking, and the scope to `VercelError` matches the observed failure. Item 1 is a medium-confidence concern: a transient error on the last attempt still throws raw and triggers the outer catch's unconditional `inactive` marking, preserving the stranded-purchase risk in that edge case. The human reviewer should confirm whether the polling budget (attempt count \u00d7 interval) is generous enough that exhausting all attempts on transient errors is unlikely in practice."
+  },
+  "verdict": "comment",
+  "action": "commented",
+  "gates": [],
+  "findings": [
+    {
+      "path": "packages/gp-api/src/websites/services/domains.service.ts",
+      "line": 1457,
+      "endLine": 1464,
+      "body": "**Last-attempt transient error still strands the purchase.**\n\nWhen `attempt === REGISTRAR_ORDER_POLL_MAX_ATTEMPTS` and Vercel returns a transient 5xx, the guard `attempt < REGISTRAR_ORDER_POLL_MAX_ATTEMPTS` is false, so the raw `VercelError` is re-thrown. It propagates to the outer catch at line 1385, which unconditionally sets `status: DomainStatus.inactive` \u2014 the same stranded-purchase scenario the PR is designed to prevent.\n\nRemoving only the `attempt <` guard doesn't fully help either: the loop would exit and the timeout throw at line 1479 still reaches the same outer catch. The deeper fix is either (a) removing the attempt guard here **and** having the outer catch distinguish transient-poll-exhaustion from real failures (so it doesn't mark inactive when all polls were transient), or (b) accepting one extra retry by dropping the guard, which at least gives the final poll a chance to succeed rather than failing immediately on the transient error.\n\n(Falsification check: the outer catch at lines 1385\u20131397 has no transient-error guard \u2014 it calls `model.update({ status: DomainStatus.inactive })` unconditionally for all exceptions from `assertRegistrarOrderCompleted`.)",
+      "category": "bugs",
+      "confidence": "medium",
+      "id": "c98b2de5-7675-4fea-b45b-ea5b6ae66073",
+      "anchorAdjusted": false,
+      "commentId": 4233257552,
+      "threadId": "PRRT_kwDOSuUSjM6q5eXH"
+    }
+  ],
+  "droppedFindings": [],
+  "reviewId": 5473822448
+}

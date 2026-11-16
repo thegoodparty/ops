@@ -1,0 +1,41 @@
+{
+  "runId": "be011a3f-6d49-4ac0-898d-b704a9199496",
+  "repo": "thegoodparty/omni",
+  "prNumber": 2701,
+  "baseSha": "cb4c01a38925b7883f7943ed36580be618af30f4",
+  "headSha": "9612f1b93db46801942028f39520fa85f7edc124",
+  "trigger": "webhook",
+  "agentVersion": "677c8a8cfb9636b78021926025a2505016e9a331",
+  "model": "claude-opus-4-6",
+  "startedAt": "2026-10-13T15:17:13.510Z",
+  "finishedAt": "2026-10-13T15:18:21.461Z",
+  "wallTimeMs": 67951,
+  "costUsd": 0.18530740000000004,
+  "bundle": {
+    "repo": "thegoodparty/omni",
+    "prNumber": 2701,
+    "baseRef": "main",
+    "baseSha": "cb4c01a38925b7883f7943ed36580be618af30f4",
+    "headSha": "9612f1b93db46801942028f39520fa85f7edc124",
+    "author": "tomer-tgp",
+    "title": "docs: say where agent experiment runs work",
+    "body": "A teammate setting up locally assumed a working Gemini key plus AWS credentials would let the community-issues research job run on a laptop, and that PR previews run it. Neither holds, and agents keep re-deriving this from deploy config.\n\n- Local can't work even with credentials: a run's result comes back on dev's shared agent-results queue, dev gp-api consumes it, finds no matching row, and the local run sits `QUEUED`. So the answer is seed locally, not vend AWS creds.\n- Previews have no `AGENT_DISPATCH_QUEUE_NAME` by design.\n- `MEETINGS_AUTOMATION_ENABLED` is prod-only and gates only the on-create dispatch and crons, so on dev a real run needs the staff dispatch buttons or the dispatch endpoints.\n\nThe local setup guide gets the general rule; the communityIssues doc gets the per-environment detail and the manual triggers.\n\n\ud83e\udd16 Generated with [Claude Code](https://claude.com/claude-code)\n\n<!-- CURSOR_SUMMARY -->\n---\n\n> [!NOTE]\n> **Low Risk**\n> Documentation-only; no runtime, config, or deployment behavior changes.\n> \n> **Overview**\n> Documents **where agent experiment runs actually work** so local/preview setup mistakes stop recurring.\n> \n> **`docs/development.md`** adds a short callout that a local stack cannot run agent experiments (community issues, briefings, etc.): results land on dev\u2019s shared queue and dev gp-api owns consumption, so extra `LOCAL_DEV_ENV` keys or AWS creds won\u2019t help. It steers people to **seed locally** (e.g. `POST /v1/community-issues/seed`) and run real jobs on **dev**, notes **`MEETINGS_AUTOMATION_ENABLED` is prod-only** (dev won\u2019t auto-dispatch gated flows), and that **PR previews** can\u2019t run experiments\u2014pointing to the community-issues agent doc for detail.\n> \n> **`packages/gp-api/src/communityIssues/AGENTS.md`** adds a **\u201cWhere a real run works\u201d** section: requirements (`AGENT_DISPATCH_QUEUE_NAME` + shared results queue), per-environment behavior (local \u2192 use `/seed`; preview \u2192 queue unset \u2192 `FAILED`; dev \u2192 manual staff/endpoint triggers), and why dev doesn\u2019t auto-dispatch new offices without prod automation.\n> \n> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit 9612f1b93db46801942028f39520fa85f7edc124. Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>\n<!-- /CURSOR_SUMMARY -->",
+    "diff": "diff --git a/docs/development.md b/docs/development.md\nindex 95a0716..a358e56 100644\n--- a/docs/development.md\n+++ b/docs/development.md\n@@ -36,6 +36,15 @@ election-api and\n gp-admin aren't part of it; gp-webapp already defaults to the deployed dev\n election-api, and gp-admin isn't part of the stack `scripts/dev.sh` boots.\n \n+A local stack can't run agent experiments (community issues, briefings,\n+opponent research, compliance setup). A run's result comes back on dev's\n+shared results queue to dev gp-api, so no `LOCAL_DEV_ENV` key or AWS\n+credential fixes it. Seed the data locally (community issues have\n+`POST /v1/community-issues/seed`) and test real runs on dev. Dev doesn't\n+dispatch anything gated by `MEETINGS_AUTOMATION_ENABLED` on its own, because\n+that flag is prod-only. Previews can't run agent experiments at all. See\n+`packages/gp-api/src/communityIssues/AGENTS.md`.\n+\n Once the stack is healthy, it finishes by seeding a login: a QA fixture user\n (`packages/gp-api/src/testFixtures/`) in product state `--user-state`\n (default `free-win`), minted via a per-run Clerk M2M token and printed once\ndiff --git a/packages/gp-api/src/communityIssues/AGENTS.md b/packages/gp-api/src/communityIssues/AGENTS.md\nindex ee3e684..aaa2c97 100644\n--- a/packages/gp-api/src/communityIssues/AGENTS.md\n+++ b/packages/gp-api/src/communityIssues/AGENTS.md\n@@ -80,6 +80,23 @@ lives in `src/shared/util/userActivity.util.ts`, shared with\n `meetingBriefings.service.ts` \u2014 the two domains use the same threshold and\n comparison, just wired through different dispatch flows.\n \n+## Where a real run works\n+\n+A real run needs `AGENT_DISPATCH_QUEUE_NAME`, and its result returns on the\n+env's shared agent-results queue (`src/agentExperiments/AGENTS.md`).\n+\n+- **Local:** no. Don't vend AWS credentials or point a laptop at\n+  `agent-dispatch-dev.fifo`: dev gp-api consumes the result, finds no\n+  matching run in its DB, and the local row stays `QUEUED`. Use\n+  `POST /seed` for UI work.\n+- **PR preview:** no. The queue is unset by design, so dispatch flips the row\n+  to `FAILED`.\n+- **Dev:** yes, but only when triggered by hand. `MEETINGS_AUTOMATION_ENABLED`\n+  is `true` only in prod, and it gates only `onElectedOfficeCreated` and the\n+  crons. So a new dev office dispatches nothing. Use the staff buttons on the\n+  Serve Community Issues page (`POST /self-dispatch`, `@goodparty.org`\n+  login), `POST /dispatch-if-needed`, or `POST /dispatch`.\n+\n ## Test command\n \n ```bash\n",
+    "changedFiles": [
+      "docs/development.md",
+      "packages/gp-api/src/communityIssues/AGENTS.md"
+    ],
+    "priorFindings": []
+  },
+  "output": {
+    "status": "complete",
+    "findings": [],
+    "summary": "Documentation-only PR adding 26 lines of prose across two markdown files. The scout verified all factual claims against the codebase: `POST /v1/community-issues/seed` exists, `MEETINGS_AUTOMATION_ENABLED` is indeed empty in dev/preview (prod-only), `onElectedOfficeCreated` exists in `communityIssueDispatch.service.ts`, and the three dispatch endpoints (`/self-dispatch`, `/dispatch-if-needed`, `/dispatch`) are real routes. No code, config, or deployment changes \u2014 no issues found."
+  },
+  "verdict": "approve",
+  "action": "approved",
+  "gates": [],
+  "findings": [],
+  "droppedFindings": [],
+  "reviewId": 5505875270
+}

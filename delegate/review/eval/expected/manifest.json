@@ -19,7 +19,7 @@
   },
   {
     "id": "omni-2713-auth-bypass",
-    "key": "reviews/thegoodparty/omni/2713/4bcac394cac65f994be6d6c4d30b7210c70a657d/dd09a5a3-35e0-4612-9bed-f142cb6c8fdc.json",
+    "bundle": "omni-2713-auth-bypass.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -30,11 +30,12 @@
     "tests": "The owner shortcut in ServiceReadGuard reads personId from the query string, so any signed-in user passes the guard on list endpoints that take no personId. Production caught it; the author fixed it.",
     "split": "tune",
     "source": "production-caught",
-    "kind": "bug"
+    "kind": "bug",
+    "reviewedAt": "2026-10-13T17:55:42.456Z"
   },
   {
     "id": "omni-2618-missing-slug",
-    "key": "reviews/thegoodparty/omni/2618/fc14cbe36c782623ec5699cb4eb8c661ceb0e81a/e811f0f9-1e83-4486-8fb5-6cc6ada4bbce.json",
+    "bundle": "omni-2618-missing-slug.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -45,18 +46,20 @@
     "tests": "The create mutation reads data.slug, but POST /v1/test-mode/organizations returns the test-mode state, so a new test org is never switched to. Production approved; the next commit fixed it.",
     "split": "holdout",
     "source": "production-missed",
-    "kind": "bug"
+    "kind": "bug",
+    "reviewedAt": "2026-10-09T06:55:30.038Z"
   },
   {
     "id": "gp-data-platform-1159-docs-fix",
-    "key": "reviews/thegoodparty/gp-data-platform/1159/0b6ca4f7e904911004cfd2af3a7602c7c20430f7/4b406688-57bd-4c2a-89bb-1a9f39a8bc05.json",
+    "bundle": "gp-data-platform-1159-docs-fix.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "A one-line documentation correction: quote a skill description so strict YAML parsers load it. Nothing to block.",
     "split": "tune",
     "source": "production-caught",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-07T17:21:14.824Z"
   },
   {
     "id": "gp-pi-57-multi-instance",
@@ -79,14 +82,15 @@
   },
   {
     "id": "gp-data-platform-1183-null-regex-guard",
-    "key": "reviews/thegoodparty/gp-data-platform/1183/43a641af7f4d4977eaa820765c345ba9ebff47f8/6334c17a-7fd8-478e-b3b6-7cd5c8066a29.json",
+    "bundle": "gp-data-platform-1183-null-regex-guard.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production's third review at 43a641a, which re-listed the finding as an open prior. The reviewer wanted a `where: ... is not null` guard on a regex test over a nullable column. dbt_expectations returns failing rows with `where not(expression = true)`, and a null predicate is never returned: 0 failures over 218,051,528 voter rows with 8,725,708 null, and the same test already runs unguarded on `geocode_full`. Nothing to block.",
     "split": "holdout",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-14T18:22:05.957Z"
   },
   {
     "id": "ops-plan-consistent-change",
@@ -243,7 +247,7 @@
   },
   {
     "id": "omni-3004-admin-action-rejects-serve",
-    "key": "reviews/thegoodparty/omni/3004/e21744093841dffd2f8c48fc8b17cfcad8dab661/847e1ab1-3815-4a38-8a8a-ccbcaed30adb.json",
+    "bundle": "omni-3004-admin-action-rejects-serve.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -254,11 +258,12 @@
     "tests": "The new POST test-fixtures/vendor-mocks/outreach/:id/admin-actions route runs assertOutreachOwner, which 404s any outreach row with a null campaignId, while the same PR's applyOutreachAdminAction accepts null campaignId. Serve sends are org-scoped with campaignId null, so the route is dead for the Serve outreach it was built to drive. Production approved; ecf00407de fixed it.",
     "split": "holdout",
     "source": "production-missed",
-    "kind": "bug"
+    "kind": "bug",
+    "reviewedAt": "2026-10-20T20:17:57.360Z"
   },
   {
     "id": "omni-3298-abandoned-resend-hidden",
-    "key": "reviews/thegoodparty/omni/3298/52fb25fc9c4782ba6690ded20915d627fc6b4432/3d66b647-952c-43ef-a00b-9ea7b1398bb4.json",
+    "bundle": "omni-3298-abandoned-resend-hidden.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -269,11 +274,12 @@
     "tests": "Resending a payment-failed robocall runs convertDraft, which moves settleState from hold_failed to pending_payment before payment. If the candidate leaves the pay step, findByScope hides the row (it shows pending_payment only for a hold_failed robocall) and the cancel sweep only claims hold_failed rows, so the send vanishes from history and cannot be resent. Production approved; b1f7b4ae58 fixed it.",
     "split": "holdout",
     "source": "production-missed",
-    "kind": "bug"
+    "kind": "bug",
+    "reviewedAt": "2026-10-27T20:08:12.924Z"
   },
   {
     "id": "omni-2588-hold-skips-free-texts",
-    "key": "reviews/thegoodparty/omni/2588/44a4370a508555f01d81ebc5c850bc7dd20241e1/61d0182f-86c2-4038-bdcd-a119d263fc80.json",
+    "bundle": "omni-2588-hold-skips-free-texts.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -284,40 +290,44 @@
     "tests": "With WIN_SMS_HOLD_BILLING on, the hold path prices a free-texts-eligible P2P send (5,000 contacts or fewer) at the undiscounted amount, while SmsReviewStep still computes isFree and calls complete-free-purchase, which purchase.service rejects for a non-zero amount. The send can never go out. Production approved; dcd48fb923 (#2811) fixed it.",
     "split": "holdout",
     "source": "production-missed",
-    "kind": "bug"
+    "kind": "bug",
+    "reviewedAt": "2026-10-08T20:43:43.406Z"
   },
   {
     "id": "omni-2702-multi-office-skip",
-    "key": "reviews/thegoodparty/omni/2702/99c785718cbb1e28d374f6c5cadfd67b50f18075/10d1b0d8-c5cc-48f0-bd0f-ef20133a4b9b.json",
+    "bundle": "omni-2702-multi-office-skip.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on a multi-office org silently skipping a community issue in priorityOnboarding.service.ts. ElectedOffice.organizationSlug is @unique, so an org holds one office and the path cannot happen; the reviewer's own earlier run at this sha falsified the same lead. Nothing to block.",
     "split": "tune",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-13T16:36:10.073Z"
   },
   {
     "id": "omni-2986-vitest-undefined-key",
-    "key": "reviews/thegoodparty/omni/2986/27404f2505d3c9bbfa7f34cf1060ed6212ac10b3/89e02f95-e5d9-41a9-9903-7b9c880fcdbd.json",
+    "bundle": "omni-2986-vitest-undefined-key.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked claiming clerk-auth.service.test.ts would break because verifyToken now gets an options key set to undefined. Vitest's toHaveBeenCalledWith uses non-strict equality, so an undefined key matches a missing one, and the tests passed. The prior commit's review falsified the same lead. Nothing to block.",
     "split": "tune",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-20T14:51:46.132Z"
   },
   {
     "id": "gp-data-platform-1235-serve-month-start",
-    "key": "reviews/thegoodparty/gp-data-platform/1235/ba6ccefc0965d3c93ea73de1b5ae0a9d39bb75c8/7abd6ec1-adb2-4313-a25f-545a9822dcc7.json",
+    "bundle": "gp-data-platform-1235-serve-month-start.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked saying the Serve month grid in user_lookup_peer_grids.sql drops steps before serve_started_at. That is the documented intent: the model's yaml says the grid runs from the signup or Serve start month to today. Nothing to block.",
     "split": "tune",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-20T21:32:28.430Z"
   },
   {
     "id": "omni-3370-contact-upload-body-cap",
@@ -336,58 +346,63 @@
   },
   {
     "id": "omni-2679-starlette-sync-background",
-    "key": "reviews/thegoodparty/omni/2679/d5f718dc6d611135c2923aecb534dba9a2ba64a7/61e03aa3-16e3-461e-b5da-551f25d6fc85.json",
+    "bundle": "omni-2679-starlette-sync-background.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on record_fetch and record_head in packages/gp-ai/broker/page_replay.py blocking the event loop with boto3 calls. They are sync callables run as BackgroundTasks, and the Starlette the broker locks (1.3.1, uv.lock) sends sync callables to the threadpool. Nothing to block.",
     "split": "tune",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-12T02:27:03.038Z"
   },
   {
     "id": "gp-data-platform-1255-json-path-case",
-    "key": "reviews/thegoodparty/gp-data-platform/1255/07a3c20d8529140d8c369be3ec43a6861dd936f4/6c12899f-b82f-40e7-885a-72374e7e8f67.json",
+    "bundle": "gp-data-platform-1255-json-path-case.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on event_properties:activeproduct in int__amplitude_events_classified.sql not matching the camelCase activeProduct key. The : path on a JSON string column is case-insensitive in Databricks, which the author confirmed on the warehouse. Nothing to block.",
     "split": "tune",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-23T17:44:10.557Z"
   },
   {
     "id": "gp-data-platform-982-splink-source-dataset",
-    "key": "reviews/thegoodparty/gp-data-platform/982/6778c5fc2763391f3229c681e8bf88f05e43f280/9c8a962e-0cc6-4c46-88ce-151d4d346da7.json",
+    "bundle": "gp-data-platform-982-splink-source-dataset.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on matcha/tests/test_pipeline.py reading a source_dataset column the PR renamed. The line is in an untouched smoke test on the Splink-native path, and Splink's Linker adds source_dataset itself for multi-table input; the matcha suite passed at this head. Nothing to block.",
     "split": "holdout",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-07T19:32:10.459Z"
   },
   {
     "id": "omni-2946-hold-free-path-unreachable",
-    "key": "reviews/thegoodparty/omni/2946/58b4da323629ac37983d2cbbb6926928d82166d7/d93f7d4f-3860-49f8-9e6a-54b177d3604b.json",
+    "bundle": "omni-2946-hold-free-path-unreachable.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on SmsReviewStep.tsx treating a covered send as free while gp-api returns a real hold. resolveReadyHoldAmount in outreachPurchase.service.ts returns 0 when the offer covers a built list, and isFreeSend in SmsFlow.tsx keeps checkout waiting for the build, so a hold above 0 on a covered send cannot reach the review step. Nothing to block.",
     "split": "holdout",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-19T16:37:02.776Z"
   },
   {
     "id": "omni-3126-race-floor-from-frame",
-    "key": "reviews/thegoodparty/omni/3126/5b35345d4ab4310075261f613ff21ca9e5ef6308/f4adcc5a-d9f3-441b-bfb8-a270dc864670.json",
+    "bundle": "omni-3126-race-floor-from-frame.bundle.json",
     "expect": {
       "verdict": "approve"
     },
     "tests": "Production blocked on priorityResults.service.ts taking race from the census frame rather than the answers, while its own finding says the read is only held back longer, never released early. The sizing target and the floor are both frameAnswersNeeded of the same frame, so they agree by design. Nothing to block.",
     "split": "holdout",
     "source": "refuted",
-    "kind": "false-finding"
+    "kind": "false-finding",
+    "reviewedAt": "2026-10-22T12:56:04.160Z"
   },
   {
     "id": "omni-inc101-sync-audience-paging",
@@ -468,7 +483,7 @@
   },
   {
     "id": "omni-2977-mrp-per-tract-on-request",
-    "key": "reviews/thegoodparty/omni/2977/6ddbc85430ef0d339bb59e5eba7ca3c30604ab23/573c933f-bb09-424d-b96a-9b78d04ad6a6.json",
+    "bundle": "omni-2977-mrp-per-tract-on-request.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -480,11 +495,12 @@
     "tests": "Swaps the priority read to the MRP model with census tract as a dimension, one parameter per tract, fit synchronously inside gp-api's read-status request. The repo's ADR (docs/adr/2026-10-19-civic-panel-mrp-in-gp-api.md) sized it at a few dozen parameters and about 1 ms, and the PR body says speed on very large districts was not measured. Statewide North Carolina has 3,003 tracts; each read took 4 to 9 minutes on Node's one thread and froze the prod fleet on 2026-11-04 (post-mortem \"Statewide read freeze\"). Production approved with no findings. The fix (#3588) caps the model.",
     "split": "tune",
     "source": "production-missed",
-    "kind": "scale"
+    "kind": "scale",
+    "reviewedAt": "2026-10-19T23:24:21.895Z"
   },
   {
     "id": "omni-3023-mrp-read-on-home-load",
-    "key": "reviews/thegoodparty/omni/3023/cb0d89a3dca8c3ff3ed9a6362a7fb459601b92d1/e6b3e609-45e4-4f01-89c7-7dfd909b7311.json",
+    "bundle": "omni-3023-mrp-read-on-home-load.bundle.json",
     "expect": {
       "verdict": "block",
       "paths": [
@@ -497,7 +513,8 @@
     "tests": "Adds the priority read (the per-tract MRP fit from #2977) to Home card sync, so every Home load runs it synchronously inside the request, with only a per-server cache. A large district's read takes minutes on Node's one thread, and the least-outstanding-requests balancer spreads repeat loads across servers until the fleet freezes (post-mortem \"Statewide read freeze\", 2026-11-04). The change is a small part of a 54-file PR. Production approved with no findings. Scored on the architecture finding only: other real bugs in dashboardCards.service.ts used to pass this case without the reviewer seeing the read.",
     "split": "tune",
     "source": "production-missed",
-    "kind": "scale"
+    "kind": "scale",
+    "reviewedAt": "2026-10-20T23:25:48.786Z"
   },
   {
     "id": "omni-2852-priority-page-waits-on-read",
