@@ -333,14 +333,22 @@ uniform and a mistake is uniform:
   Each provider entry also carries `key_ids: ["*"]`, because a provider config
   with no keys allows none: empty is deny, `"*"` is "use the provider's keys",
   and the gateway's keys are the deployment's, not the person's.
-- **No `budgets` and no `rate_limit` on the key.** Decided in review on this
-  PR: per-person budgets and rate limits are skipped for now, because AWS and
-  Fireworks already impose provider-level limits that act as the stopgap, and a
-  number chosen before there is any usage data is as likely to starve a person
-  mid-task as to catch anything. What stays is attribution, which is what the
-  key is for. What this gives up is stated in "Deferred": nothing stops one
-  person's runaway loop except the provider's own limit, and the account
-  budget alerts rather than binds.
+- **No key-level `budgets` and no `rate_limit` on the key; a budget per provider
+  entry.** Decided in review on this PR, and amended since. Per-person budgets
+  and rate limits were skipped for pass one, because AWS and Fireworks already
+  impose provider-level limits that act as the stopgap, and a number chosen
+  before there is any usage data is as likely to starve a person mid-task as to
+  catch anything. **Amended:** per-provider budgets are now in the template. The
+  `bedrock` entry carries `[{ "max_limit": 1500, "reset_duration": "1M" }]` and
+  the `fireworks` entry carries none, so per-person Bedrock spend is capped at
+  $1500 a calendar month and DeepSeek stays uncapped
+  ([`bifrost-reconciler.md`](./bifrost-reconciler.md), decision 18). The
+  argument that expired is the same one and at the same time as the key-level
+  reversal: the log store has a quarter of per-request cost keyed by virtual key,
+  so $1500 is read off evidence. The key-level `budgets` field is still empty in
+  the template, and it is what an override uses for a total that spans providers.
+  What a per-provider cap gives up is stated in decision 18: it is bound to the
+  provider's name, so a model later served on Fireworks escapes the Bedrock cap.
 - **A marker in `description`** identifies the key as Lambda-managed. It is the
   janitor's only input, and it is what keeps a hand-made key — a test key, an
   experiment, a key a human created in the dashboard — out of reach of a job
@@ -664,7 +672,7 @@ and the diff-and-apply loop is `deploy-workbench/bifrost/vk-janitor-core.ts`.
   "team_id": "<engineering team id, phase 2 item 14>",
   "is_active": true,
   "provider_configs": [
-    { "provider": "bedrock",   "allowed_models": ["…"], "key_ids": ["*"] },
+    { "provider": "bedrock",   "allowed_models": ["…"], "key_ids": ["*"], "budgets": [{ "max_limit": 1500, "reset_duration": "1M" }] },
     { "provider": "fireworks", "allowed_models": ["…"], "key_ids": ["*"] }
   ]
 }
@@ -676,8 +684,10 @@ gateway routes — seven Bedrock classes, all `global.` inference profiles, and
 one US-only Fireworks router. DeepSeek V3.2 is absent because Bedrock
 publishes no inference profile for it at all, `global.` or `us.`, so it was
 removed from both files on 2026-11-04; the team is the one item 14 creates.
-There is deliberately no `budgets` or `rate_limit` entry (decision 5):
-adding one later is adding a field here.
+There is deliberately no key-level `budgets` or `rate_limit` entry (decision 5):
+adding one later is adding a field here. The per-provider `budgets` on the
+bedrock entry is decision 18's cap, and Fireworks carrying no such field is how
+"uncapped" is written.
 
 ## Deferred, recorded and not designed
 
@@ -696,12 +706,14 @@ adding one later is adding a field here.
   for pass one: AWS and Fireworks already impose provider-level limits that act
   as the stopgap, and a per-person number chosen before there is any usage data
   is a guess that can starve a person mid-task as easily as catch a runaway.
-  **What this costs is real and worth knowing:** the key gives attribution and
-  no cap, so a runaway loop spends the team's provider quota rather than
-  tripping a gateway limit, and the account budget alerts rather than binds.
-  Coming back is cheap — `budgets` and `rate_limit` are fields on the key's
-  template (decision 5) and the key is already attributable, which is what
-  makes a number possible to choose from evidence rather than by guessing.
+  **Reversed**, keyed by provider: per-provider budgets came back first — the
+  template caps Bedrock at $1500 a calendar month and leaves Fireworks uncapped
+  ([`bifrost-reconciler.md`](./bifrost-reconciler.md), decision 18) — and the
+  key-level budget is available as an override (decision 13). The defect this
+  recorded is therefore closed for spend: a runaway loop now trips a gateway
+  limit on Bedrock rather than only spending the team's provider quota. It is
+  not closed for Fireworks, which is uncapped on purpose, and the account budget
+  still alerts rather than binds.
 - **Scheduled rotation.** The endpoints exist at the pinned tag —
   `POST /api/governance/virtual-keys/{vk_id}/rotate` and the bulk
   `POST /api/governance/virtual-keys/rotate` — and a rotated key keeps its
@@ -744,8 +756,9 @@ Step: 2
 1. **The default template, as data.** A committed JSON template beside the
    mint Lambda, with the test that pins it to
    `deploy-workbench/bifrost/config.json`'s model lists. No infrastructure, no
-   code path — reviewable on its own. It carries no budget or rate limit
-   (decision 5).
+   code path — reviewable on its own. It carried no budget or rate limit
+   (decision 5); the per-provider Bedrock cap was added later, by decision 18 of
+   [`bifrost-reconciler.md`](./bifrost-reconciler.md).
 2. **The read-only membership role.** In `deploy/`: `bifrost-vk-reader`, a
    management-account role trusting the two workbench Lambdas' roles by
    account-root-plus-`aws:PrincipalArn`, in the shape of

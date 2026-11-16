@@ -41,13 +41,21 @@ Success, in the order it should be proven:
    person's traffic and nothing else has to be rotated; who gets one, and what
    takes it away, is
    [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md).
-3. **Spend per person, visible.** Per-person spend is visible in the gateway
-   and attributable, because each key belongs to a person. **The cap is the
-   provider's, not the gateway's, for now**: per-key budgets and rate limits
-   were dropped by agreement on #404
-   ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred") in
-   favour of the limits AWS and Fireworks already impose, plus the account's
-   billing alert.
+3. **Spend per person, visible and capped.** Per-person spend is visible in the
+   gateway and attributable, because each key belongs to a person. **The cap is
+   now a pair of them**: a per-person Bedrock budget of $1500 per calendar
+   month, and no budget at all on Fireworks, so DeepSeek is uncapped. Those two
+   lines live in `deploy-workbench/bifrost/vk-mint-template.json` and the
+   reconciler converges every key to them
+   ([`bifrost-reconciler.md`](./bifrost-reconciler.md), decisions 13 and 18).
+   Per-key budgets and rate limits were dropped by agreement on #404; both came
+   back once the log store had a quarter of per-key cost data, which is what
+   made the numbers evidence rather than a guess, and the deferral is recorded
+   in [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred". The
+   account billing alert is unchanged and still alerts rather than binds.
+   A per-*provider* cap has one thing worth knowing: it is bound to the
+   provider's name, so a model later served on the uncapped Fireworks provider
+   is outside the Bedrock cap.
 4. **Metadata only.** Prompt and completion bodies are not persisted by the
    gateway, matching the workbench account's existing Bedrock invocation
    logging posture. See "Observability".
@@ -888,7 +896,7 @@ Two consequences are accepted with the decision:
   base model's serverless price from 2026-09-01
   (https://docs.fireworks.ai/serverless/us-only-serverless.md), and that is
   accepted as the price of the residency guarantee. It also puts pressure on
-  the cost record, which is the one number the deferred budget would enforce
+  the cost record, which is the one number the per-provider budget enforces
   against: Bifrost's catalog either prices the base model or does not know the
   router id at all, so item 16's reconciliation against a week of real billing
   is what proves the per-key numbers and produces the override. The DeepSeek
@@ -1081,13 +1089,15 @@ Virtual keys are Bifrost's primary governance entity
   key works across Claude Code, Codex and Gemini CLI.
 - **A team per group of humans.** An `engineering` team owns the human keys, so
   the gateway can total them. It was to carry a monthly budget with per-key
-  budgets under it; **per-key budgets and rate limits were dropped by agreement
-  on #404** ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md),
-  "Deferred"), with the providers' own limits as the stopgap. Budget
-  enforcement, when it comes back, is a rationing tool: it stops one engineer
-  starving the others, and it caps the fleet's spend. It does not raise the
-  provider ceiling, which is the account and quota argument
-  `workbench-account.md` already makes.
+  budgets under it; per-key budgets and rate limits were dropped by agreement on
+  #404 ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred"), and
+  per-key budgets have since come back on the individual key rather than under a
+  team ([`bifrost-reconciler.md`](./bifrost-reconciler.md), decisions 13 and 18).
+  The team therefore carries no budget and the caps live on each key's provider
+  entries; the team stays because it is what totals the fleet. Budget enforcement
+  is a rationing tool: it stops one engineer starving the others, and it caps the
+  fleet's spend. It does not raise the provider ceiling, which is the account and
+  quota argument `workbench-account.md` already makes.
 - **Expiry and offboarding.** Offboarding is "deactivate the virtual key",
   which is one action and does not touch a provider. Who does it, and when,
   is [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a scheduled
@@ -1207,17 +1217,21 @@ Virtual keys are Bifrost's primary governance entity
   pricing should be checked against the catalog and overridden with
   `custom_pricing`/pricing overrides if it is wrong or missing — a gateway
   whose per-key cost numbers are wrong is worse than one with none, because
-  those numbers are the whole answer to "who spent what" now that budgets are
-  deferred, and what a budget would enforce against when one comes back.
+  those numbers are the whole answer to "who spent what" and what the per-key
+  and per-provider budgets are enforced against.
 - **Budgets and alerts.** The account already has `workbench-monthly-spend` in
-  `deploy-workbench/index.ts` with actual and forecasted email notifications,
-  and that is the only cap in place for now: per-key and per-team budgets
-  inside Bifrost were dropped by agreement on #404
-  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred"), leaving
-  the providers' own limits as the stopgap. The AWS budget is an alert rather
-  than a rationer — it lags hours and stops nothing — which is worth saying
-  plainly now that it is the only guardrail on spend. RDS adds its own storage
-  and instance cost, which the account budget already covers.
+  `deploy-workbench/index.ts` with actual and forecasted email notifications.
+  It is no longer the only guardrail: since
+  [`bifrost-reconciler.md`](./bifrost-reconciler.md) decisions 13 and 18 the
+  reconciler converges a per-person budget onto every Lambda-managed key — $1500
+  a calendar month on the Bedrock provider entry, and nothing on Fireworks, so
+  DeepSeek stays uncapped. Per-key and per-team budgets inside Bifrost were
+  dropped by agreement on #404
+  ([`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md), "Deferred") and the
+  key-level ones have since come back; what is still true is that the AWS budget
+  is an alert rather than a rationer — it lags hours and stops nothing — so the
+  gateway's own cap is now the thing that actually refuses a request. RDS adds
+  its own storage and instance cost, which the account budget already covers.
 - **Audit.** CloudTrail for the account covers infrastructure actions. The
   gateway's own log is the record of model traffic. Neither is a content log,
   by design.
@@ -1352,7 +1366,8 @@ What genuinely remains open:
   the base price from 2026-09-01, so a catalog entry that prices the base model
   is wrong by that factor and every per-key cost number inherits the error,
   while the Bedrock entries moved from the geo table to the global one and must
-  agree with it. Wrong pricing makes a future budget wrong. Item 16.
+  agree with it. Wrong pricing makes a budget wrong, and there is one now on the
+  Bedrock entry. Item 16.
 - **How a person is designated for a higher tier.** One key per person and one
   default tier are designed; "who may reach the higher-grade models" is
   deliberately deferred, with the two candidate shapes — a second Identity
@@ -1560,8 +1575,9 @@ network or a permission can land before the item that creates it.
     connector. The upstream docs are explicit that the layers compose, so this
     is a test, not a reading.
 14. Create the `engineering` team declaratively in `config.json` — the team and
-    no budget, since Bifrost-side budgets and rate limits were dropped by
-    agreement on #404 — and write the issue/rotate/revoke runbook next to the
+    no budget of its own, since the caps live on each key's provider entries
+    rather than under a team ([`bifrost-reconciler.md`](./bifrost-reconciler.md),
+    decisions 13 and 18) — and write the issue/rotate/revoke runbook next to the
     other runbooks. **Superseded in part** by
     [`bifrost-virtual-keys.md`](./bifrost-virtual-keys.md): a per-person key is
     minted from Identity Center membership rather than declared here, so this
@@ -1583,9 +1599,11 @@ network or a permission can land before the item that creates it.
     catalog.
 17. Confirm the account budget is wired and that a threshold crossing is
     actually delivered (the workbench document's warning about alerts that only
-    prove the wire exists). The Bifrost-side budgets this item used to name
-    were dropped by agreement on #404, so the account budget is the only one to
-    prove.
+    prove the wire exists). It is not the only guardrail any more — the
+    reconciler enforces a per-person Bedrock cap of $1500 a calendar month on
+    every Lambda-managed key ([`bifrost-reconciler.md`](./bifrost-reconciler.md),
+    decision 18) — but it is the one whose delivery is worth proving independently
+    of the gateway.
 
 **Phase 4 — migration**
 

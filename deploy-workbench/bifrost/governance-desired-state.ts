@@ -74,6 +74,31 @@
  * the wire an empty one means "remove the limit" and an override should never
  * do that by accident.
  *
+ * ## Per-provider budgets (decision 18)
+ *
+ * A provider entry may carry its own `budgets`, which is how the Bedrock cap is
+ * expressed: `$1500` on a `1M` window for `bedrock`, and nothing at all for
+ * `fireworks`. It is the same `CreateBudgetRequest` shape as the key's own, so
+ * it is validated by the same `checkBudgets` — one rule set, including the
+ * refusal of two budgets on one `reset_duration`, rather than a second one that
+ * would drift from it.
+ *
+ * The field is a complete set per entry, not a patch. On an update an omitted
+ * `budgets` leaves whatever that entry already carries, and an explicit array
+ * reconciles the entry to exactly that set. So `governanceBody` writes
+ * `budgets` on every provider entry, `[]` included: a provider the desired
+ * state gives no budget has to say so, or a budget git has dropped would
+ * survive every tick and one set by hand in the dashboard would never be
+ * pruned. The diff agrees with that spelling, because the gateway reports the
+ * field with `omitempty` and an entry with none comes back without the key.
+ *
+ * What this gives up is worth stating because it is invisible: the cap is bound
+ * to the provider's *name*, so a model later served on `fireworks` is not
+ * covered by the Bedrock entry's budget, and moving a model between providers
+ * moves it out of a cap. That is the honest reading of a per-provider limit,
+ * and it is why the Fireworks entry staying uncapped is expressed as the
+ * absence of a budget rather than as an exemption.
+ *
  * ## The merge, and who calls it
  *
  * `desiredStateFor` is the merge. `governanceDesiredState` (below) is the whole
@@ -119,11 +144,16 @@ export type GovernanceRateLimit = {
 /**
  * One provider entry of a key's `provider_configs`.
  *
- * Deliberately absent, and refused if a document names one: `id` (the
- * reconciler matches entries by `provider`), and the three nested budget and
- * rate-limit fields (`budgets`, `model_budgets`, `rate_limit` under a provider
- * config). Per-provider limits are not in this plan; adding one is a field and
- * a validation rule, not a new mechanism.
+ * `budgets` is the entry's own limit (decision 18), a complete set per entry:
+ * git naming none means the entry has none, and the body writes an empty array
+ * to say so. A provider the desired state gives no budget — `fireworks`, whose
+ * DeepSeek route is deliberately uncapped — therefore carries no key here at
+ * all, which the diff reads as the empty set the body writes.
+ *
+ * Still deliberately absent, and refused if a document names one: `id` (the
+ * reconciler matches entries by `provider`), `model_budgets` and `rate_limit`
+ * under a provider config. Each is a field and a rule of its own when it is
+ * wanted; none of the three is what this change needed.
  */
 export type GovernanceProviderConfig = {
   provider: string;
@@ -131,6 +161,7 @@ export type GovernanceProviderConfig = {
   blacklisted_models?: string[];
   weight?: number;
   key_ids?: string[];
+  budgets?: GovernanceBudget[];
 };
 
 /** A key's governance, as the gateway's `PUT` takes it. */
@@ -198,6 +229,7 @@ const PROVIDER_CONFIG_FIELDS = [
   "blacklisted_models",
   "weight",
   "key_ids",
+  "budgets",
 ] as const;
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -431,6 +463,15 @@ const checkProviderConfig = (
       path: `${path}.weight`,
       message: "must be a number, zero or greater",
     });
+  }
+
+  // The entry's own budget set, checked by the key's `checkBudgets` rather than
+  // a second copy of the rules: the wire takes the same `CreateBudgetRequest`
+  // there, so a duration this accepts and the gateway rejects would be the same
+  // `400` on every tick one step further down. `inherit` is left to
+  // `checkNoInherit` above, which is the message that says why.
+  if (value.budgets !== undefined && !isInherit(value.budgets)) {
+    checkBudgets(value.budgets, `${path}.budgets`, problems);
   }
 };
 
@@ -994,6 +1035,17 @@ export const governanceBody = (
     }
     if (config.weight !== undefined) entry.weight = config.weight;
     if (config.key_ids !== undefined) entry.key_ids = config.key_ids;
+    // Always, even empty, for the reason decision 18 records: an entry's
+    // `budgets` is its own complete set on the update path, where an omitted
+    // one leaves whatever that entry already carries. A provider the desired
+    // state gives no budget has to say so — `fireworks` is uncapped — or a
+    // budget git has dropped would survive every tick, and one set by hand in
+    // the dashboard would never be pruned. An explicit `[]` decodes as the
+    // empty set rather than as absent, which is what makes it mean "none".
+    entry.budgets = (config.budgets ?? []).map((budget) => ({
+      max_limit: budget.max_limit,
+      reset_duration: budget.reset_duration,
+    }));
     return entry;
   });
 
