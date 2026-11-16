@@ -174,7 +174,7 @@ const main = async () => {
       return `| ${c.id} | ${expected} | ${cells.join(" | ")} |`;
     }),
     `| **Block cases passed (runs)** | | ${reports.map(({ reports: rs }) => { const b = rs.filter((r) => r.c.expect.verdict === "block"); return `${b.reduce((a, r) => a + passes(r), 0)}/${b.reduce((a, r) => a + r.scores.length, 0)}`; }).join(" | ")} |`,
-    `| **Approve cases passed (runs)** | | ${reports.map(({ reports: rs }) => { const b = rs.filter((r) => r.c.expect.verdict === "approve"); return `${b.reduce((a, r) => a + passes(r), 0)}/${b.reduce((a, r) => a + r.scores.length, 0)}`; }).join(" | ")} |`,
+    `| **Approve and no-finding cases passed (runs)** | | ${reports.map(({ reports: rs }) => { const b = rs.filter((r) => r.c.expect.verdict === "approve" || r.c.expect.verdict === "no-finding"); return `${b.reduce((a, r) => a + passes(r), 0)}/${b.reduce((a, r) => a + r.scores.length, 0)}`; }).join(" | ")} |`,
     `| **Avg cost per run** | | ${arms.map((a) => { const c = costOf(a.dir); return c.n ? money(c.total / c.n) : "n/a"; }).join(" | ")} |`,
     "",
     `Total spend in ${out}, every round: ${money(
