@@ -6,10 +6,7 @@
       "key": "reviews/thegoodparty/omni/2656/080676f4f09f73acf86ea0cb031602e2327f5929/e5cd7541-701a-4c1b-ad0e-c623ef143d3d.json",
       "expect": {
         "verdict": "block",
-        "paths": [
-          "packages/gp-api/deploy/components/alerts.ts",
-          "packages/gp-api/deploy/components/grafana.ts"
-        ]
+        "reason": "The event alert rules rely on keepFiringFor to hold an incident open, but an idle count_over_time returns no series and noDataState OK resolves the alert, so bursts page repeatedly."
       },
       "tests": "Event rules rely on keepFiringFor to hold an incident open, but an idle count_over_time returns no series and noDataState OK resolves it, so bursts page repeatedly. Production approved; the bug was confirmed and fixed in 57cab94c1.",
       "split": "tune",

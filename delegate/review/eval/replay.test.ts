@@ -388,7 +388,7 @@ test("replayAll writes one result file per replay and skips the ones that exist"
   const record = makeRecord();
   const calls: string[] = [];
   const agent: RunAgentImpl = async (_config, _prompt, overrides) => {
-    calls.push(overrides.cwd);
+    if (_config.name === "pr-reviewer") calls.push(overrides.cwd);
     return fakeRunAgent(_config, _prompt, overrides);
   };
 
@@ -420,7 +420,7 @@ test("replayAll replays only the missing run of a partly cached case", async () 
 
   let calls = 0;
   const agent: RunAgentImpl = async (c, p, o) => {
-    calls++;
+    if (c.name === "pr-reviewer") calls++;
     return fakeRunAgent(c, p, o);
   };
   const results = await replayAll([record], { out, workDir: tmpDir(), variant: "new", replays: 2 }, { concurrency: 1 }, agent, fakeCheckout);
@@ -452,8 +452,8 @@ test("replayAll runs multiple cases with the worker pool", async () => {
   const records = [makeRecord(), makeRecord(), makeRecord()];
 
   let callCount = 0;
-  const countingAgent: RunAgentImpl = async () => {
-    callCount++;
+  const countingAgent: RunAgentImpl = async (config) => {
+    if (config.name === "pr-reviewer") callCount++;
     return {
       agent: "pr-reviewer",
       output: "",
@@ -878,41 +878,41 @@ test("replayCase shows the review the post-mortems selection kept, and records t
     { output: `{"ids": ["${first.file}#1"]}` },
     { output: `{"ids": ["${first.file}"]}` },
   ]);
-  const result = await replayCase(
-    makeRecord({ startedAt: "2099-01-01T00:00:00.000Z" }),
-    { workDir: tmpDir(), variant: "v1" },
-    agent,
-    fakeCheckout,
-  );
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
   assert.equal(selectorPrompts.length, 2);
   assert.ok(reviewPrompts[0].includes(`<postmortem file="${first.file}">`));
   assert.deepEqual(result.postmortems, [{ file: first.file, lessons: [`${first.file}#1`] }]);
 });
 
-test("replayCase shows no post-mortem dated on or after the recorded review", async () => {
-  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([]);
-  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
-  assert.equal(selectorPrompts.length, 0);
-  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
-  assert.equal(result.postmortems, undefined);
+test("replayCase shows every post-mortem, whatever the recorded review's date, and a simulated case too", async () => {
+  const [first] = loadPostmortems();
+  const record = makeRecord();
+  assert.ok(record.startedAt < first.date);
+  for (const r of [record, { runId: record.runId, bundle: record.bundle } as ReviewRecord]) {
+    const { agent, selectorPrompts } = postmortemAgent([{ output: '{"ids": []}' }]);
+    await replayCase(r, { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+    assert.equal(selectorPrompts.length, 1);
+    assert.ok(selectorPrompts[0].includes(`<lesson id="${first.file}#1">`));
+  }
 });
 
-test("replayCase shows a simulated case with no review date no post-mortems", async () => {
-  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([]);
-  const record = makeRecord();
-  await replayCase({ runId: record.runId, bundle: record.bundle } as ReviewRecord, { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
-  assert.equal(selectorPrompts.length, 0);
-  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
+test("replayCase strips PR numbers, GitHub links and commits from the post-mortems it shows", async () => {
+  const [first] = loadPostmortems();
+  assert.match(first.text, /#2977/);
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
+    { output: `{"ids": ["${first.file}#1"]}` },
+    { output: `{"ids": ["${first.file}"]}` },
+  ]);
+  await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  for (const prompt of [...selectorPrompts, reviewPrompts[0]]) {
+    assert.doesNotMatch(prompt, /#2977|#3023|#2852|github\.com\/thegoodparty\/omni\/pull/);
+  }
+  assert.ok(reviewPrompts[0].includes(`<postmortem file="${first.file}">`));
 });
 
 test("replayCase reviews without post-mortems when the selection call errors", async () => {
   const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([{ output: "Agent error: overloaded", errorSubtype: "error_during_execution" }]);
-  const result = await replayCase(
-    makeRecord({ startedAt: "2099-01-01T00:00:00.000Z" }),
-    { workDir: tmpDir(), variant: "v1" },
-    agent,
-    fakeCheckout,
-  );
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
   assert.equal(selectorPrompts.length, 1);
   assert.ok(!reviewPrompts[0].includes("<postmortems>"));
   assert.ok(!result.error);

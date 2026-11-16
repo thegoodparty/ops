@@ -34,9 +34,8 @@ export const POSTMORTEM_SELECTOR: AgentConfig = {
   maxBudgetUsd: 1,
 };
 
-export const loadPostmortems = (options: { dir?: string; before?: Date } = {}): Postmortem[] => {
+export const loadPostmortems = (options: { dir?: string } = {}): Postmortem[] => {
   const dir = options.dir ?? POSTMORTEMS_DIR;
-  const beforeDay = options.before?.toISOString().slice(0, 10);
   return readdirSync(dir)
     .filter((file) => file.endsWith(".md") && file !== "README.md")
     .sort()
@@ -55,9 +54,18 @@ export const loadPostmortems = (options: { dir?: string; before?: Date } = {}): 
         postmortem: body[1].trim(),
         text,
       };
-    })
-    .filter((p) => beforeDay === undefined || p.date < beforeDay);
+    });
 };
+
+const REPOS = ["omni", "ops", "gp-api", "gp-webapp", "gp-admin", "gp-pi", "gp-ai-projects", "people-api", "election-api"];
+
+// Replay strips what names the PRs and commits behind an incident, so a
+// post-mortem shown to a case cannot point the reviewer at that case's answer.
+export const redactIdentifiers = (text: string): string =>
+  text
+    .replace(/https?:\/\/(?:www\.)?github\.com\/[\w.-]+\/[\w.-]+\/(?:pulls?|commits?|compare)\b[^\s)\]>"'`]*/gi, "(link)")
+    .replace(new RegExp(`(?:\\b[\\w.-]+\\/[\\w.-]+ ?|\\b[\\w.-]+(?=#)|\\b(?:${REPOS.join("|")}) )?#\\d+\\b|\\bPRs? ?#?\\d+\\b`, "g"), "a PR")
+    .replace(/\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b/gi, "(commit)");
 
 const untrusted = (text: string) => `<untrusted>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</untrusted>`;
 
@@ -74,10 +82,19 @@ const parseIds = (text: string): string[] => {
 // review runs without post-mortems; it never fails the review.
 export const selectPostmortems = async (
   bundle: Bundle,
-  options: { ask: (prompt: string) => Promise<string>; dir?: string; before?: Date },
+  options: { ask: (prompt: string) => Promise<string>; dir?: string; redact?: boolean },
 ): Promise<SelectedPostmortem[]> => {
   try {
-    const postmortems = loadPostmortems({ dir: options.dir, before: options.before });
+    const loaded = loadPostmortems({ dir: options.dir });
+    const postmortems = options.redact
+      ? loaded.map((p) => ({
+          ...p,
+          title: redactIdentifiers(p.title),
+          lessons: p.lessons.map(redactIdentifiers),
+          postmortem: redactIdentifiers(p.postmortem),
+          text: redactIdentifiers(p.text),
+        }))
+      : loaded;
     const lessons = postmortems.flatMap((p) =>
       p.lessons.map((text, k) => ({ id: `${p.file}#${k + 1}`, file: p.file, title: p.title, text })),
     );

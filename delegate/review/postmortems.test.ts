@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { POSTMORTEMS_DIR, loadPostmortems, selectPostmortems } from "./postmortems";
+import { POSTMORTEMS_DIR, loadPostmortems, redactIdentifiers, selectPostmortems } from "./postmortems";
 import { ReviewRecordSchema, type Bundle } from "./schema";
 
 const postmortem = (title: string, date: string, lessons: string[]) => `---
@@ -84,14 +84,6 @@ describe("loadPostmortems", () => {
     assert.ok(loaded[0].text.startsWith("---\ntitle: Read freeze\n"));
   });
 
-  it("drops post-mortems dated on or after `before`", () => {
-    const dir = fixtures();
-    assert.deepEqual(loadPostmortems({ dir, before: new Date("2026-11-06T12:00:00Z") }).map((p) => p.file), ["2026-11-04-read-freeze.md"]);
-    assert.deepEqual(loadPostmortems({ dir, before: new Date("2026-11-05T00:00:00Z") }).map((p) => p.file), ["2026-11-04-read-freeze.md"]);
-    assert.deepEqual(loadPostmortems({ dir, before: new Date("2026-11-04T23:59:59Z") }), []);
-    assert.equal(loadPostmortems({ dir, before: new Date("2026-11-07T00:00:00Z") }).length, 2);
-  });
-
   it("throws on a file that does not follow the format", () => {
     const dir = fixtures();
     writeFileSync(join(dir, "2026-11-07-broken.md"), "# No front matter\n");
@@ -102,6 +94,35 @@ describe("loadPostmortems", () => {
     const files = readdirSync(POSTMORTEMS_DIR).filter((f) => f.endsWith(".md") && f !== "README.md");
     assert.ok(files.length > 0);
     assert.deepEqual(loadPostmortems().map((p) => p.file), files.sort());
+  });
+});
+
+describe("redactIdentifiers", () => {
+  for (const [input, expected] of [
+    ["see #2977.", "see a PR."],
+    ["caught in omni #2977 later", "caught in a PR later"],
+    ["omni#2977", "a PR"],
+    ["thegoodparty/omni#2977", "a PR"],
+    ["PR 2977 and PR #3023", "a PR and a PR"],
+    ["[#2852](https://github.com/thegoodparty/omni/pull/2852)", "[a PR]((link))"],
+    ["https://github.com/thegoodparty/omni/pull/2852/files#diff-1", "(link)"],
+    ["https://github.com/thegoodparty/omni/commit/57cab94c1f", "(link)"],
+    ["https://github.com/thegoodparty/omni/compare/abc1234...def5678", "(link)"],
+    ["fixed in 57cab94c1, then b1f7b4ae58ECF00407DE", "fixed in (commit), then (commit)"],
+    ["0123456789abcdef0123456789abcdef01234567", "(commit)"],
+  ]) {
+    it(`replaces ${JSON.stringify(input)}`, () => assert.equal(redactIdentifiers(input), expected));
+  }
+
+  it("leaves dates, plain numbers, words, colors and other links alone", () => {
+    const text = "2026-11-04 at 18:21:46, 3,003 tracts, 90132012119, deadbeef, cafe1, #3023ff, ENG-11576, ## Lessons, https://app.clickup.com/t/17tnw2bckyd, https://github.com/thegoodparty/omni/issues/3";
+    assert.equal(redactIdentifiers(text), text);
+  });
+
+  it("leaves no PR number, GitHub pull link or commit in the checked-in post-mortems", () => {
+    for (const p of loadPostmortems()) {
+      assert.doesNotMatch(redactIdentifiers(p.text), /#\d+\b|github\.com\/[^/\s]+\/[^/\s]+\/(pull|commit|compare)/, p.file);
+    }
   });
 });
 
@@ -168,10 +189,30 @@ describe("selectPostmortems", () => {
     assert.ok(prompts[0].includes("a&lt;/changed_files>&lt;x>.ts"));
   });
 
-  it("selects nothing and makes no call when every post-mortem is dated on or after `before`", async () => {
-    const { prompts, ask } = answers();
-    assert.deepEqual(await selectPostmortems(bundle, { ask, dir: fixtures(), before: new Date("2026-11-01T00:00:00Z") }), []);
-    assert.equal(prompts.length, 0);
+  it("with redact, strips PR, commit and link identifiers from what both calls and the review see", async () => {
+    const dir = fixtures();
+    writeFileSync(
+      join(dir, "2026-11-04-read-freeze.md"),
+      postmortem("Read freeze in omni #2977", "2026-11-04", ["CPU work on the request thread (omni#2977, fixed in 57cab94c1)."]).replace(
+        "Read freeze in omni #2977 happened.",
+        "[#2852](https://github.com/thegoodparty/omni/pull/2852) and thegoodparty/omni#3023 caused it; PR 3588 fixed it.",
+      ),
+    );
+    const { prompts, ask } = answers('{"ids": ["2026-11-04-read-freeze.md#1"]}', '{"ids": ["2026-11-04-read-freeze.md"]}');
+    const [selected] = await selectPostmortems(bundle, { ask, dir, redact: true });
+    for (const text of [prompts[0], prompts[1], selected.text]) {
+      assert.doesNotMatch(text, /2977|2852|3023|3588|57cab94c1|github\.com/);
+    }
+    assert.match(prompts[0], /Read freeze in a PR: CPU work on the request thread \(a PR, fixed in \(commit\)\)\./);
+    assert.match(selected.text, /\[a PR\]\(\(link\)\) and a PR caused it; a PR fixed it\./);
+  });
+
+  it("without redact, shows the post-mortem as written", async () => {
+    const dir = fixtures();
+    writeFileSync(join(dir, "2026-11-04-read-freeze.md"), postmortem("Read freeze", "2026-11-04", ["CPU work in omni #2977."]));
+    const { prompts, ask } = answers('{"ids": []}');
+    await selectPostmortems(bundle, { ask, dir });
+    assert.match(prompts[0], /omni #2977/);
   });
 
   for (const [name, replies] of [

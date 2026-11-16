@@ -422,26 +422,22 @@ export const replayCase = async (
     writeFileSync(diffPath, promptDiff(bundle.diff).inline);
   }
 
-  // A case is never graded with a post-mortem written after it was reviewed,
-  // so selection reads only those dated before the record's review. A
-  // simulated case is a bundle with no record behind it and no date, so it
-  // gets no post-mortems at all.
-  const reviewedAt = typeof record.startedAt === "string" ? new Date(record.startedAt) : undefined;
-  if (reviewedAt && !Number.isNaN(reviewedAt.getTime())) {
-    postmortems = await selectPostmortems(bundle, {
-      before: reviewedAt,
-      ask: async (prompt) => {
-        const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
-          cwd: repoDir,
-          mcpServers: {},
-          env: agentEnv(),
-          preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
-        });
-        if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
-        return selection.output;
-      },
-    });
-  }
+  // The suite asks what today's reviewer does with a change, so every case
+  // sees today's post-mortems, with the PR and commit identifiers stripped so
+  // a post-mortem cannot name a case's answer.
+  postmortems = await selectPostmortems(bundle, {
+    redact: true,
+    ask: async (prompt) => {
+      const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
+        cwd: repoDir,
+        mcpServers: {},
+        env: agentEnv(),
+        preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
+      });
+      if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
+      return selection.output;
+    },
+  });
 
   let agentResult: AgentResult;
   try {
