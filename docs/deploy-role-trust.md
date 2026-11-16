@@ -735,8 +735,9 @@ ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni's
 `gp-ai.yml` and `gp-api.yml` assume `github-actions-preview-deploy`. Both
 grant `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken`
 (`EcrPublicLogin` and `RegistryLogin`), which mint a login token and read or
-push nothing. The plan role no longer does. Any pull request in those repositories can already assume its role
-by editing the workflow, so the build job holding it exposes nothing new.
+push nothing. The plan role no longer does. Any pull request in those
+repositories can already assume its role by editing the workflow, so the
+build job holding it exposes nothing new.
 Main builds log in with `github-actions-pulumi-deploy`.
 
 ## What step 8 found
