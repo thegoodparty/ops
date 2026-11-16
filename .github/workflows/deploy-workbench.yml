@@ -478,6 +478,40 @@ jobs:
           WORKBENCH_DEPLOY_ROLE_ARN: arn:aws:iam::024901689212:role/pulumi-deploy
         run: npx --no-install tsx scripts/verify-convergence.ts --retry-window-seconds 300
 
+      # The usage export's database role does not exist until something creates
+      # it, and nothing else can: the database is private, its security group
+      # admits 5432 from inside the VPC only, and creating a Postgres role needs
+      # the master credential. So the apply creates a one-purpose function that
+      # holds the master-secret read, and this step invokes it.
+      #
+      # **This runs on every deploy and is a no-op after the first.** The
+      # handler's first act is to read the export's own secret and stop if it
+      # holds a password, so a later deploy cannot rotate a working credential
+      # out from under a running export. That is what makes it safe to leave a
+      # provisioning step in a workflow that fires on every merge, rather than a
+      # one-time command somebody has to remember.
+      #
+      # `RequestResponse` and a poll, never fire-and-forget: an `Event` invoke
+      # returns 202 whether the run provisioned or threw, which is the
+      # `75d30ae` class of bug. The script retries a throttle and fails on
+      # anything that is not a recognised outcome.
+      #
+      # A missing function is checked, not tolerated. The function's resource is
+      # deleted in a follow-up PR once the export has run, and this step can
+      # outlive it by a deploy or two; so `ResourceNotFound` is success **only
+      # if** the export secret already holds a password. Otherwise the apply
+      # never created the function, and the run has provisioned nothing — which
+      # is exactly the state a green workflow must not hide.
+      #
+      # It makes the same `pulumi-deploy` hop as the two checks above, so no new
+      # IAM: that role is AdministratorAccess and the same-account invoke needs
+      # no resource-based policy.
+      - name: Provision the usage export's database role
+        working-directory: deploy-workbench
+        env:
+          WORKBENCH_DEPLOY_ROLE_ARN: arn:aws:iam::024901689212:role/pulumi-deploy
+        run: npx --no-install tsx scripts/verify-usage-export-bootstrap.ts --retry-window-seconds 120
+
       # Bedrock model access is not a Pulumi resource, so it cannot ride in
       # deploy.sh; see the header of the script for why none exists. Without
       # this step the script would be something a human had to remember, which

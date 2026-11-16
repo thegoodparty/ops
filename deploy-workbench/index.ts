@@ -23,6 +23,7 @@ import { createBifrostVkMint } from "./bifrost-vk-mint";
 import { createBifrostVkJanitor } from "./bifrost-vk-janitor";
 import { WORKBENCH_ALERT_EMAIL } from "./alert-email";
 import { createBifrostGatewayAlarms } from "./alarms";
+import { createBifrostUsageExport } from "./usage-export";
 
 /**
  * Contents of the `goodparty-workbench` account.
@@ -722,4 +723,52 @@ export const bifrostGatewayAlarmNames = [
   alarms.memoryPressureAlarm.name,
   alarms.alb5xxAlarm.name,
   alarms.availabilityAlarm.name,
+];
+
+// ---------------------------------------------------------------------------
+// The Bifrost usage export.
+//
+// The job that reads the gateway's own `logs` table and writes one Parquet
+// object per run into a bucket this account owns, for the finance mart. The
+// warehouse half had to exist first and does (the loader in
+// `thegoodparty/gp-data-platform`), so this is the writer the contract was
+// written for.
+//
+// It consumes the network for the private subnets and the database group, and
+// the database for its endpoint and the master secret's ARN. It adds the
+// database group's first two ingress exceptions, both group references, in its
+// own module rather than in `network.ts` — the same placement the two 8080
+// exceptions use, because a rule belongs with the job that needs it.
+//
+// The bucket policy admits a role in the **management** account, not this one:
+// under the approved design the Databricks storage-credential role lives in the
+// account `gp-terraform-dataplatform` deploys into. `usage-export.ts`'s header
+// records why that distinction is load-bearing and what breaks if it is wrong.
+const usageExport = createBifrostUsageExport({ provider, network, database });
+
+/** Where the export writes, for a human and for the loader's Airflow Variables. */
+export const bifrostUsageExportBucket = usageExport.bucketName;
+export const bifrostUsageExportPrefix = usageExport.exportPrefix;
+
+/** The function, so the first run does not start with a console hunt. */
+export const bifrostUsageExportFunctionName = usageExport.functionName;
+
+/**
+ * The bootstrap function the deploy invokes after every apply. Its resource is
+ * deleted once the export has run; this output is how `verify-usage-export-bootstrap.ts`
+ * and a human find it until then.
+ */
+export const bifrostUsageExportBootstrapFunctionName = usageExport.bootstrapFunctionName;
+
+/**
+ * The IAM role the terraform repo creates, spelled out so its PR reads the name
+ * from here rather than retyping it. A drift is a bucket policy that admits
+ * nothing.
+ */
+export const bifrostUsageExportReaderRoleArn = usageExport.readerRoleArn;
+
+/** The two alarm names, so the runbook entry and a reader find them. */
+export const bifrostUsageExportAlarmNames = [
+  usageExport.failureAlarm.name,
+  usageExport.neverRanAlarm.name,
 ];

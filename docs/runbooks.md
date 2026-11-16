@@ -224,3 +224,125 @@ outage is why this alarm exists.
 
 **Status:** not rehearsed. Written with the alarms, so the commands above were
 checked against the account but have not yet been run against a real firing.
+
+---
+
+## The Bifrost usage export is failing or has stopped running
+
+**Alarms:** `bifrost-usage-export-failed` and `bifrost-usage-export-never-ran`
+(`deploy-workbench/usage-export.ts`).
+**Metrics:** `AWS/Lambda` `Errors` (one five-minute period, threshold 1) and
+`Invocations` (one **one-day** period, `LessThanThreshold` 1, missing data
+treated as breaching). Both publish to the `bifrost-usage-export-alerts` topic,
+subscribed to `aws-workbench@goodparty.org`.
+
+**What it means.** The export Lambda reads the gateway's `logs` table and writes
+one Parquet object per run for the finance mart. `-failed` means a run started
+and threw; `-never-ran` means a day passed with no invocation at all, which is a
+different failure: a disabled or deleted rule, a schedule expression that
+stopped matching, or a function removed by a bad apply.
+
+**The two are separate on purpose.** `Errors` publishes nothing when a function
+is never invoked, so `-failed` is structurally blind to a dead job. Do not
+"simplify" the pair into one alarm.
+
+### 1. Which alarm, and when
+
+- **`-never-ran` fires up to a day late.** One day is the alarm's period, so it
+  cannot evaluate a day until that day closes. A missed 09:00 run is noticed at
+  the earliest the following night. That lag is accepted; if it ever needs to be
+  tighter, the answer is a heartbeat metric, not a shorter period.
+- **Expect one `-never-ran` page on the day this stack is first applied.** The
+  function exists from the apply, nothing invokes it until the 09:00 rule fires,
+  and `treatMissingData: breaching` reads that first empty day as a failure. It
+  is a false page with a known cause, and it clears itself after the first run.
+  Do not "fix" it with `notBreaching`, which would blind the alarm to a deleted
+  function for good; if it becomes annoying, the fix is to acknowledge it once
+  or to have the deploy invoke the export after the bootstrap provisions.
+- **`-never-ran` does not mean the monthly run is due.** The daily rule is
+  expected every day. The 90-day run on the 1st is additional.
+- **A missed monthly run is not alarmed on its own, and that is an accepted
+  gap.** Both
+  alarms are per function, so a day whose daily run succeeded looks healthy even
+  if the 09:30 monthly run never fired. A monthly run that *threw* raises
+  `-failed`, so the uncovered case is a monthly rule that stopped firing while
+  the daily one kept working. If you are debugging "the 90-day window has not run
+  since a certain date", check the rule before the code:
+
+  ```sh
+  aws events list-rules --region us-west-2 \
+    --query "Rules[?Name=='bifrost-usage-export-monthly'].{name:Name,schedule:ScheduleExpression,state:State}"
+  ```
+
+```sh
+aws cloudwatch describe-alarms --region us-west-2 \
+  --alarm-name-prefix bifrost-usage-export \
+  --query 'MetricAlarms[].{name:AlarmName,state:StateValue,reason:StateReason}'
+
+aws events list-rules --region us-west-2 \
+  --query "Rules[?starts_with(Name,'bifrost-usage-export')].{name:Name,schedule:ScheduleExpression,state:State}"
+```
+
+A rule whose `state` is `DISABLED` explains `-never-ran` completely.
+
+### 2. The run itself
+
+```sh
+aws logs tail /aws/lambda/bifrost-usage-export --since 2d --region us-west-2
+```
+
+A successful run logs one line: the window, the row count, the byte count and
+the object key. **It never logs a row**, so an absence of per-person data in that
+log group is correct and not a sign of truncation.
+
+The failures worth recognising:
+
+- **`not a timestamptz` / `not a decimal`** — a column type changed under the
+  export. The value is in the message; the fix is on this side, in
+  `deploy-workbench/bifrost/usage-export-core.ts`.
+- **`secret ... has no non-empty password`** — the bootstrap has not run, or its
+  secret was cleared. See section 4.
+- **`AccessDenied` on `s3:PutObject`** — the function's role or the bucket policy
+  was edited. The policy admits a role in the **management** account by
+  `aws:PrincipalArn`; a role in this account is the wrong one.
+- **`password authentication failed for user "bifrost_usage_export"`** — the
+  secret and the database disagree. Usually a rotated secret with no matching
+  `ALTER ROLE`; see section 4.
+
+### 3. Did anything land?
+
+```sh
+aws s3api list-objects-v2 --bucket goodparty-workbench-bifrost-usage \
+  --prefix bifrost/logs/ --region us-west-2 \
+  --query 'reverse(sort_by(Contents,&LastModified))[0:5].{key:Key,size:Size,when:LastModified}'
+```
+
+One object per run, named for the run instant, none overwritten. A gap is a
+missed run; a zero-byte object would be a bug, because an empty window writes a
+valid empty Parquet file rather than nothing.
+
+### 4. Rotation, and the bootstrap
+
+The export's password lives in `bifrost/usage-export`, written by the bootstrap
+Lambda. The deploy invokes that function after every apply and it **no-ops** once
+the secret holds a password, so a deploy cannot rotate a working credential.
+
+To rotate deliberately:
+
+1. If the bootstrap's resource has already been removed, restore it (`git revert`
+   the PR that removed it) and run `Deploy workbench` once. The secret still holds
+   a password, so this provisions nothing.
+2. Clear the password, keeping the container: `aws secretsmanager put-secret-value
+   --secret-id bifrost/usage-export --secret-string '{}' --region us-west-2`.
+   This needs Secrets Manager write in this account, which is `/breakglass` plus an
+   approval in `#sensitive-access-requests`.
+3. Run `Deploy workbench`. The step sees no password, generates one, alters the
+   role and writes it.
+4. Confirm the next scheduled run succeeds, then remove the bootstrap again with
+   the same PR that removed it the first time.
+
+Do not force-delete the secret: Pulumi owns the container, and a missing one makes
+the next refresh recreate it empty.
+
+**Status:** not rehearsed. Written with the alarms; the commands were checked
+against the account but have not been run against a real firing.
