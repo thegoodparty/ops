@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
 import { GATING_FLAG_REASON, isGatedRepo, type GatingFlag } from "../gating";
-import { BundleSchema, FindingSchema, ReviewRecordSchema } from "../schema";
+import { BundleSchema, ReviewRecordSchema } from "../schema";
 import type { Bundle, ReviewRecord } from "../schema";
 import { isCacheable } from "./cache";
 import { replayCase } from "./replay";
@@ -43,7 +43,6 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
   z.strictObject({
     verdict: z.literal("block"),
     paths: z.array(z.string().min(1)).min(1),
-    categories: z.array(FindingSchema.shape.category).optional(),
     consistency: ConsistencySchema.optional(),
   }),
   z.strictObject({
@@ -81,9 +80,11 @@ const ExpectedCaseSchema = z
     // Why main's own result on this case is noise, not a bar. Set, the gate
     // still scores and reports it but never counts it as a regression.
     flakyOnMain: z.string().min(1).optional(),
-    // When the review being replayed happened, for a simulated case that has
-    // no record to carry it. Replay shows a case only the post-mortems dated
-    // before it, and with no date it shows none.
+    // The date replay treats as the review's, which decides the post-mortems
+    // it is shown: only those dated before it. A simulated case has no record
+    // to carry a date, so without this it is shown none. On a recorded case it
+    // overrides the record's own date, for a case that is meant to be reviewed
+    // as of today, with the post-mortem it caused.
     reviewedAt: z.iso.datetime().optional(),
   })
   .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
@@ -222,7 +223,7 @@ const loadRecord = async (
   }
   const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: c.key }));
   const record = ReviewRecordSchema.parse(JSON.parse(await readBody(res.Body)));
-  return { ...record, runId: c.id };
+  return { ...record, runId: c.id, ...(c.reviewedAt ? { startedAt: c.reviewedAt } : {}) };
 };
 
 export interface RunScore {
@@ -286,11 +287,9 @@ export const scoreRun = (expect: Expect, result: Result): RunScore => {
   } else if (findings.length === 0) {
     outcome = { pass: false, outcome: "approved" };
   } else {
-    const hit = findings.some(
-      (f) =>
-        expect.paths.includes(f.path) &&
-        (!expect.categories || expect.categories.includes(f.category)),
-    );
+    // The outcome is what is scored. Which reviewer raised a finding, and the
+    // category it filed it under, are the reviewer's own business.
+    const hit = findings.some((f) => expect.paths.includes(f.path));
     outcome = { pass: hit, outcome: `blocked${hit ? "" : " on the wrong thing"}: ${listed}` };
   }
 
@@ -315,7 +314,7 @@ const describeExpect = (e: Expect): string => {
   if (e.verdict === "approve") return `approve${diagnostic}`;
   if (e.verdict === "flag") return `flag \`${e.reason}\`${diagnostic}`;
   const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
-  return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
+  return `block in ${files}${diagnostic}`;
 };
 
 export interface Baseline {

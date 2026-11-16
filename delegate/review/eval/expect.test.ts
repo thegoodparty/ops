@@ -85,7 +85,6 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
   assert.deepEqual(byId.get("ops-plan-addition-unnamed")?.expect, {
     verdict: "block",
     paths: ["deploy-workbench/bifrost/vk-mint-handler.ts"],
-    categories: ["bugs", "security"],
     consistency: "consistent",
   });
   assert.deepEqual(byId.get("ops-plan-amends-itself")?.expect, {
@@ -388,10 +387,13 @@ test("block passes only on a finding in an expected file", () => {
   assert.equal(scoreRun(block, result()).pass, false);
 });
 
-test("block with categories ignores findings of another category", () => {
-  const security: Expect = { ...block, categories: ["security"] };
-  assert.equal(scoreRun(security, withFindings([finding("a.ts", "tests")])).pass, false);
-  assert.equal(scoreRun(security, withFindings([finding("a.ts", "security")])).pass, true);
+test("a block counts whatever category the finding was filed under", () => {
+  assert.equal(scoreRun(block, withFindings([finding("a.ts", "tests")])).pass, true);
+  assert.equal(scoreRun(block, withFindings([finding("a.ts", "architecture")])).pass, true);
+});
+
+test("an expectation that names categories is refused", () => {
+  assert.throws(() => ManifestSchema.parse([{ id: "c", bundle: "c.bundle.json", expect: { verdict: "block", paths: ["a.ts"], categories: ["bugs"] }, tests: "t", split: "tune", source: "simulated", kind: "bug" }]));
 });
 
 test("a run that produced no review fails either way", () => {
