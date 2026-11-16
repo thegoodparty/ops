@@ -1,5 +1,7 @@
-import { describe, it } from "node:test";
+import { describe, it, after, before } from "node:test";
 import assert from "node:assert/strict";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { WORKBENCH_ACCOUNT_ID } from "../../utils/accounts";
 import {
@@ -8,7 +10,7 @@ import {
   type VirtualKey,
   type VirtualKeyGateway,
 } from "./vk-mint-core";
-import { createHandler, type HandlerDeps } from "./vk-mint-handler";
+import { createBifrostGateway, createHandler, type HandlerDeps } from "./vk-mint-handler";
 import type {
   GovernanceOverrides,
   GovernanceTemplate,
@@ -285,6 +287,143 @@ describe("the mint endpoint", () => {
     assert.equal(response.statusCode, 502);
     assert.ok(!response.body.includes("sk-bf-leak"));
     assert.ok(!JSON.stringify(logs).includes("sk-bf-leak"));
+  });
+});
+
+describe("the caller's usage over the real gateway adapter", () => {
+  /**
+   * The create path end to end, through the adapter that is deployed rather
+   * than through a fake that hands back the governance directly. That
+   * distinction is the bug: a fake gateway that returns `budgets` proves the
+   * decision layer reads them, and nothing about whether `toKey` copied them
+   * out of the response. `#550` shipped the fake-only version, and the
+   * deployed mint answered `usage.budgets: []` for a key with budgets.
+   */
+  const requests: Array<{ method?: string; url?: string }> = [];
+  let responses: Array<{ status: number; body: unknown }> = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url });
+      const next = responses.shift() ?? { status: 200, body: {} };
+      res.writeHead(next.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(next.body));
+    });
+  });
+
+  let baseUrl = "";
+
+  before(async () => {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    baseUrl = `http://127.0.0.1:${address.port}`;
+  });
+
+  after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  /** The handler over the real adapter, with everything but the gateway faked. */
+  const handlerOverRealGateway = (logs: Record<string, unknown>[]) =>
+    createHandler({
+      readGovernance: async () => ({ template: template(), overrides: {} }),
+      readSetupToken: async () => SETUP_TOKEN,
+      createDirectory: async () => ({
+        getUserId: async () => "user-1",
+        listMemberUserIds: async () => ["user-1"],
+      }),
+      createGateway: (setupToken: string) =>
+        createBifrostGateway({ baseUrl, setupToken }),
+      log: (entry) => logs.push(entry),
+    });
+
+  /** A key as the create route answers it, hydrated from its model configs. */
+  const createdKey = () => ({
+    id: "vk-created",
+    name: EMAIL,
+    value: KEY_VALUE,
+    is_active: true,
+    description: "lambda-managed per-user key",
+    calendar_aligned: true,
+    budgets: [
+      { id: "b1", max_limit: 250, reset_duration: "1M", current_usage: 12.5, last_reset: "2026-11-01T00:00:00Z" },
+    ],
+    provider_configs: [
+      {
+        id: 7,
+        provider: "bedrock",
+        allowed_models: ["m"],
+        allow_all_keys: true,
+        keys: [],
+        budgets: [
+          { id: "b2", max_limit: 1500, reset_duration: "1M", current_usage: 412.37, last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+    ],
+    rate_limit: { request_max_limit: 600, request_reset_duration: "5m", request_current_usage: 3 },
+  });
+
+  it("reports the key's and each provider entry's budgets on the create path", async () => {
+    requests.length = 0;
+    responses = [
+      // The mint lists first and finds nothing, then creates.
+      { status: 200, body: { virtual_keys: [], count: 0, total_count: 0 } },
+      { status: 200, body: { message: "ok", virtual_key: createdKey() } },
+    ];
+    const logs: Record<string, unknown>[] = [];
+    const response = await handlerOverRealGateway(logs)(functionUrlEvent(workbenchArn(EMAIL)));
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(requests.map((request) => request.method), ["GET", "POST"]);
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: {
+        calendar_aligned: true,
+        budgets: [
+          { scope: "key", max_limit: 250, current_usage: 12.5, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+          { scope: "bedrock", max_limit: 1500, current_usage: 412.37, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+    });
+    // Nothing new reaches the logs, and nothing about the governance does.
+    assert.deepEqual(logs, [{ event: "vk-mint", outcome: "created", email: EMAIL }]);
+    assert.ok(!JSON.stringify(logs).includes("412.37"), "the counters must not be logged");
+  });
+
+  it("reports an uncapped key as uncapped, with calendar_aligned still present", async () => {
+    // gp-pi#147 reads an empty `budgets` with `calendar_aligned` present as
+    // "genuinely uncapped" and calls the same empty list with the field absent
+    // "could not read the usage". A key that really has no budgets has to keep
+    // the field, or a correct answer is reported as a failure.
+    requests.length = 0;
+    responses = [
+      { status: 200, body: { virtual_keys: [], count: 0, total_count: 0 } },
+      {
+        status: 200,
+        body: {
+          message: "ok",
+          virtual_key: {
+            id: "vk-uncapped",
+            name: EMAIL,
+            value: KEY_VALUE,
+            is_active: true,
+            calendar_aligned: true,
+            budgets: [],
+            provider_configs: [
+              { id: 9, provider: "bedrock", allowed_models: ["m"], allow_all_keys: true, keys: [] },
+            ],
+          },
+        },
+      },
+    ];
+    const response = await handlerOverRealGateway([])(functionUrlEvent(workbenchArn(EMAIL)));
+
+    assert.equal(response.statusCode, 200);
+    const usage = JSON.parse(response.body).usage;
+    assert.deepEqual(usage, { calendar_aligned: true, budgets: [] });
+    assert.ok("calendar_aligned" in usage, "the field the consumer tells uncapped by");
   });
 });
 
