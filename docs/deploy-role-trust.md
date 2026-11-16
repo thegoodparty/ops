@@ -111,8 +111,8 @@ from the allows, every object version, every secret value but GP_API_DEV,
 and every parameter but the passphrase and the diff's two Grafana tokens.
 Any omni pull request could already assume both roles, so the combined role
 reads no more than the two did between them. The plan role keeps
-gp-terraform-dataplatform, which is not an omni workflow, and loses omni's
-subject and state keys once omni has switched.
+gp-terraform-dataplatform, which is not an omni workflow, and no longer
+trusts omni or reads omni's state.
 
 ## Progress
 

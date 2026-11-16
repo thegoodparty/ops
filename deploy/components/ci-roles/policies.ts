@@ -1079,10 +1079,9 @@ export const githubActionsPulumiPreview: PolicyDocument = {
 // eleven dev roots) and gp-terraform-dataplatform's `on-pull-request.yaml`.
 // Neither applies anything, and neither touches Pulumi.
 //
-// Two subjects on one role, which the rest of this plan argues against for the
-// preview roles. It is right here because the separation that matters is plan
-// versus apply, not repository: both subjects are read-only, and the denies
-// below mean neither can reach anything the other owns.
+// omni's plan has since moved to the pull-request role, so this role serves
+// gp-terraform-dataplatform alone. It is not an omni workflow, so the
+// one-pull-request-role rule does not fold it in.
 //
 // gp-api's diff workflow is deliberately NOT on this role. Its Pulumi program
 // reads secret values at program time, so it cannot run without
@@ -1092,10 +1091,9 @@ const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 
 // Every state object a plan on this role may read, allowed below and used
 // again as the NotResource of the deny that makes the allow meaningful.
-//
-// `shared/slack-notifier` is not a `*/dev/*` key and is easy to miss: gp-ai's
-// dev roots reach it through `data "terraform_remote_state"`. It read fine
-// before the deny existed, because ReadOnlyAccess covered it.
+// gp-terraform-dataplatform reads only its own state. omni's gp-ai plan moved
+// to the pull-request role, which reads gp-ai's dev states itself
+// (`TerraformDevState`).
 //
 // The `.tflock` object is on this list because releasing a lock reads it
 // before deleting it, to check the ID it is about to remove is the one it
@@ -1105,10 +1103,8 @@ const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 // take the lock and then fail to release it, stranding the lockfile and
 // blocking every later plan until someone removed it by hand.
 const TF_STATE_READABLE = [
-  `${TF_BUCKET}/*/dev/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate.tflock`,
-  `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
 ];
 
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
@@ -1131,7 +1127,6 @@ export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
           // name `@refs/pull/N/merge` and constrain nothing, because the
           // workflow file comes from the pull request too.
           "token.actions.githubusercontent.com:sub": [
-            "repo:thegoodparty/omni:pull_request",
             "repo:thegoodparty/gp-terraform-dataplatform:pull_request",
           ],
         },
@@ -1169,9 +1164,7 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Resource: TF_BUCKET,
     },
     {
-      // Scoped to the states these two actually plan. gp-ai plans only its
-      // dev roots on a pull request ("Only dev is planned" in gp-ai.yml), so
-      // the prod states are not reachable from here.
+      // Scoped to the one state dataplatform plans.
       Sid: "TerraformStateObjects",
       Effect: "Allow",
       Action: ["s3:GetObject"],

@@ -17,12 +17,11 @@ const asList = (value: unknown) =>
   Array.isArray(value) ? value : [value as string];
 
 describe("githubActionsPulumiPlanTrust", () => {
-  it("trusts exactly the two pull_request subjects, under StringEquals", () => {
+  it("trusts exactly dataplatform's pull_request subject, under StringEquals", () => {
     assert.equal(githubActionsPulumiPlanTrust.Statement.length, 1);
     const condition = githubActionsPulumiPlanTrust.Statement[0].Condition;
     assert.equal(condition.StringLike, undefined);
     assert.deepEqual(condition.StringEquals?.[SUBJECT_KEY], [
-      "repo:thegoodparty/omni:pull_request",
       "repo:thegoodparty/gp-terraform-dataplatform:pull_request",
     ]);
   });
@@ -114,10 +113,8 @@ describe("githubActionsPulumiPlan", () => {
   });
 
   const READABLE = [
-    "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock",
-    "arn:aws:s3:::goodparty-terraform-state-us-west-2/shared/slack-notifier/terraform.tfstate",
   ];
 
   it("reads only the listed Terraform states", () => {
