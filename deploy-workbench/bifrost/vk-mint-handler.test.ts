@@ -130,7 +130,33 @@ describe("the mint endpoint", () => {
     const { handler, logs } = deps({ keys: [activeKey(EMAIL)] });
     const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(JSON.parse(response.body), { key: KEY_VALUE, email: EMAIL });
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: { budgets: [] },
+    });
+    assert.deepEqual(logs, [{ event: "vk-mint", outcome: "existing", email: EMAIL }]);
+  });
+
+  it("returns the caller's own spend beside the key, and logs neither", async () => {
+    const { handler, logs } = deps({
+      keys: [
+        {
+          ...activeKey(EMAIL),
+          provider_configs: [
+            {
+              provider: "bedrock",
+              budgets: [{ max_limit: 1500, reset_duration: "1M", current_usage: 412.37 }],
+            },
+          ],
+        },
+      ],
+    });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(JSON.parse(response.body).usage, {
+      budgets: [{ scope: "bedrock", max_limit: 1500, current_usage: 412.37, reset_duration: "1M" }],
+    });
     assert.deepEqual(logs, [{ event: "vk-mint", outcome: "existing", email: EMAIL }]);
   });
 
@@ -221,7 +247,11 @@ describe("the mint endpoint", () => {
     const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
     assert.equal(response.statusCode, 200);
     assert.equal(updated, true);
-    assert.deepEqual(JSON.parse(response.body), { key: KEY_VALUE, email: EMAIL });
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: { budgets: [] },
+    });
   });
 
   it("never logs the key, the setup token or the request body (decision 3)", async () => {

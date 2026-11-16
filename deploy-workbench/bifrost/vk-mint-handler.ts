@@ -43,7 +43,9 @@
  * function stays small and boring: "it reads a name, a template and the setup
  * token; it makes one or two calls; it returns a key." The second document does
  * not change that shape: it is the same read, from the same parameter family,
- * in the same dependency.
+ * in the same dependency. Nor does `usage` in the response: it is the budget
+ * counters on the key record the mint has already read, so it adds no call and
+ * no permission, and the caller gets nothing about anyone but themselves.
  */
 
 import {
@@ -188,8 +190,14 @@ export const createHandler =
         email: result.email,
       });
       // The response is the one place the key appears, and it is the caller's
-      // own key: the Function URL response is not logged by Lambda.
-      return json(200, { key: result.key, email: result.email });
+      // own key: the Function URL response is not logged by Lambda. `usage` is
+      // that key's own spend and caps (`keyUsage`), read from the record the
+      // mint already fetched, and is not logged either.
+      return json(200, {
+        key: result.key,
+        email: result.email,
+        usage: result.usage,
+      });
     } catch (error) {
       if (error instanceof MintFailure) {
         deps.log({

@@ -43,7 +43,10 @@ import {
   type GovernanceOverrides,
   type GovernanceTemplate,
 } from "./governance-desired-state";
-import type { ObservedGovernance } from "./vk-governance-observed";
+import type {
+  ObservedBudget,
+  ObservedGovernance,
+} from "./vk-governance-observed";
 
 /**
  * The Identity Center group that decides who may hold a key (decision 1). It
@@ -332,7 +335,82 @@ export const needsReactivation = (key: VirtualKey): boolean =>
 
 export type MintAction = "existing" | "reactivated" | "created";
 
-export type MintResult = { key: string; email: string; action: MintAction };
+/**
+ * One budget on the caller's own key, as the caller is shown it.
+ *
+ * `scope` is `"key"` for a key-level budget and the provider's name for an
+ * entry's own (decision 18 of `docs/bifrost-reconciler.md`), because the same
+ * person can carry both and they run out separately. The other fields are the
+ * gateway's, copied rather than computed: what was spent, the cap, the window
+ * and when it last reset. Nothing is derived here, so a field the gateway does
+ * not report is absent rather than guessed.
+ */
+export type BudgetUsage = {
+  scope: string;
+  max_limit: number;
+  current_usage?: number;
+  reset_duration?: string;
+  last_reset?: string;
+};
+
+/**
+ * The caller's own spend against their own caps, returned beside the key.
+ *
+ * An engineer's key cannot read its own governance (the admin API sits behind
+ * the setup token), so before this the only way to see a number was to hit a
+ * `402`. The mint already holds the key record that carries the counters, so
+ * returning them costs no call and adds no reach: it is the caller's own key,
+ * read by the same request that already returns its secret.
+ */
+export type KeyUsage = {
+  calendar_aligned?: boolean | null;
+  budgets: BudgetUsage[];
+};
+
+export type MintResult = {
+  key: string;
+  email: string;
+  action: MintAction;
+  usage: KeyUsage;
+};
+
+const budgetUsage = (scope: string, budget: ObservedBudget): BudgetUsage | undefined => {
+  if (typeof budget.max_limit !== "number") return undefined;
+  const usage: BudgetUsage = { scope, max_limit: budget.max_limit };
+  if (typeof budget.current_usage === "number") usage.current_usage = budget.current_usage;
+  if (typeof budget.reset_duration === "string") usage.reset_duration = budget.reset_duration;
+  if (typeof budget.last_reset === "string") usage.last_reset = budget.last_reset;
+  return usage;
+};
+
+/**
+ * Picks the budget rows out of a key record: the key's own, then each provider
+ * entry's in the order the gateway lists them. Only the accounting fields are
+ * copied, never the record, so nothing but numbers and dates leaves this
+ * function (no ids, no model lists, no `value`).
+ */
+export const keyUsage = (key: ObservedGovernance): KeyUsage => {
+  const budgets: BudgetUsage[] = [];
+  for (const budget of key.budgets ?? []) {
+    const row = budgetUsage("key", budget);
+    if (row) budgets.push(row);
+  }
+  for (const config of key.provider_configs ?? []) {
+    if (typeof config.provider !== "string") continue;
+    for (const budget of config.budgets ?? []) {
+      const row = budgetUsage(config.provider, budget);
+      if (row) budgets.push(row);
+    }
+  }
+  return {
+    ...(key.calendar_aligned === undefined ? {} : { calendar_aligned: key.calendar_aligned }),
+    budgets,
+  };
+};
+
+/** Whether a record carries any governance to read usage from. */
+const hasGovernance = (key: ObservedGovernance): boolean =>
+  key.budgets !== undefined || key.provider_configs !== undefined;
 
 const requireKeyValue = (key: VirtualKey): string => {
   const value = key.value;
@@ -360,14 +438,22 @@ const settleExisting = async (
   key: VirtualKey,
 ): Promise<MintResult> => {
   if (!needsReactivation(key)) {
-    return { key: requireKeyValue(key), email, action: "existing" };
+    return {
+      key: requireKeyValue(key),
+      email,
+      action: "existing",
+      usage: keyUsage(key),
+    };
   }
   const updated = await gateway.update(key.id, { ...REACTIVATION_BODY });
   const value =
     typeof updated.value === "string" && updated.value.length > 0
       ? updated.value
       : requireKeyValue(key);
-  return { key: value, email, action: "reactivated" };
+  // The same fallback as the value: a reactivation does not touch governance,
+  // so the listing's counters are right when the `PUT` response omits them.
+  const usage = keyUsage(hasGovernance(updated) ? updated : key);
+  return { key: value, email, action: "reactivated", usage };
 };
 
 /**
@@ -459,5 +545,10 @@ export const mintVirtualKey = async (args: {
     }
     return settleExisting(gateway, email, winner);
   }
-  return { key: requireKeyValue(created), email, action: "created" };
+  return {
+    key: requireKeyValue(created),
+    email,
+    action: "created",
+    usage: keyUsage(created),
+  };
 };
