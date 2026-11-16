@@ -277,6 +277,8 @@ If leads is empty, skip Phase 2. Zero leads is a valid signal that the diff is l
 
 Spawn one deep-reviewer subagent per scout lead using the Task tool. Send all Task calls in a single message so they run in parallel. Pass each lead's area, paths, lineRange, category, and hypothesis in the subagent prompt alongside the relevant part of the diff (or the diff file path) and any prior_findings context.
 
+Pass each hypothesis as the scout wrote it. Do not add your own judgment to a deep-reviewer's instructions: not whether the lead is a blocker, not whether the problem existed before this PR, not how much it matters. Deciding that is the deep-reviewer's job, from the code.
+
 Wait for ALL deep-reviewers before proceeding. The Task tool's completion signal is the only authoritative one — a long quiet window is normal, not a timeout. If a deep-reviewer's Task call returns an error result, record it and continue with the others; set status "failed" in your output if the failure prevents a reliable verdict.
 
 ## Aggregating findings

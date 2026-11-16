@@ -155,6 +155,8 @@ If evidence falsifies the finding, drop it. If not, emit it and include the fals
 
 If you cannot name a concrete falsification check, the finding is speculation — drop it.
 
+Drop a finding only on evidence that the defect is absent. Once you have confirmed the defect in code this diff adds or changes, these are not disproofs: "the impact is low", "nothing reaches this path yet", "a later change will wire it up", or "the gap existed before this PR". A check, guard or validation the diff adds that fails at its own stated purpose is a blocker, even when nothing calls it yet. The bar against speculation still holds: a defect you have not confirmed in the code is still dropped.
+
 Examples that FAIL the disprove-it pass (drop these):
 - "Wrap this JSON.parse in try/catch" when the input is from a Zod-validated config, not request input.
 - "Add a null check" when the upstream type guarantees non-null and there is no realistic path to null.
