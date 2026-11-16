@@ -237,12 +237,17 @@ describe("idempotent minting", () => {
     assert.equal(result.key, "sk-bf-new");
     // The template's own fields, the name, and the governance the reconciler
     // would compute for this person. The governance half (`budgets: []`,
-    // `calendar_aligned: true`) is `governanceBody`'s, so a key created here is
-    // already the shape the first tick compares against (step 5 of
-    // `docs/bifrost-reconciler.md`).
+    // `calendar_aligned: true`, and `budgets: []` inside each provider entry —
+    // decision 18's "this entry has none") is `governanceBody`'s, so a key
+    // created here is already the shape the first tick compares against (step 5
+    // of `docs/bifrost-reconciler.md`).
     assert.deepEqual(creates, [
       {
         ...template,
+        provider_configs: template.provider_configs.map((entry) => ({
+          ...entry,
+          budgets: [],
+        })),
         calendar_aligned: true,
         budgets: [],
         name: "jeff@goodparty.org",
@@ -526,6 +531,12 @@ describe("a minted key starts converged (step 5)", () => {
             ? (config.key_ids as unknown[]).includes("*")
             : false,
           keys: [],
+          // The entry's own budgets, and the same `omitempty` the wire applies:
+          // an entry with none comes back without the key at all, which is the
+          // shape the diff has to read as the empty set (decision 18).
+          ...(Array.isArray(config.budgets) && config.budgets.length > 0
+            ? { budgets: config.budgets }
+            : {}),
         })),
         rate_limit:
           stored?.rate_limit === undefined
@@ -622,8 +633,13 @@ describe("a minted key starts converged (step 5)", () => {
     });
     assert.equal(created[0].calendar_aligned, true);
     // The template's model policy survived a budget-only override: the merge is
-    // field by field (decision 9), not a replacement of the whole document.
-    assert.deepEqual(created[0].provider_configs, keyTemplate().provider_configs);
+    // field by field (decision 9), not a replacement of the whole document. The
+    // `budgets: []` on each entry is decision 18's "this entry has none", not a
+    // dropped field.
+    assert.deepEqual(
+      created[0].provider_configs,
+      keyTemplate().provider_configs?.map((entry) => ({ ...entry, budgets: [] })),
+    );
 
     // The criterion: the reconciler over that key writes nothing.
     const result = await reconcile(gateway, overrides);
@@ -673,7 +689,12 @@ describe("a minted key starts converged (step 5)", () => {
     });
 
     assert.deepEqual(created[0].provider_configs, [
-      { provider: "bedrock", allowed_models: ["us.anthropic.claude-sonnet-5-5"], key_ids: ["*"] },
+      {
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+        key_ids: ["*"],
+        budgets: [],
+      },
     ]);
     assert.equal(created[0].calendar_aligned, false);
 
@@ -803,6 +824,11 @@ describe("the committed documents, minted and then reconciled", () => {
             ? (config.key_ids as unknown[]).includes("*")
             : false,
           keys: [],
+          // `omitempty` on the wire: an entry with no budgets is reported
+          // without the field, which the diff must read as the empty set.
+          ...(Array.isArray(config.budgets) && config.budgets.length > 0
+            ? { budgets: config.budgets }
+            : {}),
         })),
         rate_limit:
           stored?.rate_limit === undefined

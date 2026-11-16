@@ -393,6 +393,16 @@ export const reconcileVirtualKeys = async (args: {
  *   list, and the diff compares the lists whole. Omitting `key_ids` is the one
  *   narrow exception that leaves associations alone; this module never relies on
  *   it.
+ * - **A provider entry's `budgets` is a set of its own** (decision 18). It is
+ *   the same two-field budget shape as the key's, so one `checkBudgets` validates
+ *   both, and `governanceBody` writes it on every entry, `[]` included. The
+ *   empty array is load-bearing rather than tidy: the entry's own omission means
+ *   "leave that entry's budgets alone", so a `fireworks` entry with no budget
+ *   has to say "none" out loud or a budget git dropped would live forever. The
+ *   gateway reports the field with `omitempty`, so an entry with none arrives
+ *   without the key — which is why the comparison below treats absent and empty
+ *   as one value. Without that, that entry would differ on every tick and the
+ *   run would rewrite every key forever, the failure `changed` exists to expose.
  * - **`inherit` is distinct from absent** (decision 9), even where the two
  *   resolve to the same value: `"provider_configs": "inherit"` in an override
  *   says "keep the template's" out loud, and the composed state records which of
@@ -430,14 +440,6 @@ export const reconcileVirtualKeys = async (args: {
 type BudgetLike = { max_limit?: unknown; reset_duration?: unknown };
 
 /**
- * One provider entry as either side reports it.
- *
- * Deliberately loose rather than the union of the two typed shapes: the desired
- * side has `key_ids` and the observed side has `allow_all_keys`/`keys`, and the
- * conversion below has to read whichever arrived.
- */
-
-/**
  * A budget set as a sorted list of the two fields git owns.
  *
  * The gateway reports `current_usage`, `last_reset` and its override columns
@@ -450,6 +452,22 @@ const budgetSetKey = (budgets: readonly BudgetLike[] | undefined): string[] =>
   (budgets ?? [])
     .map((budget) => JSON.stringify([budget.reset_duration, budget.max_limit]))
     .sort();
+
+/**
+ * One provider entry's own budgets, compared the same way.
+ *
+ * The same `budgetSetKey` the key-level set uses, wrapped so that absent and
+ * empty are one value. That equality is load-bearing rather than tidy: the
+ * desired state writes `budgets: []` for a provider it gives no budget
+ * (`fireworks`), and the gateway reports the field with `omitempty`, so the
+ * entry arrives back without the key at all. A comparison that told the two
+ * apart would see that entry differ on every single tick and rewrite every key
+ * forever, with `changed` never reaching zero — the failure the header above
+ * warns about.
+ */
+const providerBudgetsKey = (
+  budgets: readonly BudgetLike[] | null | undefined,
+): string => JSON.stringify(budgetSetKey(budgets ?? []));
 
 /**
  * A rate limit as a sorted list of its set (maximum, duration) pairs.
@@ -483,6 +501,10 @@ const rateLimitKey = (
  * every run would read `key_ids: ["*"]` against "no key_ids" as a difference and
  * rewrite every key every tick, which is precisely the no-op traffic the diff
  * exists to prevent.
+ *
+ * Deliberately loose rather than the union of the two typed shapes: the desired
+ * side has `key_ids` and the observed side has `allow_all_keys`/`keys`, and the
+ * conversion below has to read whichever arrived.
  */
 type ProviderConfigLike = {
   provider?: unknown;
@@ -492,6 +514,8 @@ type ProviderConfigLike = {
   key_ids?: unknown;
   allow_all_keys?: unknown;
   keys?: unknown;
+  /** The entry's own budget rows, absent when it carries none. */
+  budgets?: readonly BudgetLike[] | null;
 };
 
 const providerConfigKey = (config: ProviderConfigLike): string => {
@@ -511,6 +535,10 @@ const providerConfigKey = (config: ProviderConfigLike): string => {
     [...((config.blacklisted_models as string[] | undefined) ?? [])].sort(),
     config.weight ?? null,
     keyIds,
+    // A sixth element of the entry's own key: an entry's budget set differing
+    // is that entry differing, and the `PUT` that fixes it carries the whole
+    // provider list anyway.
+    providerBudgetsKey(config.budgets),
   ]);
 };
 

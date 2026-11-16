@@ -14,11 +14,13 @@
     "",
     "There is no default rate limit anywhere, deliberately: an omitted rate_limit means \"leave the key's alone\" on Bifrost's update path, so a limit is something you add here for the people it should apply to. A rate limit needs a maximum and its duration together.",
     "",
+    "A provider entry may carry its own budgets, which is how the Bedrock cap is expressed in the template: [{ \"max_limit\": 1500, \"reset_duration\": \"1M\" }] on the bedrock entry, and no budgets at all on fireworks, because DeepSeek is deliberately uncapped. The rules are the key-level budget's: the same duration forms, and no two budgets on one reset_duration. An entry's budgets are a complete set, so leaving the field out of an entry you restate means that entry has none; that is how a provider stays uncapped rather than an exemption spelling it out. The cap is bound to the provider's name, though, so a model later served on fireworks is not covered by the bedrock entry's budget.",
+    "",
     "Three shapes, as they are written:",
     "  \"someone@goodparty.org\": { \"budgets\": [{ \"max_limit\": 250, \"reset_duration\": \"1M\" }] }",
     "  \"someone@goodparty.org\": { \"rate_limit\": { \"request_max_limit\": 600, \"request_reset_duration\": \"5m\" } }",
-    "  \"someone@goodparty.org\": { \"provider_configs\": [ { \"provider\": \"bedrock\", \"allowed_models\": [\"global.anthropic.claude-sonnet-5-5\"], \"key_ids\": [\"*\"] } ], \"calendar_aligned\": true }",
+    "  \"someone@goodparty.org\": { \"provider_configs\": [ { \"provider\": \"bedrock\", \"allowed_models\": [\"global.anthropic.claude-sonnet-5-5\"], \"key_ids\": [\"*\"], \"budgets\": [{ \"max_limit\": 2000, \"reset_duration\": \"1M\" }] } ], \"calendar_aligned\": true }",
     "",
-    "Empty is the correct state until there is usage data to choose a number from: every key gets the template, and the reconciler has nothing to do."
+    "Empty is the correct state until somebody needs a number the template does not give them: every key gets the template, and the reconciler has nothing to do."
   ]
 }

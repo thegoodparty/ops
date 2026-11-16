@@ -8,6 +8,8 @@
  * model configs before the response is sent (`hydrateVKListGovernance` at the
  * pinned tag, and `applyVKGovernanceFromModelConfigs`, which copies the model
  * config's budgets and rate limit back onto the key and its provider entries).
+ * A provider entry's own `budgets` arrive the same way: the entry's VK-scoped
+ * model config for that provider is the row that holds them.
  *
  * So the diff in `vk-janitor-core.ts` reads what the list already carries rather
  * than making a second request per key — which matters at a five-minute cadence,
@@ -58,6 +60,16 @@ export type ObservedProviderConfig = {
   weight?: number | null;
   allow_all_keys?: boolean;
   keys?: Array<{ key_id?: string; name?: string }>;
+  /**
+   * The entry's own budgets, which is where a per-provider cap lives (decision
+   * 18 of `docs/bifrost-reconciler.md`). Two fields are git's and the rest are
+   * the accounting's; the reconciler compares them through `budgetSetKey`, the
+   * same function the key-level set goes through.
+   *
+   * Probably absent rather than `[]` when the entry has none: the field is
+   * `omitempty` on the wire, which is why the diff reads the two as one value.
+   */
+  budgets?: ObservedBudget[];
   [field: string]: unknown;
 };
 

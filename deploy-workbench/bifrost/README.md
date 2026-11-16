@@ -28,8 +28,9 @@ files that belong in review:
 - `governance-overrides.json` — the per-person overrides of that shape, keyed by
   lowercase email, with its own `$comment` stating the merge rules
   ([`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md), step 2). See
-  "Governance overrides" below. Empty until there is usage data to pick a
-  number from, which is the correct state and not an unfinished one.
+  "Governance overrides" below. Empty of people, because the fleet's numbers are
+  in the template (the Bedrock cap, decision 18) and an entry here is for the
+  exceptions — which is the correct state and not an unfinished one.
 - `governance-desired-state.ts` — the merge and the validation for both
   documents, with no AWS SDK and no `fetch` in it, so a bad override is a failed
   test or a failed apply rather than a `400` retried every five minutes behind
@@ -382,14 +383,26 @@ What it carries, and why each is a decision (decision 5):
 - **`key_ids: ["*"]` on each entry**, because a provider config with no keys
   allows none: empty is deny, and `"*"` means "use the provider's keys" — the
   deployment's, not the person's.
-- **No `budgets` and no `rate_limit` in this file.** Both are fields of the
-  desired state, and neither belongs in the template. A limit in the template
-  reaches every key on the next reconciler tick, so one line here is a
-  fleet-wide cap nobody asked for; and a number chosen without usage data can
-  starve a person mid-task as easily as it catches a runaway. Per-person budgets
-  came back with usage data behind them (decision 13 of
-  [`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md)) and live in
-  `governance-overrides.json`, below.
+- **A `budgets` on the `bedrock` entry, and none on `fireworks`.** This is where
+  the fleet's cap lives: $1500 per calendar month per person on Bedrock, and
+  nothing at all on Fireworks, so DeepSeek is uncapped (decision 18 of
+  [`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.md)). A budget on
+  an entry is that entry's own, enforced on that provider's requests only, so a
+  person who has used up Bedrock can still reach Fireworks. It stays in the
+  template rather than in an override because it is a fleet-wide cap, and a
+  template value reaches every key on the next tick — which is what a cap is;
+  an individual who needs a different number gets one in
+  `governance-overrides.json`, below. Writing a cap here is not the mistake the
+  next bullet refuses: it is the deliberate one, made with a quarter of
+  per-key cost data behind it.
+- **No key-level `budgets` and no `rate_limit` in this file.** Both are fields of
+  the desired state, and neither belongs in the template that way. A key-level
+  limit in the template is one total covering every provider, and it would make
+  Fireworks spend draw down the same number the per-provider cap is protecting;
+  `rate_limit` has no default anywhere for the reason `bifrost-reconciler.md`
+  decision 12 gives, and a number chosen without usage data can starve a person
+  mid-task as easily as it catches a runaway. Per-person key-level budgets are
+  available and live in `governance-overrides.json`, below.
 - **No `name`**, which is the caller's email and belongs to the mint, not the
   template: one name in a shared template is one name for everyone, and
   Bifrost's unique index on the key name would hand the first caller's key to
@@ -436,6 +449,15 @@ Durations are Bifrost's own (`1d`, `1w`, `1M` = 30 days, `1Q`, `1Y`, or Go's
 here. `rate_limit` has no default anywhere: an omitted one means "leave the
 key's alone", so a limit is added here for the people it should apply to, never
 in the template, where it would reach every key on the next tick.
+
+A **provider entry** may carry its own `budgets` too, validated by the same
+rules — a duration the gateway accepts, and no two budgets on one
+`reset_duration`. That is how a person's Bedrock cap can differ from the
+template's: an override that names `provider_configs` restates the whole list, so
+the entry it writes carries whatever budget it means and `[]` for a provider it
+does not want capped. Leaving the field out of an entry you restate means that
+entry has none, not that it keeps the template's — the field is a complete set
+per entry, and the template is not merged into an override's list.
 
 ### Both documents, and the one computation that reads them
 

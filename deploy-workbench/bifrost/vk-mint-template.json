@@ -14,7 +14,8 @@
         "global.xai.grok-4.7",
         "global.zai.glm-5.3"
       ],
-      "key_ids": ["*"]
+      "key_ids": ["*"],
+      "budgets": [{ "max_limit": 1500, "reset_duration": "1M" }]
     },
     {
       "provider": "fireworks",

@@ -9,7 +9,10 @@ import {
   type VirtualKeyGateway,
 } from "./vk-mint-core";
 import { createHandler, type HandlerDeps } from "./vk-mint-handler";
-import type { GovernanceOverrides } from "./governance-desired-state";
+import type {
+  GovernanceOverrides,
+  GovernanceTemplate,
+} from "./governance-desired-state";
 
 /**
  * The handler's wiring: the verified caller, the fail-closed statuses, the
@@ -40,8 +43,24 @@ const functionUrlEvent = (userArn: string, body?: unknown) => ({
 const template = () => ({
   description: "lambda-managed per-user key",
   is_active: true,
-  provider_configs: [{ provider: "bedrock" as const, allowed_models: ["m"], key_ids: ["*"] }],
+  provider_configs: [
+    {
+      provider: "bedrock" as const,
+      allowed_models: ["m"],
+      key_ids: ["*"],
+    },
+  ],
 });
+
+/**
+ * The template's provider list as the create body must carry it, with the
+ * budgets set every entry now names: an entry with none says so with `[]`
+ * rather than by leaving the field out, because on the update path an omitted
+ * `budgets` leaves that entry's existing ones alone (decision 18 of
+ * `docs/bifrost-reconciler.md`).
+ */
+const templateProviderConfigsWithBudgets = () =>
+  template().provider_configs.map((entry) => ({ ...entry, budgets: [] }));
 
 const activeKey = (name: string): VirtualKey => ({
   id: `id-${name}`,
@@ -60,6 +79,8 @@ const deps = (options: {
   create?: (body: Record<string, unknown>) => Promise<VirtualKey>;
   /** The per-person document the handler reads beside the template. */
   overrides?: Record<string, unknown>;
+  /** The template the handler reads; defaults to the one-provider fixture. */
+  template?: Record<string, unknown>;
 }) => {
   const logs: Record<string, unknown>[] = [];
   const creates: Record<string, unknown>[] = [];
@@ -86,7 +107,7 @@ const deps = (options: {
       if (options.templateError) throw options.templateError;
       if (options.overridesError) throw options.overridesError;
       return {
-        template: template(),
+        template: (options.template ?? template()) as unknown as GovernanceTemplate,
         overrides: (options.overrides ?? {}) as GovernanceOverrides,
       };
     },
@@ -257,7 +278,7 @@ describe("the create carries the caller's governance (step 5)", () => {
     assert.deepEqual(body.budgets, [{ max_limit: 250, reset_duration: "1M" }]);
     // `inherit` resolved to the template's list rather than being sent as the
     // sentinel or as nothing: the field is a replacement set on the wire.
-    assert.deepEqual(body.provider_configs, template().provider_configs);
+    assert.deepEqual(body.provider_configs, templateProviderConfigsWithBudgets());
     // Decision 11's fleet-wide default, and decision 12's absent rate limit.
     assert.equal(body.calendar_aligned, true);
     assert.ok(!("rate_limit" in body));
@@ -272,7 +293,49 @@ describe("the create carries the caller's governance (step 5)", () => {
     assert.equal(response.statusCode, 200);
     assert.deepEqual(creates[0].budgets, []);
     assert.equal(creates[0].calendar_aligned, true);
-    assert.deepEqual(creates[0].provider_configs, template().provider_configs);
+    assert.deepEqual(creates[0].provider_configs, templateProviderConfigsWithBudgets());
+  });
+
+  it("sends a provider entry's own budget, and the empty set for one that has none", async () => {
+    // Decision 18: a per-provider cap is the entry's own `budgets`, and the
+    // entry the template leaves uncapped says so with `[]`. Both halves matter:
+    // an entry that left the field out would keep whatever it already carried on
+    // an update, so a cap git had dropped would never be removed.
+    const capped = () => ({
+      description: "lambda-managed per-user key",
+      is_active: true,
+      provider_configs: [
+        {
+          provider: "bedrock" as const,
+          allowed_models: ["m"],
+          key_ids: ["*"],
+          budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+        },
+        {
+          provider: "fireworks" as const,
+          allowed_models: ["f"],
+          key_ids: ["*"],
+        },
+      ],
+    });
+    const { handler, creates } = deps({ overrides: {}, template: capped() });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+
+    assert.deepEqual(creates[0].provider_configs, [
+      {
+        provider: "bedrock",
+        allowed_models: ["m"],
+        key_ids: ["*"],
+        budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+      },
+      {
+        provider: "fireworks",
+        allowed_models: ["f"],
+        key_ids: ["*"],
+        budgets: [],
+      },
+    ]);
   });
 
   it("refuses rather than creating from half the desired state when the overrides document cannot be read", async () => {

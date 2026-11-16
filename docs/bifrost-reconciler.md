@@ -190,10 +190,10 @@ second template and a mapping from group membership to template, and the
 engineer's decision is that the fleet is not big enough to need one yet.
 
 The template is the committed `deploy-workbench/bifrost/vk-mint-template.json`
-(704 bytes) and it is already the source of truth for a minted key's shape,
-stored as `/bifrost/vk-mint-template` by `deploy-workbench/bifrost-vk-mint.ts:383-392`
-and read by the mint through `ssm:GetParameter`
-(`deploy-workbench/bifrost/vk-mint-handler.ts:394-399`).
+(839 bytes on disk, 628 as published) and it is already the source of truth for
+a minted key's shape, stored as `/bifrost/vk-mint-template` by
+`deploy-workbench/bifrost-vk-mint.ts:383-392` and read by the mint through
+`ssm:GetParameter` (`deploy-workbench/bifrost/vk-mint-handler.ts:394-399`).
 This plan leaves that mechanism alone and adds one thing beside it: an
 overrides document.
 
@@ -228,7 +228,7 @@ limit of 4 KB and no charge; advanced parameters hold 8 KB and incur a charge).
 `deploy-workbench/bifrost/config.json` is already 3,794 bytes on its own, and
 `ecs.ts:590-593` records that going past 4 KiB means `tier: "Advanced"`. So the
 two governance documents cannot share a ceiling with anything else. Split, the
-704-byte template has room to grow and the overrides document has the other
+839-byte template has room to grow and the overrides document has the other
 ~3 KiB:
 
 - a budget-only override is about 105 bytes as written above, so roughly 25 with
@@ -452,16 +452,20 @@ partial one hoping for a merge.
 
 ### What the governance API accepts, and why that is enough
 
-`UpdateVirtualKeyRequest` at `governance.go:429-471` accepts, and the handler
-applies: `budgets` as `[]CreateBudgetRequest`, which "replaces all VK-level
-budgets" (`:451`); `provider_configs[]` with `allowed_models`,
-`blacklisted_models`, `model_budgets`, `rate_limit`, `weight` and `key_ids`
-(`:432-442`); `rate_limit` (`:452`); `is_active` (`:453`);
-`calendar_aligned` (`:454`); `allow_all_providers` (`:455`);
-`reset_budget_usage` (`:456`); `expires_at` (`:457`);
-`delete_after_expire` (`:461`); `metadata` (`:467`); `team_id` (`:448`).
+`UpdateVirtualKeyRequest` at `governance.go:436-479` — line numbers in this
+paragraph are `transports/v2.4.0`'s, the current pin, because a provider entry
+now carries a `budgets` field that the older ones did not — accepts, and the
+handler applies: `budgets` as `[]CreateBudgetRequest`, which "replaces all VK-level
+budgets" (`:458`); `provider_configs[]` with `allowed_models`,
+`blacklisted_models`, `budgets`, `model_budgets`, `rate_limit`, `weight` and
+`key_ids` (`:439-449`); `rate_limit` (`:459`); `is_active` (`:460`);
+`calendar_aligned` (`:461`); `allow_all_providers` (`:462`);
+`reset_budget_usage` (`:463`); `expires_at` (`:464`);
+`delete_after_expire` (`:468`); `metadata` (`:474`); `team_id` (`:455`).
 `CreateBudgetRequest` is `{ id?, max_limit, reset_duration, reset_config? }`
-(`:565-572`).
+(`:573-580`). A provider entry's own `budgets` uses that same request type
+(`:379`, `:445`), which is why the desired-state module validates it with the
+key-level `checkBudgets` rather than a second rule set.
 
 That covers the whole governance desired state in one call per key, which is why
 one reconciler can own all of it.
@@ -518,6 +522,15 @@ store has been collecting per-request cost keyed by virtual key at 90-day
 retention (`deploy-workbench/bifrost/config.json`, `client.log_retention_days:
 90`), so the number can now be chosen from evidence rather than guessed. The
 reversal is deliberate and this paragraph is the record of it.
+
+**Per-provider budgets are reconciled too** (decision 18), and they are where
+the fleet's actual cap lives: the committed template gives the `bedrock` entry
+`$1500` on a `1M` window and gives `fireworks` no budget at all, so Bedrock spend
+is capped per person per calendar month while DeepSeek on Fireworks stays
+uncapped. The key-level `budgets` field above remains available for a total that
+spans providers, and the two are independent: an entry's budget is enforced on
+that provider's requests only, so exhausting Bedrock does not stop a Fireworks
+request and vice versa.
 
 One honest bound on what a budget enforces. `CheckBudget` compares the budget's
 `CurrentUsage` plus a per-budget baseline against the limit
@@ -855,6 +868,78 @@ and the restarts that remain are exactly the ones those two knobs make
 survivable. The rest of the archived plan (steps 2 onward, including #438) is
 abandoned with it.
 
+### 18. Per-provider budgets are reconciled, so the Bedrock cap is $1500 a month
+
+**Added 2026-11-16.** Every provider entry a virtual key carries may now hold its
+own `budgets`, in the same `CreateBudgetRequest` shape as the key's own, and the
+reconciler converges it like any other field of the desired state. The committed
+template gives `bedrock` `[{ "max_limit": 1500, "reset_duration": "1M" }]` and
+gives `fireworks` nothing, which is how the Fireworks side — DeepSeek V4.1
+Flash — stays uncapped: an entry with no budget has none, and the absence is the
+whole statement. There is no exemption to spell out.
+
+This is decision 13's argument applied one level down, and the reason it is a
+decision rather than a field: the same objection `#404` raised — that a number
+chosen without usage data is a guess that can starve somebody mid-task — applied
+here too, and it has expired in the same way. The log store has been collecting
+per-request cost keyed by virtual key at 90-day retention
+(`deploy-workbench/bifrost/config.json`, `client.log_retention_days: 90`), so
+$1500 is read off a quarter of evidence rather than invented. It is also a
+per-provider number and not a fleet-wide one for a reason the evidence supports:
+Bedrock is where the expensive models are, and a person who has exhausted
+Bedrock for the month can still reach Fireworks.
+
+**What it enforces, and what it does not.** At `transports/v2.4.0` the create and
+update routes both take `budgets` inside a `provider_configs` entry
+(`transports/bifrost-http/handlers/governance.go:379` and `:445`), and the entry's
+budgets are written to that entry's virtual-key-scoped model config
+(`syncVKGovernanceToModelConfigs` → `reconcileVKModelConfig` →
+`reconcileModelConfigBudgets`, `:1084`, `:1139`, `:912`). Enforcement is
+`PermitProviderLimits` (`plugins/governance/store.go:1854`), which gathers every
+provider config the key holds for the provider being called, feeding
+`GatherLimits` (`:4851`) and load balancing's
+`CheckProviderCandidateExclusion` (`:1486`). So a Bedrock request is refused once
+that entry's budget is spent, whichever Bedrock model it names, and the same
+request on Fireworks is not. That is not inferred from the code alone: the
+pinned tag carries `TestProviderScopedLimitsFundOnlyTheirOwnProvider`
+(`plugins/governance/providerscopedlimits_test.go`), which asserts exactly this
+set for both providers from one fixture.
+
+The honest bound: **the cap is bound to the provider's name.** A model later
+served on `fireworks` — a router that fails over, a model moved between
+providers, a class Bedrock stops publishing — is not covered by the bedrock
+entry's budget, so a move out of Bedrock silently moves spend out of the cap.
+That is what a per-provider limit means, and the alternative (one key-level
+budget covering everything) is decision 13's field, still available as an
+override for anyone the split does not fit.
+
+Two wire subtleties, both of which are load-bearing for convergence rather than
+for correctness of a single write:
+
+- **An entry's `budgets` is its own complete set.** On the update path an absent
+  `budgets` on a provider entry leaves that entry's existing budgets alone, where
+  an explicit array reconciles it to exactly that set (`governance.go:2900`,
+  `budgetsProvided: pc.Budgets != nil`). Since the desired state is a complete
+  composed document, `governanceBody` therefore writes `budgets` on every entry,
+  `[]` included: Fireworks says "none" out loud rather than by omission, or a
+  budget git dropped would survive every tick and one set by hand in the
+  dashboard would never be pruned.
+- **Absent and `[]` compare as equal.** The field is `omitempty` on the wire, so
+  an entry with none comes back without the key. A diff that told the two apart
+  would see Fireworks differ on every tick and rewrite every key forever, with
+  `changed` never reaching zero — the failure decision 6 exists to prevent. The
+  comparison normalises both to the empty set, and the idempotency test over the
+  committed documents is what pins it.
+
+Rejected: **one key-level budget instead.** It is one total rather than a
+per-provider number, so a person's Fireworks spend would eat their Bedrock
+headroom, and Fireworks is meant to be the relief valve rather than the thing
+that draws the cap down. Rejected: **a cap per person in the overrides document
+only.** Overrides naming individuals are how a person gets a different number,
+but the fleet's default has to live in the template or it is a list somebody has
+to maintain by hand, and the reconciler's rule is that a template value applies to
+everybody — which is exactly what a fleet-wide $1500 Bedrock cap is.
+
 ## The knobs
 
 Read from the code, not from memory.
@@ -866,7 +951,7 @@ Read from the code, not from memory.
 | Deploy workflow invoke | `.github/workflows/deploy-workbench.yml` after the apply | none | `RequestResponse`, then a poll, then a failure if not converged |
 | Digest input | `ecs.ts:645-657` | the whole file | the boot-only paths, from parsed JSON |
 | Digest allowlist | new, in `ecs.ts` or beside it | none | committed paths, covering `providers.*.keys[].value` and the four whole keys, with a two-way drift test |
-| Governance template parameter | `bifrost-vk-mint.ts:100`, `:383-392` | `/bifrost/vk-mint-template`, 704 bytes | unchanged name, gains budgets/rate-limit shape |
+| Governance template parameter | `bifrost-vk-mint.ts:100`, `:383-392` | `/bifrost/vk-mint-template`, 704 bytes as written | unchanged name, gains the budgets/rate-limit shape (839 bytes today, decision 18) |
 | Overrides parameter | new | none | `/bifrost/governance-overrides`, one String |
 | Parameter tier | `ecs.ts:590-593` records the ceiling | standard | standard until 4 KiB, then `Advanced` |
 | `stopTimeout` | `ecs.ts:270`, `:1265-1266` | `120` | unchanged (kept from #437) |
@@ -1069,7 +1154,7 @@ In this repository:
 | A config change rolls the task, and why that seam was added | commit `75d30ae`; `deploy-workbench/ecs.test.ts`, the `BIFROST_CONFIG_VERSION` assertions |
 | The parameter is a `String`, standard tier, 4 KiB | `deploy-workbench/ecs.ts:590-593`; `:1074-1085` |
 | `config.json` is 3,794 bytes and its `governance` block holds only `auth_config` | `deploy-workbench/bifrost/config.json` (`wc -c`) |
-| The template is 704 bytes and stored as `/bifrost/vk-mint-template` | `deploy-workbench/bifrost/vk-mint-template.json`; `deploy-workbench/bifrost-vk-mint.ts:100`, `:383-392` |
+| The template is 704 bytes (839 today, since decision 18) and stored as `/bifrost/vk-mint-template` | `deploy-workbench/bifrost/vk-mint-template.json`; `deploy-workbench/bifrost-vk-mint.ts:100`, `:383-392` |
 | The mint reads the template with `ssm:GetParameter` | `deploy-workbench/bifrost/vk-mint-handler.ts:394-399`; the grant at `bifrost-vk-mint.ts:236-239` |
 | The janitor's interval, timeout, concurrency and its schedule | `deploy-workbench/bifrost-vk-janitor.ts:99`, `:107`, `:120`, `:389-421` |
 | The janitor's VPC attachment, Cloud Map name and setup-token read | `bifrost-vk-janitor.ts:232-320`, `:180-189`; `deploy-workbench/discovery.ts:56-66`; `network.ts:89` |
@@ -1082,6 +1167,7 @@ In this repository:
 | The knobs kept from #437 | `deploy-workbench/ecs.ts:270`, `:1265-1266`, `:1516-1522` |
 | Target-group timing and the 2026-10-26 measurement | `deploy-workbench/ingress.ts:262-284`, `:311-314` |
 | Per-key budgets were deferred on #404 | `docs/bifrost-virtual-keys.md`, "Deferred"; `docs/bifrost-gateway.md`, "Budgets and alerts" |
+| Per-provider budgets are reconciled, and the Bedrock cap is $1500 a month | `deploy-workbench/bifrost/vk-mint-template.json`; `governance-desired-state.ts` (`GovernanceProviderConfig.budgets`); decision 18 here |
 | The old plan's assumption about the update path, which this plan corrects | `docs/bifrost-virtual-keys.md`, "Cited so the next session can check" (the `UpdateVirtualKeyRequest` row) |
 | The archived plan, kept as evidence | `docs/archived/bifrost-zero-downtime-deploys.md` |
 | The spend-alert wiring an alarm would join | `deploy-workbench/index.ts:290-352`; `deploy-infrastructure/group-sync-lambda.ts:355-400` (the topic and its CloudWatch policy) |
@@ -1110,6 +1196,17 @@ below are the `v2.3.2` ones:
 | An `env.` reference resolves through the process environment | `core/schemas/secretvar.go:117-135` (and the reference forms at `:22-32`) |
 | A budget duration is validated, and duplicates are refused | `governance.go:905-919` |
 | There are 66 config-store tables at this tag | `framework/configstore/tables/`, 66 `TableName()` methods |
+
+At the current pin, `transports/v2.4.0`, read for decision 18 (the line numbers
+above describe `v2.3.2` and have drifted):
+
+| Fact | Source |
+|---|---|
+| A provider entry takes its own `budgets`, on create and on update | `transports/bifrost-http/handlers/governance.go:379` (`CreateVirtualKeyRequest`), `:445` (`UpdateVirtualKeyRequest`); the same `CreateBudgetRequest` at `:573-580` |
+| An omitted entry `budgets` leaves that entry's budgets alone; an explicit set reconciles them | `governance.go:2900` (`budgetsProvided: pc.Budgets != nil`), applied by `reconcileVKModelConfig` at `:1139` → `reconcileModelConfigBudgets` at `:912` |
+| Hydration reports an entry's budgets back to the list route | `governance.go:1461` (`applyVKGovernanceFromModelConfigs`, the `pc.Budgets = mc.Budgets` line), from `hydrateVKListGovernance` at `:1557` |
+| An entry with no budgets is reported without the field, so absent and `[]` must compare equal | `framework/configstore/tables/virtualkey.go:39` (`json:"budgets,omitempty"`) |
+| A per-provider budget is enforced on that provider's requests | `plugins/governance/store.go:1854` (`PermitProviderLimits`) → `GatherLimits` at `:4851`; load balancing's `CheckProviderCandidateExclusion` at `:1486` |
 
 Outside the two repositories:
 

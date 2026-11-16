@@ -35,9 +35,10 @@ import {
  * 3,604 bytes against that ceiling (`ecs.ts`'s
  * `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES`), so a combined governance
  * document would grow into the same wall from the far side. Split, the
- * 704-byte template has room and the overrides document gets the rest; the
- * sizes are asserted by `governance-parameters.test.ts`, which fails the build
- * rather than the apply when either crosses the line.
+ * template (839 bytes on disk, and 628 as published) has room and the overrides
+ * document gets the rest; the sizes are asserted by
+ * `governance-parameters.test.ts`, which fails the build rather than the apply
+ * when either crosses the line.
  *
  * ## Where the validation runs, and why it is split
  *
