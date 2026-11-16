@@ -127,7 +127,7 @@ export const buildScaleCheckXml = (triggers: ScaleTrigger[]): string => {
 The harness found changed code that queries or iterates over data whose size depends on production volume:
 ${listed}${more}
 
-In Phase 2, in the same message as the deep-reviewer Task calls, spawn exactly one scale-check subagent, even when the scout returned no leads. Give it this file list and the diff (inline, or the diff file path). It runs once per review, independently of the scout's leads. Treat its findings like a deep-reviewer's, and keep their category "scale". If it returns {"findings":[]}, there is nothing to add.
+In Phase 2, in the same message as the deep-reviewer Task calls, spawn exactly one scale-check subagent, even when the scout returned no leads. Give it this file list and the diff (inline, or the diff file path), and nothing else: not the scout's leads, not your own hypotheses, and no request to be brief. It sizes the change independently of the other reviewers. Treat its findings like a deep-reviewer's, and keep their category "scale". If it returns {"findings":[]}, there is nothing to add.
   </scale_check>
 `;
 };
@@ -149,7 +149,7 @@ ${SCALE_FACTS}
 
 ## What to do
 
-1. For each flagged file, find the new or changed code whose work grows with a data size: rows read, items held in memory, loop iterations, parameters bound or fitted, calls or writes made per item.
+1. For each flagged file, find the new or changed code whose work grows with a data size: rows read, items held in memory, loop iterations, parameters bound or fitted, calls or writes made per item. A count of groups is a size too: when the work makes one item per district, tract or other group, N is the number of groups, from its row.
 2. Trace where that size comes from. Read the callers and the input that reaches the code in production, not the fixtures or the tests. Find every cap, page size, limit or guard on the way, in the code or in the table above.
 3. Find where the code runs: on a request a user is waiting for, or off the request path (a queue consumer, a scheduled job, a script).
 
