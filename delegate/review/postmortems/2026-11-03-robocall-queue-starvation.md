@@ -28,9 +28,9 @@ source: https://goodparty.clickup.com/90132012119/v/dc/2ky4jq2q-20493/2ky4jq2q-2
 Impact start is the 11/2 dial window opening at 09:00 ET, impact end is the fix live in prod on 2026-11-03 at 6:26 PM ET, and detection is the #bugs report at 12:04 PM ET on 11/3. The candidate's send was never delivered, so the fix removes the cause but repairs nothing. The capacity side of the same day is in [2026-11-03 | Election Robocall Postportem](https://goodparty.clickup.com/90132012119/v/dc/2ky4jq2q-20493/2ky4jq2q-179213); this page covers the state machine that stranded the individual send.
 
 ### Participants
-*   the on-call engineer (ST)
-*   an engineer (HK)
-*   a support staff member (C)
+*   the on-call engineer
+*   an engineer
+*   a support staff member
 
 ### Timeline
 
