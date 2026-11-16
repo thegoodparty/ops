@@ -1,5 +1,6 @@
 import { GIT_TOOL_NAMES } from "../review/git-tool";
 import type { AgentConfig } from "../framework";
+import { scaleCheckSubagent } from "./scale-check";
 
 const DEEP_REVIEWER_OUTPUT = `
 ## Output
@@ -138,4 +139,6 @@ ${DEEP_REVIEWER_OUTPUT}`,
     tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
     model: "claude-sonnet-5-5",
   },
+
+  "scale-check": scaleCheckSubagent,
 };
