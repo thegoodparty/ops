@@ -60,8 +60,7 @@ two. None is consolidated yet; each is its own change.
 - `github-actions-pulumi-preview`: ops `pull_request` runs, `pulumi-preview.yml`
   and the ECR Public login in `deploy.yml`.
 - `github-actions-pulumi-plan`: gp-terraform-dataplatform's pull request
-  plan. omni's pull request Terraform plan and ECR Public logins move to the
-  pull-request role (below).
+  plan. No omni workflow assumes it.
 - `github-actions-delegate-eval`: ops `delegate-eval.yml` and
   `delegate-eval-run.yml`.
 - `github-actions-delegate-eval-cache-push`: ops
@@ -86,9 +85,11 @@ three changes, so nothing loses access in between:
    assume the pull-request role, and the pull request E2E shards drop
    credentials, since the one spec that calls AWS is `@dev-only`. The main
    E2E in `release.yml` assumes the deploy role.
-3. The old roles go once nothing assumes them: `web-app-e2e-tests` by hand,
-   as it was made, and `github-actions-judge-sweep` from omni's Terraform.
-   The plan role's `EcrPublicLogin` statement is removed here.
+3. The old roles go once nothing assumes them. The plan role loses its
+   `EcrPublicLogin` statement here. omni stops managing
+   `github-actions-judge-sweep` in its Terraform, and both it and
+   `web-app-e2e-tests` are deleted by hand, since CI refuses to apply a
+   destroy and the E2E role was never in code.
 
 **The judge goes to the pull-request role, not the deploy role.** judge.yml
 starts from omni's main (a dispatch, a `/judge` comment or the guard's
@@ -110,8 +111,8 @@ from the allows, every object version, every secret value but GP_API_DEV,
 and every parameter but the passphrase and the diff's two Grafana tokens.
 Any omni pull request could already assume both roles, so the combined role
 reads no more than the two did between them. The plan role keeps
-gp-terraform-dataplatform, which is not an omni workflow, and loses omni's
-subject and state keys once omni has switched.
+gp-terraform-dataplatform, which is not an omni workflow, and no longer
+trusts omni or reads omni's state.
 
 ## Progress
 
@@ -734,8 +735,9 @@ ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni's
 `gp-ai.yml` and `gp-api.yml` assume `github-actions-preview-deploy`. Both
 grant `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken`
 (`EcrPublicLogin` and `RegistryLogin`), which mint a login token and read or
-push nothing. Any pull request in those repositories can already assume its role
-by editing the workflow, so the build job holding it exposes nothing new.
+push nothing. The plan role no longer does. Any pull request in those
+repositories can already assume its role by editing the workflow, so the
+build job holding it exposes nothing new.
 Main builds log in with `github-actions-pulumi-deploy`.
 
 ## What step 8 found

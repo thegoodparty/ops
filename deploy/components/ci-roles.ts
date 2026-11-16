@@ -210,8 +210,8 @@ export const createCiRoles = () => {
   });
 
   // The Terraform plan role, step 4 of docs/deploy-role-trust.md. Trusted by
-  // `pull_request` in omni and gp-terraform-dataplatform, which plan Terraform
-  // on PRs and today assume the shared admin role to do it.
+  // `pull_request` in gp-terraform-dataplatform, which plans Terraform on PRs.
+  // omni's plan moved to the pull-request role.
   //
   // Unlike the preview role above, this one carries a managed policy as well
   // as its inline document. `terraform plan` reads whatever its roots manage,
@@ -224,7 +224,7 @@ export const createCiRoles = () => {
   const planRole = new aws.iam.Role("githubActionsPulumiPlan", {
     name: "github-actions-pulumi-plan",
     description:
-      "Read-only Terraform plans from pull_request runs in thegoodparty/omni and thegoodparty/gp-terraform-dataplatform.",
+      "Read-only Terraform plans from pull_request runs in thegoodparty/gp-terraform-dataplatform.",
     assumeRolePolicy: JSON.stringify(githubActionsPulumiPlanTrust),
     maxSessionDuration: 3600,
   });
