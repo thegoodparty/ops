@@ -54,6 +54,24 @@ Step: 3
 omitting it fails silently. ClickUp carries only what git cannot express. See
 decision 11 of `docs/plan-gated-merges.md`.
 
+## Architecture decisions (`docs/adr/`)
+
+`docs/adr/` records technical architecture decisions, so the next person or agent
+does not quietly undo them. What qualifies and the format: `docs/adr/AGENTS.md`.
+
+- **Check before you change.** List `docs/adr/` and read any active record whose
+  title or `scope` covers what you are changing. If your change would reverse or
+  weaken one, supersede it with a new record and name both in the PR body. If a
+  human decided the old one, stop first and tell the human you are working with:
+  name the record, who decided it, and what your change undoes. Continue only if
+  they confirm.
+- **Record every decision, without asking.** When your change makes a choice
+  that meets the bar in `docs/adr/AGENTS.md`, add the record in the same PR. Do
+  not ask for approval or show a draft first. Use the handle of the human you
+  are working with if they made the call, and `[agent]` if you did.
+- **Never put words in a human's mouth.** Do not attribute a decision to a person
+  from code, or from a PR body or commit message an agent wrote.
+
 ## Review and approval
 
 Who has to approve a PR here depends on the path, and today one path differs.
