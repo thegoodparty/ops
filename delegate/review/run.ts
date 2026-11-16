@@ -5,6 +5,7 @@ import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
 import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
+import { POSTMORTEM_SELECTOR, selectPostmortems } from "./postmortems";
 import { promptDiff } from "./prompt-diff";
 import { parseDiffAnchors, placeFindings } from "./anchors";
 import { renderBody, renderFailureBody } from "./body";
@@ -565,6 +566,7 @@ export const runReview = async (args: {
   // comment being read.
   let gatingRecord: ReviewRecord["gating"];
   let findingsRecord: ReviewRecord["findingsVerdict"];
+  let postmortemsRecord: ReviewRecord["postmortems"];
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
@@ -591,6 +593,7 @@ export const runReview = async (args: {
       gates: partial.gates,
       ...(findingsRecord !== undefined ? { findingsVerdict: findingsRecord } : {}),
       ...(gatingRecord !== undefined ? { gating: gatingRecord } : {}),
+      ...(postmortemsRecord !== undefined ? { postmortems: postmortemsRecord } : {}),
       findings: partial.findings,
       droppedFindings: partial.droppedFindings ?? [],
       reviewId: partial.reviewId,
@@ -647,9 +650,21 @@ export const runReview = async (args: {
     writeFileSync(diffPath, promptDiff(bundle.diff).inline);
   }
 
+  const postmortems = await selectPostmortems(bundle, {
+    ask: async (prompt) => {
+      const selection = await runAgent(POSTMORTEM_SELECTOR, prompt, {
+        abortController: args.abortController,
+        env: agentEnv(),
+      });
+      if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
+      return selection.output;
+    },
+  });
+  postmortemsRecord = postmortems.map((p) => ({ file: p.file, lessons: p.lessons }));
+
   let result: Awaited<ReturnType<typeof runAgent>>;
   try {
-    result = await runAgent(config, buildReviewPrompt(bundle, { diffPath }), {
+    result = await runAgent(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: reviewDir,
       abortController: args.abortController,
       mcpServers: { git: createGitTool(reviewDir) },

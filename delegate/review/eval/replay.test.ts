@@ -9,6 +9,7 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
 import type { SubagentCall } from "../../framework/types";
+import { loadPostmortems } from "../postmortems";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
   runId: randomUUID(),
@@ -853,4 +854,67 @@ test("a file name inside a longer one is not a citation", async () => {
     ),
     [["Retry", "not-investigated"]],
   );
+});
+
+const postmortemAgent = (selectorReplies: { output: string; errorSubtype?: string }[]) => {
+  const selectorPrompts: string[] = [];
+  const reviewPrompts: string[] = [];
+  const agent: RunAgentImpl = async (config, prompt, overrides) => {
+    if (config.name === "postmortem-selector") {
+      assert.deepEqual(config.tools, []);
+      assert.equal(config.model, "claude-sonnet-5-5");
+      selectorPrompts.push(prompt);
+      return { agent: config.name, durationMs: 1, ...selectorReplies[selectorPrompts.length - 1] };
+    }
+    reviewPrompts.push(prompt);
+    return fakeRunAgent(config, prompt, overrides);
+  };
+  return { agent, selectorPrompts, reviewPrompts };
+};
+
+test("replayCase shows the review the post-mortems selection kept, and records them", async () => {
+  const [first] = loadPostmortems();
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
+    { output: `{"ids": ["${first.file}#1"]}` },
+    { output: `{"ids": ["${first.file}"]}` },
+  ]);
+  const result = await replayCase(
+    makeRecord({ startedAt: "2099-01-01T00:00:00.000Z" }),
+    { workDir: tmpDir(), variant: "v1" },
+    agent,
+    fakeCheckout,
+  );
+  assert.equal(selectorPrompts.length, 2);
+  assert.ok(reviewPrompts[0].includes(`<postmortem file="${first.file}">`));
+  assert.deepEqual(result.postmortems, [{ file: first.file, lessons: [`${first.file}#1`] }]);
+});
+
+test("replayCase shows no post-mortem dated on or after the recorded review", async () => {
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([]);
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  assert.equal(selectorPrompts.length, 0);
+  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
+  assert.equal(result.postmortems, undefined);
+});
+
+test("replayCase shows a simulated case with no review date no post-mortems", async () => {
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([]);
+  const record = makeRecord();
+  await replayCase({ runId: record.runId, bundle: record.bundle } as ReviewRecord, { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  assert.equal(selectorPrompts.length, 0);
+  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
+});
+
+test("replayCase reviews without post-mortems when the selection call errors", async () => {
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([{ output: "Agent error: overloaded", errorSubtype: "error_during_execution" }]);
+  const result = await replayCase(
+    makeRecord({ startedAt: "2099-01-01T00:00:00.000Z" }),
+    { workDir: tmpDir(), variant: "v1" },
+    agent,
+    fakeCheckout,
+  );
+  assert.equal(selectorPrompts.length, 1);
+  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
+  assert.ok(!result.error);
+  assert.equal(result.output?.status, "complete");
 });

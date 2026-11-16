@@ -9,6 +9,7 @@ import {
   commitSyntheticHead,
   computeGate,
   mainRunsShort,
+  ManifestSchema,
   ParkedSchema,
   scoreDir,
   scoreHistory,
@@ -169,11 +170,11 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
 
 test("the checked-in manifest holds out a minority, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 36);
+  assert.equal(cases.length, 43);
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
-  assert.equal(holdout.length, 16);
+  assert.equal(holdout.length, 18);
   for (const split of ["tune", "holdout"]) {
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
     assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
@@ -759,4 +760,15 @@ test("every parked case has a reason, a valid case and an id the manifest no lon
   const parked = ParkedSchema.parse(JSON.parse(readFileSync(join(dirname(MANIFEST), "parked.json"), "utf-8")));
   const ids = new Set(readManifest(MANIFEST).map((c) => c.id));
   for (const p of parked) assert.equal(ids.has(p.case.id), false, p.case.id);
+});
+
+test("a simulated case can carry the date its review happened", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "expect-reviewed-at-"));
+  const bundle = readBundleFile(MANIFEST, "repeat-task-memory-cache.bundle.json");
+  writeFileSync(join(dir, "b.bundle.json"), JSON.stringify(bundle));
+  const manifest = [{ id: "dated", bundle: "b.bundle.json", expect: { verdict: "approve" }, tests: "t", split: "tune", source: "simulated", kind: "architecture", reviewedAt: "2026-11-13T00:00:00Z" }];
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify(manifest));
+  const [c] = readManifest(join(dir, "manifest.json"));
+  assert.equal(c.reviewedAt, "2026-11-13T00:00:00Z");
+  assert.throws(() => ManifestSchema.parse([{ ...manifest[0], reviewedAt: "last week" }]), /reviewedAt/);
 });
