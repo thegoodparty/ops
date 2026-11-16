@@ -1497,7 +1497,8 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // role trusted on its subject, so a separate role for the diff would separate
 // nothing, and one role keeps what an omni pull request can reach in one
 // document. The diff adds reads only, each named, in the `Diff` statements
-// before `DenyProductionTagged`.
+// at the end. The denies on prod-tagged resources are in
+// `githubActionsPullRequestJobs`, where there was room for them.
 //
 // Sized from the code on omni's main and from CloudTrail for one create, one
 // update and one teardown of a live preview under the shared role
@@ -1634,6 +1635,17 @@ const PROD_SERVICE =
   "arn:aws:ecs:us-west-2:333022194791:service/gp-master-fargateCluster/gp-api-master";
 const PROD_APP_SECRET =
   "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_PROD-??????";
+
+// The network every environment shares. The VPC, its subnets and its route
+// tables are tagged `Environment=prod`, and gp-ai's dev Terraform roots read
+// them: the VPC through `data "aws_vpc"`, the subnets and route tables as
+// references in the resources they plan. Every VPC, subnet and route table,
+// rather than the shared one's ids: the role writes none of them anywhere.
+const NETWORK = [
+  "arn:aws:ec2:us-west-2:333022194791:vpc/*",
+  "arn:aws:ec2:us-west-2:333022194791:subnet/*",
+  "arn:aws:ec2:us-west-2:333022194791:route-table/*",
+];
 
 export const githubActionsPreviewDeploy: PolicyDocument = {
   Version: "2012-10-17",
@@ -2015,7 +2027,7 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       ],
     },
     {
-      // The infrastructure diff, step 5b, from here to `DenyProductionTagged`:
+      // The infrastructure diff, step 5b, from here to the end:
       // `pulumi preview` of gp-api's dev and prod stacks. Sized from
       // CloudTrail for the 21 diff runs on 2026-11-02 and 11-03 under the
       // shared role. The rest of what they called is granted above for
@@ -2073,31 +2085,6 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
         PROD_SERVICE,
       ],
     },
-    {
-      // The two prod resources the diff reads are tagged `Environment=prod`,
-      // so the deny below leaves them out, and this one holds them to the
-      // diff's three reads instead, tag or no tag. None returns a secret
-      // value.
-      Sid: "DiffProdReadsOnly",
-      Effect: "Deny",
-      NotAction: [
-        "ecs:DescribeServices",
-        "secretsmanager:DescribeSecret",
-        "secretsmanager:GetResourcePolicy",
-      ],
-      Resource: [PROD_SERVICE, PROD_APP_SECRET],
-    },
-    {
-      // The plan's "no write to any resource carrying the production tags",
-      // as a deny so it holds whatever is later added above. Nothing this role
-      // writes is tagged `Environment=prod`. The shared VPC is, and this role
-      // acts on nothing in it directly: ECS places the tasks.
-      Sid: "DenyProductionTagged",
-      Effect: "Deny",
-      Action: "*",
-      NotResource: [PROD_SERVICE, PROD_APP_SECRET],
-      Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
-    },
   ],
 };
 
@@ -2108,8 +2095,8 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
 // inline one, for the omni jobs that moved onto the role from roles of their
 // own. The inline document is within a few hundred characters of the 10,240
 // quota role inline policies share, and a managed policy does not count
-// against it. `DenyProductionTagged` in the inline document still applies:
-// an explicit deny holds across every policy on the role.
+// against it. Its denies, including the ones on prod-tagged resources, hold
+// across every policy on the role, the inline one included.
 //
 // Each statement is what the old role granted and the job still calls,
 // taken from the old role's policy and the workflow, nothing wider:
@@ -2226,9 +2213,45 @@ export const githubActionsPullRequestJobs: PolicyDocument = {
   Version: "2012-10-17",
   Statement: [
     ...PULL_REQUEST_JOBS_ALLOWS,
+    {
+      // The two prod resources the diff reads are tagged `Environment=prod`,
+      // so the deny below leaves them out, and this one holds them to the
+      // diff's three reads instead, tag or no tag. None returns a secret
+      // value.
+      Sid: "DiffProdReadsOnly",
+      Effect: "Deny",
+      NotAction: [
+        "ecs:DescribeServices",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+      ],
+      Resource: [PROD_SERVICE, PROD_APP_SECRET],
+    },
+    {
+      // The plan's "no write to any resource carrying the production tags",
+      // as a deny so it holds whatever is later added. Nothing this role
+      // writes is tagged `Environment=prod`. It holds everywhere on the role,
+      // inline policy included: an explicit deny beats any allow.
+      Sid: "DenyProductionTagged",
+      Effect: "Deny",
+      Action: "*",
+      NotResource: [PROD_SERVICE, PROD_APP_SECRET, ...NETWORK],
+      Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
+    },
+    {
+      // gp-ai's dev Terraform plan reads the shared VPC's attributes
+      // (`ec2:DescribeVpcAttribute`), which `DenyProductionTagged` refused
+      // on the first run. So the network is left out of that deny, and this
+      // one holds it to describes, tag or no tag. Nothing on the role acts on
+      // a VPC, subnet or route table otherwise: ECS places preview tasks.
+      Sid: "NetworkReadsOnly",
+      Effect: "Deny",
+      NotAction: ["ec2:Describe*"],
+      Resource: NETWORK,
+    },
     // The role also carries `ReadOnlyAccess`, attached in ci-roles.ts, for
     // the Terraform plan: it reads whatever gp-ai's dev roots manage, the
-    // reason the plan role was built on it. These four denies are the plan
+    // reason the plan role was built on it. The denies below are the plan
     // role's, adjusted for a role that also runs Pulumi previews: they take
     // back what `ReadOnlyAccess` adds and the role's own allows do not
     // grant, so the role reads no more than the plan role and the preview
