@@ -491,10 +491,10 @@
         "packages/gp-api/src/dashboardCards/services/dashboardCards.service.ts"
       ],
       "categories": [
-        "scale"
+        "architecture"
       ]
     },
-    "tests": "Adds the priority read (the per-tract MRP fit from #2977) to Home card sync, so every Home load runs it synchronously inside the request, with only a per-server cache. A large district's read takes minutes on Node's one thread, and the least-outstanding-requests balancer spreads repeat loads across servers until the fleet freezes (post-mortem \"Statewide read freeze\", 2026-11-04). The change is a small part of a 54-file PR. Production approved with no findings. Scored on the scale finding only: other real bugs in dashboardCards.service.ts used to pass this case without the reviewer seeing the read.",
+    "tests": "Adds the priority read (the per-tract MRP fit from #2977) to Home card sync, so every Home load runs it synchronously inside the request, with only a per-server cache. A large district's read takes minutes on Node's one thread, and the least-outstanding-requests balancer spreads repeat loads across servers until the fleet freezes (post-mortem \"Statewide read freeze\", 2026-11-04). The change is a small part of a 54-file PR. Production approved with no findings. Scored on the architecture finding only: other real bugs in dashboardCards.service.ts used to pass this case without the reviewer seeing the read.",
     "split": "tune",
     "source": "production-missed",
     "kind": "scale"

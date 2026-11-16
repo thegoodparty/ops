@@ -16,7 +16,6 @@ export const FindingSchema = z.object({
     "ai-rules",
     "cross-file",
     "thematic",
-    "scale",
     "architecture",
   ]),
   confidence: z.enum(["high", "medium"]),
