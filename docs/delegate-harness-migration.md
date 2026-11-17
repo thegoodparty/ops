@@ -346,41 +346,53 @@ what the middle stage buys, and it is worth the extra hop.
 `@ai-sdk/anthropic`, so the reviewer moves to the new call layer while still calling the API it
 calls today.
 
-**Stage 2 is the one with a condition on it.** Bedrock's AI SDK provider documents
-`us.anthropic.claude-sonnet-5-5` — the model all three subagents run — but **does not document an
-honoured `claude-opus-5-5` id**, listing opus-4 through opus-4-8 and sonnet-5/5-5/haiku-5-5/fable-5
-around it. Absence from a provider's docs is not proof the model is unavailable, so this is a check
-S8 owes rather than a fact: **if `claude-opus-5-5` cannot be reached on Bedrock, Stage 2 cannot hold
-the orchestrator's model constant**, and the stage either substitutes a model (which breaks its own
-premise) or runs Stage 2 for the subagents only and documents that the orchestrator moved provider
-and model together. That is recorded here rather than discovered in S8.
+**Stage 2's models exist and are already subscribed, and that is recorded rather than assumed.**
+`utils/bedrock-models.ts` is the account's allowlist and it carries
+`anthropic.claude-opus-5-5` with `invokeId: global.anthropic.claude-opus-5-5` — the orchestrator's
+model — beside `anthropic.claude-sonnet-5-5`, which the subagents run. Its own note on the opus entry
+says `GetFoundationModel` reports `inferenceTypesSupported: [INFERENCE_PROFILE]` and nothing else, so
+there is no in-region invocation to fall back to. Model access is not a manual step either:
+`scripts/enable-bedrock-models.ts` subscribes the account to `WORKBENCH_MODELS`, and
+`deploy-workbench.yml` runs it with `APPLY=1` on any push that touches either the script or the list,
+which is how adding a model becomes automatic. So Stage 2 has no unverified premise about model
+reachability, and nothing about it needs a spike.
 
-**Stage 2's credential does not need the task role, which is what makes it acceptable.** Bedrock was
-rejected in the previous version because it would put a model-invoke grant on the task role of the
-container that parses untrusted PR content. With a **bearer token** — `AWS_BEARER_TOKEN_BEDROCK`,
-which `@ai-sdk/amazon-bedrock` reads natively — the credential is one more key in `agentEnv`'s
-allowlist and no IAM policy changes at all: `deploy/bedrock-invoke-principals.test.ts` scans the
-policy trees for invoke actions, and no file in those trees mentions the bearer token (verified).
+**Stage 2 must select `global.` profiles, because that is the account's decision and not a default.**
+Every entry in `utils/bedrock-models.ts` is a `global.` cross-region inference profile, the file says
+plainly that no `us.` geo profile is permitted by any principal any more, and the 2026-11-04 move to
+`global.` was made to stop paying the geo premium. So the model ids Stage 2 requests are
+`global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5`, matching the list rather
+than the provider's own `us.` examples. This matters beyond naming: the residency reasoning in that
+file is written for the workbench account, which it says carries no product or voter data, and the
+delegate worker is a different account in the same organization running a different workload. Stage 2
+does not get to inherit that conclusion silently — `utils/bedrock-models.ts`, its
+`bedrockInvokeResources`, and the "Inference residency" reasoning in `docs/bifrost-gateway.md` are
+written about Bifrost's task role in the workbench account, and what the reviewer's account may invoke
+is a separate decision that S7 has to state. That is the one thing about Stage 2 this document cannot
+settle from the files, and it is flagged here rather than discovered in the implementation PR.
+
+**Stage 2's credential does almost all the IAM work by itself, and the residual is why S7 exists.**
+`deploy/bedrock-invoke-principals.test.ts` pins that invoke actions appear as an `Allow` in exactly
+one policy in the repo — Bifrost's task role — and as a `Deny` in exactly one, `WorkbenchAccess`. A
+bearer token (`AWS_BEARER_TOKEN_BEDROCK`, which `@ai-sdk/amazon-bedrock` reads natively) adds no
+policy line at all: it is one more key in `agentEnv`'s allowlist, so the invariant is untouched and
+the task role gains nothing. That is the whole reason this route is acceptable where a SigV4 grant was
+not, and it is why the bearer token is the only shape S7 declares. What it does not do is make the
+reviewer's own account able to invoke anything, which is the open question above.
+
 S5 shapes `agentEnv` for a non-role credential precisely so S7 can declare this one, and S7 declares
 it **additively** while `ANTHROPIC_API_KEY` stays, on the same rule as the Fireworks key. SigV4 and
 the instance credential chain remain out: either puts the grant back on the role.
 
-**Model access is a human step, and it is the same kind of gate `/breakglass` is.** Enabling a Claude
-model for an account on Bedrock is an AWS-side action outside Pulumi, so it cannot be a step in this
-table and S7 has to be preceded by someone doing it. The bearer token does not remove that; it only
-removes the IAM grant. S7's gate therefore checks that a review from the deployed task succeeds,
-which is the only thing that distinguishes "the model is enabled" from "the model is not".
-
-Two things Stage 2 costs that Stage 1 does not. **Region and model ids become explicit**: Bedrock
-model ids are `us.anthropic.claude-sonnet-5-5`, not `claude-sonnet-5-5`, and the provider needs a
-region, where the Anthropic provider infers everything from one key. And **structured output stops
-being transparent**: Bedrock's `structuredOutputMode` defaults to `auto`, which uses native output
-where supported and otherwise falls back to a JSON tool, and its own docs warn native structured
-output can be unreliable across workloads and Bedrock accounts. That fallback changes which
-application tools are available on the step — under `jsonTool`, `toolChoice: 'none'` sends only the
-internal JSON response tool — which is the mechanism the last-step design below relies on. S8 pins
-`structuredOutputMode` explicitly rather than leaving it on `auto`, and the Stage B gate is what
-proves the pinned value works for this schema.
+**Model ids and region become explicit, and structured output stops being transparent.** Ids move from
+`claude-sonnet-5-5` to `global.anthropic.claude-sonnet-5-5`, and the provider takes a region where the
+Anthropic provider infers everything from one key. Bedrock's `structuredOutputMode` defaults to
+`auto`, which uses native output where supported and otherwise falls back to a JSON tool, and its own
+docs warn native structured output can be unreliable across workloads and Bedrock accounts. That
+fallback changes which application tools are available on the step — under `jsonTool`,
+`toolChoice: 'none'` sends only the internal JSON response tool — which is the mechanism the last-step
+design below relies on. S8 pins `structuredOutputMode` explicitly rather than leaving it on `auto`,
+and the Stage B gate is what proves the pinned value works for this schema.
 
 **Fireworks US-only direct is the Stage 3 destination.** `FIREWORKS_API_KEY` replaces the worker's
 Anthropic key. This touches **one** human-owned file, `deploy/delegate-secret.ts`
@@ -463,7 +475,7 @@ until S11 restores it.
 | **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model, `costRatio` gated because both sides price the same table rows. Deployed under `shadow`, so S4's canary window opens here. |
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
 | **S7** | **2. The route** | **Declare the Bedrock credential, additively.** The bearer token's value goes into the live `DELEGATES` secret out of band first; then `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**, and that deploys. **No IAM change and no `worker.ts` change**: a bearer token is a key, not a grant, so `deploy/bedrock-invoke-principals.test.ts`'s file list is untouched — that is the whole reason this route is acceptable. No agent code changes, so the running reviewer is untouched. Human-owned carve-out, its own PR. | yes | `deploy.yml` reaches `./deploy.sh`; `pulumi preview` shows exactly one added entry in the task's `secrets` and nothing else; `check-secret-keys.ts` passes with both keys declared; `bedrock-invoke-principals.test.ts` still passes unchanged; a real review still posts, still on Anthropic direct. |
-| **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become `us.anthropic.claude-*` and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change.** `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. **Confirms, rather than assumes, that `claude-opus-5-5` is reachable on Bedrock**: the provider's docs list `us.anthropic.claude-sonnet-5-5` and opus only through 4-8. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. |
+| **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. |
 | **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. `delegate/pricing/models.json` lands here too, so the rate is committed before anything spends it. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
 | **S10** | 3 | **The model move, to Fireworks.** Point the orchestrator and the subagents at the Fireworks provider and its model. Code only — the key it needs was declared and deployed in S9, and both earlier keys are still declared, so the rollback actually works. | yes (flip back to the Bedrock provider, with no deploy-ordering problem) | `npm run build` and `npm test`; **Stage C** of the gate below; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
 | **S11** | — | **Restore `enforce`, once the canary has passed.** One line in the same human-owned carve-out as S4. Blocked until the canary reports zero false approves and `review_failed` at or below baseline. | revert (flip back to `shadow`) | The canary's numbers, plus a review from the deployed task that carries a real approval verdict again. |
@@ -671,10 +683,12 @@ the step that depends on them**, none of them asserted anywhere above:
    something the docs exercise, and provider-specific content parts (thinking signatures, cache
    markers, Anthropic's `container`) are where it would break. This is after Stage C, since mixing is
    configured only once the three stages are done.
-2. **That `claude-opus-5-5` is reachable on Bedrock at all.** The provider's documentation names
-   `us.anthropic.claude-sonnet-5-5` — the subagents' model — and lists opus only through `opus-4-8`.
-   Absence from docs is not proof of absence, so S8 checks it; if it is absent, Stage 2 cannot hold
-   the orchestrator's model constant and the stage's premise has to be restated before it merges.
+2. **Whether the reviewer's own account may invoke Bedrock models.** `utils/bedrock-models.ts`
+   answers this for the workbench account, and `deploy/bedrock-invoke-principals.test.ts` pins that
+   Bifrost's task role is the only principal in the repo with an `Allow`. The delegate worker is a
+   different account running a different workload, and neither the model list nor its residency
+   reasoning transfers automatically. S7 has to state which account and which profiles, and the bearer
+   token makes that a configuration question rather than an IAM one.
 3. **That `Output.object` against `ReviewOutputSchema` works on Bedrock's JSON-tool path and on
    Fireworks.** Bedrock's own documentation warns native structured output can be unreliable across
    workloads and accounts and defaults to `auto`, which falls back to a JSON tool; Fireworks' own
