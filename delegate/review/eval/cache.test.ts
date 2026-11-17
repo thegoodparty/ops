@@ -243,7 +243,7 @@ test("history keeps other keys' expected runs from the same reviewer and skips t
   assert.ok(!existsSync(join(dir, "case-c")));
 });
 
-test("sameReviewerAs matches main commits whose delegate/agents tree is this checkout's", () => {
+test("sameReviewerAs matches main commits whose agent and post-mortems are this checkout's", () => {
   const repo = tmp();
   const git = (...args: string[]) =>
     execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", ...args], {
@@ -262,15 +262,23 @@ test("sameReviewerAs matches main commits whose delegate/agents tree is this che
   };
   git("init", "-q");
   write("delegate/agents/a.ts", "v1");
+  write("delegate/review/postmortems.ts", "v1");
+  write("delegate/review/postmortems/2026-11-01-a.md", "a");
   const old = commit();
   write("delegate/agents/a.ts", "v2");
   const reviewerChange = commit();
+  write("delegate/review/postmortems/2026-11-04-b.md", "b");
+  const postmortemAdded = commit();
+  write("delegate/review/postmortems.ts", "v2");
+  const redactionChange = commit();
   write("delegate/review/r.ts", "v1");
   const evalChange = commit();
   const same = sameReviewerAs(repo);
   const run = (variant: string) => ({ caseId: "x", variant, output: null, costUsd: null }) as never;
-  assert.equal(same(run(`main-${reviewerChange.slice(0, 7)}`)), true);
   assert.equal(same(run(`main-${evalChange.slice(0, 7)}`)), true);
+  assert.equal(same(run(`main-${redactionChange.slice(0, 7)}`)), true);
+  assert.equal(same(run(`main-${postmortemAdded.slice(0, 7)}`)), false);
+  assert.equal(same(run(`main-${reviewerChange.slice(0, 7)}`)), false);
   assert.equal(same(run(`main-${old.slice(0, 7)}`)), false);
   assert.equal(same(run("main-0000000")), false);
   assert.equal(same(run(`cand-${reviewerChange.slice(0, 7)}`)), false);
