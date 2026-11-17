@@ -45,9 +45,9 @@ should use a different one.
 **One agent and two subagents, not a fleet.** `delegate/agents/index.ts` imports only
 `./pr-reviewer`; `delegate/worker/entrypoint.ts:44` refuses any other agent name at boot; the
 webhook Lambda has one route (`delegate/lambdas/handler.ts:18-20`). So the migration is
-`pr-reviewer`, `scout` and `deep-reviewer` (`pr-reviewer-subagents.ts`, the three keys of
-`prReviewerSubagents`), one seam, and the image. Everything else in `delegate/` is already
-deterministic code.
+`pr-reviewer` and its three subagents — `scout`, `architect` and `deep-reviewer`, the keys of
+`prReviewerSubagents` (`pr-reviewer-subagents.ts`) — one seam, and the image. Everything else in
+`delegate/` is already deterministic code.
 
 **The record of the old argument, and why it was the wrong one.** The first two versions of this
 document framed the goal as moving to an agnostic *harness*, and the argument for one stack in the
@@ -306,7 +306,7 @@ Both guard call sites stay, `pathGuardHook` in `delegate/review/run.ts` and `rep
 `delegate/review/eval/replay.ts`, and the existing denial assertions are **rewritten, never
 deleted** — the `agentEnv` allowlist tests and the `pathGuardHook` confinement test in
 `delegate/review/run.test.ts` (`:176-209` and `:222-238`), and the `replayToolGuard` pair in
-`delegate/review/eval/replay.test.ts` (`:694-712`). They are the only thing that fails when someone
+`delegate/review/eval/replay.test.ts` (`:695-713`). They are the only thing that fails when someone
 widens a list or drops a normalisation step.
 
 **The new constraint the objective creates: design `agentEnv()` for non-role credentials from the
