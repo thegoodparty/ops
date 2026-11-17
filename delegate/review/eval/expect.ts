@@ -1,10 +1,13 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { GATING_FLAG_REASON, isGatedRepo, type GatingFlag } from "../gating";
-import { BundleSchema, FindingSchema } from "../schema";
-import type { Bundle, ReviewRecord } from "../schema";
+import { BundleSchema } from "../schema";
+import type { Bundle, Finding, ReviewRecord } from "../schema";
+import { BlockJudgmentSchema, defaultBlockJudge } from "./block-judge";
+import type { BlockJudge, BlockJudgment } from "./block-judge";
 import { isCacheable } from "./cache";
 import { replayCase } from "./replay";
 import type { CheckoutFn, Result } from "./replay";
@@ -26,8 +29,10 @@ const GateNameSchema = z.custom<GatingFlag>(
 );
 
 // One expectation type per case. `approve`, `block` and `flag` score a merge
-// outcome; `consistency` scores the model's own `planConsistency` answer, and
-// is kept for cases that run before the gate exists (step 1 of
+// outcome; a block passes only when a judge reads one of its findings as the
+// case's `reason`, so a block on a different real problem is a miss.
+// `consistency` scores the model's own `planConsistency` answer, and is kept
+// for cases that run before the gate exists (step 1 of
 // `docs/plan-gated-merges.md`). `flag` is the third outcome: the review event
 // is a comment and the named gate fired. An outcome case may also carry
 // `consistency` as a diagnostic: when it does, the model's answer has to be
@@ -40,8 +45,7 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
   }),
   z.strictObject({
     verdict: z.literal("block"),
-    paths: z.array(z.string().min(1)).min(1),
-    categories: z.array(FindingSchema.shape.category).optional(),
+    reason: z.string().trim().min(1),
     consistency: ConsistencySchema.optional(),
   }),
   z.strictObject({
@@ -66,7 +70,7 @@ export const KindSchema = z.enum(["bug", "false-finding", "scale", "architecture
 // A case is a bundle next to the manifest. A simulated PR's head commit is
 // rebuilt locally by applying its diff to the base; any other source is a real
 // PR whose head GitHub still serves.
-const ExpectedCaseSchema = z.object({
+const ExpectedCaseSchema = z.strictObject({
   id: z.string().regex(/^[a-z0-9-]+$/),
   bundle: z.string().endsWith(".json"),
   expect: ExpectSchema,
@@ -77,10 +81,6 @@ const ExpectedCaseSchema = z.object({
   // Why main's own result on this case is noise, not a bar. Set, the gate
   // still scores and reports it but never counts it as a regression.
   flakyOnMain: z.string().min(1).optional(),
-  // When the review being replayed happened, for a case whose bundle is not a
-  // record's. Replay shows a case only the post-mortems dated before it, and
-  // with no date it shows none.
-  reviewedAt: z.iso.datetime().optional(),
 });
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
 
@@ -200,7 +200,7 @@ const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => 
 // runId is set to the case id so results are named after the case.
 const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
   const bundle = readBundleFile(manifestPath, c.bundle);
-  return { runId: c.id, bundle, ...(c.reviewedAt ? { startedAt: c.reviewedAt } : {}) } as ReviewRecord;
+  return { runId: c.id, bundle } as ReviewRecord;
 };
 
 export interface RunScore {
@@ -215,7 +215,18 @@ const describeAnswer = (answer: string | undefined, expected: string): string =>
     ? `planConsistency: ${answer}`
     : `planConsistency: ${answer ?? "absent"} (expected ${expected})`;
 
-export const scoreRun = (expect: Expect, result: Result): RunScore => {
+// The findings of a run that blocked: a complete review with at least one
+// finding, whose gate, in a gated repo, did not approve. Undefined otherwise.
+const blockingFindings = (result: Result): Finding[] | undefined => {
+  if (result.error || result.output?.status !== "complete") return undefined;
+  if (result.output.findings.length === 0 || result.gating?.verdict === "approve") return undefined;
+  return result.output.findings;
+};
+
+// A block case's run is scored with the judge's answer on whether a finding is
+// the case's reason. Without one (the replay's own progress line) a block is
+// reported as not judged, and does not pass.
+export const scoreRun = (expect: Expect, result: Result, judgment?: BlockJudgment): RunScore => {
   if (result.error || !result.output || result.output.status !== "complete") {
     const reason = result.error ?? (result.output?.status === "failed" ? result.output.reason : "no output");
     return { pass: false, outcome: `no review: ${reason.slice(0, 200)}`, errored: true };
@@ -261,15 +272,16 @@ export const scoreRun = (expect: Expect, result: Result): RunScore => {
           ? { pass: true, outcome: "approved" }
           : { pass: false, outcome: `blocked: ${listed}` };
     }
-  } else if (findings.length === 0) {
+  } else if (!blockingFindings(result)) {
     outcome = { pass: false, outcome: "approved" };
+  } else if (!judgment) {
+    outcome = { pass: false, outcome: `blocked, reason not judged: ${listed}` };
   } else {
-    const hit = findings.some(
-      (f) =>
-        expect.paths.includes(f.path) &&
-        (!expect.categories || expect.categories.includes(f.category)),
-    );
-    outcome = { pass: hit, outcome: `blocked${hit ? "" : " on the wrong thing"}: ${listed}` };
+    // Which reviewer raised the finding, its file and the category it filed
+    // it under are the reviewer's own business; what it found is not.
+    outcome = judgment.match
+      ? { pass: true, outcome: `blocked for the reason: ${judgment.why}` }
+      : { pass: false, outcome: `blocked on something else: ${judgment.why} (${listed})` };
   }
 
   // A diagnostic never changes what the outcome means, so the outcome stays
@@ -292,8 +304,7 @@ const describeExpect = (e: Expect): string => {
   const diagnostic = e.consistency ? ` (diagnostic: planConsistency: ${e.consistency})` : "";
   if (e.verdict === "approve") return `approve${diagnostic}`;
   if (e.verdict === "flag") return `flag \`${e.reason}\`${diagnostic}`;
-  const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
-  return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
+  return `block: ${e.reason.replace(/\|/g, "/")}${diagnostic}`;
 };
 
 export interface Baseline {
@@ -601,37 +612,82 @@ const parseFlags = (args: string[]): Record<string, string> => {
   return flags;
 };
 
+// A block case's judgment is cached next to its run, keyed by the reason and
+// the findings, so score, gate, arms and reruns ask the judge once per run.
+const judgeRun = async (c: ExpectedCase, file: string, r: Result, judge: BlockJudge): Promise<BlockJudgment | undefined> => {
+  const findings = blockingFindings(r);
+  if (c.expect.verdict !== "block" || !findings) return undefined;
+  const key = createHash("sha256").update(JSON.stringify([c.expect.reason, findings])).digest("hex");
+  const cache = file.replace(/\.json$/, ".judge.json");
+  try {
+    const cached = JSON.parse(readFileSync(cache, "utf-8")) as { key?: unknown };
+    if (cached.key === key) return BlockJudgmentSchema.parse(cached);
+  } catch {}
+  const judgment = await judge(c.expect.reason, findings);
+  writeFileSync(cache, JSON.stringify({ key, ...judgment }, null, 2));
+  return judgment;
+};
+
+const JUDGE_CONCURRENCY = 8;
+
+const scoreRuns = async (
+  cases: ExpectedCase[],
+  filesOf: (c: ExpectedCase) => { file: string; r: Result }[],
+  judge: BlockJudge,
+): Promise<CaseReport[]> => {
+  const runs = cases.map((c) => ({ c, runs: filesOf(c) }));
+  const tasks = runs.flatMap(({ c, runs: rs }) => rs.map((run) => ({ c, ...run })));
+  const judgments = new Map<string, BlockJudgment | undefined>();
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const { c, file, r } = tasks[next++];
+      judgments.set(file, await judgeRun(c, file, r, judge));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(JUDGE_CONCURRENCY, tasks.length) }, worker));
+  return runs.map(({ c, runs: rs }) => ({
+    c,
+    scores: rs.map(({ file, r }) => scoreRun(c.expect, r, judgments.get(file))),
+    costs: rs.map(({ r }) => r.costUsd),
+  }));
+};
+
+const runFiles = (dir: string): { file: string; r: Result }[] =>
+  existsSync(dir)
+    ? readdirSync(dir)
+        .filter((f) => /^run-\d+\.json$/.test(f))
+        .sort()
+        .map((f) => ({ file: join(dir, f), r: JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result }))
+    : [];
+
 // Scores whatever run-<n>.json files a replay left under <out>/<case>/. A case
 // with no results fails, so a replay that skipped or dropped a case can't
 // pass by omission.
-export const scoreDir = (cases: ExpectedCase[], out: string): CaseReport[] =>
-  cases.map((c) => {
-    const dir = join(out, c.id);
-    const files = existsSync(dir) ? readdirSync(dir).filter((f) => /^run-\d+\.json$/.test(f)).sort() : [];
-    const rs = files.map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result);
-    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
-  });
+export const scoreDir = (cases: ExpectedCase[], out: string, judge: BlockJudge = defaultBlockJudge()): Promise<CaseReport[]> =>
+  scoreRuns(cases, (c) => runFiles(join(out, c.id)), judge);
 
 // Main's earlier runs of the same reviewer, kept only for the PR head the
 // baseline replayed: the history spans every version of the case list, and an
 // earlier answer to an edited case says nothing about this one. A run cached
 // before the harness recorded a gating verdict would score as a miss, so it is
 // dropped wherever the baseline has one.
-export const scoreHistory = (cases: ExpectedCase[], dir: string, base: string): CaseReport[] => {
-  const runsIn = (d: string): Result[] =>
-    existsSync(d)
-      ? readdirSync(d)
-          .filter((f) => /^run-\d+\.json$/.test(f))
-          .map((f) => JSON.parse(readFileSync(join(d, f), "utf-8")) as Result)
-      : [];
-  return cases.map((c) => {
-    const baseRuns = runsIn(join(base, c.id));
-    const heads = new Set(baseRuns.map((r) => r.headSha));
-    const gated = baseRuns.some((r) => r.gating !== undefined);
-    const rs = runsIn(join(dir, c.id)).filter((r) => heads.has(r.headSha) && (!gated || r.gating !== undefined));
-    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
-  });
-};
+export const scoreHistory = (
+  cases: ExpectedCase[],
+  dir: string,
+  base: string,
+  judge: BlockJudge = defaultBlockJudge(),
+): Promise<CaseReport[]> =>
+  scoreRuns(
+    cases,
+    (c) => {
+      const baseRuns = runFiles(join(base, c.id)).map(({ r }) => r);
+      const heads = new Set(baseRuns.map((r) => r.headSha));
+      const gated = baseRuns.some((r) => r.gating !== undefined);
+      return runFiles(join(dir, c.id)).filter(({ r }) => heads.has(r.headSha) && (!gated || r.gating !== undefined));
+    },
+    judge,
+  );
 
 // --mode replay runs the agent and writes results; --mode score reads them
 // and writes the report. CI runs replay from the PR head and score from main,
@@ -661,8 +717,8 @@ const main = async () => {
   // only a count: in gate mode the ids include holdout cases, and logs are readable.
   if (mode === "main-short") {
     if (!flags.base || !flags["ids-out"]) throw new Error("--mode main-short needs --base and --ids-out");
-    const baseline = { variant: "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
-    const history = flags.history ? scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const baseline = { variant: "main", runs, reports: await scoreDir(cases, resolve(flags.base)) };
+    const history = flags.history ? await scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
     const ids = mainRunsShort(baseline, history, minMainRuns);
     writeFileSync(resolve(flags["ids-out"]), ids.join(","));
     console.log(`${ids.length} case(s) need more main runs to reach ${minMainRuns}`);
@@ -687,11 +743,11 @@ const main = async () => {
 
   if (mode === "gate") {
     if (!flags.base) throw new Error("--mode gate needs --base, main's baseline results");
-    const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
-    const reports = scoreDir(cases, out);
+    const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: await scoreDir(cases, resolve(flags.base)) };
+    const reports = await scoreDir(cases, out);
     const final = flags.final === "true";
     const targets = flags.targets ? flags.targets.split(",") : [];
-    const history = flags.history ? scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const history = flags.history ? await scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
     const gate = computeGate(reports, baseline, targets, final, history, minMainRuns);
     writeFileSync(join(out, "gate.json"), JSON.stringify(gate, null, 2));
     const report = renderExpectReport(reports, variant ?? "unknown", baseline, gate);
@@ -738,9 +794,9 @@ const main = async () => {
 
   if (mode === "score" || mode === "all") {
     const baseline = flags.baseline
-      ? { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.baseline)) }
+      ? { variant: flags["baseline-variant"] ?? "main", runs, reports: await scoreDir(cases, resolve(flags.baseline)) }
       : undefined;
-    const reports = scoreDir(cases, out);
+    const reports = await scoreDir(cases, out);
     const report = renderExpectReport(reports, variant ?? "unknown", baseline);
     writeFileSync(join(out, "report.md"), report);
     writeFileSync(join(out, "report.json"), renderExpectJson(reports, variant ?? "unknown", baseline));

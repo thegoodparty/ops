@@ -339,6 +339,7 @@ jobs:
       # mode includes holdout.
       - name: Require a baseline with no missing runs
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MODE: ${{ inputs.mode }}
         run: |
           split=(); if [ "$MODE" = tune ]; then split=(--split tune); fi
@@ -499,6 +500,7 @@ jobs:
       - name: Gate, first pass
         id: gate
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MODE: ${{ inputs.mode }}
           TARGETS: ${{ inputs.targets }}
         run: |
@@ -738,6 +740,7 @@ jobs:
         id: score
         continue-on-error: true
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MODE: ${{ inputs.mode }}
           CASES: ${{ inputs.cases }}
           TARGETS: ${{ inputs.targets }}

@@ -186,6 +186,132 @@ describe("the gateway client over real HTTP", () => {
     );
   });
 
+  /**
+   * A key as the create route answers it, hydrated the way
+   * `createVirtualKey` hydrates `preloadedVk` before `SendJSON`: the governance
+   * fields sit on the key and on each provider entry, the runtime-owned numbers
+   * included.
+   */
+  const createdKeyAsTheGatewayReportsIt = () => ({
+    id: "vk-created",
+    name: "jeff@goodparty.org",
+    value: "sk-bf-created",
+    is_active: true,
+    description: "lambda-managed per-user key",
+    calendar_aligned: true,
+    budgets: [
+      { id: "b1", max_limit: 250, reset_duration: "1M", current_usage: 12.5, last_reset: "2026-11-01T00:00:00Z" },
+    ],
+    provider_configs: [
+      {
+        id: 7,
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+        allow_all_keys: true,
+        keys: [],
+        budgets: [
+          { id: "b2", max_limit: 1500, reset_duration: "1M", current_usage: 412.37, last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+      // `omitempty` on the wire: an uncapped entry comes back without the key.
+      { id: 8, provider: "fireworks", allowed_models: ["d"], allow_all_keys: true, keys: [] },
+    ],
+    rate_limit: {
+      request_max_limit: 600,
+      request_reset_duration: "5m",
+      request_current_usage: 3,
+    },
+  });
+
+  it("copies the governance a create response carries, counters included", async () => {
+    // The bug this covers: `toKey` copied the identity fields only, so `keyUsage`
+    // read absent `budgets`/`provider_configs` and the mint reported a caller
+    // with budgets as `budgets: []`. The route does send them — the create
+    // handler hydrates the row from the model configs it just wrote — so the
+    // adapter dropping them is the whole failure.
+    const created = createdKeyAsTheGatewayReportsIt();
+    reset([{ status: 200, body: { message: "ok", virtual_key: created } }]);
+    const key = await gateway().create({ name: "jeff@goodparty.org" });
+
+    assert.deepEqual(key.budgets, created.budgets);
+    assert.deepEqual(key.provider_configs, created.provider_configs);
+    assert.deepEqual(key.rate_limit, created.rate_limit);
+    assert.equal(key.calendar_aligned, true);
+    // Still only a key and its governance: no more of the record than this.
+    assert.deepEqual(Object.keys(key).sort(), [
+      "budgets",
+      "calendar_aligned",
+      "delete_after_expire",
+      "description",
+      "expires_at",
+      "id",
+      "is_active",
+      "name",
+      "provider_configs",
+      "rate_limit",
+      "value",
+    ]);
+  });
+
+  it("copies the governance a list response carries too", async () => {
+    const stored = createdKeyAsTheGatewayReportsIt();
+    reset([
+      { status: 200, body: { virtual_keys: [stored], count: 1, total_count: 1 } },
+    ]);
+    const page = await gateway().list({ search: "jeff@goodparty.org", limit: 1, offset: 0 });
+    assert.deepEqual(page.keys[0].budgets, stored.budgets);
+    assert.deepEqual(page.keys[0].provider_configs, stored.provider_configs);
+    assert.equal(page.keys[0].calendar_aligned, true);
+  });
+
+  it("leaves a governance field the response does not carry absent rather than defaulting it", async () => {
+    // `calendar_aligned` present-or-absent is what tells `gp-bifrost-key
+    // --usage` a genuinely uncapped key from one whose governance could not be
+    // read (gp-pi#147), so the adapter must not invent the field. The real
+    // gateway always sends it; this is the shape a response it does not send it
+    // on looks like, and the consumer needs to see that honestly.
+    reset([
+      {
+        status: 200,
+        body: {
+          virtual_keys: [{ id: "vk-2", name: "x@goodparty.org", value: "sk-bf-2" }],
+          count: 1,
+          total_count: 1,
+        },
+      },
+    ]);
+    const key = (await gateway().list({ search: "x@goodparty.org", limit: 1, offset: 0 }))
+      .keys[0];
+    assert.equal("calendar_aligned" in key, false);
+    assert.equal(key.budgets, undefined);
+    assert.equal(key.rate_limit, undefined);
+  });
+
+  it("carries calendar_aligned and empty budgets for a key that is genuinely uncapped", async () => {
+    reset([
+      {
+        status: 200,
+        body: {
+          message: "ok",
+          virtual_key: {
+            id: "vk-3",
+            name: "jeff@goodparty.org",
+            value: "sk-bf-3",
+            is_active: true,
+            calendar_aligned: true,
+            budgets: [],
+            provider_configs: [
+              { id: 9, provider: "bedrock", allowed_models: ["m"], allow_all_keys: true, keys: [] },
+            ],
+          },
+        },
+      },
+    ]);
+    const key = await gateway().create({ name: "jeff@goodparty.org" });
+    assert.deepEqual(key.budgets, []);
+    assert.equal(key.calendar_aligned, true);
+  });
+
   it("updates with a PUT to the key's own path", async () => {
     reset([
       {

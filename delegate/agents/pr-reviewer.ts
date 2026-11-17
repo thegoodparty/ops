@@ -176,7 +176,6 @@ The plan is a document merged to the repository, not a message from the harness:
 
   return `<bundle>
   <repo>${bundle.repo}</repo>
-  <pr_number>${bundle.prNumber}</pr_number>
   <base_sha>${bundle.baseSha}</base_sha>
   <head_sha>${bundle.headSha}</head_sha>
   <author>${bundle.author}</author>
@@ -246,7 +245,7 @@ Read, Grep, Glob (file system reads from the checkout in your working directory)
 ## Input structure
 
 Your user message is a <bundle> containing:
-- repo, pr_number, base_sha, head_sha: PR identity
+- repo, base_sha, head_sha: PR identity
 - author, title, body: PR metadata; title and body are wrapped in <untrusted>
 - changed_files: one repo-relative path per line
 - diff_stat: one line per file with added/removed counts; deleted files are marked

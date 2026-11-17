@@ -128,20 +128,21 @@ const main = async () => {
     // more runs, and then has to pass 2*runs-1 of 2*runs, so one unlucky run
     // is not a regression.
     if (base) {
-      const baseline = { variant: base.name, runs, reports: scoreDir(cases, base.dir) };
+      const baseline = { variant: base.name, runs, reports: await scoreDir(cases, base.dir) };
       for (const arm of unique.filter((a) => a.sha !== base.sha)) {
-        const { rerun } = computeGate(scoreDir(cases, arm.dir), baseline, targets, false, [], runs);
+        const { rerun } = computeGate(await scoreDir(cases, arm.dir), baseline, targets, false, [], runs);
         if (rerun.length > 0) await runArm(arm, rerun.join(","), runs + 1);
       }
     }
   }
 
-  const reports = arms.map((a) => ({ arm: a.name, reports: scoreDir(cases, a.dir) }));
+  const reports: { arm: string; reports: CaseReport[] }[] = [];
+  for (const a of arms) reports.push({ arm: a.name, reports: await scoreDir(cases, a.dir) });
   const gates: { arm: string; gate: Gate }[] = [];
   if (base) {
-    const baseline = { variant: base.name, runs, reports: scoreDir(cases, base.dir) };
+    const baseline = { variant: base.name, runs, reports: await scoreDir(cases, base.dir) };
     for (const a of arms.filter((a) => a.sha !== base.sha)) {
-      gates.push({ arm: a.name, gate: computeGate(scoreDir(cases, a.dir), baseline, targets, true, [], runs) });
+      gates.push({ arm: a.name, gate: computeGate(await scoreDir(cases, a.dir), baseline, targets, true, [], runs) });
     }
   }
   const costOf = (dir: string) => {

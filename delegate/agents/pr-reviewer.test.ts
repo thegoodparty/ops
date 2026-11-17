@@ -29,6 +29,15 @@ const baseBundle: Bundle = {
 };
 
 describe("buildReviewPrompt", () => {
+  it("names the repo and both shas but not the PR number", () => {
+    const prompt = buildReviewPrompt(baseBundle);
+    assert.ok(prompt.includes("<repo>thegoodparty/gp-api</repo>"));
+    assert.ok(prompt.includes("<base_sha>aabbcc</base_sha>"));
+    assert.ok(prompt.includes("<head_sha>ddeeff</head_sha>"));
+    assert.doesNotMatch(prompt, /pr_number|42/);
+    assert.doesNotMatch(prReviewer.systemPrompt, /pr_number/);
+  });
+
   it("wraps title and body in <untrusted> tags", () => {
     const prompt = buildReviewPrompt(baseBundle);
     assert.ok(

@@ -691,6 +691,8 @@ jobs:
 
       - name: Gate, first pass
         id: gate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           npm run -s review:expect -- \
             --mode gate \
@@ -833,6 +835,8 @@ jobs:
           fi
 
       - name: Score against main's expectations
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           rm -f ./eval-expected/gate.json
           npm run -s review:expect -- \
@@ -849,6 +853,8 @@ jobs:
       - name: Gate, final pass
         id: gate
         continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           npm run -s review:expect -- \
             --mode gate \
