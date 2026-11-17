@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { z } from "zod";
 import { GATING_FLAG_REASON, isGatedRepo, type GatingFlag } from "../gating";
-import { BundleSchema, FindingSchema, ReviewRecordSchema } from "../schema";
-import type { Bundle, ReviewRecord } from "../schema";
+import { BundleSchema } from "../schema";
+import type { Bundle, Finding, ReviewRecord } from "../schema";
+import { BlockJudgmentSchema, defaultBlockJudge } from "./block-judge";
+import type { BlockJudge, BlockJudgment } from "./block-judge";
 import { isCacheable } from "./cache";
 import { replayCase } from "./replay";
 import type { CheckoutFn, Result } from "./replay";
@@ -14,7 +16,6 @@ import type { CheckoutFn, Result } from "./replay";
 // alone. The pairwise suite asks "better or worse than main"; this one asks
 // "did it block what must be blocked, and approve what must be approved".
 
-const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
 const DEFAULT_MANIFEST = join(__dirname, "expected", "manifest.json");
 
 const ConsistencySchema = z.enum(["consistent", "inconsistent", "unclear"]);
@@ -28,8 +29,10 @@ const GateNameSchema = z.custom<GatingFlag>(
 );
 
 // One expectation type per case. `approve`, `block` and `flag` score a merge
-// outcome; `consistency` scores the model's own `planConsistency` answer, and
-// is kept for cases that run before the gate exists (step 1 of
+// outcome; a block passes only when a judge reads one of its findings as the
+// case's `reason`, so a block on a different real problem is a miss.
+// `consistency` scores the model's own `planConsistency` answer, and is kept
+// for cases that run before the gate exists (step 1 of
 // `docs/plan-gated-merges.md`). `flag` is the third outcome: the review event
 // is a comment and the named gate fired. An outcome case may also carry
 // `consistency` as a diagnostic: when it does, the model's answer has to be
@@ -42,8 +45,7 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
   }),
   z.strictObject({
     verdict: z.literal("block"),
-    paths: z.array(z.string().min(1)).min(1),
-    categories: z.array(FindingSchema.shape.category).optional(),
+    reason: z.string().trim().min(1),
     consistency: ConsistencySchema.optional(),
   }),
   z.strictObject({
@@ -65,24 +67,21 @@ export const SplitSchema = z.enum(["tune", "holdout"]);
 export const SourceSchema = z.enum(["simulated", "production-caught", "production-missed", "refuted"]);
 export const KindSchema = z.enum(["bug", "false-finding", "scale", "architecture"]);
 
-// A case is either a recorded production run (key, in S3) or a simulated PR
-// (bundle, a file next to the manifest) whose head commit is rebuilt locally
-// by applying its diff to the base.
-const ExpectedCaseSchema = z
-  .object({
-    id: z.string().regex(/^[a-z0-9-]+$/),
-    key: z.string().startsWith("reviews/").endsWith(".json").optional(),
-    bundle: z.string().endsWith(".json").optional(),
-    expect: ExpectSchema,
-    tests: z.string().min(1),
-    split: SplitSchema,
-    source: SourceSchema,
-    kind: KindSchema,
-    // Why main's own result on this case is noise, not a bar. Set, the gate
-    // still scores and reports it but never counts it as a regression.
-    flakyOnMain: z.string().min(1).optional(),
-  })
-  .refine((c) => Boolean(c.key) !== Boolean(c.bundle), "set exactly one of key or bundle");
+// A case is a bundle next to the manifest. A simulated PR's head commit is
+// rebuilt locally by applying its diff to the base; any other source is a real
+// PR whose head GitHub still serves.
+const ExpectedCaseSchema = z.strictObject({
+  id: z.string().regex(/^[a-z0-9-]+$/),
+  bundle: z.string().endsWith(".json"),
+  expect: ExpectSchema,
+  tests: z.string().min(1),
+  split: SplitSchema,
+  source: SourceSchema,
+  kind: KindSchema,
+  // Why main's own result on this case is noise, not a bar. Set, the gate
+  // still scores and reports it but never counts it as a regression.
+  flakyOnMain: z.string().min(1).optional(),
+});
 export type ExpectedCase = z.infer<typeof ExpectedCaseSchema>;
 
 export const ManifestSchema = z
@@ -91,6 +90,11 @@ export const ManifestSchema = z
 
 export const readManifest = (path: string): ExpectedCase[] =>
   ManifestSchema.parse(JSON.parse(readFileSync(path, "utf-8")));
+
+// expected/parked.json holds cases taken out of the suite, each with why: a
+// case no change to the reviewer's prompts can pass. Nothing replays or
+// scores them; moving one back to the manifest restores it.
+export const ParkedSchema = z.array(z.object({ reason: z.string().min(1), case: ExpectedCaseSchema }));
 
 export const selectCases = (
   all: ExpectedCase[],
@@ -132,10 +136,51 @@ export const commitSyntheticHead = (bundle: Bundle, repoDir: string): void => {
   }
 };
 
-const checkoutFor = (synthetic: Set<string>): CheckoutFn => (bundle, repoDir) => {
+// A local run replays many cases against one repo, so with a mirror each
+// checkout is a `--shared` clone of a bare mirror instead of a fresh clone
+// from GitHub. The mirror only gains objects; a sha already in it is never
+// fetched again.
+export const mirrorPath = (mirrorDir: string, repo: string): string =>
+  join(mirrorDir, `${repo.replace("/", "__")}.git`);
+
+export const ensureInMirror = (mirrorDir: string, repo: string, shas: string[]): string => {
+  const mirror = mirrorPath(mirrorDir, repo);
+  if (!existsSync(mirror)) {
+    // Cloned aside and renamed into place, so a process racing on a fresh
+    // mirror dir never sees a half-cloned repo; the loser's copy is dropped.
+    mkdirSync(mirrorDir, { recursive: true });
+    const tmp = `${mirror}.tmp-${process.pid}`;
+    rmSync(tmp, { recursive: true, force: true });
+    execFileSync("gh", ["repo", "clone", repo, tmp, "--", "--bare"], { stdio: "pipe", timeout: 1_800_000 });
+    try {
+      renameSync(tmp, mirror);
+    } catch {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  for (const sha of shas) {
+    try {
+      execFileSync("git", ["cat-file", "-e", `${sha}^{commit}`], { cwd: mirror, stdio: "ignore" });
+    } catch {
+      execFileSync("git", ["fetch", "-q", "origin", sha], { cwd: mirror, stdio: "pipe", timeout: 600_000 });
+    }
+  }
+  return mirror;
+};
+
+const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
   const git = (args: string[], timeout = 120_000) =>
     execFileSync("git", args, { cwd: repoDir, stdio: "pipe", timeout });
   rmSync(repoDir, { recursive: true, force: true });
+  if (mirrorDir) {
+    const sha = synthetic.has(bundle.headSha) ? bundle.baseSha : bundle.headSha;
+    const mirror = ensureInMirror(mirrorDir, bundle.repo, [sha]);
+    execFileSync("git", ["clone", "-q", "--shared", "--no-checkout", mirror, repoDir], { stdio: "pipe", timeout: 300_000 });
+    git(["checkout", "-q", sha], 120_000);
+    if (synthetic.has(bundle.headSha)) commitSyntheticHead(bundle, repoDir);
+    git(["submodule", "update", "--init", "--recursive"]);
+    return;
+  }
   execFileSync(
     "gh",
     ["repo", "clone", bundle.repo, repoDir, "--", "--depth=1", "--no-checkout"],
@@ -149,31 +194,13 @@ const checkoutFor = (synthetic: Set<string>): CheckoutFn => (bundle, repoDir) =>
     git(["fetch", "--depth=50", "origin", bundle.headSha]);
     git(["checkout", bundle.headSha], 60_000);
   }
-  git(["submodule", "update", "--init", "--recursive"]);
 };
 
-const readBody = async (body: unknown): Promise<string> => {
-  const chunks: Buffer[] = [];
-  for await (const chunk of body as AsyncIterable<Buffer>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-};
-
-// replayCase only reads runId and bundle, so a simulated case needs no more
-// than that. runId is set to the case id so results are named after the case.
-const loadRecord = async (
-  c: ExpectedCase,
-  manifestPath: string,
-  client: S3Client,
-): Promise<ReviewRecord> => {
-  if (c.bundle) {
-    const bundle = readBundleFile(manifestPath, c.bundle);
-    return { runId: c.id, bundle } as ReviewRecord;
-  }
-  const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: c.key }));
-  const record = ReviewRecordSchema.parse(JSON.parse(await readBody(res.Body)));
-  return { ...record, runId: c.id };
+// replayCase only reads runId and bundle, so a case needs no more than that.
+// runId is set to the case id so results are named after the case.
+const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
+  const bundle = readBundleFile(manifestPath, c.bundle);
+  return { runId: c.id, bundle } as ReviewRecord;
 };
 
 export interface RunScore {
@@ -188,7 +215,18 @@ const describeAnswer = (answer: string | undefined, expected: string): string =>
     ? `planConsistency: ${answer}`
     : `planConsistency: ${answer ?? "absent"} (expected ${expected})`;
 
-export const scoreRun = (expect: Expect, result: Result): RunScore => {
+// The findings of a run that blocked: a complete review with at least one
+// finding, whose gate, in a gated repo, did not approve. Undefined otherwise.
+const blockingFindings = (result: Result): Finding[] | undefined => {
+  if (result.error || result.output?.status !== "complete") return undefined;
+  if (result.output.findings.length === 0 || result.gating?.verdict === "approve") return undefined;
+  return result.output.findings;
+};
+
+// A block case's run is scored with the judge's answer on whether a finding is
+// the case's reason. Without one (the replay's own progress line) a block is
+// reported as not judged, and does not pass.
+export const scoreRun = (expect: Expect, result: Result, judgment?: BlockJudgment): RunScore => {
   if (result.error || !result.output || result.output.status !== "complete") {
     const reason = result.error ?? (result.output?.status === "failed" ? result.output.reason : "no output");
     return { pass: false, outcome: `no review: ${reason.slice(0, 200)}`, errored: true };
@@ -234,15 +272,16 @@ export const scoreRun = (expect: Expect, result: Result): RunScore => {
           ? { pass: true, outcome: "approved" }
           : { pass: false, outcome: `blocked: ${listed}` };
     }
-  } else if (findings.length === 0) {
+  } else if (!blockingFindings(result)) {
     outcome = { pass: false, outcome: "approved" };
+  } else if (!judgment) {
+    outcome = { pass: false, outcome: `blocked, reason not judged: ${listed}` };
   } else {
-    const hit = findings.some(
-      (f) =>
-        expect.paths.includes(f.path) &&
-        (!expect.categories || expect.categories.includes(f.category)),
-    );
-    outcome = { pass: hit, outcome: `blocked${hit ? "" : " on the wrong thing"}: ${listed}` };
+    // Which reviewer raised the finding, its file and the category it filed
+    // it under are the reviewer's own business; what it found is not.
+    outcome = judgment.match
+      ? { pass: true, outcome: `blocked for the reason: ${judgment.why}` }
+      : { pass: false, outcome: `blocked on something else: ${judgment.why} (${listed})` };
   }
 
   // A diagnostic never changes what the outcome means, so the outcome stays
@@ -265,8 +304,7 @@ const describeExpect = (e: Expect): string => {
   const diagnostic = e.consistency ? ` (diagnostic: planConsistency: ${e.consistency})` : "";
   if (e.verdict === "approve") return `approve${diagnostic}`;
   if (e.verdict === "flag") return `flag \`${e.reason}\`${diagnostic}`;
-  const files = e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ");
-  return `block${e.categories ? ` (${e.categories.join("/")})` : ""} in ${files}${diagnostic}`;
+  return `block: ${e.reason.replace(/\|/g, "/")}${diagnostic}`;
 };
 
 export interface Baseline {
@@ -284,7 +322,7 @@ const baselineCounts = (b: Baseline, r: CaseReport | undefined) => {
     runs: b.runs,
     completed: done.length,
     runsPassed: done.filter((s) => s.pass).length,
-    unfinished: b.runs - done.length,
+    unfinished: Math.max(0, b.runs - done.length),
   };
 };
 
@@ -303,6 +341,9 @@ export interface GateCase {
   split: Split;
   mainPassed: number;
   mainCompleted: number;
+  // Main's runs of the same reviewer from earlier checks.
+  earlierPassed: number;
+  earlierCompleted: number;
   // Passed on some main runs and failed on others: main's own flake.
   flaky: boolean;
   candPassed: number;
@@ -320,6 +361,8 @@ export interface Gate {
   costRatio: number | null;
   costOver: boolean;
   pass: boolean;
+  // Completed main runs, here and earlier, a case needs before it can regress.
+  minMainRuns: number;
   cases: GateCase[];
 }
 
@@ -328,16 +371,80 @@ const avgCost = (reports: CaseReport[]): number | null => {
   return known.length === 0 ? null : known.reduce((a, b) => a + b, 0) / known.length;
 };
 
-// A case main passes on every run must not regress. One that drops below
-// 3/3 gets `runs` more runs and has to reach 2*runs-1 of 2*runs, so a single
-// unlucky run is not a regression. A case marked `flakyOnMain` cannot regress. A run that errored is a failed run, and
-// with `final` a rerun that never happened is a failed rerun, so infra noise
-// cannot pass as an improvement. Each target must pass every run.
+// Whether main's record on a case is a bar: at least `runs` completed runs in
+// this baseline, every one of them and of `earlier` passed, and `minMainRuns`
+// completed in all. A case main passes 9 times in 10 still passes 3 runs in a
+// row about 73% of the time, so 3/3 alone is often luck.
+const mainHolds = (c: ExpectedCase, main: { runsPassed: number; completed: number }, earlier: RunScore[], runs: number, minMainRuns: number): boolean =>
+  !c.flakyOnMain &&
+  main.completed >= runs &&
+  main.runsPassed === main.completed &&
+  earlier.every((s) => s.pass) &&
+  main.completed + earlier.length >= minMainRuns;
+
+const earlierRuns = (history: CaseReport[], id: string): RunScore[] =>
+  (history.find((h) => h.c.id === id)?.scores ?? []).filter((s) => !s.errored);
+
+// Cases main passed on every run so far whose record is still shorter than
+// `minMainRuns`: replaying main `runs` more times on these is what lets the
+// gate hold them. A case main failed once is already not held, so it is left out.
+export const mainRunsShort = (baseline: Baseline, history: CaseReport[], minMainRuns: number): string[] =>
+  baseline.reports
+    .filter((r) => {
+      const main = baselineCounts(baseline, r);
+      const earlier = earlierRuns(history, r.c.id);
+      return (
+        main.completed + earlier.length < minMainRuns &&
+        mainHolds(r.c, main, earlier, baseline.runs, 0)
+      );
+    })
+    .map((r) => r.c.id);
+
+// Main's baseline as the workflow sees it on disk, after both of its replay
+// passes. A run with no result file is a gap a re-dispatch can still replay.
+// A run that still errored, or a review that came back "failed", is never
+// cached: it recurs on every dispatch, and the gate already refuses to hold a
+// case main did not complete on every run, so it is not a gap.
+export interface BaselineGaps {
+  total: number;
+  missing: number;
+  errored: number;
+  gaveUp: number;
+}
+
+export const baselineGaps = (cases: ExpectedCase[], dir: string, runs: number): BaselineGaps => {
+  const gaps: BaselineGaps = { total: cases.length * runs, missing: 0, errored: 0, gaveUp: 0 };
+  for (const c of cases) {
+    for (let n = 1; n <= runs; n++) {
+      let r: Result;
+      try {
+        r = JSON.parse(readFileSync(join(dir, c.id, `run-${n}.json`), "utf-8")) as Result;
+      } catch {
+        gaps.missing++;
+        continue;
+      }
+      if (!r.error && r.output?.status === "failed") gaps.gaveUp++;
+      else if (!isCacheable(r)) gaps.errored++;
+    }
+  }
+  return gaps;
+};
+
+// A case main passes on every run, over at least `minMainRuns` runs, must not
+// regress. One that drops below 3/3 gets `runs` more runs and has to reach
+// 2*runs-1 of 2*runs, so a single unlucky run is not a regression. A case
+// marked `flakyOnMain` cannot regress, and neither can one that main failed on
+// any run, here or in `history` (main's earlier runs of the same reviewer). A
+// run that errored is a failed run, and with `final` a rerun that never
+// happened is a failed rerun, so infra noise cannot pass as an improvement.
+// Each target must pass every run.
 export const computeGate = (
   reports: CaseReport[],
   baseline: Baseline,
   targets: string[],
   final: boolean,
+  history: CaseReport[] = [],
+  minMainRuns: number = baseline.runs,
 ): Gate => {
   const runs = baseline.runs;
   const counts = reports.map((r) => baselineCounts(baseline, baseline.reports.find((b) => b.c.id === r.c.id)));
@@ -346,10 +453,14 @@ export const computeGate = (
   }
   const cases = reports.map((r, i): GateCase => {
     const main = counts[i];
+    const earlier = earlierRuns(history, r.c.id);
+    const earlierPassed = earlier.filter((s) => s.pass).length;
+    const passed = main.runsPassed + earlierPassed;
+    const completed = main.completed + earlier.length;
     const candPassed = r.scores.filter((s) => s.pass).length;
     const candRuns = r.scores.length;
     let outcome: GateCase["outcome"];
-    if (r.c.flakyOnMain || main.runsPassed !== runs || main.completed !== runs) outcome = "not-held";
+    if (!mainHolds(r.c, main, earlier, runs, minMainRuns)) outcome = "not-held";
     else if (candRuns > runs) outcome = candPassed >= 2 * runs - 1 ? "pass" : "regression";
     else if (candPassed >= runs) outcome = "pass";
     else outcome = final ? "regression" : "rerun";
@@ -358,7 +469,9 @@ export const computeGate = (
       split: r.c.split,
       mainPassed: main.runsPassed,
       mainCompleted: main.completed,
-      flaky: Boolean(r.c.flakyOnMain) || (main.runsPassed > 0 && main.runsPassed < main.completed),
+      earlierPassed,
+      earlierCompleted: earlier.length,
+      flaky: Boolean(r.c.flakyOnMain) || (passed > 0 && passed < completed),
       candPassed,
       candRuns,
       outcome,
@@ -381,6 +494,7 @@ export const computeGate = (
     costRatio,
     costOver: costRatio !== null && costRatio > COST_LIMIT,
     pass: regressions.length === 0 && rerun.length === 0 && targetsMissed.length === 0,
+    minMainRuns,
     cases,
   };
 };
@@ -411,7 +525,7 @@ const OUTCOME_TEXT: Record<GateCase["outcome"], string> = {
   pass: "pass",
   rerun: "needs 3 more runs",
   regression: "regression",
-  "not-held": "main does not pass this 3/3",
+  "not-held": "main does not pass this every run, or has too few runs",
 };
 
 // With a gate, holdout cases appear only as an aggregate: no ids, expectations
@@ -431,7 +545,7 @@ export const renderExpectReport = (
   const holdout = gate?.cases.filter((c) => c.split === "holdout") ?? [];
   const gateLines = gate
     ? [
-        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes 3/3 may regress; one that drops gets 3 more runs and needs 5 of 6.`,
+        `**Gate: ${gate.pass ? "pass" : gate.rerun.length > 0 ? "pending reruns" : "fail"}** on \`${variant}\`. No case main passes on every run, here and in earlier runs of the same reviewer, may regress${gate.minMainRuns > (baseline?.runs ?? gate.minMainRuns) ? ` once main has ${gate.minMainRuns} runs of it` : ""}; one that drops gets 3 more runs and needs 5 of 6.`,
         "",
         `Holdout: passed ${holdout.filter((c) => c.candRuns > 0 && c.candPassed === c.candRuns).length} of ${holdout.length}, regressions: ${holdout.filter((c) => c.outcome === "regression").length}.`,
         "",
@@ -450,7 +564,8 @@ export const renderExpectReport = (
         "| --- | --- | --- | --- | --- | --- |",
         ...reports.map((r) => {
           const g = gate.cases.find((c) => c.id === r.c.id)!;
-          const main = describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id));
+          const now = describeBaseline(baseline, baseline.reports.find((b) => b.c.id === r.c.id));
+          const main = g.earlierCompleted > 0 ? `${now}, earlier ${g.earlierPassed}/${g.earlierCompleted}` : now;
           return `| ${r.c.id} | ${describeExpect(r.c.expect)} | ${g.candPassed}/${g.candRuns} | ${main}${g.flaky ? " (flaky)" : ""} | ${OUTCOME_TEXT[g.outcome]} | ${money(r.costs)} |`;
         }),
       ]
@@ -497,16 +612,82 @@ const parseFlags = (args: string[]): Record<string, string> => {
   return flags;
 };
 
+// A block case's judgment is cached next to its run, keyed by the reason and
+// the findings, so score, gate, arms and reruns ask the judge once per run.
+const judgeRun = async (c: ExpectedCase, file: string, r: Result, judge: BlockJudge): Promise<BlockJudgment | undefined> => {
+  const findings = blockingFindings(r);
+  if (c.expect.verdict !== "block" || !findings) return undefined;
+  const key = createHash("sha256").update(JSON.stringify([c.expect.reason, findings])).digest("hex");
+  const cache = file.replace(/\.json$/, ".judge.json");
+  try {
+    const cached = JSON.parse(readFileSync(cache, "utf-8")) as { key?: unknown };
+    if (cached.key === key) return BlockJudgmentSchema.parse(cached);
+  } catch {}
+  const judgment = await judge(c.expect.reason, findings);
+  writeFileSync(cache, JSON.stringify({ key, ...judgment }, null, 2));
+  return judgment;
+};
+
+const JUDGE_CONCURRENCY = 8;
+
+const scoreRuns = async (
+  cases: ExpectedCase[],
+  filesOf: (c: ExpectedCase) => { file: string; r: Result }[],
+  judge: BlockJudge,
+): Promise<CaseReport[]> => {
+  const runs = cases.map((c) => ({ c, runs: filesOf(c) }));
+  const tasks = runs.flatMap(({ c, runs: rs }) => rs.map((run) => ({ c, ...run })));
+  const judgments = new Map<string, BlockJudgment | undefined>();
+  let next = 0;
+  const worker = async () => {
+    while (next < tasks.length) {
+      const { c, file, r } = tasks[next++];
+      judgments.set(file, await judgeRun(c, file, r, judge));
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(JUDGE_CONCURRENCY, tasks.length) }, worker));
+  return runs.map(({ c, runs: rs }) => ({
+    c,
+    scores: rs.map(({ file, r }) => scoreRun(c.expect, r, judgments.get(file))),
+    costs: rs.map(({ r }) => r.costUsd),
+  }));
+};
+
+const runFiles = (dir: string): { file: string; r: Result }[] =>
+  existsSync(dir)
+    ? readdirSync(dir)
+        .filter((f) => /^run-\d+\.json$/.test(f))
+        .sort()
+        .map((f) => ({ file: join(dir, f), r: JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result }))
+    : [];
+
 // Scores whatever run-<n>.json files a replay left under <out>/<case>/. A case
 // with no results fails, so a replay that skipped or dropped a case can't
 // pass by omission.
-export const scoreDir = (cases: ExpectedCase[], out: string): CaseReport[] =>
-  cases.map((c) => {
-    const dir = join(out, c.id);
-    const files = existsSync(dir) ? readdirSync(dir).filter((f) => /^run-\d+\.json$/.test(f)).sort() : [];
-    const rs = files.map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")) as Result);
-    return { c, scores: rs.map((r) => scoreRun(c.expect, r)), costs: rs.map((r) => r.costUsd) };
-  });
+export const scoreDir = (cases: ExpectedCase[], out: string, judge: BlockJudge = defaultBlockJudge()): Promise<CaseReport[]> =>
+  scoreRuns(cases, (c) => runFiles(join(out, c.id)), judge);
+
+// Main's earlier runs of the same reviewer, kept only for the PR head the
+// baseline replayed: the history spans every version of the case list, and an
+// earlier answer to an edited case says nothing about this one. A run cached
+// before the harness recorded a gating verdict would score as a miss, so it is
+// dropped wherever the baseline has one.
+export const scoreHistory = (
+  cases: ExpectedCase[],
+  dir: string,
+  base: string,
+  judge: BlockJudge = defaultBlockJudge(),
+): Promise<CaseReport[]> =>
+  scoreRuns(
+    cases,
+    (c) => {
+      const baseRuns = runFiles(join(base, c.id)).map(({ r }) => r);
+      const heads = new Set(baseRuns.map((r) => r.headSha));
+      const gated = baseRuns.some((r) => r.gating !== undefined);
+      return runFiles(join(dir, c.id)).filter(({ r }) => heads.has(r.headSha) && (!gated || r.gating !== undefined));
+    },
+    judge,
+  );
 
 // --mode replay runs the agent and writes results; --mode score reads them
 // and writes the report. CI runs replay from the PR head and score from main,
@@ -530,13 +711,44 @@ const main = async () => {
     throw new Error(`no case matches${flags.case ? ` --case ${flags.case}` : ""}${flags.split ? ` --split ${flags.split}` : ""}`);
   }
 
+  const minMainRuns = Number(flags["min-main-runs"] ?? runs);
+
+  // Writes the ids of cases main needs more runs on to --ids-out and prints
+  // only a count: in gate mode the ids include holdout cases, and logs are readable.
+  if (mode === "main-short") {
+    if (!flags.base || !flags["ids-out"]) throw new Error("--mode main-short needs --base and --ids-out");
+    const baseline = { variant: "main", runs, reports: await scoreDir(cases, resolve(flags.base)) };
+    const history = flags.history ? await scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const ids = mainRunsShort(baseline, history, minMainRuns);
+    writeFileSync(resolve(flags["ids-out"]), ids.join(","));
+    console.log(`${ids.length} case(s) need more main runs to reach ${minMainRuns}`);
+    return;
+  }
+
+  // The baseline as the workflow's completeness step reads it, after both of
+  // its replay passes. Only a missing result fails the step; an errored run or
+  // a review that came back failed leaves its case not held and the run going.
+  // Prints counts, never ids, since gate mode includes holdout cases.
+  if (mode === "baseline-check") {
+    if (!flags.base) throw new Error("--mode baseline-check needs --base, main's baseline results");
+    const gaps = baselineGaps(cases, resolve(flags.base), runs);
+    console.log(`${gaps.total} main runs checked: ${gaps.errored} still errored, ${gaps.gaveUp} came back failed.`);
+    if (gaps.errored + gaps.gaveUp > 0) console.log("Those cases are not held, so the run goes on.");
+    if (gaps.missing) {
+      console.log(`::error::${gaps.missing} of ${gaps.total} main baseline runs have no result. Re-dispatch to replay only those.`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   if (mode === "gate") {
     if (!flags.base) throw new Error("--mode gate needs --base, main's baseline results");
-    const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.base)) };
-    const reports = scoreDir(cases, out);
+    const baseline = { variant: flags["baseline-variant"] ?? "main", runs, reports: await scoreDir(cases, resolve(flags.base)) };
+    const reports = await scoreDir(cases, out);
     const final = flags.final === "true";
     const targets = flags.targets ? flags.targets.split(",") : [];
-    const gate = computeGate(reports, baseline, targets, final);
+    const history = flags.history ? await scoreHistory(cases, resolve(flags.history), resolve(flags.base)) : [];
+    const gate = computeGate(reports, baseline, targets, final, history, minMainRuns);
     writeFileSync(join(out, "gate.json"), JSON.stringify(gate, null, 2));
     const report = renderExpectReport(reports, variant ?? "unknown", baseline, gate);
     writeFileSync(join(out, "report.md"), report);
@@ -547,13 +759,14 @@ const main = async () => {
   }
 
   if (mode === "replay" || mode === "all") {
-    const client = new S3Client({});
     const records = new Map<string, ReviewRecord>();
-    for (const c of cases) records.set(c.id, await loadRecord(c, manifestPath, client));
+    for (const c of cases) records.set(c.id, loadRecord(c, manifestPath));
+    // A bundle case is simulated unless its source says it is a real PR,
+    // whose head commit GitHub still serves.
     const synthetic = new Set(
-      cases.filter((c) => c.bundle).map((c) => records.get(c.id)!.bundle.headSha),
+      cases.filter((c) => c.source === "simulated").map((c) => records.get(c.id)!.bundle.headSha),
     );
-    const checkout = checkoutFor(synthetic);
+    const checkout = checkoutFor(synthetic, flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined);
 
     const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: fromRun + i })));
     let next = 0;
@@ -581,9 +794,9 @@ const main = async () => {
 
   if (mode === "score" || mode === "all") {
     const baseline = flags.baseline
-      ? { variant: flags["baseline-variant"] ?? "main", runs, reports: scoreDir(cases, resolve(flags.baseline)) }
+      ? { variant: flags["baseline-variant"] ?? "main", runs, reports: await scoreDir(cases, resolve(flags.baseline)) }
       : undefined;
-    const reports = scoreDir(cases, out);
+    const reports = await scoreDir(cases, out);
     const report = renderExpectReport(reports, variant ?? "unknown", baseline);
     writeFileSync(join(out, "report.md"), report);
     writeFileSync(join(out, "report.json"), renderExpectJson(reports, variant ?? "unknown", baseline));

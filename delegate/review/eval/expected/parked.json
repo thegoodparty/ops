@@ -1,0 +1,17 @@
+[
+  {
+    "reason": "Passing needs the alerting service's own behavior for a no-data result during a keep-firing hold. That is in neither the replayed checkout nor its packages, so the deep-reviewer cannot confirm the bug and no prompt change can fix that. Parked 2026-11-11 (ENG-11621) until the reviewer has a source for vendor behavior; move it back to manifest.json then.",
+    "case": {
+      "id": "omni-2656-keep-firing-hold",
+      "bundle": "omni-2656-keep-firing-hold.bundle.json",
+      "expect": {
+        "verdict": "block",
+        "reason": "The event alert rules rely on keepFiringFor to hold an incident open, but an idle count_over_time returns no series and noDataState OK resolves the alert, so bursts page repeatedly."
+      },
+      "tests": "Event rules rely on keepFiringFor to hold an incident open, but an idle count_over_time returns no series and noDataState OK resolves it, so bursts page repeatedly. Production approved; the bug was confirmed and fixed in 57cab94c1.",
+      "split": "tune",
+      "source": "production-missed",
+      "kind": "bug"
+    }
+  }
+]

@@ -52,9 +52,10 @@ import {
  *
  * One rule this file deliberately does not invent: no assertion on the
  * *content* of the overrides document beyond validity. It is empty of people
- * today on purpose — a budget chosen before there is usage data is the guess
- * #404 was right to refuse — and a test that pinned `jeff@goodparty.org` would
- * make adding the first real override a two-file change for no reason.
+ * today on purpose — the fleet's numbers are in the template (the Bedrock cap,
+ * decision 18 of `docs/bifrost-reconciler.md`) and an entry here is the
+ * exception — and a test that pinned `jeff@goodparty.org` would make adding the
+ * first real override a two-file change for no reason.
  */
 
 const TEMPLATE = JSON.parse(readVkMintTemplate()) as {
@@ -122,6 +123,41 @@ describe("the merge, field by field (decision 9)", () => {
     const absent = composeGovernanceDesiredState(TEMPLATE, {});
     assert.deepEqual(inherited, absent);
     assert.deepEqual(inherited.provider_configs, TEMPLATE_PROVIDERS);
+  });
+
+  it("carries a provider entry's budget through the merge, inherited and overridden", () => {
+    // Decision 18: a per-provider cap is part of a provider entry, so it is
+    // inherited with the entry and replaced with it — there is no separate
+    // "budget" field at the top level to merge. Both directions, because the
+    // consequence of the second is real and worth pinning: an override that
+    // restates the provider list without a budget drops the template's cap.
+    const withOverride = composeGovernanceDesiredState(TEMPLATE, {
+      budgets: [{ max_limit: 250, reset_duration: "1M" }],
+    });
+    assert.deepEqual(
+      withOverride.provider_configs,
+      TEMPLATE_PROVIDERS,
+      "a key-level budget must not disturb the entry that carries the cap",
+    );
+
+    const restated = composeGovernanceDesiredState(TEMPLATE, {
+      provider_configs: [
+        {
+          provider: "bedrock",
+          allowed_models: ["global.anthropic.claude-sonnet-5-5"],
+          key_ids: ["*"],
+          budgets: [{ max_limit: 2000, reset_duration: "1M" }],
+        },
+      ],
+    });
+    assert.deepEqual(restated.provider_configs, [
+      {
+        provider: "bedrock",
+        allowed_models: ["global.anthropic.claude-sonnet-5-5"],
+        key_ids: ["*"],
+        budgets: [{ max_limit: 2000, reset_duration: "1M" }],
+      },
+    ]);
   });
 
   it("never carries a metadata key or a sentinel onto the wire", () => {
@@ -401,15 +437,105 @@ describe("the validation refuses what the gateway would refuse later (decision 1
         provider_configs: [{ provider: "bedrock", allowed_models: [] }],
       }).some((m) => m.includes("non-empty array")),
     );
-    // Per-provider limits are not in this plan; a config that names one is a
-    // mechanism nobody wrote, not a value silently ignored.
+    // A provider entry's own `budgets` is supported (decision 18); the two
+    // nested limits beside it are not, and a config that names one is a
+    // mechanism nobody wrote rather than a value silently ignored.
+    for (const field of ["model_budgets", "rate_limit"] as const) {
+      assert.ok(
+        messages({
+          provider_configs: [{ provider: "bedrock", [field]: [] }],
+        }).some((m) => m.includes("is not a field of a provider config")),
+        `${field} must be refused inside a provider config`,
+      );
+    }
+  });
+
+  it("accepts a provider entry's own budget, and refuses a bad one at its own path", () => {
+    // Decision 18: the same budget shape as the key's, validated by the same
+    // `checkBudgets` rather than a second set of rules, so the path is the one
+    // the author has to go and edit.
+    assert.deepEqual(
+      problemsFor({
+        provider_configs: [
+          {
+            provider: "bedrock",
+            key_ids: ["*"],
+            budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+          },
+        ],
+      }),
+      [],
+    );
+    // An empty array is the "this entry has none" spelling the body uses, so it
+    // is accepted rather than reported as a budget that means nothing.
+    assert.deepEqual(
+      problemsFor({
+        provider_configs: [{ provider: "fireworks", key_ids: ["*"], budgets: [] }],
+      }),
+      [],
+    );
+
+    const malformed = problemsFor({
+      provider_configs: [
+        { provider: "bedrock", budgets: [{ max_limit: "1500", reset_duration: "1M" }] },
+      ],
+    });
+    assert.equal(malformed.length, 1);
+    assert.equal(
+      malformed[0].path,
+      "someone@goodparty.org.provider_configs[0].budgets[0].max_limit",
+    );
+
+    const badDuration = problemsFor({
+      provider_configs: [
+        { provider: "bedrock", budgets: [{ max_limit: 1500, reset_duration: "1 month" }] },
+      ],
+    });
+    assert.ok(
+      badDuration.some(
+        (p) =>
+          p.path ===
+          "someone@goodparty.org.provider_configs[0].budgets[0].reset_duration",
+      ),
+    );
+
+    // Not an array at all, and a duplicate `reset_duration`: the second is the
+    // rule the gateway and the key-level set both refuse, reused here rather
+    // than restated.
     assert.ok(
       messages({
-        provider_configs: [
-          { provider: "bedrock", budgets: [{ max_limit: 1, reset_duration: "1M" }] },
-        ],
-      }).some((m) => m.includes("is not a field of a provider config")),
+        provider_configs: [{ provider: "bedrock", budgets: { max_limit: 1500 } }],
+      }).some((m) => m.includes("array of budgets")),
     );
+    const duplicated = problemsFor({
+      provider_configs: [
+        {
+          provider: "bedrock",
+          budgets: [
+            { max_limit: 1500, reset_duration: "1M" },
+            { max_limit: 500, reset_duration: "1M" },
+          ],
+        },
+      ],
+    });
+    assert.equal(duplicated.length, 1);
+    assert.equal(
+      duplicated[0].path,
+      "someone@goodparty.org.provider_configs[0].budgets[1].reset_duration",
+    );
+    assert.match(duplicated[0].message, /duplicates/);
+  });
+
+  it('refuses "inherit" inside a provider config\'s budgets, as anywhere else in one', () => {
+    const found = problemsFor({
+      provider_configs: [{ provider: "bedrock", budgets: "inherit" }],
+    });
+    assert.equal(found.length, 1);
+    assert.equal(
+      found[0].path,
+      "someone@goodparty.org.provider_configs[0].budgets",
+    );
+    assert.match(found[0].message, /inherit/);
   });
 
   it("refuses an email that is not an email, and one that is not lowercase", () => {
@@ -525,6 +651,34 @@ describe("the committed documents and their parameters", () => {
     assert.ok(
       !parameterValue(readGovernanceOverrides()).includes("$comment"),
       "the published overrides value still carries the $comment block",
+    );
+  });
+
+  it("keeps the template's own provider budgets valid by the same rules an override obeys", () => {
+    // The template is not validated by `checkGovernanceOverrides` (it is not
+    // keyed by email and carries fields an override may not), so its per-provider
+    // budgets would otherwise be data no rule had read. The field is a human's
+    // edit to a committed file either way, and a duration the gateway refuses
+    // there is the same `400` on every tick as one in an override.
+    const template = JSON.parse(readVkMintTemplate()) as {
+      provider_configs?: GovernanceProviderConfig[];
+    };
+    const entries = template.provider_configs ?? [];
+
+    // Everything the template gives a budget to has to survive the very check an
+    // override's entry would: the same shape, so restating it as an override
+    // verbatim is accepted.
+    const asOverrideEntries = entries
+      .filter((entry) => (entry.budgets ?? []).length > 0)
+      .map((entry) => ({ ...entry }));
+    assert.ok(
+      asOverrideEntries.length > 0,
+      "the template carries no provider budget, so decision 18 is not in effect",
+    );
+    assert.deepEqual(
+      problemsFor({ provider_configs: asOverrideEntries }),
+      [],
+      "a provider budget the template commits must be one an override could also commit",
     );
   });
 

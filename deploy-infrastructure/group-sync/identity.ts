@@ -43,6 +43,7 @@ import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
 import { IDENTITY_STORE_ID, MANAGEMENT_ACCOUNT_ID } from "../../utils/accounts";
 import type { TargetMembership } from "./diff";
 import { SyncAbortError } from "./errors";
+import type { DirectoryUserName } from "./source";
 
 export const REGION = "us-west-2";
 
@@ -59,7 +60,7 @@ export interface IdentityDirectory {
   /** `GetUserId` on `emails.value`; `null` when the user does not exist yet. */
   resolveUserId(email: string): Promise<string | null>;
   /** Resolves, then creates if needed. Returns the user id either way. */
-  createUser(email: string): Promise<string>;
+  createUser(email: string, name?: DirectoryUserName): Promise<string>;
   /** `CreateGroupMembership`; an existing membership is success. */
   addMembership(userId: string): Promise<void>;
   /** `DeleteGroupMembership` by membership id; already gone is success. */
@@ -159,27 +160,82 @@ export const assumeGrantRole = async (
 };
 
 /**
+ * The `DisplayName` and `Name` for a create request.
+ *
+ * The job prefers the user's real name from their Google public profile (open
+ * question 3, resolved 2026-11-13). Every field the store is sent must be
+ * non-empty: a `Name` without `FamilyName` is a `ValidationException` that
+ * aborts the whole run, which is what a single-token local part used to cause.
+ * So the Google name is used only when it supplies both halves, and anything
+ * less falls back to `deriveDisplayName` rather than sending a half name.
+ */
+export type CreateUserName = {
+  displayName: string;
+  givenName: string;
+  familyName: string;
+  /** Which of the two paths produced it, for the audit log. */
+  source: "google" | "derived";
+};
+
+/**
  * Derives `DisplayName` and `Name` from the email's local part.
  *
- * The job reads group membership and nothing else, so it has an address and
- * not a person's name (open question 3). The plan's default -- derive from the
- * local part and let a human correct it later -- keeps the Google scope to the
- * two group reads; enriching from the profile would need
- * `admin.directory.user.readonly` for a cosmetic field.
+ * This is the fallback now that the job reads the real name, but it is the one
+ * that runs whenever the profile read comes back empty -- contact sharing off
+ * for the domain, a profile with no `familyName`, or a failed lookup -- so it
+ * has to produce a valid request on its own.
+ *
+ * `givenName` and `familyName` are both always non-empty, because the live
+ * identity store rejects a `CreateUser` whose `Name` omits `FamilyName` with a
+ * `ValidationException`, which aborted every run that reached a member with a
+ * single-token local part (`swain@goodparty.org`). A single token is therefore
+ * duplicated into both fields: a syntactically valid placeholder the store
+ * accepts, which a human corrects later if it matters. The fallback to the
+ * address covers a local part that is empty or only separators (`...@`), which
+ * would otherwise leave the token list empty and both fields blank.
  */
 export const deriveDisplayName = (
   email: string,
-): { displayName: string; givenName: string; familyName?: string } => {
+): { displayName: string; givenName: string; familyName: string } => {
   const local = email.split("@")[0] ?? "";
   const tokens = local.split(/[._-]+/).filter(Boolean);
   const capitalized = tokens.map(
     (token) => token.charAt(0).toUpperCase() + token.slice(1).toLowerCase(),
   );
-  const displayName = capitalized.join(" ") || local;
-  const givenName = capitalized[0] ?? local;
+  // A local part that is empty or only separators yields no tokens at all, so
+  // the whole address becomes the placeholder rather than an empty `Name`.
+  const fallback = local || email;
+  const displayName = capitalized.join(" ") || fallback;
+  const givenName = capitalized[0] ?? fallback;
   const familyName =
-    capitalized.length > 1 ? capitalized.slice(1).join(" ") : undefined;
-  return { displayName, givenName, ...(familyName ? { familyName } : {}) };
+    capitalized.length > 1 ? capitalized.slice(1).join(" ") : givenName;
+  return { displayName, givenName, familyName };
+};
+
+/** Trims a profile field, treating whitespace-only as absent. */
+const cleaned = (value: string | null | undefined): string =>
+  typeof value === "string" ? value.trim() : "";
+
+/**
+ * The name to send to `CreateUser`: the Google profile's when it carries both
+ * halves, the derived one otherwise. Never returns an empty `givenName` or
+ * `familyName`.
+ */
+export const resolveCreateUserName = (
+  email: string,
+  profile?: DirectoryUserName,
+): CreateUserName => {
+  const givenName = cleaned(profile?.givenName);
+  const familyName = cleaned(profile?.familyName);
+  if (givenName && familyName) {
+    return {
+      displayName: `${givenName} ${familyName}`,
+      givenName,
+      familyName,
+      source: "google",
+    };
+  }
+  return { ...deriveDisplayName(email), source: "derived" };
 };
 
 const normalizeEmail = (email: string): string => email.trim().toLowerCase();
@@ -224,15 +280,17 @@ export const createIdentityDirectory = (options: {
   return {
     resolveUserId,
 
-    async createUser(email: string): Promise<string> {
+    async createUser(email: string, name?: DirectoryUserName): Promise<string> {
       const normalized = normalizeEmail(email);
       // Immediately before the create, not only in the caller's earlier pass:
       // a user provisioned since then is reused rather than duplicated.
       const existing = await resolveUserId(normalized);
       if (existing) return existing;
 
-      const { displayName, givenName, familyName } =
-        deriveDisplayName(normalized);
+      const { displayName, givenName, familyName } = resolveCreateUserName(
+        normalized,
+        name,
+      );
       try {
         const result = await withRetry(
           () =>
@@ -241,9 +299,12 @@ export const createIdentityDirectory = (options: {
                 IdentityStoreId: identityStoreId,
                 UserName: normalized,
                 DisplayName: displayName,
+                // Both are always set: the store requires `FamilyName`, and
+                // a create that omits it is a `ValidationException` that aborts
+                // the whole run.
                 Name: {
                   GivenName: givenName,
-                  ...(familyName ? { FamilyName: familyName } : {}),
+                  FamilyName: familyName,
                 },
                 Emails: [{ Value: normalized, Primary: true, Type: "work" }],
               }),

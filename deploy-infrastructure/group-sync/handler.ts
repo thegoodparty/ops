@@ -176,6 +176,7 @@ export const handle = async (
     getGroup: async (request) => (await getDirectory()).getGroup(request),
     listMembers: async (request) =>
       (await getDirectory()).listMembers(request),
+    getUser: async (request) => (await getDirectory()).getUser(request),
   };
   const identityFor = (pair: SyncPair): IdentityDirectory => {
     const get = once(async () => deps.buildIdentity(pair));

@@ -12,6 +12,7 @@ import {
   REACTIVATION_BODY,
   WORKBENCH_ACCESS_ROLE_PREFIX,
   findExactKey,
+  keyUsage,
   mintVirtualKey,
   needsReactivation,
   requireEngineer,
@@ -223,6 +224,7 @@ describe("idempotent minting", () => {
       key: "sk-bf-existing",
       email: "jeff@goodparty.org",
       action: "existing",
+      usage: { budgets: [] },
     });
     assert.deepEqual(calls, ["list:0"]);
   });
@@ -237,12 +239,17 @@ describe("idempotent minting", () => {
     assert.equal(result.key, "sk-bf-new");
     // The template's own fields, the name, and the governance the reconciler
     // would compute for this person. The governance half (`budgets: []`,
-    // `calendar_aligned: true`) is `governanceBody`'s, so a key created here is
-    // already the shape the first tick compares against (step 5 of
-    // `docs/bifrost-reconciler.md`).
+    // `calendar_aligned: true`, and `budgets: []` inside each provider entry —
+    // decision 18's "this entry has none") is `governanceBody`'s, so a key
+    // created here is already the shape the first tick compares against (step 5
+    // of `docs/bifrost-reconciler.md`).
     assert.deepEqual(creates, [
       {
         ...template,
+        provider_configs: template.provider_configs.map((entry) => ({
+          ...entry,
+          budgets: [],
+        })),
         calendar_aligned: true,
         budgets: [],
         name: "jeff@goodparty.org",
@@ -526,6 +533,12 @@ describe("a minted key starts converged (step 5)", () => {
             ? (config.key_ids as unknown[]).includes("*")
             : false,
           keys: [],
+          // The entry's own budgets, and the same `omitempty` the wire applies:
+          // an entry with none comes back without the key at all, which is the
+          // shape the diff has to read as the empty set (decision 18).
+          ...(Array.isArray(config.budgets) && config.budgets.length > 0
+            ? { budgets: config.budgets }
+            : {}),
         })),
         rate_limit:
           stored?.rate_limit === undefined
@@ -622,8 +635,13 @@ describe("a minted key starts converged (step 5)", () => {
     });
     assert.equal(created[0].calendar_aligned, true);
     // The template's model policy survived a budget-only override: the merge is
-    // field by field (decision 9), not a replacement of the whole document.
-    assert.deepEqual(created[0].provider_configs, keyTemplate().provider_configs);
+    // field by field (decision 9), not a replacement of the whole document. The
+    // `budgets: []` on each entry is decision 18's "this entry has none", not a
+    // dropped field.
+    assert.deepEqual(
+      created[0].provider_configs,
+      keyTemplate().provider_configs?.map((entry) => ({ ...entry, budgets: [] })),
+    );
 
     // The criterion: the reconciler over that key writes nothing.
     const result = await reconcile(gateway, overrides);
@@ -673,7 +691,12 @@ describe("a minted key starts converged (step 5)", () => {
     });
 
     assert.deepEqual(created[0].provider_configs, [
-      { provider: "bedrock", allowed_models: ["us.anthropic.claude-sonnet-5-5"], key_ids: ["*"] },
+      {
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+        key_ids: ["*"],
+        budgets: [],
+      },
     ]);
     assert.equal(created[0].calendar_aligned, false);
 
@@ -803,6 +826,11 @@ describe("the committed documents, minted and then reconciled", () => {
             ? (config.key_ids as unknown[]).includes("*")
             : false,
           keys: [],
+          // `omitempty` on the wire: an entry with no budgets is reported
+          // without the field, which the diff must read as the empty set.
+          ...(Array.isArray(config.budgets) && config.budgets.length > 0
+            ? { budgets: config.budgets }
+            : {}),
         })),
         rate_limit:
           stored?.rate_limit === undefined
@@ -880,5 +908,60 @@ describe("the committed documents, minted and then reconciled", () => {
     });
     assert.equal(result.changed, 0);
     assert.equal(result.unchanged, 1);
+  });
+});
+
+describe("the caller's own usage", () => {
+  const governed = {
+    calendar_aligned: true,
+    budgets: [
+      { id: "b1", max_limit: 250, reset_duration: "1M", current_usage: 12.5, last_reset: "2026-11-01T00:00:00Z" },
+    ],
+    provider_configs: [
+      {
+        id: 7,
+        provider: "bedrock",
+        allowed_models: ["m"],
+        budgets: [
+          { id: "b2", max_limit: 1500, reset_duration: "1M", current_usage: 412.37, last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+      // `omitempty` on the wire: an uncapped entry carries no `budgets`.
+      { id: 8, provider: "fireworks", allowed_models: ["d"] },
+    ],
+  };
+
+  it("reads the key's budgets and each provider entry's, and nothing else", () => {
+    assert.deepEqual(keyUsage(governed), {
+      calendar_aligned: true,
+      budgets: [
+        { scope: "key", max_limit: 250, current_usage: 12.5, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+        { scope: "bedrock", max_limit: 1500, current_usage: 412.37, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+      ],
+    });
+  });
+
+  it("drops a budget row with no cap rather than guessing one", () => {
+    assert.deepEqual(keyUsage({ budgets: [{ current_usage: 3 }] }), { budgets: [] });
+  });
+
+  it("returns the listed key's usage beside an existing key", async () => {
+    const { gateway } = fakeGateway({
+      pages: [{ keys: [key({ name: "jeff@goodparty.org", ...governed })], totalCount: 1 }],
+    });
+    const result = await mintVirtualKey({ gateway, template, email: "jeff@goodparty.org" });
+    assert.equal(result.usage.budgets.length, 2);
+    assert.equal(result.usage.budgets[1].current_usage, 412.37);
+  });
+
+  it("falls back to the listing's counters when a reactivation response carries none", async () => {
+    const { gateway } = fakeGateway({
+      pages: [{ keys: [key({ name: "jeff@goodparty.org", is_active: false, ...governed })], totalCount: 1 }],
+      update: async (id) => ({ id, name: "jeff@goodparty.org", is_active: true }),
+    });
+    const result = await mintVirtualKey({ gateway, template, email: "jeff@goodparty.org" });
+    assert.equal(result.action, "reactivated");
+    assert.equal(result.usage.budgets[1].scope, "bedrock");
+    assert.equal(result.usage.budgets[1].current_usage, 412.37);
   });
 });

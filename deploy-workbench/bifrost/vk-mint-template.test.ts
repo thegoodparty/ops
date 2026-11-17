@@ -46,6 +46,8 @@ type ProviderConfigEntry = {
   provider: string;
   allowed_models: string[];
   key_ids: string[];
+  /** The entry's own cap, if it has one. Absent means uncapped (decision 18). */
+  budgets?: Array<{ max_limit: number; reset_duration: string }>;
 };
 
 type Template = {
@@ -255,7 +257,7 @@ describe("bifrost virtual-key template", () => {
     }
   });
 
-  it("uses the deployment's provider keys, with no budgets, rate limit or per-person fields", () => {
+  it("uses the deployment's provider keys, with no key-level budget or per-person field", () => {
     const template = loadTemplate();
     for (const entry of providerConfigs(template)) {
       // Decision 5: a provider config with no keys allows none, so the entry
@@ -268,22 +270,17 @@ describe("bifrost virtual-key template", () => {
       );
     }
 
-    // Per-person budgets and rate limits are deliberately not here, and the
-    // reason changed with `docs/bifrost-reconciler.md` (decisions 12 and 13)
-    // without changing this assertion. They come back as per-person overrides
-    // in `governance-overrides.json`, not as a template field: because the
-    // reconciler converges every existing key to template plus override, a
-    // value in the template is not "applies to new keys", it is "applies to
-    // the whole fleet on the next tick". A fleet-wide limit introduced by one
-    // line here is exactly the silent default decision 12 refuses, and a
-    // budget chosen before there is usage data is the guess #404 was right to
-    // defer. Per-key budgets are back now that the log store has a quarter of
-    // per-request cost data; they go in an override, naming the people they
-    // apply to.
+    // A key-level budget and a rate limit are still not here: they belong in a
+    // per-person override in `governance-overrides.json`, because the reconciler
+    // converges every existing key to template plus override, so a value in the
+    // template is not "applies to new keys" — it is "applies to the whole
+    // fleet on the next tick" (`docs/bifrost-reconciler.md`, decisions 12 and
+    // 13). A per-provider cap is different in kind and is here, in the assertion
+    // after this one.
     for (const forbidden of ["budgets", "rate_limit"] as const) {
       assert.ok(
         !(forbidden in template),
-        `the template must carry no ${forbidden}: it would apply to the whole fleet on the next reconcile, and a limit belongs in a per-person override (docs/bifrost-reconciler.md decisions 12 and 13)`,
+        `the template must carry no key-level ${forbidden}: it would apply to the whole fleet on the next reconcile, and a limit belongs in a per-person override (docs/bifrost-reconciler.md decisions 12 and 13)`,
       );
     }
 
@@ -293,6 +290,30 @@ describe("bifrost virtual-key template", () => {
     assert.ok(
       !("name" in template),
       "the template must not carry a name; it is the caller's email, set per mint",
+    );
+  });
+
+  it("caps Bedrock at $1500 a calendar month and leaves Fireworks uncapped", () => {
+    // Decision 18 of `docs/bifrost-reconciler.md`, as the two lines of data that
+    // carry it. `calendar_aligned: true` (decision 11) is what makes `1M` the
+    // calendar month rather than 30 days from the key's creation, so the figure
+    // and the window together are the whole statement.
+    const byProvider = new Map(
+      providerConfigs(loadTemplate()).map((entry) => [entry.provider, entry]),
+    );
+
+    assert.deepEqual(byProvider.get("bedrock")?.budgets, [
+      { max_limit: 1500, reset_duration: "1M" },
+    ]);
+
+    // Uncapped is the **absence** of a budget on the Fireworks entry, not an
+    // exemption spelled out somewhere: nothing in the config language exempts a
+    // provider, so the only way to say "no cap" is to give that entry none.
+    const fireworks = byProvider.get("fireworks");
+    assert.ok(fireworks, "the template has no fireworks entry");
+    assert.ok(
+      fireworks.budgets === undefined || fireworks.budgets.length === 0,
+      "Fireworks must carry no budget: DeepSeek is deliberately uncapped",
     );
   });
 });

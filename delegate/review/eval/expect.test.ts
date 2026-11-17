@@ -1,13 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  baselineGaps,
   commitSyntheticHead,
   computeGate,
+  mainRunsShort,
+  ManifestSchema,
+  ParkedSchema,
   scoreDir,
+  scoreHistory,
   readBundleFile,
   readManifest,
   renderExpectJson,
@@ -19,6 +24,7 @@ import type { Expect, RunScore } from "./expect";
 import type { ExpectedCase } from "./expect";
 import type { Result } from "./replay";
 import type { Bundle, Finding } from "../schema";
+import type { BlockJudge, BlockJudgment } from "./block-judge";
 
 const MANIFEST = join(__dirname, "expected", "manifest.json");
 
@@ -45,13 +51,16 @@ const finding = (path: string, category: Finding["category"] = "bugs"): Finding 
 const withFindings = (findings: Finding[]) =>
   result({ output: { status: "complete", findings, summary: "s" } });
 
-const block: Expect = { verdict: "block", paths: ["a.ts", "b.ts"] };
+const block: Expect = { verdict: "block", reason: "the cache key drops the org id" };
+
+const matched: BlockJudgment = { match: true, finding: 1, why: "finding 1 says the key drops the org id" };
+const unmatched: BlockJudgment = { match: false, why: "the findings are about logging, not the key" };
 
 test("the manifest parses and every simulated bundle matches its diff", () => {
   const cases = readManifest(MANIFEST);
   assert.ok(cases.some((c) => c.expect.verdict === "approve"), "needs an approve case");
-  for (const c of cases.filter((x) => x.bundle)) {
-    const bundle = readBundleFile(MANIFEST, c.bundle!);
+  for (const c of cases) {
+    const bundle = readBundleFile(MANIFEST, c.bundle);
     const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
     assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
   }
@@ -77,12 +86,10 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
   // not name is still consistent (that case blocks on a real defect in its
   // handler), an amendment the harness flags is still a consistent diagnostic,
   // and a widening is a flag on the model's answer.
-  assert.deepEqual(byId.get("ops-plan-addition-unnamed")?.expect, {
-    verdict: "block",
-    paths: ["deploy-workbench/bifrost/vk-mint-handler.ts"],
-    categories: ["bugs", "security"],
-    consistency: "consistent",
-  });
+  const unnamed = byId.get("ops-plan-addition-unnamed")?.expect;
+  assert.equal(unnamed?.verdict, "block");
+  assert.match(unnamed?.verdict === "block" ? unnamed.reason : "", /vk-mint-handler\.ts/);
+  assert.equal(unnamed?.consistency, "consistent");
   assert.deepEqual(byId.get("ops-plan-amends-itself")?.expect, {
     verdict: "flag",
     reason: "touches_docs",
@@ -99,8 +106,7 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
     assert.match(byId.get(id)!.tests, /#41[14]/, `${id} must name the PR it came from`);
   }
   for (const c of cases) {
-    assert.ok(c.bundle, `${c.id} must be a simulated bundle`);
-    const bundle = readBundleFile(MANIFEST, c.bundle!);
+    const bundle = readBundleFile(MANIFEST, c.bundle);
     const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
     assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
     assert.ok(bundle.plan, `${c.id} must carry the plan in its bundle`);
@@ -165,11 +171,11 @@ test("a manifest entry missing split, source or kind, or with a bad value, is re
 
 test("the checked-in manifest holds out a minority, with block and approve on both sides", () => {
   const cases = readManifest(MANIFEST);
-  assert.equal(cases.length, 37);
+  assert.equal(cases.length, 43);
   const holdout = selectCases(cases, { split: "holdout" });
   // The three vocabulary cases are tune: the prompt's worked examples are their
   // shapes, so none of them can honestly claim holdout independence.
-  assert.equal(holdout.length, 16);
+  assert.equal(holdout.length, 18);
   for (const split of ["tune", "holdout"]) {
     const verdicts = new Set(selectCases(cases, { split }).map((c) => c.expect.verdict));
     assert.ok(verdicts.has("block") && verdicts.has("approve"), `${split} needs block and approve`);
@@ -190,10 +196,10 @@ test("selectCases filters by split and case, and returns everything with no filt
   assert.throws(() => selectCases(cases, { split: "dev" }));
 });
 
-test("scoreDir with a holdout filter scores only holdout cases", () => {
+test("scoreDir with a holdout filter scores only holdout cases", async () => {
   const out = mkdtempSync(join(tmpdir(), "expect-split-"));
   const holdout = selectCases(readManifest(MANIFEST), { split: "holdout" });
-  const reports = scoreDir(holdout, out);
+  const reports = await scoreDir(holdout, out);
   assert.deepEqual(reports.map((r) => r.c.id), holdout.map((c) => c.id));
 });
 
@@ -287,13 +293,13 @@ test("a diagnostic on an outcome case has to be right as well", () => {
 
   const blockWithAnswer: Expect = {
     verdict: "block",
-    paths: ["b.ts"],
+    reason: "r",
     consistency: "inconsistent",
   };
-  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("b.ts")])).pass, true);
-  assert.equal(scoreRun(blockWithAnswer, withConsistency("consistent", [finding("b.ts")])).pass, false);
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("b.ts")]), matched).pass, true);
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("consistent", [finding("b.ts")]), matched).pass, false);
   // A matching answer never rescues a wrong outcome.
-  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("c.ts")])).pass, false);
+  assert.equal(scoreRun(blockWithAnswer, withConsistency("inconsistent", [finding("c.ts")]), unmatched).pass, false);
 });
 
 test("the report names a consistency expectation, a flag and an outcome diagnostic", () => {
@@ -377,16 +383,116 @@ test("approve passes only with zero findings", () => {
   assert.equal(scoreRun({ verdict: "approve" }, withFindings([finding("a.ts")])).pass, false);
 });
 
-test("block passes only on a finding in an expected file", () => {
-  assert.equal(scoreRun(block, withFindings([finding("b.ts")])).pass, true);
-  assert.equal(scoreRun(block, withFindings([finding("c.ts")])).pass, false);
-  assert.equal(scoreRun(block, result()).pass, false);
+test("block passes only when the judge finds the reason among the findings", () => {
+  const hit = scoreRun(block, withFindings([finding("c.ts")]), matched);
+  assert.deepEqual(hit, { pass: true, outcome: "blocked for the reason: finding 1 says the key drops the org id" });
+  const miss = scoreRun(block, withFindings([finding("a.ts", "architecture")]), unmatched);
+  assert.equal(miss.pass, false);
+  assert.match(miss.outcome, /^blocked on something else: the findings are about logging, not the key \(a\.ts:10 \[architecture\]\)$/);
+  assert.deepEqual(scoreRun(block, result(), matched), { pass: false, outcome: "approved" });
 });
 
-test("block with categories ignores findings of another category", () => {
-  const security: Expect = { ...block, categories: ["security"] };
-  assert.equal(scoreRun(security, withFindings([finding("a.ts", "tests")])).pass, false);
-  assert.equal(scoreRun(security, withFindings([finding("a.ts", "security")])).pass, true);
+test("a block that was not judged does not pass", () => {
+  const r = scoreRun(block, withFindings([finding("a.ts")]));
+  assert.equal(r.pass, false);
+  assert.match(r.outcome, /reason not judged/);
+});
+
+test("a block whose gate approved is an approval, whatever the findings", () => {
+  const approved = result({
+    repo: "thegoodparty/ops",
+    output: { status: "complete", findings: [finding("a.ts")], summary: "s" },
+    gating: { mode: "enforce", verdict: "approve", gates: [], wouldApprove: true },
+  });
+  assert.deepEqual(scoreRun(block, approved, matched), { pass: false, outcome: "approved" });
+});
+
+test("a block expectation needs a reason, and paths, categories and reviewedAt are refused", () => {
+  const entry = { id: "c", bundle: "c.bundle.json", expect: { verdict: "block", reason: "r" }, tests: "t", split: "tune", source: "simulated", kind: "bug" };
+  assert.equal(ManifestSchema.parse([entry])[0].expect.verdict, "block");
+  assert.throws(() => ManifestSchema.parse([{ ...entry, expect: { verdict: "block" } }]), /reason/);
+  assert.throws(() => ManifestSchema.parse([{ ...entry, expect: { verdict: "block", reason: " " } }]), /reason/);
+  assert.throws(() => ManifestSchema.parse([{ ...entry, expect: { verdict: "block", reason: "r", paths: ["a.ts"] } }]), /paths/);
+  assert.throws(() => ManifestSchema.parse([{ ...entry, expect: { verdict: "block", reason: "r", categories: ["bugs"] } }]), /categories/);
+  assert.throws(() => ManifestSchema.parse([{ ...entry, reviewedAt: "2026-11-13T00:00:00Z" }]), /reviewedAt/);
+});
+
+test("every block case in the manifest and in parked names its reason", () => {
+  const parked = ParkedSchema.parse(JSON.parse(readFileSync(join(dirname(MANIFEST), "parked.json"), "utf-8")));
+  for (const c of [...readManifest(MANIFEST), ...parked.map((p) => p.case)]) {
+    if (c.expect.verdict === "block") assert.ok(c.expect.reason.length > 40, c.id);
+  }
+});
+
+const stubJudge = (answers: BlockJudgment[]) => {
+  const calls: { reason: string; findings: Finding[] }[] = [];
+  const judge: BlockJudge = async (reason, findings) => {
+    calls.push({ reason, findings });
+    return answers[calls.length - 1] ?? matched;
+  };
+  return { calls, judge };
+};
+
+const blockCaseIn = (out: string, runs: Result[]): ExpectedCase => {
+  const c = { ...readManifest(MANIFEST).find((x) => x.expect.verdict === "block")!, id: "block-case" };
+  mkdirSync(join(out, c.id), { recursive: true });
+  runs.forEach((r, i) => writeFileSync(join(out, c.id, `run-${i + 1}.json`), JSON.stringify(r)));
+  return c;
+};
+
+test("scoreDir judges each blocked run once and caches the judgment next to it", async () => {
+  const out = mkdtempSync(join(tmpdir(), "expect-judge-"));
+  const c = blockCaseIn(out, [withFindings([finding("a.ts")]), withFindings([finding("b.ts")]), result()]);
+  const first = stubJudge([matched, unmatched]);
+  const [r] = await scoreDir([c], out, first.judge);
+  assert.equal(first.calls.length, 2, "an approved run is not judged");
+  assert.ok(first.calls.every((x) => x.reason === (c.expect as { reason: string }).reason));
+  assert.deepEqual(r.scores.map((s) => s.pass), [true, false, false]);
+  assert.match(r.scores[0].outcome, /^blocked for the reason: /);
+  assert.match(r.scores[1].outcome, /^blocked on something else: /);
+  const cached = JSON.parse(readFileSync(join(out, c.id, "run-1.judge.json"), "utf-8"));
+  assert.equal(cached.match, true);
+  assert.match(cached.key, /^[0-9a-f]{64}$/);
+
+  const again = stubJudge([]);
+  const [r2] = await scoreDir([c], out, again.judge);
+  assert.equal(again.calls.length, 0, "a rerun reads the cached judgments");
+  assert.deepEqual(r2.scores, r.scores);
+});
+
+test("a cached judgment is not reused once the reason or the findings change", async () => {
+  const out = mkdtempSync(join(tmpdir(), "expect-judge-"));
+  const c = blockCaseIn(out, [withFindings([finding("a.ts")])]);
+  await scoreDir([c], out, stubJudge([matched]).judge);
+
+  const reworded = stubJudge([unmatched]);
+  const [r] = await scoreDir([{ ...c, expect: { verdict: "block", reason: "something else entirely" } }], out, reworded.judge);
+  assert.equal(reworded.calls.length, 1);
+  assert.equal(r.scores[0].pass, false);
+
+  writeFileSync(join(out, c.id, "run-1.json"), JSON.stringify(withFindings([finding("a.ts"), finding("z.ts")])));
+  const refound = stubJudge([matched]);
+  await scoreDir([c], out, refound.judge);
+  assert.equal(refound.calls.length, 1);
+  assert.equal(refound.calls[0].findings.length, 2);
+});
+
+test("scoreDir never asks the judge about approve or flag cases", async () => {
+  const out = mkdtempSync(join(tmpdir(), "expect-judge-"));
+  const approveCase = readManifest(MANIFEST).find((c) => c.expect.verdict === "approve")!;
+  mkdirSync(join(out, approveCase.id));
+  writeFileSync(join(out, approveCase.id, "run-1.json"), JSON.stringify(withFindings([finding("a.ts")])));
+  const flagCase = readManifest(MANIFEST).find((c) => c.expect.verdict === "flag")!;
+  mkdirSync(join(out, flagCase.id));
+  writeFileSync(
+    join(out, flagCase.id, "run-1.json"),
+    JSON.stringify(withGating("inconsistent", { verdict: "comment", gates: [(flagCase.expect as { reason: string }).reason] })),
+  );
+  const { calls, judge } = stubJudge([]);
+  const reports = await scoreDir([approveCase, flagCase], out, judge);
+  assert.equal(calls.length, 0);
+  assert.equal(reports[0].scores[0].pass, false);
+  assert.match(reports[1].scores[0].outcome, /^flagged: /);
 });
 
 test("a run that produced no review fails either way", () => {
@@ -453,16 +559,16 @@ test("the report counts a case as passed only when every run passed", () => {
   assert.match(report, /run 2: FAIL, approved/);
 });
 
-test("scoreDir fails a case the replay left no results for", () => {
+test("scoreDir fails a case the replay left no results for", async () => {
   const [approveCase] = readManifest(MANIFEST).filter((c) => c.expect.verdict === "approve");
   const out = mkdtempSync(join(tmpdir(), "expect-out-"));
-  const report = renderExpectReport(scoreDir([approveCase], out), "v");
+  const report = renderExpectReport(await scoreDir([approveCase], out), "v");
   assert.match(report, /\*\*0\/1 cases passed\*\*/);
   assert.match(report, /FAIL, no results/);
 
   mkdirSync(join(out, approveCase.id));
   writeFileSync(join(out, approveCase.id, "run-1.json"), JSON.stringify(result()));
-  assert.match(renderExpectReport(scoreDir([approveCase], out), "v"), /\*\*1\/1 cases passed\*\*/);
+  assert.match(renderExpectReport(await scoreDir([approveCase], out), "v"), /\*\*1\/1 cases passed\*\*/);
 });
 
 test("the report carries main's pass count per case, and the json does too", () => {
@@ -601,6 +707,48 @@ test("gate: a case marked flakyOnMain cannot regress even when main passed it 3/
   assert.deepEqual([g.cases[0].outcome, g.cases[0].flaky, g.regressions, g.pass], ["not-held", true, [], true]);
 });
 
+test("gate: earlier main runs of the same reviewer that failed make a 3/3 case not held", () => {
+  const { tune } = gateCases();
+  const base = mkBase([mkReport(tune, runsOf(true, true, true))]);
+  const cand = mkReport(tune, runsOf(true, false, false, true, false, false));
+  const lucky = computeGate([cand], base, [], true, [mkReport(tune, runsOf(true, false, true))]);
+  assert.deepEqual(
+    [lucky.cases[0].outcome, lucky.cases[0].flaky, lucky.cases[0].earlierPassed, lucky.cases[0].earlierCompleted, lucky.pass],
+    ["not-held", true, 2, 3, true],
+  );
+  const stable = computeGate([cand], base, [], true, [mkReport(tune, runsOf(true, true, true))]);
+  assert.deepEqual([stable.cases[0].outcome, stable.cases[0].flaky, stable.regressions], ["regression", false, [tune.id]]);
+  const errored = computeGate([cand], base, [], true, [mkReport(tune, [{ pass: false, outcome: "no review", errored: true }])]);
+  assert.deepEqual([errored.cases[0].outcome, errored.cases[0].earlierCompleted], ["regression", 0]);
+});
+
+test("gate: with minMainRuns, main 3/3 holds a case only once its runs here and earlier reach it", () => {
+  const { tune } = gateCases();
+  const cand = mkReport(tune, runsOf(true, false, false, true, false, false));
+  const short = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true))]), [], true, [], 6);
+  assert.deepEqual([short.cases[0].outcome, short.regressions, short.minMainRuns], ["not-held", [], 6]);
+  const withEarlier = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true))]), [], true, [mkReport(tune, runsOf(true, true, true))], 6);
+  assert.deepEqual(withEarlier.regressions, [tune.id]);
+  const topped = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true, true, true, true))]), [], true, [], 6);
+  assert.deepEqual([topped.cases[0].mainCompleted, topped.regressions], [6, [tune.id]]);
+  const toppedFail = computeGate([cand], mkBase([mkReport(tune, runsOf(true, true, true, true, false, true))]), [], true, [], 6);
+  assert.deepEqual([toppedFail.cases[0].outcome, toppedFail.cases[0].flaky], ["not-held", true]);
+});
+
+test("mainRunsShort names cases main passed every run so far with fewer than minMainRuns runs", () => {
+  const { tune, holdout } = gateCases();
+  const second = readManifest(MANIFEST).filter((c) => c.split === "tune")[1];
+  const base = mkBase([
+    mkReport(tune, runsOf(true, true, true)),
+    mkReport(holdout, runsOf(true, true, false)),
+    mkReport(second, runsOf(true, true, true)),
+  ]);
+  assert.deepEqual(mainRunsShort(base, [mkReport(second, runsOf(true, true, true))], 6), [tune.id]);
+  assert.deepEqual(mainRunsShort(base, [], 3), []);
+  const errored = mkBase([mkReport(tune, [P, P, { pass: false, outcome: "no review", errored: true }])]);
+  assert.deepEqual(mainRunsShort(errored, [], 6), []);
+});
+
 test("gate: a target below 3/3 fails, and an unknown target id does too", () => {
   const { tune } = gateCases();
   const base = mkBase([mkReport(tune, runsOf(false, false, false))]);
@@ -649,8 +797,68 @@ test("gate report flags cost over the limit", () => {
   assert.match(md, /Cost vs main: 150%, needs justification in the PR body\./);
 });
 
+test("baselineGaps: a run still errored after both passes is not held, and only an absent result blocks", async () => {
+  const { tune } = gateCases();
+  const out = mkdtempSync(join(tmpdir(), "eval-gaps-"));
+  const put = (n: number, r: Result) => {
+    mkdirSync(join(out, tune.id), { recursive: true });
+    writeFileSync(join(out, tune.id, `run-${n}.json`), JSON.stringify(r));
+  };
+  put(1, result({ caseId: tune.id }));
+  put(2, result({ caseId: tune.id, output: null, error: "API Error: Opus 5's safeguards flagged this message" }));
+  put(3, result({ caseId: tune.id, output: { status: "failed", reason: "gave up" } }));
+  assert.deepEqual(baselineGaps([tune], out, 3), { total: 3, missing: 0, errored: 1, gaveUp: 1 });
+
+  const base = { variant: "main-abc", runs: 3, reports: await scoreDir([tune], out) };
+  const gate = computeGate([mkReport(tune, runsOf(true, true, true))], base, [], true);
+  assert.deepEqual([gate.cases[0].outcome, gate.regressions, gate.pass], ["not-held", [], true]);
+
+  assert.deepEqual(baselineGaps([tune], out, 4), { total: 4, missing: 1, errored: 1, gaveUp: 1 });
+});
+
 test("selectCases takes a comma-separated list of ids", () => {
   const all = readManifest(MANIFEST);
   const ids = [all[0].id, all[2].id];
   assert.deepEqual(selectCases(all, { case: ids.join(",") }).map((c) => c.id), ids);
+});
+
+test("history keeps only earlier runs of the same case head as the baseline", async () => {
+  const { tune } = gateCases();
+  const root = mkdtempSync(join(tmpdir(), "eval-history-"));
+  const put = (dir: string, n: number, headSha: string) => {
+    mkdirSync(join(root, dir, tune.id), { recursive: true });
+    writeFileSync(
+      join(root, dir, tune.id, `run-${n}.json`),
+      JSON.stringify({ caseId: tune.id, headSha, variant: "main-1111111", output: null, error: "x", costUsd: null }),
+    );
+  };
+  put("base", 1, "head-now");
+  put("history", 1, "head-now");
+  put("history", 2, "head-old");
+  put("history", 3, "head-now");
+  const [r] = await scoreHistory([tune], join(root, "history"), join(root, "base"));
+  assert.equal(r.scores.length, 2);
+});
+
+test("history drops runs cached before the harness recorded a gating verdict", async () => {
+  const { tune } = gateCases();
+  const root = mkdtempSync(join(tmpdir(), "eval-history-"));
+  const put = (dir: string, n: number, gating?: { verdict: string; gates: string[] }) => {
+    mkdirSync(join(root, dir, tune.id), { recursive: true });
+    writeFileSync(
+      join(root, dir, tune.id, `run-${n}.json`),
+      JSON.stringify({ caseId: tune.id, headSha: "h", variant: "main-1111111", output: null, error: "x", costUsd: null, gating }),
+    );
+  };
+  put("base", 1, { verdict: "approve", gates: [] });
+  put("history", 1);
+  put("history", 2, { verdict: "approve", gates: [] });
+  const [r] = await scoreHistory([tune], join(root, "history"), join(root, "base"));
+  assert.equal(r.scores.length, 1);
+});
+
+test("every parked case has a reason, a valid case and an id the manifest no longer uses", () => {
+  const parked = ParkedSchema.parse(JSON.parse(readFileSync(join(dirname(MANIFEST), "parked.json"), "utf-8")));
+  const ids = new Set(readManifest(MANIFEST).map((c) => c.id));
+  for (const p of parked) assert.equal(ids.has(p.case.id), false, p.case.id);
 });

@@ -1,0 +1,11 @@
+[Unit]
+Description=Free agent workspace space on the swarm data volume and report usage
+Requires=docker.service
+After=docker.service
+ConditionPathIsMountPoint=/var/lib/docker
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/opt/agent-swarm/disk-cleanup.sh

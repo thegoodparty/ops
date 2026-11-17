@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
-import { listRecordKeys, mine, missedCandidates, refutedCandidate, scoreFix, selectRecords } from "./mine";
+import { bundleFileName, listRecordKeys, mine, missedCandidates, refutedCandidate, scoreFix, selectRecords } from "./mine";
 import type { FixCommit, MinedRecord, Runners } from "./mine";
 import type { ReviewRecord } from "../schema";
 
@@ -78,12 +78,25 @@ const fixCommit = (overrides: Partial<FixCommit> = {}): FixCommit => ({
 });
 
 test("an added line later removed by a fix commit is flagged with its path", () => {
-  const found = missedCandidates(mined(makeRecord()), [fixCommit()], "mergesha");
+  const record = makeRecord();
+  const found = missedCandidates(mined(record), [fixCommit()], "mergesha");
   assert.equal(found.length, 1);
   assert.equal(found[0].fixCommit, "81bc332479");
   assert.deepEqual(found[0].overlappingPaths, ["src/tags.ts"]);
   assert.equal(found[0].overlapLines, 2);
   assert.equal(found[0].message, "Fix tag creation race");
+});
+
+// A proposal is only useful as a case if it carries the bundle the case
+// replays, named after the candidate: a key into the bucket would leave the
+// case outside the repo.
+test("a missed candidate carries its bundle and names it after its id", () => {
+  const record = makeRecord();
+  const [found] = missedCandidates(mined(record), [fixCommit()], "mergesha");
+  assert.deepEqual(found.bundle, record.bundle);
+  assert.equal(found.id, `omni-${record.prNumber}-missed-81bc332`);
+  assert.equal(bundleFileName(found.id), `${found.id}.bundle.json`);
+  assert.equal("key" in found, false);
 });
 
 test("a fix that only removes lines the approved diff did not add is not flagged", () => {
@@ -206,6 +219,9 @@ test("a finding replied to with its line unchanged at merge is a refuted candida
   assert.deepEqual(found?.replies, ["findUnique is guarded by a unique index"]);
   assert.equal(found?.mergedSha, "mergesha");
   assert.deepEqual(found?.findings, [{ path: "src/tags.ts", line: 11, body: "findUnique then create races" }]);
+  assert.equal(found?.id, "omni-2368-refuted-mergesh");
+  assert.deepEqual(found?.bundle, blocked(7).bundle);
+  assert.equal(found && "key" in found, false);
 });
 
 test("a finding whose line changed before merge is excluded", () => {

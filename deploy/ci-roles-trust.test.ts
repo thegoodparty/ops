@@ -37,6 +37,7 @@ describe("githubActionsPulumiDeployTrust", () => {
         operator: "StringEquals",
         value: [
           "repo:thegoodparty/omni:ref:refs/heads/main",
+          "repo:thegoodparty/omni:environment:production",
           "repo:thegoodparty/gp-terraform-dataplatform:ref:refs/heads/main",
           "repo:thegoodparty/gp-terraform-dataplatform:environment:production",
           "repo:thegoodparty/gpvpn:ref:refs/heads/main",
@@ -58,12 +59,16 @@ describe("githubActionsPulumiDeployTrust", () => {
   });
 
   // An environment subject is only as narrow as the environment's branch
-  // policy, which lives in GitHub, not here. Keep it to the one apply that
-  // needs it.
-  it("trusts one environment subject, dataplatform's production", () => {
+  // policy, which lives in GitHub, not here. Keep it to the production
+  // environments whose applies need it: omni's admits only `main`,
+  // dataplatform's `main` and `v*` tags behind a reviewer.
+  it("trusts two environment subjects, omni's and dataplatform's production", () => {
     assert.deepEqual(
       allSubjects().filter((s) => s.includes(":environment:")),
-      ["repo:thegoodparty/gp-terraform-dataplatform:environment:production"]
+      [
+        "repo:thegoodparty/omni:environment:production",
+        "repo:thegoodparty/gp-terraform-dataplatform:environment:production",
+      ]
     );
   });
 

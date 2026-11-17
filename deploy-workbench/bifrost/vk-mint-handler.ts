@@ -43,7 +43,9 @@
  * function stays small and boring: "it reads a name, a template and the setup
  * token; it makes one or two calls; it returns a key." The second document does
  * not change that shape: it is the same read, from the same parameter family,
- * in the same dependency.
+ * in the same dependency. Nor does `usage` in the response: it is the budget
+ * counters on the key record the mint has already read, so it adds no call and
+ * no permission, and the caller gets nothing about anyone but themselves.
  */
 
 import {
@@ -188,8 +190,14 @@ export const createHandler =
         email: result.email,
       });
       // The response is the one place the key appears, and it is the caller's
-      // own key: the Function URL response is not logged by Lambda.
-      return json(200, { key: result.key, email: result.email });
+      // own key: the Function URL response is not logged by Lambda. `usage` is
+      // that key's own spend and caps (`keyUsage`), read from the record the
+      // mint already fetched, and is not logged either.
+      return json(200, {
+        key: result.key,
+        email: result.email,
+        usage: result.usage,
+      });
     } catch (error) {
       if (error instanceof MintFailure) {
         deps.log({
@@ -339,6 +347,32 @@ export const createBifrostGateway = (args: {
       ? (value as Record<string, unknown>)
       : {};
 
+  /**
+   * The governance the response carries, copied through as the janitor's own
+   * `toKey` copies it (`vk-janitor-handler.ts`), because `keyUsage` reads it off
+   * the record this returns: without the copy the mint reports `budgets: []` for
+   * a key that has budgets, which it did until this was fixed. The gateway
+   * sends these on the create and update responses as well as the list —
+   * `createVirtualKey` hydrates `preloadedVk` from the model configs it just
+   * wrote before `SendJSON` — so nothing here needs a second call or a wider
+   * permission, and a shape it does not recognise is copied as nothing rather
+   * than guessed at.
+   *
+   * Absent stays absent, which is where this differs from the janitor's version
+   * on purpose. The janitor's `toKey` reports a missing `calendar_aligned` as
+   * `null` because its diff compares against a value; the mint's `usage` is read
+   * by `gp-bifrost-key --usage`, which tells "no budgets on this key" from "the
+   * governance could not be read" by whether `calendar_aligned` is present at
+   * all. Defaulting it here would make that second answer unreachable, and a
+   * future regression in this copy would print "nothing is capped" instead of
+   * saying it could not read the key. The real gateway always sends it
+   * (`CalendarAligned` on `TableVirtualKey` has no `omitempty`), so a key with no
+   * budgets still carries it through.
+   *
+   * `rate_limit` is copied although nothing in `keyUsage` reads it: the two
+   * adapters describe the same wire, and a field one of them silently drops is
+   * how the budgets went missing in the first place.
+   */
   const toKey = (value: unknown): VirtualKey => {
     const raw = record(value);
     return {
@@ -353,7 +387,17 @@ export const createBifrostGateway = (args: {
           : null,
       description:
         typeof raw.description === "string" ? raw.description : null,
-    };
+      ...(typeof raw.calendar_aligned === "boolean"
+        ? { calendar_aligned: raw.calendar_aligned }
+        : {}),
+      ...(Array.isArray(raw.budgets) ? { budgets: raw.budgets } : {}),
+      ...(Array.isArray(raw.provider_configs)
+        ? { provider_configs: raw.provider_configs }
+        : {}),
+      ...(Object.keys(record(raw.rate_limit)).length > 0
+        ? { rate_limit: record(raw.rate_limit) }
+        : {}),
+    } as VirtualKey;
   };
 
   /**

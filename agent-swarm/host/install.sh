@@ -33,9 +33,12 @@ done < <(find . -path ./systemd -prune -o -type f -print0)
 # otherwise stay here forever.
 rm -rf "$DEST/scripts" "$DEST/skills" "$DEST/soul" "$DEST/bootstrap.sh"
 
-install -m 644 "$STAGE"/systemd/*.service /etc/systemd/system/
+install -m 644 "$STAGE"/systemd/*.service "$STAGE"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable agent-swarm.service
+# up.sh opens it as ec2-user; a copy root created first would lock it out.
+[[ -e "$DEST/.deploy.lock" ]] || install -o ec2-user -g ec2-user -m 644 /dev/null "$DEST/.deploy.lock"
+systemctl enable --now agent-swarm-disk-cleanup.timer
 
 # A new host is installed before anyone has filled the secret. Leave the
 # stack down until they have, but still fail on any other error.

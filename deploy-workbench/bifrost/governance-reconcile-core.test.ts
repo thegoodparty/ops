@@ -300,11 +300,55 @@ describe("the complete-set body (acceptance 4)", () => {
     assert.deepEqual(body, {
       calendar_aligned: true,
       provider_configs: [
-        { provider: "bedrock", allowed_models: ["a"], key_ids: ["*"] },
-        { provider: "fireworks", allowed_models: ["b"], key_ids: ["*"] },
+        {
+          provider: "bedrock",
+          allowed_models: ["a"],
+          key_ids: ["*"],
+          budgets: [],
+        },
+        {
+          provider: "fireworks",
+          allowed_models: ["b"],
+          key_ids: ["*"],
+          budgets: [],
+        },
       ],
       budgets: [{ max_limit: 250, reset_duration: "1M" }],
     });
+  });
+
+  it("carries a provider entry's own budgets, and the empty set for one without", () => {
+    // Decision 18: an entry's `budgets` is its own complete set, so the Bedrock
+    // cap is emitted where it belongs and Fireworks says "none" with `[]`
+    // rather than by leaving the field out — an omitted one means "leave that
+    // entry's existing budgets alone" on the update path.
+    const body = convergenceBody({
+      calendar_aligned: true,
+      provider_configs: [
+        {
+          provider: "bedrock",
+          allowed_models: ["a"],
+          key_ids: ["*"],
+          budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+        },
+        { provider: "fireworks", allowed_models: ["b"], key_ids: ["*"] },
+      ],
+    });
+
+    assert.deepEqual(
+      (body.provider_configs as Array<Record<string, unknown>>).map(
+        (entry) => entry.budgets,
+      ),
+      [[{ max_limit: 1500, reset_duration: "1M" }], []],
+    );
+    // Exactly the two fields git owns, as on the key-level budget: an `id` would
+    // be written and never read, and the entry's budget is matched by
+    // `reset_duration` when none is given, which is what preserves its usage.
+    const bedrock = (body.provider_configs as Array<Record<string, unknown>>)[0];
+    assert.deepEqual(
+      Object.keys((bedrock.budgets as object[])[0]).sort(),
+      ["max_limit", "reset_duration"],
+    );
   });
 
   it("never sends reset_budget_usage, which is what keeps a retune from wiping a month", () => {
@@ -558,7 +602,12 @@ describe("the converge loop (acceptance 1, 2, 3, 6)", () => {
     assert.deepEqual(updates[0].body, {
       calendar_aligned: true,
       provider_configs: [
-        { provider: "bedrock", allowed_models: ["us.anthropic.claude-sonnet-5-5"], key_ids: ["*"] },
+        {
+          provider: "bedrock",
+          allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+          key_ids: ["*"],
+          budgets: [],
+        },
       ],
       budgets: [{ max_limit: 250, reset_duration: "1M" }],
     });
@@ -652,6 +701,213 @@ describe("the converge loop (acceptance 1, 2, 3, 6)", () => {
     assert.equal(second.changed, 0);
     assert.equal(second.unchanged, 1);
     assert.deepEqual(after.updates, []);
+  });
+
+  it("puts a template's provider budget on an existing key, which is every key and not only a new one", async () => {
+    // The subtlety `docs/bifrost-reconciler.md` states against the rate limit,
+    // read the other way round here: a value that *is* in the template reaches
+    // every key on the next tick. So the Bedrock cap is not a cap on future
+    // mints, it is a cap on the fleet, and this is the test that says so — the
+    // key below was minted long before anyone wrote a budget.
+    const { gateway, updates } = fakeGateway({
+      keys: [convergedKey({ name: "jeff@goodparty.org" })],
+    });
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: {
+        ...template(),
+        provider_configs: [
+          {
+            provider: "bedrock",
+            allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+            key_ids: ["*"],
+            budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+          },
+        ],
+      },
+      overrides: {},
+    });
+
+    assert.equal(result.changed, 1);
+    assert.deepEqual(result.applied, [
+      { name: "jeff@goodparty.org", fields: ["provider_configs"] },
+    ]);
+    assert.deepEqual(updates[0].body.provider_configs, [
+      {
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+        key_ids: ["*"],
+        budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+      },
+    ]);
+
+    // And the tick after that PUT is a no-op. The entry comes back the way the
+    // gateway reports it — `omitempty` drops nothing here, but `fireworks` in
+    // the committed document has no budget and is written as `[]`, so the
+    // round trip is exercised with both shapes below.
+    const after = fakeGateway({
+      keys: [
+        convergedKey({
+          name: "jeff@goodparty.org",
+          provider_configs: [
+            {
+              provider: "bedrock",
+              allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+              blacklisted_models: [],
+              weight: null as unknown as undefined,
+              allow_all_keys: true,
+              keys: [],
+              budgets: [
+                {
+                  max_limit: 1500,
+                  reset_duration: "1M",
+                  current_usage: 320.5,
+                  last_reset: "2026-11-01T00:00:00Z",
+                },
+              ],
+            },
+          ],
+        } as Partial<VirtualKey> & { name: string }),
+      ],
+    });
+    const second = await reconcileGovernance({
+      gateway: after.gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: {
+        ...template(),
+        provider_configs: [
+          {
+            provider: "bedrock",
+            allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+            key_ids: ["*"],
+            budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+          },
+        ],
+      },
+      overrides: {},
+    });
+    assert.equal(second.changed, 0);
+    assert.equal(second.unchanged, 1);
+    assert.deepEqual(after.updates, []);
+  });
+
+  it("reads an entry's absent budgets and its explicit empty list as the same thing", async () => {
+    // The convergent trap, and it needs the document to say `[]` out loud: the
+    // template and the overrides both accept `"budgets": []` on an entry, and
+    // `governanceBody` writes that as the entry's complete set. The gateway's
+    // `omitempty` then reports the entry back **without** the key, because an
+    // empty Go slice serialises as absent. A diff that told the two apart would
+    // rewrite every key on every tick and `changed` would never reach zero —
+    // the failure this module's header warns about.
+    const { gateway, updates } = fakeGateway({
+      keys: [
+        convergedKey({
+          name: "jeff@goodparty.org",
+          provider_configs: [
+            {
+              provider: "bedrock",
+              allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+              blacklisted_models: [],
+              weight: null as unknown as undefined,
+              allow_all_keys: true,
+              keys: [],
+              // Absent: no `budgets` key at all, which is how an entry the
+              // desired state gives an explicit `[]` comes back.
+            },
+          ],
+        } as Partial<VirtualKey> & { name: string }),
+      ],
+    });
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: {
+        ...template(),
+        provider_configs: [
+          {
+            provider: "bedrock",
+            allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+            key_ids: ["*"],
+            // Said out loud, and equal to not saying it at all.
+            budgets: [],
+          },
+        ],
+      },
+      overrides: {},
+    });
+
+    assert.equal(result.changed, 0);
+    assert.equal(result.unchanged, 1);
+    assert.deepEqual(updates, []);
+  });
+
+  it("clears a provider budget git no longer names, and reports the entry as changed", async () => {
+    // The rollback, for the cap: revert the template, and the next tick removes
+    // the entry's budget rather than leaving it because the field was omitted.
+    const { gateway, updates } = fakeGateway({
+      keys: [
+        convergedKey({
+          name: "jeff@goodparty.org",
+          provider_configs: [
+            {
+              provider: "bedrock",
+              allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+              blacklisted_models: [],
+              weight: null as unknown as undefined,
+              allow_all_keys: true,
+              keys: [],
+              budgets: [{ max_limit: 1500, reset_duration: "1M", current_usage: 900 }],
+            },
+          ],
+        } as Partial<VirtualKey> & { name: string }),
+      ],
+    });
+
+    const result = await reconcileGovernance({
+      gateway,
+      directory: directory({ members: ["user-1"], userIds: { "jeff@goodparty.org": "user-1" } }),
+      template: template(),
+      overrides: {},
+    });
+
+    assert.deepEqual(result.applied, [
+      { name: "jeff@goodparty.org", fields: ["provider_configs"] },
+    ]);
+    assert.deepEqual(updates[0].body.provider_configs, [
+      {
+        provider: "bedrock",
+        allowed_models: ["us.anthropic.claude-sonnet-5-5"],
+        key_ids: ["*"],
+        budgets: [],
+      },
+    ]);
+  });
+
+  it("keeps Fireworks uncapped while the cap on Bedrock is asserted", async () => {
+    // The committed template, whose Bedrock entry carries $1500 and whose
+    // Fireworks entry carries nothing: uncapped is expressed by the absence of
+    // a budget on that entry, not by an exemption anywhere else.
+    const capped = committedTemplate();
+    const result = composeDesiredState({
+      template: capped,
+      overrides: {},
+      email: "someone@goodparty.org",
+    });
+    const body = convergenceBody(result.state);
+    const byProvider = new Map(
+      (body.provider_configs as Array<Record<string, unknown>>).map((entry) => [
+        entry.provider as string,
+        entry.budgets,
+      ]),
+    );
+
+    assert.deepEqual(byProvider.get("bedrock"), [
+      { max_limit: 1500, reset_duration: "1M" },
+    ]);
+    assert.deepEqual(byProvider.get("fireworks"), []);
   });
 
   it("converges only the keys that differ, and counts both sides honestly", async () => {
@@ -879,6 +1135,26 @@ describe("the committed documents converge a key to the same shape twice", () =>
         weight: (entry.weight as number | undefined) ?? null,
         allow_all_keys: true,
         keys: [],
+        // The entry's own budgets as the hydrated list route reports them: the
+        // two fields git owns plus the accounting's, and `omitempty` dropping
+        // the field entirely for an entry that has none. That last part is the
+        // trap — `fireworks` is written as `[]` and comes back without the
+        // key — so the round trip below is what proves absent and empty compare
+        // equal rather than producing a diff every tick.
+        ...((entry.budgets as Array<Record<string, unknown>>).length > 0
+          ? {
+              budgets: (
+                entry.budgets as Array<Record<string, unknown>>
+              ).map((budget) => ({
+                id: `budget-${String(budget.reset_duration)}`,
+                max_limit: budget.max_limit as number,
+                reset_duration: budget.reset_duration as string,
+                current_usage: 12.5,
+                last_reset: "2026-11-01T00:00:00Z",
+                is_calendar_aligned: true,
+              })),
+            }
+          : {}),
       })),
       budgets: (body.budgets as Array<Record<string, unknown>>).map((entry) => ({
         max_limit: entry.max_limit as number,

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import type { S3Client } from "@aws-sdk/client-s3";
 import { execFileSync } from "node:child_process";
-import { cachePrefix, pullCache, pushCache, replayKey } from "./cache";
+import { cachePrefix, pullCache, pullHistory, pushCache, replayKey, sameReviewerAs } from "./cache";
 
 const KEY = "abc123";
 const PREFIX = `eval-cache/main/${KEY}/core/`;
@@ -216,4 +216,62 @@ test("the replay key changes when any input main's replay executes changes", () 
     assert.notEqual(next, previous, `${f} must change the key`);
     previous = next;
   }
+});
+
+const mainRun = (id: string, variant: string) =>
+  JSON.stringify({ caseId: id, variant, output: { status: "complete", findings: [], summary: "s" }, costUsd: 1 });
+
+test("history keeps other keys' expected runs from the same reviewer and skips the rest", async () => {
+  const { client } = fakeS3({
+    [`eval-cache/main/now/expected-aaa/case-a/run-1.json`]: mainRun("case-a", "main-1111111"),
+    [`eval-cache/main/old1/expected-aaa/case-a/run-1.json`]: mainRun("case-a", "main-1111111"),
+    [`eval-cache/main/old1/expected-aaa/case-a/run-2.json`]: errored("case-a"),
+    [`eval-cache/main/old2/expected-bbb/case-a/run-1.json`]: mainRun("case-a", "main-1111111"),
+    [`eval-cache/main/old2/expected-bbb/case-b/run-1.json`]: mainRun("case-b", "main-2222222"),
+    [`eval-cache/main/old2/core/case-c/run-1.json`]: mainRun("case-c", "main-1111111"),
+  });
+  const dir = tmp();
+  const kept = await pullHistory(
+    { key: "now", suitePrefix: "expected-", dir, sameReviewer: (r) => r.variant === "main-1111111" },
+    client,
+  );
+  assert.equal(kept, 2);
+  assert.ok(existsSync(join(dir, "case-a", "run-1.json")));
+  assert.ok(existsSync(join(dir, "case-a", "run-2.json")));
+  assert.ok(!existsSync(join(dir, "case-a", "run-3.json")));
+  assert.ok(!existsSync(join(dir, "case-b")));
+  assert.ok(!existsSync(join(dir, "case-c")));
+});
+
+test("sameReviewerAs matches main commits whose delegate/agents tree is this checkout's", () => {
+  const repo = tmp();
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", ...args], {
+      cwd: repo,
+      encoding: "utf-8",
+      stdio: "pipe",
+    }).trim();
+  const write = (path: string, body: string) => {
+    mkdirSync(join(repo, path, ".."), { recursive: true });
+    writeFileSync(join(repo, path), body);
+  };
+  const commit = () => {
+    git("add", "-A");
+    git("commit", "-q", "-m", "c");
+    return git("rev-parse", "HEAD");
+  };
+  git("init", "-q");
+  write("delegate/agents/a.ts", "v1");
+  const old = commit();
+  write("delegate/agents/a.ts", "v2");
+  const reviewerChange = commit();
+  write("delegate/review/r.ts", "v1");
+  const evalChange = commit();
+  const same = sameReviewerAs(repo);
+  const run = (variant: string) => ({ caseId: "x", variant, output: null, costUsd: null }) as never;
+  assert.equal(same(run(`main-${reviewerChange.slice(0, 7)}`)), true);
+  assert.equal(same(run(`main-${evalChange.slice(0, 7)}`)), true);
+  assert.equal(same(run(`main-${old.slice(0, 7)}`)), false);
+  assert.equal(same(run("main-0000000")), false);
+  assert.equal(same(run(`cand-${reviewerChange.slice(0, 7)}`)), false);
 });

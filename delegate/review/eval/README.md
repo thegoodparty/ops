@@ -1,19 +1,59 @@
 # PR-reviewer eval
 
-Replay recorded production reviews against the agent code in any checkout and compare two variants pairwise.
+Replay PRs with known right answers against the reviewer code in any checkout, and score how often each version gets them right.
+
+## Start here: measure a change locally
+
+`review:arms` is the one command for trying a change to the reviewer, prompt text or structure (a new subagent, injected context, a new tool). Each version you want to compare is an arm: a worktree on its own commit. Every arm replays the same tune cases from `expected/manifest.json` with its own code, and the checkout you run from scores them all, so an arm can't change what it is graded on. Holdout cases never run locally.
+
+```sh
+# from a checkout of main: it is the scorer, and the `main` arm
+git worktree add ../ops-arms/idea -b arm/idea origin/main
+(cd ../ops-arms/idea && npm ci)          # each arm runs its own install
+# ...make the change in ../ops-arms/idea and commit it
+
+npm run review:arms -- --arms main=.,idea=../ops-arms/idea --base main --out ~/delegate-lab
+```
+
+- **Results are kept per commit**, under `<out>/runs/<sha>`. An arm whose commit already has runs reuses them under any name, and changed code always replays. So keep one `--out` for a whole session. Uncommitted changes under `delegate/` are refused, because they would be filed under a commit that doesn't contain them.
+- **An arm may not differ from the scorer's commit in the hill-climb `neverTouch` paths** (`delegate/review/`, `delegate/framework/`, `.github/`, `package.json`, `package-lock.json`; the list is in `.claude/skills/hill-climb/targets/delegate-pr-reviewer.json`). Each arm replays with its own eval code and writes the results the scorer reads, so a change there could grade itself. Structural changes under `delegate/agents/` are fine. An arm made from an older main has to be rebased onto the scorer's commit.
+- **`--base <arm>` gates every other arm against that one.** A case the base passed on every run must not get worse. An arm that drops it gets `--runs` more runs and needs 5 of 6, so one unlucky run isn't a regression. `--targets a,b` names cases an arm must pass on every run. The verdict is printed under the table and written to `<out>/gate.json`.
+- `--case a,b` narrows to some tune cases. `--runs` (default 3), `--concurrency` (replays per arm, default 2) and `--parallel-arms` (default 3) set the load. Keep them low on a shared laptop.
+- `--mode score` re-renders the table and the gate from results already on disk, without replaying.
+- Credentials: `ANTHROPIC_API_KEY` if set, otherwise your Claude Code login, for the replays and for the judge that scores block cases. `gh` auth clones the reviewed repos. Every case, production records included, is a bundle file in this repo, so no AWS access is needed.
+
+## Hill-climbing
+
+Improve the reviewer one idea at a time, against whichever version is best so far, which is main only at the start.
+
+1. **Pick a case to fix.** Run main alone (`--arms main=.`) and take a tune case it fails, or one the change is meant to cover. Read its runs: `leads` on each `run-<n>.json` says whether the scout never raised the problem or a deep-reviewer dropped it.
+2. **Make one change** in a new arm worktree and commit it. One idea per arm, so a result can be traced to its cause.
+3. **Inner loop.** `--arms best=<path>,idea=<path> --base best --case <id>` until the case passes. Amend and rerun; changed commits replay, and `best` comes from disk.
+4. **Check for regressions.** The same command without `--case`, plus `--targets <id>`. The idea has to pass the gate against `best`.
+5. **Promote it.** The winning arm becomes `best` for the next idea, and its runs carry over. Try several ideas side by side as separate arms against the same base.
+6. **Open a PR** from the winning branch, with the final table in the body. Comment `delegate eval` on it to run the full suite in CI, holdout included. That is the only place holdout runs, and it gates against main. A human code owner approves and merges.
+
+The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of this loop.
+
+## Other ways to run it
+
+- **`delegate eval` on a PR** (next section): CI runs the full expected-result suite against main, holdout included, plus a pairwise judge on `scenarios.json`. Use it once, on the PR, as the final check.
+- **Dispatched run** (`delegate-eval-run.yml`, below): the same gate in CI on a branch without a PR, for prompt-text changes only, with a per-run budget. It is how the Delegate swarm hill-climbs, always, and how any agent without local credentials does.
+- **`review:expect`**: the replay and scoring engine under all of the above, for one checkout at a time.
+- **`review:eval replay` and `judge`**: pairwise comparison of two result sets by a model judge, on recorded production reviews.
 
 ## From a PR
 
 Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval <suite>` (for example `delegate eval re-review`) to run another suite from `scenarios.json`. The workflow:
 
-1. Loads the suite's scenarios from `scenarios.json`: fixed production review records in S3, so every eval runs the same cases. If your PR changes `scenarios.json`, its copy is used.
+1. Loads the suite's scenarios from `scenarios.json`, where each entry names a record file under `scenarios/`, so every eval runs the same cases and none of them needs the bucket. If your PR changes `scenarios.json`, its copy and its record files are used.
 2. Replays every scenario twice per side in parallel (`--replays 2`): two replays with main's agent code and two with your PR head's.
 3. Judges the two sides pairwise and posts a single comment to the PR with three verdicts: **Quality (tune)** and **Quality (holdout)** (each Better / Worse / Can't tell, from the sign test over that split's judged cases) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). The holdout line shows only the verdict and counts. The drop-down lists tune cases only; every raw result and the full report, holdout cases included, are on the workflow run as artifacts.
 4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
 **Cost and time:** each replay is a full `claude-opus-5-5` agent run at roughly $1.50, and each side runs every case twice, so the PR side costs about $3 per case. Main's side is cached, so it costs that only after a change to main's agents, framework or review code. The 23-case `core` suite takes about 30 minutes and costs around $69 for the PR side (and the same again for an uncached main) plus a few dollars for judging.
 
-**Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the S3 `key` of the record, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
+**Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the `record` file holding the production `ReviewRecord`, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
 
 **Repo settings the workflow needs:**
 
@@ -25,21 +65,13 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 ## Concepts
 
-**Case** — one production `ReviewRecord` stored in S3. The record contains the full `bundle` (diff, changed files, prior findings, PR metadata) that was the agent's complete input. Because the bundle is self-contained, a case can be replayed without calling GitHub — except for checking out the repo at `bundle.headSha` so the agent can read files.
+**Case** — one production `ReviewRecord`, or the bundle alone, committed to this repo. The bundle (diff, changed files, prior findings, PR metadata) was the agent's complete input. Because the bundle is self-contained, a case can be replayed without calling GitHub — except for checking out the repo at `bundle.headSha` so the agent can read files.
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
 **Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs, gating?, leads?, subagentCalls? }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes. `gating` is the gate's outcome (`{ mode, verdict, gates, wouldApprove }`) and is present only for a repo that has adopted gating: the agent's `output` cannot tell a flag from an ordinary comment, because both are a complete review with no findings. Replays of the pr-reviewer also carry `leads`: the scout's leads, each with an `outcome` (`not-investigated`, `dropped`, `raised`, `reported`, `unknown`) telling what the deep-reviewer did with it, so a miss can be told apart as "scout never raised it" or "deep-reviewer dropped it". Absent on production-record results and on files written before it existed. `subagentCalls` keeps each subagent's prompt and answer, so lead tracing can be checked and re-run offline without another paid replay.
 
 ## Commands
-
-### Snapshot a corpus
-
-```sh
-npm run review:eval -- cases snapshot --out ./eval-cases [--repo thegoodparty/gp-api] [--limit 20]
-```
-
-Lists every `ReviewRecord` in S3 (`REVIEW_BUCKET`, default `delegate-reviews`) and writes them to a local directory. Freeze a corpus before running an experiment so both variants are judged on exactly the same cases.
 
 ### Replay from a variant
 
@@ -67,7 +99,7 @@ npm run review:eval -- cache pull --suite core --layout runs --key "$(npm run -s
 npm run review:eval -- cache push --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 ```
 
-`--layout runs` is for `<case>/run-<n>.json` directories, which is what both the pairwise and the expected suites use; the default `flat` is one `<case>.json` per case. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, and a record under `reviews/` is written once, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 run(s); N already had results`.
+`--layout runs` is for `<case>/run-<n>.json` directories, which is what both the pairwise and the expected suites use; the default `flat` is one `<case>.json` per case. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, which a scenario's record file carries and a case's id never changes, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 run(s); N already had results`.
 
 ### Judge two sets of results
 
@@ -87,8 +119,10 @@ Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by defau
 ## Worked example — comparing main vs a branch
 
 ```sh
-# 1. Freeze a corpus (run once from any checkout)
-npm run review:eval -- cases snapshot --out ./eval-cases --limit 20
+# 1. Materialize the pairwise suite's cases as record files
+npm run review:eval -- cases scenarios \
+  --manifest delegate/review/eval/scenarios.json \
+  --out ./eval-cases --suite core
 
 # 2. Replay from main
 git worktree add ../review-eval-main main
@@ -113,7 +147,9 @@ cat report.md
 
 ## Expected-result suite
 
-Thirty-seven cases with a known right answer, listed in `expected/manifest.json`. Each is scored on its own expectation, with no judge. A block case passes when a finding lands in one of its `paths` (and, if set, one of its `categories`); an approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired.
+Forty-three cases with a known right answer, listed in `expected/manifest.json`. `expected/parked.json` holds cases taken out of the suite, each with its reason (today one that needs vendor behavior the replayed checkout does not contain); nothing replays or scores them, and moving one back to the manifest restores it. Each is scored on its own expectation. An approve case passes when the gate's review event is an approval and there are no findings; a flag case passes when the review event is a comment and the named gate fired. Neither involves a model.
+
+A block case names its `reason`: one sentence saying what mistake the review must catch. It passes only when the review blocked (at least one finding, and in a gated repo a review event that is not an approval) and at least one finding identifies that mistake: the same underlying problem, however it is worded, in whatever file or category, whichever reviewer raised it. A block on a different real problem fails as "blocked on something else". omni-3023 is why: a run blocked in the right file on a different real bug, and scoring by file would have passed it. Whether a finding is the reason is decided by a judge, `claude-sonnet-5-5`, one call per scored run that blocked, answering `{ match, finding?, why }` through a strict tool (`block-judge.ts`). The findings reach it inside `<untrusted>`, since the reviewer under test wrote them. With `ANTHROPIC_API_KEY` set it calls the API; without one it uses your Claude Code login through the agent SDK, with no tools. Each answer is cached next to its run as `<case>/run-<n>.judge.json`, keyed by a hash of the reason and the findings, so score mode, gate mode, `review:arms` and reruns ask once per run, and editing a reason asks again. Replay's own progress line does not call the judge, so it reports a block as "reason not judged". Report lines carry the judge's one-line answer: `blocked for the reason: …` or `blocked on something else: …`.
 
 The two plan cases carry their outcome plus the model's answer as a diagnostic: `{ "verdict": "approve", "consistency": "consistent" }` for the consistent change and `{ "verdict": "flag", "reason": "inconsistent", "consistency": "inconsistent" }` for the inconsistent one. The outcome decides the case; the diagnostic says whether a wrong outcome came from the model or from the gate. Each of their bundles carries the approved plan's text and blob sha, so nothing is fetched from GitHub and they replay like any other simulated PR.
 
@@ -127,24 +163,28 @@ Every `delegate eval` comment also runs this suite as a parallel job and posts t
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY`, `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Thirty-seven cases at three runs costs about $170 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY` (score, gate and `main-short` use it for the block judge too) and `gh` auth for the target repos; the cases themselves are in the repo. Forty-three cases at three runs costs about $195 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
 
 ### Gate
 
-`--mode gate --base <main-results-dir> [--targets id,id] [--final true] [--runs 3]` turns the baseline into a verdict and writes `<out>/gate.json` and the gate report to `<out>/report.md`. It refuses to run without `--base`, or when main has no completed runs at all.
+`--mode gate --base <main-results-dir> [--history <dir>] [--targets id,id] [--final true] [--runs 3] [--min-main-runs 6]` turns the baseline into a verdict and writes `<out>/gate.json` and the gate report to `<out>/report.md`. It refuses to run without `--base`, or when main has no completed runs at all.
 
 - A case main passed on every run (`runsPassed == completed == runs`) must not regress. If the candidate passes fewer than `runs`, the case is returned in `rerun`; after `runs` more runs (`--mode replay --case a,b --from-run 4`) it needs `2*runs-1` of `2*runs` (5 of 6), or it is a `regression`. With `--final true` a case still short of `runs` passes counts as a regression, so a rerun that never happened cannot pass.
 - A case main did not pass 3/3 (including one with unfinished main runs) cannot regress.
+- `--min-main-runs` (default `runs`) is how many completed main runs, this baseline's and `--history`'s together, a case needs before it can regress: a case main passes 9 times in 10 still passes three in a row about 73% of the time. `delegate-eval-run.yml` passes 6, and before gating replays main's runs 4 to 6 on every case main passed so far with fewer (`--mode main-short --base <dir> [--history <dir>] --min-main-runs 6 --ids-out <file>` writes those ids to a file and prints only a count). Those runs are cached like the first three, and like them are not charged to the run id.
+- `--history` holds main's earlier runs of the same reviewer, pulled by `review:eval cache history` from other replay keys: a run counts when its `main-<sha>` variant has this checkout's `delegate/agents` tree and its case head matches the baseline's. A key changes with any edit under `delegate/review`, so without history the gate sees only this check's three main runs and treats a lucky streak as a bar. A case main failed on any earlier run cannot regress either, and `flaky` counts both. `delegate-eval-run.yml` passes it; `delegate eval` on a PR does not yet.
 - Every id in `--targets` must pass all its runs, or it is in `targetsMissed`. An unknown id is a miss.
 - `costRatio` is the candidate's average cost per run over main's (null when either is unknown). Above `1.10` sets `costOver`, which is reported but never fails the gate.
 - `pass` is true only with no `regressions`, `rerun` or `targetsMissed`. The exit code is non-zero only with `--final true` and `pass` false.
-- `gate.json`: `{ regressions, rerun, targetsMissed, costRatio, costOver, pass, cases: [{ id, split, mainPassed, mainCompleted, flaky, candPassed, candRuns, outcome }] }`. Main's flake rate for a case is `mainPassed/mainCompleted`; `flaky` is true when that is strictly between 0 and 1.
+- `gate.json`: `{ regressions, rerun, targetsMissed, costRatio, costOver, pass, minMainRuns, cases: [{ id, split, mainPassed, mainCompleted, earlierPassed, earlierCompleted, flaky, candPassed, candRuns, outcome }] }`. Main's flake rate for a case is its passes over its completed runs, this check's and earlier ones together; `flaky` is true when that is strictly between 0 and 1, or when the case is marked `flakyOnMain`.
 
 The report lists tune cases with the candidate's and main's pass counts and shows holdout only as `passed X of Y, regressions: N`. `gate.json` and `report.json` still name holdout ids, so they stay in the workflow artifact and are not posted. `delegate eval` on a PR passes no `--targets`; the hill-climb dispatch (ticket 07) supplies them, from main's side, never from PR files. In the workflow, `expected-gate` runs the first pass, `expected-rerun` (PR code, read-only eval role) replays only the flagged cases, and `expected-score` merges only `run-4` to `run-6` from the rerun, gates with `--final true`, posts the gate report (never the score report, which names holdout cases) and goes red on failure.
 
+The suite asks what today's reviewer does with a fixed change, so replay always selects from every post-mortem in `delegate/review/postmortems/` in the checkout, whatever the date of the case, recorded or simulated. Before selection, and so before the review sees them, replay strips identifiers from each post-mortem's text (`redactIdentifiers` in `postmortems.ts`): PR references (`#2977`, `omni #2977`, `thegoodparty/omni#2977`, `PR 2977`) become "a PR", GitHub links to pulls, commits and compares become "(link)", and commit shas become "(commit)". A post-mortem written about a case would otherwise name its PR and fix, and work as an answer key. Production reviews see post-mortems as written. The review prompt carries no PR number either, in production or replay.
+
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). An optional `flakyOnMain` says why main's own result on a case is noise; the gate still scores that case but never counts it as a regression. No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 
-A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
+A case is a `bundle` file next to the manifest. A bundle whose `source` is `simulated` is a PR whose head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
 
 ### Dispatched run (`delegate-eval-run.yml`)
 
@@ -156,7 +196,7 @@ gh workflow run delegate-eval-run.yml --ref main -f mode=dry-run -f branch=<bran
 
 Inputs: `mode` (`dry-run` is the default and spends nothing; `inner` replays the given tune `cases` once each; `tune` gates the tune cases with 3 runs; `gate` gates every case with 3 runs and reruns), `branch`, `run_id` (`^[a-z0-9-]{1,64}$`, keys the budget), `cases` (inner only, tune case ids), `targets` (tune and gate, tune case ids that must pass every run; they come from the dispatch, never from the branch), `budget_usd` (default 150).
 
-The candidate is main's tree with `delegate/agents/pr-reviewer.ts` and `delegate/agents/pr-reviewer-subagents.ts` taken from the branch. The run fails before any replay if the branch changes any other file, so the branch's eval code, manifests, scoring, workflows and dependencies are never used; replay is the only step that runs the branch's files, and scoring, the gate, the budget and the ledger run in jobs of main's code. Main's baseline comes from the eval cache, replayed and pushed through `delegate-eval-cache-push.yml` when missing; its cost is not charged to the run id. If any of main's runs is still missing or errored after the replay, the run fails rather than leave that case ungated; good runs are cached, so a re-dispatch replays only the gaps.
+The candidate is main's tree with `delegate/agents/pr-reviewer.ts` and `delegate/agents/pr-reviewer-subagents.ts` taken from the branch. The run fails before any replay if the branch changes any other file, so the branch's eval code, manifests, scoring, workflows and dependencies are never used; replay is the only step that runs the branch's files, and scoring, the gate, the budget and the ledger run in jobs of main's code. Main's baseline comes from the eval cache, replayed and pushed through `delegate-eval-cache-push.yml` when missing; its cost is not charged to the run id. Main's replay makes a second pass over any run the first left incomplete. A run that still errored after that, like a review that comes back `failed` (the reviewer gave up), is never cached: it recurs on every dispatch, counts as a run main did not pass, so that case is not held, and the run goes on. Only a run with no result file is a gap, and that fails the run; good runs are cached, so a re-dispatch replays only those. In tune and gate mode the candidate waits for main's baseline and is skipped when it fails, so that failure charges the run id nothing.
 
 The two files are TypeScript that replay runs in-process, so `prepare` also compares each with its merge-base copy and refuses the run unless they differ only in the text of string and template literals (`${...}` expressions, imports, identifiers, calls and statements must match exactly; comments and whitespace may change). Import specifiers, `require()` and `import()` arguments and `x["key"]` lookups count as code, written with quotes or backticks. Tool names are literals a candidate may change, so replay denies any tool outside its own read-only list (Read, Grep, Glob, Task/Agent, StructuredOutput and the git tools) whatever the reviewer config says. Structural changes go through a human-authored PR.
 
@@ -164,16 +204,32 @@ Nothing is posted to GitHub. Wait with `gh run watch <run-id> --exit-status` (re
 
 **Budget.** The spend of a run id is `eval-cache/ledger/<run_id>/<ghRunId>-<attempt>-<mode>.json`, one object per measured dispatch, written once with `If-None-Match` by `delegate-eval-ledger.yml` (role `github-actions-delegate-eval-ledger`, trusted only by that file). Before replaying, the dispatch refuses if recorded spend plus the estimate would pass the budget: inner is $4 per case, tune is tune cases x 3 x $1.30, gate is all cases x 3 x $1.30 (reruns are not in the estimate). The lowest `budget_usd` ever given for a run id wins, so a later dispatch can lower but not raise it. After the run, the summed `costUsd` of every candidate result, failed and cancelled runs included, is recorded. Dispatches for one run id are serialized by a concurrency group; the budget is per run id, so a new id is a new budget.
 
+## Cases outside the suite
+
+To try a PR that isn't in `expected/manifest.json` yet, build a local manifest of the same shape and pass it with `--manifest`. Its bundles resolve next to it.
+
+```sh
+# a real PR as a case, from GitHub alone (no S3), as production would have seen it at that sha
+npm run review:from-pr -- --pr 2977 --sha <reviewed sha> --out ~/delegate-lab/bundles/omni-2977.bundle.json
+
+npm run review:arms -- --manifest ~/delegate-lab/manifest.json --arms main=.,idea=../ops-arms/idea --base main --out ~/delegate-lab
+```
+
+- A bundle case whose `source` is `simulated` gets its head commit rebuilt from the diff; any other source is a real PR, and its head is fetched from GitHub.
+- `--mirror-dir` (default under `--work-dir`) keeps one bare clone per repo. Each replay is a `--shared` clone of it, and every sha the cases need is fetched once before the arms start.
+- Runs are keyed by commit and case id, not by the case's contents. After editing a case, delete its directory under `<out>/runs/*/`.
+
 ## Mining candidate cases
 
 ```sh
-npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 --out candidates.jsonl
+npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 \
+  --bundles ~/delegate-lab/proposed --out candidates.jsonl
 ```
 
-Read-only. Walks every page of `REVIEW_BUCKET`, keeps the latest non-`eval` record per head sha, and proposes cases for a human to confirm. Needs S3 read access and `gh` auth. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--out` (stdout if omitted).
+Reads production reviews: every page of `REVIEW_BUCKET` is its input, which is the one thing here that still needs S3 read access, alongside `gh` auth. Keeps the latest non-`eval` record per head sha and proposes cases for a human to confirm. A proposal carries its candidate's `bundle` and nothing else about the record: `--bundles <dir>` writes one bundle file per candidate, named after its `id`, which is the file that goes next to the manifest. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--bundles` (required when anything is proposed), `--out` (the proposal JSONL; stdout if omitted).
 
-- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, key, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
-- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, key, repo, pr, findings, replies, mergedSha }`.
+- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, id, bundle, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
+- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, id, bundle, repo, pr, findings, replies, mergedSha }`.
 
 Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and many real misses need a running system to see, so a person labels each one.
 
@@ -181,6 +237,7 @@ Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and man
 
 - **Replay**: each replay is a full `claude-opus-5-5` agent run. Budget $1–5 per replay, two per side per case in `delegate eval`; a 20-case corpus costs roughly $40–200 for the PR side depending on diff complexity.
 - **Judge**: each pass is a short `claude-sonnet-5-5` call (one structured verdict). Budget a few cents per pass; 20 cases × 2 pairs × 4 passes ≈ $1–4.
+- **Block judge**: one short `claude-sonnet-5-5` call per run that blocked on a block case, main's and the candidate's, cached beside the run. A few cents each; a full expected-result check is well under $5.
 
 ## Statistical interpretation
 

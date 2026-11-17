@@ -1,39 +1,9 @@
 import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import {
-  S3Client,
-  ListObjectsV2Command,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
+import { dirname, join } from "node:path";
 import { z } from "zod";
-import { ReviewRecordSchema, isLockKey } from "../schema";
+import { ReviewRecordSchema } from "../schema";
 import type { ReviewRecord } from "../schema";
 import { KindSchema, SourceSchema, SplitSchema } from "./expect";
-
-const REVIEW_BUCKET = process.env.REVIEW_BUCKET ?? "delegate-reviews";
-
-const readBody = async (body: unknown): Promise<string> => {
-  const chunks: Buffer[] = [];
-  for await (const chunk of body as AsyncIterable<Buffer>) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
-  }
-  return Buffer.concat(chunks).toString("utf-8");
-};
-
-export interface LoadOptions {
-  from: string;
-  repo?: string;
-  limit?: number;
-  onlyComplete?: boolean;
-}
-
-const applyFilters = (records: ReviewRecord[], opts: LoadOptions): ReviewRecord[] => {
-  let result = records;
-  if (opts.repo) result = result.filter((r) => r.repo === opts.repo);
-  if (opts.onlyComplete) result = result.filter((r) => r.output?.status === "complete");
-  if (opts.limit !== undefined) result = result.slice(0, opts.limit);
-  return result;
-};
 
 const loadFromDir = (dir: string): ReviewRecord[] => {
   const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
@@ -56,73 +26,15 @@ const loadFromDir = (dir: string): ReviewRecord[] => {
   return records;
 };
 
-const loadFromS3 = async (client: S3Client): Promise<ReviewRecord[]> => {
-  const keys: string[] = [];
-  let continuationToken: string | undefined;
-
-  do {
-    const res = await client.send(
-      new ListObjectsV2Command({
-        Bucket: REVIEW_BUCKET,
-        Prefix: "reviews/",
-        ContinuationToken: continuationToken,
-      }),
-    );
-    for (const obj of res.Contents ?? []) {
-      if (obj.Key && !isLockKey(obj.Key)) {
-        keys.push(obj.Key);
-      }
-    }
-    continuationToken = res.NextContinuationToken;
-  } while (continuationToken);
-
-  const records: ReviewRecord[] = [];
-  for (const key of keys) {
-    let text: string;
-    try {
-      const res = await client.send(
-        new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: key }),
-      );
-      text = await readBody(res.Body);
-    } catch (err) {
-      console.warn(
-        `cases: failed to fetch ${key}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      continue;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      console.warn(`cases: invalid JSON at ${key}`);
-      continue;
-    }
-    const result = ReviewRecordSchema.safeParse(parsed);
-    if (!result.success) {
-      console.warn(`cases: invalid ReviewRecord at ${key}: ${result.error.message}`);
-      continue;
-    }
-    records.push(result.data);
-  }
-  return records;
-};
-
-export const loadCases = async (
-  opts: LoadOptions,
-  client: S3Client = new S3Client({}),
-): Promise<ReviewRecord[]> => {
-  const records =
-    opts.from === "s3" ? await loadFromS3(client) : loadFromDir(opts.from);
-  return applyFilters(records, opts);
-};
+export const loadCases = (dir: string): ReviewRecord[] => loadFromDir(dir);
 
 // A scenario is a recorded production run picked on purpose: its bundle is
-// the fixed input, so every eval replays the same cases. The manifest holds
-// pointers only; the records (and the diffs inside them) stay in S3.
+// the fixed input, so every eval replays the same cases. The manifest names a
+// record file next to it, so a scenario needs no AWS access to load.
 export const ScenarioSchema = z.object({
   id: z.string().regex(/^[a-z0-9-]+$/),
   suite: z.string().regex(/^[a-z0-9-]+$/),
-  key: z.string().startsWith("reviews/").endsWith(".json"),
+  record: z.string().endsWith(".record.json"),
   tests: z.string().min(1),
   split: SplitSchema,
   source: SourceSchema,
@@ -137,23 +49,19 @@ export const ScenarioManifestSchema = z
 export const readManifest = (path: string): Scenario[] =>
   ScenarioManifestSchema.parse(JSON.parse(readFileSync(path, "utf-8")));
 
-// The report names a case by its scenario id rather than its run id.
-export const scenarioNames = (scenarios: Scenario[]): Map<string, string> =>
-  new Map(scenarios.map((s) => [s.key.split("/").pop()!.replace(/\.json$/, ""), s.id]));
-
-// Keyed like scenarioNames, so the report can split cases without a lookup.
-export const scenarioSplits = (scenarios: Scenario[]): Map<string, Scenario["split"]> =>
-  new Map(scenarios.map((s) => [s.key.split("/").pop()!.replace(/\.json$/, ""), s.split]));
+export interface LoadedScenario {
+  scenario: Scenario;
+  record: ReviewRecord;
+}
 
 // Fails loudly on a missing or invalid scenario: a suite that silently
 // shrinks is the moving-corpus problem this replaces.
-export const loadScenarios = async (
-  scenarios: Scenario[],
+export const loadScenarios = (
+  manifestPath: string,
   opts: { suite?: string; split?: string } = {},
-  client: S3Client = new S3Client({}),
-): Promise<{ scenario: Scenario; record: ReviewRecord }[]> => {
+): LoadedScenario[] => {
   const split = opts.split === undefined ? undefined : SplitSchema.parse(opts.split);
-  const selected = scenarios.filter(
+  const selected = readManifest(manifestPath).filter(
     (s) => (!opts.suite || s.suite === opts.suite) && (!split || s.split === split),
   );
   if (selected.length === 0) {
@@ -161,17 +69,23 @@ export const loadScenarios = async (
       `no scenarios${opts.suite ? ` in suite "${opts.suite}"` : ""}${split ? ` in split "${split}"` : ""}`,
     );
   }
-  const loaded: { scenario: Scenario; record: ReviewRecord }[] = [];
-  for (const scenario of selected) {
-    const res = await client.send(new GetObjectCommand({ Bucket: REVIEW_BUCKET, Key: scenario.key }));
-    const parsed = ReviewRecordSchema.safeParse(JSON.parse(await readBody(res.Body)));
+  return selected.map((scenario) => {
+    const path = join(dirname(manifestPath), scenario.record);
+    const parsed = ReviewRecordSchema.safeParse(JSON.parse(readFileSync(path, "utf-8")));
     if (!parsed.success) {
-      throw new Error(`scenario ${scenario.id}: invalid ReviewRecord at ${scenario.key}: ${parsed.error.message}`);
+      throw new Error(`scenario ${scenario.id}: invalid ReviewRecord at ${scenario.record}: ${parsed.error.message}`);
     }
-    loaded.push({ scenario, record: parsed.data });
-  }
-  return loaded;
+    return { scenario, record: parsed.data };
+  });
 };
+
+// The report names a case by its scenario id rather than its run id.
+export const scenarioNames = (loaded: LoadedScenario[]): Map<string, string> =>
+  new Map(loaded.map(({ scenario, record }) => [record.runId, scenario.id]));
+
+// Keyed like scenarioNames, so the report can split cases without a lookup.
+export const scenarioSplits = (loaded: LoadedScenario[]): Map<string, Scenario["split"]> =>
+  new Map(loaded.map(({ scenario, record }) => [record.runId, scenario.split]));
 
 export const saveCases = (records: ReviewRecord[], dir: string): void => {
   mkdirSync(dir, { recursive: true });

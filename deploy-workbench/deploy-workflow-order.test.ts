@@ -263,6 +263,24 @@ describe("deploy-workbench.yml step order", () => {
     );
   });
 
+  it("provisions the usage export's database role after the apply", () => {
+    // The function it invokes is created by that apply, so the step cannot run
+    // before it; and it must run before the export's first scheduled run rather
+    // than at some later convenience, because the run without a role fails.
+    assert.ok(
+      stepIndex("Provision the usage export's database role") > stepIndex("Deploy"),
+      "the bootstrap must be invoked after the apply that creates it",
+    );
+    // It reads the export's secret, so it needs the workbench session like the
+    // two checks above rather than the first-hop one deploy.sh needs.
+    assert.ok(
+      stepNamed("Provision the usage export's database role").body.includes(
+        "WORKBENCH_DEPLOY_ROLE_ARN",
+      ),
+      "the bootstrap step must make the pulumi-deploy hop",
+    );
+  });
+
   it("leaves Bedrock enablement after the apply", () => {
     // It mutates the account by accepting model-provider terms, so a failed
     // apply is a reason to stop rather than to carry on. Pre-existing property

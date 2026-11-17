@@ -14,6 +14,11 @@
  * a truncated SHA-256 of the email, never the address. `member.skipped` carries
  * the domain, not the local part, so a misconfiguration is debuggable without
  * putting addresses in CloudWatch. `sync.completed` carries counts.
+ *
+ * The same rule covers the name read from the Google profile: `user.created`
+ * carries `nameSource` (`google` or `derived`) and never the name itself. A
+ * `member.skipped` with `reason: "profile-lookup-failed"` is the one line that
+ * says a lookup was attempted and did not answer; it still carries no name.
  */
 import { createHash } from "node:crypto";
 

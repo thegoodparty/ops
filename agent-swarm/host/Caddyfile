@@ -1,21 +1,28 @@
 # delegate-swarm.infra.goodparty.org: serve the self-built dashboard SPA from
 # /srv/ui and reverse-proxy every API path to the api container.
 #
-# API prefixes (agent-swarm v2.6.0):
+# API prefixes (agent-swarm v2.10.0):
 #   /api/*          every REST route (src/http/*.ts: path: "/api/...")
-#   /p/*            public page views  (src/http/pages-public.ts:54,75)
-#   /@swarm/*       page SDK + proxy    (src/http/page-proxy.ts:37, realtime.ts)
-#   /mcp            swarm MCP endpoint  (src/http/mcp.ts:158)
-#   /mcp-user       user-token MCP      (src/http/mcp-user.ts:46, core.ts:454)
-#   /health /openapi.json /docs         (src/http/core.ts:416,434,442)
-#   /status         (src/http/status.ts:766)
-#   /ping /close    (src/http/core.ts:356,378)
-#   /x/*            (src/http/x.ts)
-# None of these collide with SPA routes (apps/ui/src/app/router.tsx:129-211:
-# /agents /tasks /sessions /chat /services /schedules /workflows /workflow-runs
+#   /p/*            public page views     (src/http/pages-public.ts)
+#   /@swarm/*       page SDK + proxy      (src/http/page-proxy.ts, realtime.ts)
+#   /agentfs/*      agent-fs proxy        (src/http/agentfs-proxy.ts)
+#   /share/* /site/*  public agent-fs pages, same proxy
+#   /mcp            swarm MCP endpoint    (src/http/mcp.ts)
+#   /mcp-user       user-token MCP        (src/http/mcp-user.ts)
+#   /health /openapi.json /docs           (src/http/core.ts)
+#   /status /status/test-connection        (src/http/status.ts)
+#   /ping /close                          (src/http/core.ts)
+#   /invite/*       invite link redirect   (src/http/users.ts)
+#
+# The three agent-fs prefixes are routed so that /agentfs, /share and /site
+# never fall through to the SPA and answer a file preview with index.html.
+# AGENT_FS_PROXY is pinned off in docker-compose.yml, so the API 404s them
+# until someone turns it on (README, "Shared files").
+# None of these collide with SPA routes (apps/ui/src/app/routes.tsx: /agents
+# /tasks /sessions /chat /services /schedules /workflows /workflow-runs
 # /connections /scripts /script-runs /approval-requests /usage /settings
 # /templates /mcp-servers /skills /repos /people /memory /pages /apps /file
-# /setup /integrations).
+# /setup /connect /join /integrations).
 #
 # SWARM_AUTH (set by render-env.sh, passed to the caddy container) picks the
 # snippet: "open" (bearer auth only) or "sso" (Google login via oauth2-proxy
@@ -37,7 +44,7 @@
 }
 
 (open) {
-	@api path /api/* /p/* /@swarm/* /mcp /mcp-user /health /status /docs /docs/* /openapi.json /x/* /ping /close
+	@api path /api/* /p/* /@swarm/* /agentfs/* /share/* /site/* /mcp /mcp-user /health /status /status/* /invite/* /docs /docs/* /openapi.json /ping /close
 	handle @api {
 		reverse_proxy api:3013
 	}
@@ -67,7 +74,7 @@
 
 	# Machine callers with their own bearer or signature, and IdP callbacks
 	# that carry their own state: no browser cookie.
-	@noauth path /mcp /mcp-user /health /status /ping /api/webhooks/* /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
+	@noauth path /mcp /mcp-user /share/* /site/* /health /status /invite/* /ping /api/webhooks/* /api/github/webhook /api/gitlab/webhook /api/azure-devops/webhook /api/agentmail/webhook /api/integrations/kapso/webhook /api/mcp-oauth/callback /api/oauth/callback /api/oauth/*/callback
 	handle @noauth {
 		reverse_proxy api:3013
 	}
@@ -89,7 +96,7 @@
 
 		# The dashboard is built with a placeholder key (build-ui.sh); the API
 		# gets the signed-in person's token instead.
-		@api path /api/* /p/* /@swarm/* /docs /docs/* /openapi.json /x/* /close
+		@api path /api/* /p/* /@swarm/* /agentfs/* /status/* /docs /docs/* /openapi.json /close
 		handle @api {
 			@unprovisioned vars {swarm_user_token} ""
 			respond @unprovisioned "Signed in, but this address has no dashboard token (allowed-emails.txt, sync-dashboard-users.sh)" 403

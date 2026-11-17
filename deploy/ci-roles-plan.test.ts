@@ -17,12 +17,11 @@ const asList = (value: unknown) =>
   Array.isArray(value) ? value : [value as string];
 
 describe("githubActionsPulumiPlanTrust", () => {
-  it("trusts exactly the two pull_request subjects, under StringEquals", () => {
+  it("trusts exactly dataplatform's pull_request subject, under StringEquals", () => {
     assert.equal(githubActionsPulumiPlanTrust.Statement.length, 1);
     const condition = githubActionsPulumiPlanTrust.Statement[0].Condition;
     assert.equal(condition.StringLike, undefined);
     assert.deepEqual(condition.StringEquals?.[SUBJECT_KEY], [
-      "repo:thegoodparty/omni:pull_request",
       "repo:thegoodparty/gp-terraform-dataplatform:pull_request",
     ]);
   });
@@ -114,10 +113,8 @@ describe("githubActionsPulumiPlan", () => {
   });
 
   const READABLE = [
-    "arn:aws:s3:::goodparty-terraform-state-us-west-2/*/dev/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate",
     "arn:aws:s3:::goodparty-terraform-state-us-west-2/dataplatform/terraform.tfstate.tflock",
-    "arn:aws:s3:::goodparty-terraform-state-us-west-2/shared/slack-notifier/terraform.tfstate",
   ];
 
   it("reads only the listed Terraform states", () => {
@@ -180,17 +177,11 @@ describe("githubActionsPulumiPlan", () => {
     assert.ok(asList(statement("DenyOtherS3Objects").NotResource).includes(lock));
   });
 
-  it("logs in to ECR Public and can push nothing there", () => {
-    const login = statement("EcrPublicLogin");
-    assert.equal(login.Effect, "Allow");
-    assert.ok("Action" in login);
-    assert.deepEqual(login.Action, [
-      "ecr-public:GetAuthorizationToken",
-      "sts:GetServiceBearerToken",
-    ]);
+  // omni's pull request image builds log in with the pull-request role.
+  it("grants nothing in ECR", () => {
     const ecr = githubActionsPulumiPlan.Statement.flatMap((s) =>
       "Action" in s ? asList(s.Action) : []
-    ).filter((a) => a.startsWith("ecr"));
-    assert.deepEqual(ecr, ["ecr-public:GetAuthorizationToken"]);
+    ).filter((a) => a.startsWith("ecr") || a === "sts:GetServiceBearerToken");
+    assert.deepEqual(ecr, []);
   });
 });

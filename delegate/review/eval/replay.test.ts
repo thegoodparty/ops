@@ -9,6 +9,7 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
 import type { SubagentCall } from "../../framework/types";
+import { loadPostmortems } from "../postmortems";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
   runId: randomUUID(),
@@ -387,7 +388,7 @@ test("replayAll writes one result file per replay and skips the ones that exist"
   const record = makeRecord();
   const calls: string[] = [];
   const agent: RunAgentImpl = async (_config, _prompt, overrides) => {
-    calls.push(overrides.cwd);
+    if (_config.name === "pr-reviewer") calls.push(overrides.cwd);
     return fakeRunAgent(_config, _prompt, overrides);
   };
 
@@ -419,7 +420,7 @@ test("replayAll replays only the missing run of a partly cached case", async () 
 
   let calls = 0;
   const agent: RunAgentImpl = async (c, p, o) => {
-    calls++;
+    if (c.name === "pr-reviewer") calls++;
     return fakeRunAgent(c, p, o);
   };
   const results = await replayAll([record], { out, workDir: tmpDir(), variant: "new", replays: 2 }, { concurrency: 1 }, agent, fakeCheckout);
@@ -451,8 +452,8 @@ test("replayAll runs multiple cases with the worker pool", async () => {
   const records = [makeRecord(), makeRecord(), makeRecord()];
 
   let callCount = 0;
-  const countingAgent: RunAgentImpl = async () => {
-    callCount++;
+  const countingAgent: RunAgentImpl = async (config) => {
+    if (config.name === "pr-reviewer") callCount++;
     return {
       agent: "pr-reviewer",
       output: "",
@@ -782,4 +783,138 @@ test("replayCase does not treat an area as unique once earlier leads claimed its
       ["Tests", "not-investigated"],
     ],
   );
+});
+
+const traced = async (leads: object[], prompts: string[]) => {
+  const calls: SubagentCall[] = [
+    { subagent: "scout", prompt: "diff", result: JSON.stringify({ leads, summary: "s" }) },
+    ...prompts.map((prompt, i) => ({
+      subagent: "deep-reviewer",
+      prompt,
+      result: JSON.stringify({ findings: i === 0 ? [finding("src/a.ts", 5)] : [] }),
+    })),
+  ];
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, withSubagents(calls), fakeCheckout);
+  return result.leads?.map((l) => [l.area, l.outcome]);
+};
+
+test("a reworded lead is traced by the file and category its deep-reviewer prompt cites", async () => {
+  assert.deepEqual(
+    await traced(
+      [{ area: "Unbounded IN list", paths: ["packages/api/src/text.service.ts"], category: "scale", hypothesis: "findTextedSince binds one parameter per person in the resolved audience" }],
+      ["Verify a scout lead. File: packages/api/src/text.service.ts lines 66-85. Category: scale. Check whether the personId list can exceed the bind limit."],
+    ),
+    [["Unbounded IN list", "reported"]],
+  );
+});
+
+test("a lead whose words fit another call better still gets its own call", async () => {
+  assert.deepEqual(
+    await traced(
+      [
+        { area: "Retry loop", paths: ["src/retry.ts"], category: "bugs", hypothesis: "the retry swallows errors from the cache client" },
+        { area: "Cache expiry", paths: ["src/cache.ts"], category: "bugs", hypothesis: "entries never expire" },
+      ],
+      [
+        "Lead in src/retry.ts, category bugs: errors thrown inside the loop are caught and ignored.",
+        'Lead: area "Cache expiry"; the cache client keeps entries forever, and the retry reads errors from it.',
+      ],
+    ),
+    [
+      ["Retry loop", "reported"],
+      ["Cache expiry", "dropped"],
+    ],
+  );
+});
+
+test("two leads on one file with different categories map to different calls", async () => {
+  assert.deepEqual(
+    await traced(
+      [
+        { area: "Missing await", paths: ["src/job.ts"], category: "bugs", hypothesis: "the handler returns before the write finishes" },
+        { area: "No test for the job", paths: ["src/job.ts"], category: "tests", hypothesis: "nothing covers the failure branch" },
+      ],
+      [
+        "Paths: src/job.ts. Category: tests. Hypothesis: no test covers the failure branch of the job.",
+        "Paths: src/job.ts. Category: bugs. Hypothesis: the handler returns before the write to the table finishes.",
+      ],
+    ),
+    [
+      ["Missing await", "dropped"],
+      ["No test for the job", "reported"],
+    ],
+  );
+});
+
+test("a file name inside a longer one is not a citation", async () => {
+  assert.deepEqual(
+    await traced(
+      [{ area: "Retry", paths: ["src/service.ts"], category: "bugs", hypothesis: "zzz qqq" }],
+      ["Paths: src/text.service.ts, lib/my-service.ts. Category: bugs. Check the cache keys."],
+    ),
+    [["Retry", "not-investigated"]],
+  );
+});
+
+const postmortemAgent = (selectorReplies: { output: string; errorSubtype?: string }[]) => {
+  const selectorPrompts: string[] = [];
+  const reviewPrompts: string[] = [];
+  const agent: RunAgentImpl = async (config, prompt, overrides) => {
+    if (config.name === "postmortem-selector") {
+      assert.deepEqual(config.tools, []);
+      assert.equal(config.model, "claude-sonnet-5-5");
+      selectorPrompts.push(prompt);
+      return { agent: config.name, durationMs: 1, ...selectorReplies[selectorPrompts.length - 1] };
+    }
+    reviewPrompts.push(prompt);
+    return fakeRunAgent(config, prompt, overrides);
+  };
+  return { agent, selectorPrompts, reviewPrompts };
+};
+
+test("replayCase shows the review the post-mortems selection kept, and records them", async () => {
+  const [first] = loadPostmortems();
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
+    { output: `{"ids": ["${first.file}#1"]}` },
+    { output: `{"ids": ["${first.file}"]}` },
+  ]);
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  assert.equal(selectorPrompts.length, 2);
+  assert.ok(reviewPrompts[0].includes(`<postmortem file="${first.file}">`));
+  assert.deepEqual(result.postmortems, [{ file: first.file, lessons: [`${first.file}#1`] }]);
+});
+
+test("replayCase shows every post-mortem, whatever the recorded review's date, and a simulated case too", async () => {
+  const [first] = loadPostmortems();
+  const record = makeRecord();
+  assert.ok(record.startedAt < first.date);
+  for (const r of [record, { runId: record.runId, bundle: record.bundle } as ReviewRecord]) {
+    const { agent, selectorPrompts } = postmortemAgent([{ output: '{"ids": []}' }]);
+    await replayCase(r, { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+    assert.equal(selectorPrompts.length, 1);
+    assert.ok(selectorPrompts[0].includes(`<lesson id="${first.file}#1">`));
+  }
+});
+
+test("replayCase strips PR numbers, GitHub links and commits from the post-mortems it shows", async () => {
+  const [first] = loadPostmortems();
+  assert.match(first.text, /#2977/);
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
+    { output: `{"ids": ["${first.file}#1"]}` },
+    { output: `{"ids": ["${first.file}"]}` },
+  ]);
+  await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  for (const prompt of [...selectorPrompts, reviewPrompts[0]]) {
+    assert.doesNotMatch(prompt, /#2977|#3023|#2852|github\.com\/thegoodparty\/omni\/pull/);
+  }
+  assert.ok(reviewPrompts[0].includes(`<postmortem file="${first.file}">`));
+});
+
+test("replayCase reviews without post-mortems when the selection call errors", async () => {
+  const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([{ output: "Agent error: overloaded", errorSubtype: "error_during_execution" }]);
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, agent, fakeCheckout);
+  assert.equal(selectorPrompts.length, 1);
+  assert.ok(!reviewPrompts[0].includes("<postmortems>"));
+  assert.ok(!result.error);
+  assert.equal(result.output?.status, "complete");
 });

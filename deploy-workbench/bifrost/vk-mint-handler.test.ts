@@ -1,5 +1,7 @@
-import { describe, it } from "node:test";
+import { describe, it, after, before } from "node:test";
 import assert from "node:assert/strict";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { WORKBENCH_ACCOUNT_ID } from "../../utils/accounts";
 import {
@@ -8,8 +10,11 @@ import {
   type VirtualKey,
   type VirtualKeyGateway,
 } from "./vk-mint-core";
-import { createHandler, type HandlerDeps } from "./vk-mint-handler";
-import type { GovernanceOverrides } from "./governance-desired-state";
+import { createBifrostGateway, createHandler, type HandlerDeps } from "./vk-mint-handler";
+import type {
+  GovernanceOverrides,
+  GovernanceTemplate,
+} from "./governance-desired-state";
 
 /**
  * The handler's wiring: the verified caller, the fail-closed statuses, the
@@ -40,8 +45,24 @@ const functionUrlEvent = (userArn: string, body?: unknown) => ({
 const template = () => ({
   description: "lambda-managed per-user key",
   is_active: true,
-  provider_configs: [{ provider: "bedrock" as const, allowed_models: ["m"], key_ids: ["*"] }],
+  provider_configs: [
+    {
+      provider: "bedrock" as const,
+      allowed_models: ["m"],
+      key_ids: ["*"],
+    },
+  ],
 });
+
+/**
+ * The template's provider list as the create body must carry it, with the
+ * budgets set every entry now names: an entry with none says so with `[]`
+ * rather than by leaving the field out, because on the update path an omitted
+ * `budgets` leaves that entry's existing ones alone (decision 18 of
+ * `docs/bifrost-reconciler.md`).
+ */
+const templateProviderConfigsWithBudgets = () =>
+  template().provider_configs.map((entry) => ({ ...entry, budgets: [] }));
 
 const activeKey = (name: string): VirtualKey => ({
   id: `id-${name}`,
@@ -60,6 +81,8 @@ const deps = (options: {
   create?: (body: Record<string, unknown>) => Promise<VirtualKey>;
   /** The per-person document the handler reads beside the template. */
   overrides?: Record<string, unknown>;
+  /** The template the handler reads; defaults to the one-provider fixture. */
+  template?: Record<string, unknown>;
 }) => {
   const logs: Record<string, unknown>[] = [];
   const creates: Record<string, unknown>[] = [];
@@ -86,7 +109,7 @@ const deps = (options: {
       if (options.templateError) throw options.templateError;
       if (options.overridesError) throw options.overridesError;
       return {
-        template: template(),
+        template: (options.template ?? template()) as unknown as GovernanceTemplate,
         overrides: (options.overrides ?? {}) as GovernanceOverrides,
       };
     },
@@ -109,7 +132,33 @@ describe("the mint endpoint", () => {
     const { handler, logs } = deps({ keys: [activeKey(EMAIL)] });
     const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(JSON.parse(response.body), { key: KEY_VALUE, email: EMAIL });
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: { budgets: [] },
+    });
+    assert.deepEqual(logs, [{ event: "vk-mint", outcome: "existing", email: EMAIL }]);
+  });
+
+  it("returns the caller's own spend beside the key, and logs neither", async () => {
+    const { handler, logs } = deps({
+      keys: [
+        {
+          ...activeKey(EMAIL),
+          provider_configs: [
+            {
+              provider: "bedrock",
+              budgets: [{ max_limit: 1500, reset_duration: "1M", current_usage: 412.37 }],
+            },
+          ],
+        },
+      ],
+    });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(JSON.parse(response.body).usage, {
+      budgets: [{ scope: "bedrock", max_limit: 1500, current_usage: 412.37, reset_duration: "1M" }],
+    });
     assert.deepEqual(logs, [{ event: "vk-mint", outcome: "existing", email: EMAIL }]);
   });
 
@@ -200,7 +249,11 @@ describe("the mint endpoint", () => {
     const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
     assert.equal(response.statusCode, 200);
     assert.equal(updated, true);
-    assert.deepEqual(JSON.parse(response.body), { key: KEY_VALUE, email: EMAIL });
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: { budgets: [] },
+    });
   });
 
   it("never logs the key, the setup token or the request body (decision 3)", async () => {
@@ -237,6 +290,143 @@ describe("the mint endpoint", () => {
   });
 });
 
+describe("the caller's usage over the real gateway adapter", () => {
+  /**
+   * The create path end to end, through the adapter that is deployed rather
+   * than through a fake that hands back the governance directly. That
+   * distinction is the bug: a fake gateway that returns `budgets` proves the
+   * decision layer reads them, and nothing about whether `toKey` copied them
+   * out of the response. `#550` shipped the fake-only version, and the
+   * deployed mint answered `usage.budgets: []` for a key with budgets.
+   */
+  const requests: Array<{ method?: string; url?: string }> = [];
+  let responses: Array<{ status: number; body: unknown }> = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url });
+      const next = responses.shift() ?? { status: 200, body: {} };
+      res.writeHead(next.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(next.body));
+    });
+  });
+
+  let baseUrl = "";
+
+  before(async () => {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as AddressInfo;
+    baseUrl = `http://127.0.0.1:${address.port}`;
+  });
+
+  after(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  /** The handler over the real adapter, with everything but the gateway faked. */
+  const handlerOverRealGateway = (logs: Record<string, unknown>[]) =>
+    createHandler({
+      readGovernance: async () => ({ template: template(), overrides: {} }),
+      readSetupToken: async () => SETUP_TOKEN,
+      createDirectory: async () => ({
+        getUserId: async () => "user-1",
+        listMemberUserIds: async () => ["user-1"],
+      }),
+      createGateway: (setupToken: string) =>
+        createBifrostGateway({ baseUrl, setupToken }),
+      log: (entry) => logs.push(entry),
+    });
+
+  /** A key as the create route answers it, hydrated from its model configs. */
+  const createdKey = () => ({
+    id: "vk-created",
+    name: EMAIL,
+    value: KEY_VALUE,
+    is_active: true,
+    description: "lambda-managed per-user key",
+    calendar_aligned: true,
+    budgets: [
+      { id: "b1", max_limit: 250, reset_duration: "1M", current_usage: 12.5, last_reset: "2026-11-01T00:00:00Z" },
+    ],
+    provider_configs: [
+      {
+        id: 7,
+        provider: "bedrock",
+        allowed_models: ["m"],
+        allow_all_keys: true,
+        keys: [],
+        budgets: [
+          { id: "b2", max_limit: 1500, reset_duration: "1M", current_usage: 412.37, last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+    ],
+    rate_limit: { request_max_limit: 600, request_reset_duration: "5m", request_current_usage: 3 },
+  });
+
+  it("reports the key's and each provider entry's budgets on the create path", async () => {
+    requests.length = 0;
+    responses = [
+      // The mint lists first and finds nothing, then creates.
+      { status: 200, body: { virtual_keys: [], count: 0, total_count: 0 } },
+      { status: 200, body: { message: "ok", virtual_key: createdKey() } },
+    ];
+    const logs: Record<string, unknown>[] = [];
+    const response = await handlerOverRealGateway(logs)(functionUrlEvent(workbenchArn(EMAIL)));
+
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(requests.map((request) => request.method), ["GET", "POST"]);
+    assert.deepEqual(JSON.parse(response.body), {
+      key: KEY_VALUE,
+      email: EMAIL,
+      usage: {
+        calendar_aligned: true,
+        budgets: [
+          { scope: "key", max_limit: 250, current_usage: 12.5, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+          { scope: "bedrock", max_limit: 1500, current_usage: 412.37, reset_duration: "1M", last_reset: "2026-11-01T00:00:00Z" },
+        ],
+      },
+    });
+    // Nothing new reaches the logs, and nothing about the governance does.
+    assert.deepEqual(logs, [{ event: "vk-mint", outcome: "created", email: EMAIL }]);
+    assert.ok(!JSON.stringify(logs).includes("412.37"), "the counters must not be logged");
+  });
+
+  it("reports an uncapped key as uncapped, with calendar_aligned still present", async () => {
+    // gp-pi#147 reads an empty `budgets` with `calendar_aligned` present as
+    // "genuinely uncapped" and calls the same empty list with the field absent
+    // "could not read the usage". A key that really has no budgets has to keep
+    // the field, or a correct answer is reported as a failure.
+    requests.length = 0;
+    responses = [
+      { status: 200, body: { virtual_keys: [], count: 0, total_count: 0 } },
+      {
+        status: 200,
+        body: {
+          message: "ok",
+          virtual_key: {
+            id: "vk-uncapped",
+            name: EMAIL,
+            value: KEY_VALUE,
+            is_active: true,
+            calendar_aligned: true,
+            budgets: [],
+            provider_configs: [
+              { id: 9, provider: "bedrock", allowed_models: ["m"], allow_all_keys: true, keys: [] },
+            ],
+          },
+        },
+      },
+    ];
+    const response = await handlerOverRealGateway([])(functionUrlEvent(workbenchArn(EMAIL)));
+
+    assert.equal(response.statusCode, 200);
+    const usage = JSON.parse(response.body).usage;
+    assert.deepEqual(usage, { calendar_aligned: true, budgets: [] });
+    assert.ok("calendar_aligned" in usage, "the field the consumer tells uncapped by");
+  });
+});
+
 describe("the create carries the caller's governance (step 5)", () => {
   it("creates the key from the template and the caller's override, in the composed shape", async () => {
     const { handler, creates } = deps({
@@ -257,7 +447,7 @@ describe("the create carries the caller's governance (step 5)", () => {
     assert.deepEqual(body.budgets, [{ max_limit: 250, reset_duration: "1M" }]);
     // `inherit` resolved to the template's list rather than being sent as the
     // sentinel or as nothing: the field is a replacement set on the wire.
-    assert.deepEqual(body.provider_configs, template().provider_configs);
+    assert.deepEqual(body.provider_configs, templateProviderConfigsWithBudgets());
     // Decision 11's fleet-wide default, and decision 12's absent rate limit.
     assert.equal(body.calendar_aligned, true);
     assert.ok(!("rate_limit" in body));
@@ -272,7 +462,49 @@ describe("the create carries the caller's governance (step 5)", () => {
     assert.equal(response.statusCode, 200);
     assert.deepEqual(creates[0].budgets, []);
     assert.equal(creates[0].calendar_aligned, true);
-    assert.deepEqual(creates[0].provider_configs, template().provider_configs);
+    assert.deepEqual(creates[0].provider_configs, templateProviderConfigsWithBudgets());
+  });
+
+  it("sends a provider entry's own budget, and the empty set for one that has none", async () => {
+    // Decision 18: a per-provider cap is the entry's own `budgets`, and the
+    // entry the template leaves uncapped says so with `[]`. Both halves matter:
+    // an entry that left the field out would keep whatever it already carried on
+    // an update, so a cap git had dropped would never be removed.
+    const capped = () => ({
+      description: "lambda-managed per-user key",
+      is_active: true,
+      provider_configs: [
+        {
+          provider: "bedrock" as const,
+          allowed_models: ["m"],
+          key_ids: ["*"],
+          budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+        },
+        {
+          provider: "fireworks" as const,
+          allowed_models: ["f"],
+          key_ids: ["*"],
+        },
+      ],
+    });
+    const { handler, creates } = deps({ overrides: {}, template: capped() });
+    const response = await handler(functionUrlEvent(workbenchArn(EMAIL)));
+    assert.equal(response.statusCode, 200);
+
+    assert.deepEqual(creates[0].provider_configs, [
+      {
+        provider: "bedrock",
+        allowed_models: ["m"],
+        key_ids: ["*"],
+        budgets: [{ max_limit: 1500, reset_duration: "1M" }],
+      },
+      {
+        provider: "fireworks",
+        allowed_models: ["f"],
+        key_ids: ["*"],
+        budgets: [],
+      },
+    ]);
   });
 
   it("refuses rather than creating from half the desired state when the overrides document cannot be read", async () => {

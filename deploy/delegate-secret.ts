@@ -15,10 +15,6 @@ export const DELEGATE_SECRET_KEYS = [
   // Anthropic
   "ANTHROPIC_API_KEY",
 
-  // Slack
-  "SLACK_BOT_TOKEN",
-  "SLACK_SIGNING_SECRET",
-
   // Verifies GitHub webhook deliveries in the Lambda.
   "GITHUB_WEBHOOK_SECRET",
 
@@ -26,21 +22,6 @@ export const DELEGATE_SECRET_KEYS = [
   // checkout, review, and status. Read by `worker/github-auth.ts`;
   // pr-reviewer exits at boot without it.
   "REVIEWER_APP_PRIVATE_KEY",
-
-  // ClickUp. `CLICKUP_API_TOKEN` is what the worker reads. `CLICKUP_TOKEN` is
-  // not referenced in this repo.
-  "CLICKUP_API_TOKEN",
-  "CLICKUP_TOKEN",
-
-  // Observability. `GRAFANA_WEBHOOK_SECRET` is not referenced in this repo.
-  "DATABRICKS_TOKEN",
-  "GRAFANA_SERVICE_ACCOUNT_TOKEN",
-  "GRAFANA_WEBHOOK_SECRET",
-  "SENTRY_AUTH_TOKEN",
-
-  // Not referenced in this repo. Supplied by the live secret, so it stays to
-  // keep the task definition unchanged.
-  "WORKFLOW_USERS",
 ] as const;
 
 /** Keys declared here but absent from the live secret, and vice versa. */

@@ -1,4 +1,4 @@
-# agent-swarm 2.6.0 on delegate-swarm.infra.goodparty.org
+# agent-swarm 2.13.0 on delegate-swarm.infra.goodparty.org
 # Derived from docker-compose.example.yml at that tag. .env is rendered by
 # render-env.sh from Secrets Manager:DELEGATE_SWARM; never edit .env by hand.
 # Start with: ./up.sh  (docker compose --profile tls [--profile sso] up -d)
@@ -37,10 +37,8 @@ x-agent-entrypoint: &agent-entrypoint
 x-worker-env: &worker-env
   ANONYMIZED_TELEMETRY: "false"
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-pi}
-  # Anthropic is kept for the api service and as the fallback path; the agents
-  # themselves run Fireworks US-only (see PI_MODELS_JSON in
-  # global-setup-script.sh and the "Models" section of agent-swarm/README.md).
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # No Anthropic key on purpose: the agents run Fireworks US-only, so a task
+  # that pins an Anthropic model fails instead of billing ~9x.
   # The pi harness's own key for the ONE model it may run. render-env.sh copies
   # it from the secret; compose has to enumerate it or nothing passes it into
   # the container.
@@ -55,7 +53,6 @@ x-worker-env: &worker-env
   # key in swarm config on boot, so only the URL is set here.
   AGENT_FS_API_URL: http://agent-fs:7433
   MEMORY_RATERS: ${MEMORY_RATERS-implicit-citation,explicit-self}
-  YOLO: "true"
   # Git and gh authenticate as the GitHub App (delegate-gp[bot]) through the
   # gh-app-token helper that global-setup-script.sh installs.
   GITHUB_APP_ID: ${GITHUB_APP_ID:-}
@@ -78,7 +75,7 @@ x-worker-env: &worker-env
 # tag changes with the version or the patch, which is what makes compose
 # recreate the agents; an unchanged tag is not rebuilt.
 x-worker-base: &worker-base
-  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.6.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
+  image: "delegate-swarm-worker:${AGENT_SWARM_VERSION:-2.13.0}-${WORKER_PATCH_HASH:?rendered by render-env.sh}"
   pull_policy: never
   entrypoint: *agent-entrypoint
   platform: linux/amd64
@@ -91,7 +88,7 @@ x-worker-base: &worker-base
 
 services:
   # agent-fs: the swarm's shared file store, mounted as /afs in agents and
-  # catalog scripts. Taken from docker-compose.example.yml at 2.6.0. Files live
+  # catalog scripts. Taken from docker-compose.example.yml at 2.13.0. Files live
   # in a local MinIO on the data volume, not in AWS. No ports are published:
   # only the API and the agents reach it, over the compose network. The MinIO
   # root login is upstream's default for the same reason; anything that can
@@ -131,7 +128,7 @@ services:
     logging: *logging
 
   agent-fs:
-    image: ghcr.io/desplega-ai/agent-fs:0.18.5
+    image: ghcr.io/desplega-ai/agent-fs:0.18.26
     platform: linux/amd64
     depends_on:
       minio-init:
@@ -190,7 +187,7 @@ services:
     logging: *logging
 
   api:
-    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.6.0}"
+    image: "ghcr.io/desplega-ai/agent-swarm:${AGENT_SWARM_VERSION:-2.13.0}"
     platform: linux/amd64
     stop_grace_period: 60s
     pids_limit: 1024
@@ -206,6 +203,11 @@ services:
       - NODE_ENV=${NODE_ENV:-production}
       - API_KEY=${API_KEY}
       - AGENT_FS_API_URL=http://agent-fs:7433
+      # 2.10.0 serves agent-fs at /agentfs, /share and /site (and turns on the
+      # dashboard's Files page and Comb) whenever AGENT_FS_API_URL is set. That
+      # publishes agent-fs outside the compose network, which this host does
+      # not do yet, so pin it off. Caddy already routes the three prefixes.
+      - AGENT_FS_PROXY=${AGENT_FS_PROXY:-false}
       # agent-swarm sends usage events to desplega by default, tagged with the
       # org name and the admin's email domain.
       - ANONYMIZED_TELEMETRY=false
@@ -216,7 +218,6 @@ services:
       - APP_URL=${APP_URL:-https://delegate-swarm.infra.goodparty.org}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - API_DRAIN_MAX_MS=${API_DRAIN_MAX_MS:-30000}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - EMBEDDING_API_BASE_URL=${EMBEDDING_API_BASE_URL:-http://tei:80/v1}
       - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-local}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text-v1.5}

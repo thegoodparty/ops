@@ -99,10 +99,17 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "GetFoundationModel reports inferenceTypesSupported: [INFERENCE_PROFILE] and nothing else, so there is no in-region invocation to fall back to and a cross-region profile is mandatory",
   },
   {
-    id: "moonshotai.kimi-k3",
-    invokeId: "global.moonshotai.kimi-k3",
+    // Moonshot's successor to Kimi K3, swapped in on 2026-11-10. The model id
+    // is `k3.1` with a dot, which is Moonshot's spelling and not a version of
+    // ours to normalise. The model card names `global.moonshotai.kimi-k3.1` as
+    // the Global inference ID, alongside `us.` and `in.` geo profiles, and
+    // quotes $4.00 / $20.00 per 1M tokens on the global one. It lists no
+    // Marketplace product id, so `enable-bedrock-models` reports no agreement
+    // to create for it, which is the same shape as `kimi-k3` had.
+    id: "moonshotai.kimi-k3.1",
+    invokeId: "global.moonshotai.kimi-k3.1",
     crossRegion: true,
-    note: "no in-region support in any region, so a cross-region profile is mandatory",
+    note: "replaced kimi-k3 on 2026-11-10; open weight; the model card documents US, India and Global cross-region profiles, and this account selects the global one as it does for every entry",
   },
   {
     id: "openai.gpt-6.1-sol",

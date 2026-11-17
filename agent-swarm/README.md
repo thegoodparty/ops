@@ -3,7 +3,7 @@
 ## What this is
 
 The deployment of [agent-swarm](https://github.com/desplega-ai/agent-swarm)
-v2.6.0 that shows up in Slack as **Delegate** and serves its dashboard at
+v2.13.0 that shows up in Slack as **Delegate** and serves its dashboard at
 https://delegate-swarm.infra.goodparty.org. One EC2 host in the infrastructure
 account runs the whole stack in Docker Compose. This file is how to operate it.
 
@@ -45,10 +45,12 @@ host; the next deploy overwrites them.
   before docker starts and formats it only if it is blank, so a replacement
   instance picks up the same state. The root disk holds nothing that matters.
 - Secrets Manager secret `DELEGATE_SWARM` (filled by hand, never by Pulumi)
-  with keys `ANTHROPIC_API_KEY`, `API_KEY`, `CLICKUP_API_TOKEN`,
+  with keys `API_KEY`, `CLICKUP_API_TOKEN`,
   `FIREWORKS_API_KEY`, `GRAFANA_SERVICE_ACCOUNT_TOKEN`,
   `SECRETS_ENCRYPTION_KEY`, `SLACK_APP_TOKEN`, `SLACK_BOT_TOKEN`, and
-  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login
+  optionally the three `OAUTH2_PROXY_*` keys that turn on Google login. There
+  is no `ANTHROPIC_API_KEY` deliberately: every agent runs the Fireworks US
+  router and holds no Anthropic credential.
 - Container logs: CloudWatch Logs `/delegate-swarm/containers`, one stream
   per container. `docker compose logs` on the host still works.
 - Memory: m6a.2xlarge (32 GB, no swap). The three agents are capped at
@@ -71,6 +73,46 @@ There is no SSO profile for the infrastructure account yet. Until there is,
 assume `OrganizationAccountAccessRole` from a management admin session; the
 top of `fill-secrets.sh` has the `~/.aws/config` profile
 (`gp-infrastructure`) every command below uses.
+
+## Disk
+
+The 500 GB data volume fills from the agents' own clones and worktrees:
+each gets its own `npm ci`, about 5 GB and 300k files for omni, and agents
+never delete them. When the volume runs out of space or inodes, SQLite
+rejects every write (`SQLITE_FULL` in the api stream), Delegate stops
+answering Slack and tasks cannot be cancelled, while `/health` stays 200.
+
+`disk-cleanup.sh` runs every 15 minutes as root from
+`agent-swarm-disk-cleanup.timer`. In the coder, reviewer and lead volumes it
+deletes `node_modules` from any checkout where nothing else has changed for
+48 hours, or 6 hours once the volume is past 80%. Source trees, `.git` and
+uncommitted work are never touched; the next task in that checkout reinstalls.
+Each run first grows the filesystem to the volume's size (`xfs_growfs`), so
+resizing the volume is only a change to `size` in
+`deploy-infrastructure/agent-swarm.ts`.
+It also prunes unused images and build cache. While `up.sh` holds
+`/opt/agent-swarm/.deploy.lock`, which it does for a whole deploy, the run
+reports its metrics and does nothing else: the sweep and the prunes compete
+with the container swap and with the migrations the new api applies before it
+serves, and a prune can drop an image the deploy pulled but has no container
+for yet. It reports `DataVolumeUsedPercent` and `DataVolumeInodesUsedPercent`
+to the CloudWatch namespace `DelegateSwarm` either way. The lock is mutual, so
+a deploy that starts while a sweep is running waits for that sweep to finish
+before it touches a container.
+
+The alarms `delegate-swarm-data-volume-space` and
+`delegate-swarm-data-volume-inodes` fire at 85%, or when the metric stops
+arriving, and email `aws-infrastructure@goodparty.org` through the SNS topic
+`delegate-swarm-alerts`. A full volume is not the only way this host stalls:
+on 2026-11-10 a 3 minute outage was the deploy replacing the api, with the EBS
+queue length under 2.5 and no OOM line anywhere (see "Upgrade agent-swarm").
+To see what is using space:
+
+```sh
+sudo du -xsh /var/lib/docker/volumes/* | sort -h
+sudo df -h /var/lib/docker; sudo df -i /var/lib/docker
+sudo systemctl start agent-swarm-disk-cleanup; journalctl -u agent-swarm-disk-cleanup -n 5
+```
 
 ## Connect
 
@@ -98,6 +140,14 @@ versioning is off on purpose, so a delete is a delete. When you bump
 agent-swarm, take the agent-fs image tag from the new
 `docker-compose.example.yml`.
 
+agent-fs is not reachable from a browser: the api service pins
+`AGENT_FS_PROXY` off, so `/agentfs`, `/share` and `/site` return 404. Turning
+it on publishes agent-fs at those three prefixes behind the same Caddy auth,
+and enables the dashboard's Files page and Comb. Set it in the
+`DELEGATE_SWARM` secret rather than in `.env`: `render-env.sh` rewrites `.env`
+on every boot and only carries the keys that are in the secret. `/share` and
+`/site` are public share pages gated by their own token.
+
 ## Upgrade agent-swarm
 
 The lead and both workers do not run the upstream worker image directly.
@@ -123,10 +173,18 @@ Node and is used as is.
    `render-env.sh`.
 3. Merge. `up.sh` sees the dashboard marker
    (`ui-dist/.agent-swarm-version`) is stale and rebuilds the UI from the new
-   tag, builds the worker image, then compose pulls the new API image and
-   recreates every agent-swarm container. The API drains for up to 30
-   seconds; a task still running is superseded into a resume task on the
-   same agent.
+   tag, builds the worker image, then recreates every agent-swarm container.
+
+   A recreate is an outage, not a restart: the api leaves the compose network
+   and is gone until its replacement is listening. That window is the drain
+   (up to 30 seconds), the container swap, and the boot of the new process,
+   which applies the release's schema migrations before it serves. Measured on
+   2026-11-10, a 15-release bump spent 2m15s with no api container at all and
+   then 33 seconds booting, 28 of them applying 40 migrations (one took 21
+   seconds), so `/health` answered 502 through Caddy for about 3 minutes; both
+   synthetic probes failed and the swarm-unreachable alert paged (ENG-11612).
+   Budget minutes, not seconds, for a version bump. A task still running is
+   superseded into a resume task on the same agent.
 4. Check: `/health` is 200, the three agents show idle in the dashboard, and
    Delegate answers a mention in `#swarm-testing`.
 
@@ -229,7 +287,7 @@ that file; an address there also needs to be in `allowed-emails.txt` to
 sign in. Roles set by hand in the API are overwritten on the next deploy.
 
 An admin can do nearly everything the operator key can do, with tasks,
-config and token changes attributed to them. On v2.6.0 a user token cannot create or edit swarm-scope MCP servers (lead only),
+config and token changes attributed to them. A user token cannot create or edit swarm-scope MCP servers (lead only),
 steer a task someone else requested, refresh the model catalog, or read the
 asset key audit. Do those with `API_KEY` from the host (as
 `sync-agent-config.sh` does).
@@ -307,6 +365,31 @@ not in this repo, so they are recorded here. Checked 2026-11-06.
   secrets can't be read back through the API. The eval roles trust only
   GitHub's OIDC provider, so the host role can't assume them.
 
+### Hill-climb runs
+
+The lead can run the `hill-climb` skill to try reviewer prompt changes
+against the delegate eval and open at most one PR. The skill's source is
+`.claude/skills/hill-climb/` on ops `main`; the swarm's copy is the live one,
+like every swarm skill (see below). After a merge that changes the skill, ask
+Delegate in Slack to create it, or update it, from the file on `main` and
+install it on the lead. The target config stays in the repo: the skill reads
+`targets/delegate-pr-reviewer.json` from the ops checkout, so ops must be
+registered with auto-clone.
+
+- Start: mention Delegate with the target and budget, for example
+  "hill-climb the reviewer on omni-2656, budget $200". With no target it
+  takes every failing tune case that isn't flaky; with no budget it uses the
+  config's `budgetUsd`.
+- Cost: the eval spend of a `run_id` is capped by the S3 ledger at its
+  budget, and the lowest budget ever given for a `run_id` wins. The swarm's
+  own model use is not in the ledger; check it in the dashboard after a run.
+- Stop: ask Delegate in the run's thread to stop; the lead follows it like
+  any request. The hard stop is cancelling the run's `delegate-eval-run`
+  dispatch in Actions. Nothing merges either way, and a candidate branch with
+  no PR can be deleted.
+- One climb at a time: dispatches for a `run_id` are serialized, and two
+  climbs would share the lead's task slots with normal Slack work.
+
 ## What lives in this repo and what lives in the swarm
 
 The swarm keeps scripts, skills, schedules, souls, identities and plain
@@ -336,13 +419,17 @@ those, for example an S3 permission or a Slack scope, only that part is a PR.
 
 ### Swarm state this repo owns
 
-`host/sync-agent-config.sh` writes three things into the swarm's database.
+`host/sync-agent-config.sh` writes four things into the swarm's database.
 `up.sh` runs it on every deploy, after the stack is up, so merging is all a
 change to them needs:
 
 - the global `SETUP_SCRIPT` config, from `host/global-setup-script.sh` (runs
   as root at every agent container start)
 - the grafana and clickup MCP servers, installed on all three agents
+- the model-catalogue overlay row that teaches the dashboard about the one
+  model the agents run: its reasoning levels, context window, output limit and
+  (display-only) US rates. It never touches the swarm's price book, so it does
+  not change what a session is charged (see "Models")
 - each agent's harness and model, from `HARNESS_PROVIDER` and the
   `*_MODEL_OVERRIDE` values `render-env.sh` writes
 
@@ -387,13 +474,20 @@ the dashboard or asking Delegate. The token is the existing global
 only `s3:PutObject` under `agent-replies/` in the two buckets; gp-api's bucket
 policy grants the other half.
 
-- `tevyn-handoffs-new` returns the hand-off posts it has not returned before,
-  as compact JSON (outreachId, sendAt, timeZone, mode, repliesKey, message,
-  recipientCount, channel, ts). It keeps a cursor in KV (`tevyn:cursor`) and
-  claims each outreach id as `handoff:<outreachId>` = `{ state: 'new', slackTs,
-  channel, sendAt, timeZone, mode, message, recipientCount }`, so an id is
-  returned once and can still be handled from KV if nobody got its output. Posts without the "Delegate is handling this wave"
-  note or with an invalid machine block are skipped.
+- `tevyn-handoffs-new` returns `{handoffs, unreadable}`: the hand-off posts it
+  has not returned before, as compact JSON (outreachId, sendAt, timeZone, mode,
+  repliesKey, message, recipientCount, channel, ts), and the posts it could not
+  read. It keeps a cursor in KV (`tevyn:cursor`) and claims each outreach id as
+  `handoff:<outreachId>` = `{ state: 'new', slackTs, channel, sendAt, timeZone,
+  mode, message, recipientCount }`, so an id is returned once and can still be
+  handled from KV if nobody got its output. A post without the "Delegate is
+  handling this wave" note is not ours and is skipped. A post that carries the
+  note but cannot be read (no machine block, invalid fields, replies key
+  mismatch) is never claimed: it is reported in `unreadable` with its reason and
+  gets one warning reply in its own thread, deduped by `unparsed:<ts>`, and the
+  cursor stops just before the oldest unreleased one so history still covers it
+  next run. After 48h from first sight it stops holding the cursor and is
+  reported with `released: true`.
 - `tevyn-handoff-csv` (`channel`, `ts`) saves the post's recipient CSV under
   `/afs/tevyn-handoffs/` and returns only that path, never the Slack URL.
 - `s2w-replies-upload` (`outreachId`, `exportPath`) PUTs the export to
@@ -414,8 +508,9 @@ policy grants the other half.
 - `panel-waves-tick` is the dispatcher, meant to run on a schedule (below). Each
   run it (1) runs `tevyn-handoffs-new` through `ctx.swarm.script_run`, because
   catalog scripts cannot import each other, only to trigger the claim (the claim
-  record already holds the hand-off, so the output is ignored and a failed run
-  still leaves the KV scan, flagged as `triggerFailed`); (2) lists
+  record already holds the hand-off, so only its `unreadable` list is carried
+  into this result, and a failed run still leaves the KV scan, flagged as
+  `triggerFailed`); (2) lists
   KV by the `handoff:` prefix; (3) for each record it should act on, writes
   `lease:<outreachId>` with a one hour expiry and bumps `attempts` (counted per action, with `attemptsFor`), then creates
   one coder task, "Handle <id> (schedule|export_replies) following the
@@ -427,8 +522,9 @@ policy grants the other half.
   `repliesDueAt` (a shadow wave is scheduled by a person but exported by the
   agent). It leaves `replies_uploaded` and `needs_human` alone,
   and stops at 5 attempts per action. Its result lists `dispatched`, `skipped` (records
-  with no stored details, exhausted attempts, unreadable) and `failed`; look
-  there when a wave seems stuck. It sends with `allowDuplicate: true` because two
+  with no stored details, exhausted attempts, unreadable record), `failed` and
+  `unreadable` (hand-off posts the scan could not read); look there when a wave
+  seems stuck. It sends with `allowDuplicate: true` because two
   waves posted together read as near-copies to the duplicate check.
 
 ### KV states
@@ -538,7 +634,99 @@ Where it lives:
 - Cost is the US-only price, $0.45 in / $0.009 cached / $1.80 out per 1M
   tokens, 1.5x the global endpoint. pi's built-in catalogue carries
   .3 / .006 / 1.2 for the `-1017` entries, so the file overrides it; without
-  that the dashboard under-reports the bill by a third.
+  that pi would under-report the bill by a third.
+
+pi's price is what the ledger stores (see "Cost accounting" below). What the
+swarm's own price book cannot do is *recognise* it, so these sessions are tagged
+`unpriced`; the dollars are right, the provenance is not.
+
+**The swarm's own model catalogue does not list this model, so
+`sync-agent-config.sh` adds it.** agent-swarm reads a models.dev projection whose
+`fireworks-ai` section has no row for a dated `-us` router and no `fireworks-us`
+provider at all. Before the overlay row existed, the dashboard's agent runtime
+page said *"No reasoning effort applies to this model: the catalog does not list
+it, or it does not reason"*, the reasoning-effort picker offered no level to
+pick, a `reasoning_effort` PATCH was rejected as unsupported, and the context
+window fell back to 200k instead of 1M. **The agents were never the problem**:
+pi sends no `thinkingLevel` here, so it falls back to its own default, this
+model's `thinkingLevelMap` maps that away and pi's clamp walks forward to
+`high`, which goes out as adaptive thinking at high effort. What was missing was
+the console's view of the model.
+
+So `host/sync-agent-config.sh` upserts one model-catalogue overlay row
+(`PUT /api/models-catalog/overlay`, lead-or-operator, an upsert keyed on
+provider and model id) on every deploy, from the same `models.json` heredoc the
+worker loads:
+
+- `reasoning_options` is the `thinkingLevelMap`'s non-null values, i.e. the
+  provider's own effort tokens (`none`/`low`/`high`/`max`). Nothing restates
+  them in the script, so editing the map moves the console with it;
+  `host/scripts/model-catalog-overlay.test.ts` fails if a second copy appears or
+  if the two disagree. A literal `off` would be wrong here: agent-swarm's effort
+  map normalizes `none` to its own `off` and drops anything else without a word.
+- `contextWindow` and `maxOutput` come from the model's `contextWindow` and
+  `maxTokens`.
+- `pricing` is the heredoc's `cost` block, renamed to the overlay's snake_case
+  fields. It is **display only**: agent-swarm's `toCatalogModel` copies it into
+  the served catalogue, so the runtime page and the model picker print the real
+  US rates ($0.45 in / $0.009 cached / $1.80 out per 1M) instead of no price at
+  all. It does **not** price a session — see "Cost accounting" below.
+- `expiresWhenUpstreamMatches: false`. Overlay rows normally delete themselves
+  once models.dev catches up, but models.dev has no `fireworks-us` section, so
+  that can never happen and that row is permanent by design.
+
+A failed overlay write is printed to the journal and the sync carries on
+(`model catalogue overlay: the upsert failed ...`), because the setup script,
+the MCP servers and the runtime model are what make the agents run. The write is
+an upsert, so re-running the script is the retry.
+
+#### Cost accounting
+
+A session of this model records the **right dollars** and the **wrong
+provenance**, and both halves matter to a reader of the dashboard.
+
+The dollars are right because pi reports its own cost: the worker sends
+`totalCostUsd = stats.cost`, computed from the `cost` block in `models.json`,
+which is the US 1.5x rate. When the API cannot recompute the row it stores that
+figure verbatim (`recomputeSessionCost` → `unpricedResult`,
+`src/http/session-cost-recompute.ts`). The provenance is wrong because
+the swarm keeps its own price book, `pricing`, keyed by (provider, model,
+token class) where *provider is the harness* — `pi`, not `fireworks-us`. For a
+`pi` row, the lookup is `pi` + `fireworks-us/accounts/fireworks/routers/…`, and
+nothing seeds that row.
+
+The overlay's `pricing` cannot seed it, and that is upstream: overlay prices
+become price-book rows through `applyOverlayPricingRows`, which builds a
+models.dev-shaped cache and hands it to `buildModelsDevSeedRows`
+(`src/be/seed-pricing.ts`). That projection enumerates a fixed set of provider
+sections — `anthropic`/`openai`/`google`/`fireworks-ai` (as `amp`), `openai`,
+`deepseek`, `openrouter`, `xai`, and the OpenAI-compatible registry — and
+`fireworks-us` is in none of them, so the row contributes zero price-book rows.
+There is also no generic way in: `POST /api/pricing/{provider}/{model}/{tokenClass}`
+(`src/http/pricing.ts`) is the only generic writer and takes the model id as a
+**path segment**, while the id the recompute looks up contains slashes and
+nothing URL-decodes before route matching, so the row cannot even be addressed.
+
+What an operator sees today, precisely:
+
+- the task's Cost figure is the correct US-only amount;
+- beside it, the yellow **NO RATE** badge (`cost-source-badge.tsx`), whose
+tooltip reads "No pricing row matched this provider/model; USD is the
+worker-reported value";
+- the runtime page and the model picker show the right per-1M rates, from this
+overlay row;
+- `costSource` is `unpriced`, so `compound-insights` counts these sessions in
+`unpricedRows`/`unpricedSpendUsd` and leaves them out of `avgCostPerTaskUsd`,
+`trustedSpendUsd` and its "trusted" coverage percentage, and the OTel
+cost counter carries `cost_source: unpriced`.
+
+**That is not the same as "free" or "unmeasured" in dollars** — the money is
+right and the attribution is not. Budget admission sums `totalCostUsd` and so is
+unaffected. Making these sessions `pricing-table` needs an upstream change: a
+`fireworks-us` section in `buildModelsDevSeedRows`, or a model id the pricing
+route can carry in one segment. Until then the honest label is the one the
+dashboard gives it, and the figures to read are `totalSpendUsd` (which does
+include them) rather than `avgCostPerTaskUsd` (which does not).
 
 **Adding a model is a reviewed change, not an automatic upgrade.** Adding one
 means minting a new dated US router id with Fireworks and editing
@@ -548,8 +736,11 @@ later date) is the same edit; there is no `-latest` US router to track it, which
 is why the dated id is pinned deliberately.
 
 `FIREWORKS_API_KEY` is a key in the `DELEGATE_SWARM` secret (see "Where it
-runs"). `ANTHROPIC_API_KEY` stays in the secret and in the worker env for the
-api service and as a fallback path, but no agent runs an Anthropic model.
+runs"). There is no `ANTHROPIC_API_KEY` in it: no agent runs an Anthropic
+model, and a task that pins one fails before its first turn instead of billing
+~9x. The older `delegate/` stack is a SEPARATE deployment in the serve account
+and still needs `ANTHROPIC_API_KEY` in its `DELEGATES` secret; the two secrets
+are not the same one.
 
 ## MCP servers
 
@@ -607,7 +798,7 @@ The swarm starts with fresh state. In order:
    started.`
 2. **Fill the secret.** From this directory on a laptop:
    `AWS_PROFILE=gp-infrastructure ./fill-secrets.sh`. It asks for the Slack,
-   Anthropic, GitHub, ClickUp and Grafana tokens, generates `API_KEY` and
+   Fireworks, ClickUp and Grafana tokens, generates `API_KEY` and
    `SECRETS_ENCRYPTION_KEY` when the secret lacks them, and never prints
    either. Losing `SECRETS_ENCRYPTION_KEY` loses every secret the swarm
    stores. It ends by listing any required key still missing.

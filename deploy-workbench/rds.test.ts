@@ -40,6 +40,21 @@ const INDEX_SOURCE = fs.readFileSync(
 );
 
 /**
+ * Every Pulumi program that could declare a rule on the database group, read as
+ * source. The module that owns the group is not the only place a rule can live —
+ * the two 8080 exceptions are in the modules that need them — so the invariant
+ * has to be checked across all of them rather than in the one file that happened
+ * to hold the first rule.
+ */
+const PULUMI_SOURCES = fs
+  .readdirSync(__dirname)
+  .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"))
+  .map((entry) => ({
+    name: entry,
+    source: fs.readFileSync(path.resolve(__dirname, entry), "utf8"),
+  }));
+
+/**
  * The source of one named resource's constructor call, from its logical-name
  * literal to the next `new aws.` (or the end of the file). Enough to tell
  * whether an argument belongs to that resource rather than a sibling, which a
@@ -224,6 +239,25 @@ describe("bifrost database", () => {
     );
   });
 
+  /**
+   * The database group's ingress is `bifrostDatabaseIngressPostgres` in
+   * `network.ts` plus the two exceptions the usage export adds in
+   * `usage-export.ts`. The exceptions are the database's first, and this test is
+   * the gate on them: it walks **every** Pulumi file that names the database
+   * group, so an exception cannot be added beside this assertion instead of
+   * through it. That is what the test was always for — "a second one would be a
+   * source nobody reviewed" — and it used to be enforced by counting occurrences
+   * in one file, which was the weakest form of it.
+   */
+  const databaseIngressSources = (): { file: string; rule: string }[] =>
+    PULUMI_SOURCES.flatMap(({ name, source }) =>
+      [...source.matchAll(/new aws\.vpc\.SecurityGroupIngressRule\(([\s\S]*?)\n  \);/g)]
+        .map((match) => match[1])
+        .filter((block) => block.includes("securityGroupId: network.databaseSecurityGroup.id") ||
+          block.includes("securityGroupId: databaseSecurityGroup.id"))
+        .map((rule) => ({ file: name, rule })),
+    );
+
   it("admits 5432 from the gateway's security group and nothing else", () => {
     const ingressRule = resourceBlock(
       NETWORK_SOURCE,
@@ -245,15 +279,33 @@ describe("bifrost database", () => {
       !ingressRule.includes("cidrIpv4"),
       "the database ingress rule must not admit a CIDR",
     );
-    // Exactly one ingress rule exists for the database group: a second one
-    // would be a source nobody reviewed, and the assertion above would still
-    // pass because it only reads the named block.
+  });
+
+  it("admits 5432 to the database group from exactly three group references and no CIDR", () => {
+    const rules = databaseIngressSources();
+    // The gateway's own rule, and the usage export's two: the export function and
+    // the one-time bootstrap. Three named principals, nothing addressable.
     assert.equal(
-      NETWORK_SOURCE.match(/securityGroupId: databaseSecurityGroup\.id,/g)
-        ?.length,
-      1,
-      "the database security group must have exactly one ingress rule",
+      rules.length,
+      3,
+      `the database group must have exactly three ingress rules, found: ${rules
+        .map((entry) => `${entry.file}`)
+        .join(", ")}`,
     );
+    for (const { file, rule } of rules) {
+      assert.ok(
+        rule.includes("fromPort: POSTGRES_PORT") && rule.includes("toPort: POSTGRES_PORT"),
+        `${file}: a database ingress rule must be the Postgres port`,
+      );
+      assert.ok(
+        rule.includes("referencedSecurityGroupId:"),
+        `${file}: a database ingress rule must reference a security group, not a CIDR`,
+      );
+      assert.ok(
+        !rule.includes("cidrIpv4"),
+        `${file}: a database ingress rule must not admit a CIDR`,
+      );
+    }
   });
 
   it("has an identifier RDS accepts", () => {

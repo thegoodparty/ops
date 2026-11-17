@@ -18,6 +18,102 @@ sized to what they actually do. It is the sibling of
 own subject, and it reuses that plan's roles, helpers and workflow shape
 wherever they fit.
 
+## One deploy role, one pull-request role
+
+**Decided (2026-11-12, swain).** There is one deploy role and one
+pull-request role, and every workflow assumes one of them:
+
+- `github-actions-pulumi-deploy`, the deploy role: `main` runs and
+  production-environment runs.
+- `github-actions-preview-deploy`, the pull-request role: omni
+  `pull_request` runs.
+
+A new workflow does not get a role of its own. If it needs access its role
+lacks, widen that role's policy, and move part of it to a managed policy when
+the inline document is near the 10,240-character limit.
+
+This supersedes the approach the rest of this plan takes, of giving each
+workflow that needs credentials a role "sized to what they actually do". The
+steps and findings below are left as the record of that approach and are not
+rewritten. Step 5b had already moved toward the rule: the gp-api diff runs on
+the preview deploy role instead of a role of its own.
+
+The first change made under it is omni's `vercel-config.yml`, which applies
+the `vercel-config` Pulumi stack in omni's `production` environment, where
+the Vercel token lives. Instead of a new role, the deploy role now trusts
+`repo:thegoodparty/omni:environment:production` beside omni's main ref, and
+the stack's pull request diff reads its one checkpoint under the preview
+deploy role. omni's `production` environment, checked against the GitHub API
+on 2026-11-12, has a custom deployment branch policy naming the one branch
+`main`, no tag pattern and no required reviewer, so a job in it is a `main`
+job and the subject grants nothing the main ref does not.
+`can_admins_bypass` is on, as it is on gp-terraform-dataplatform's.
+
+Roles that predate the rule, and are candidates for folding into one of the
+two. None is consolidated yet; each is its own change.
+
+- `github-actions-org-deploy`: ops `deploy-org.yml` on `main`.
+- `github-actions-workbench-deploy`: ops `deploy-workbench.yml` on `main`,
+  chaining into the workbench account's `pulumi-deploy`.
+- `github-actions-infrastructure-deploy`: ops `deploy-infrastructure.yml` on
+  `main`, chaining into the infrastructure account.
+- `github-actions-pulumi-preview`: ops `pull_request` runs, `pulumi-preview.yml`
+  and the ECR Public login in `deploy.yml`.
+- `github-actions-pulumi-plan`: gp-terraform-dataplatform's pull request
+  plan. No omni workflow assumes it.
+- `github-actions-delegate-eval`: ops `delegate-eval.yml` and
+  `delegate-eval-run.yml`.
+- `github-actions-delegate-eval-cache-push`: ops
+  `delegate-eval-cache-push.yml`.
+- `github-actions-delegate-eval-ledger`: ops `delegate-eval-ledger.yml`.
+
+### Folding omni's E2E, judge and ECR Public login roles
+
+omni also assumed two roles this repo does not define, `web-app-e2e-tests`
+(made in the console) and `github-actions-judge-sweep` (omni gp-ai's
+`universal-judge-sweep-policy` Terraform), and borrowed the plan role for
+its pull request ECR Public logins. Each moves onto one of the two roles, in
+three changes, so nothing loses access in between:
+
+1. This repo grants first. The pull-request role gets a managed policy,
+   `GitHubActionsPullRequestJobs`, because its inline document is within a
+   few hundred characters of the quota. It holds what the old roles granted
+   and the jobs still call: the pull request E2E report upload and the
+   judge's dev staging, records and dispatch. The ECR Public login needs
+   nothing new: `RegistryLogin` already grants it.
+2. omni switches its workflows. Pull request E2E and the ECR Public logins
+   assume the pull-request role, and the pull request E2E shards drop
+   credentials, since the one spec that calls AWS is `@dev-only`. The main
+   E2E in `release.yml` assumes the deploy role.
+3. The old roles go once nothing assumes them. The plan role loses its
+   `EcrPublicLogin` statement here. omni stops managing
+   `github-actions-judge-sweep` in its Terraform, and both it and
+   `web-app-e2e-tests` are deleted by hand, since CI refuses to apply a
+   destroy and the E2E role was never in code.
+
+**The judge goes to the pull-request role, not the deploy role.** judge.yml
+starts from omni's main (a dispatch, a `/judge` comment or the guard's
+`pull_request_target`), so it presents the main ref, but its sweep job runs
+the judged branch's code with the credentials in its environment. On the
+deploy role that would be `AdministratorAccess` for unreviewed code. So the
+pull-request role trusts omni's main ref as well, pinned by
+`job_workflow_ref` to `judge.yml` on main, and allows a four-hour session,
+which the sweep asks for so its credentials outlast the background runs it
+polls.
+
+**gp-ai's Terraform plan follows, the same three steps.** The plan reads
+whatever gp-ai's dev roots manage, which is why the plan role was built on
+`ReadOnlyAccess` rather than an enumerated list, and the pull-request role
+now carries it too. The plan role's denies come with it, adjusted for a role
+that also runs Pulumi previews. Each takes back what `ReadOnlyAccess` adds
+and the role's own allows do not grant: object reads outside a list derived
+from the allows, every object version, every secret value but GP_API_DEV,
+and every parameter but the passphrase and the diff's two Grafana tokens.
+Any omni pull request could already assume both roles, so the combined role
+reads no more than the two did between them. The plan role keeps
+gp-terraform-dataplatform, which is not an omni workflow, and no longer
+trusts omni or reads omni's state.
+
 ## Progress
 
 One step at a time, one pull request per step. A step's status is derived from
@@ -634,13 +730,14 @@ role. Stray permission, no effect, remove it.
 Docker builds in ops and omni pull their base images from ECR Public and log
 in first, because anonymous pulls are limited per IP and shared runners hit
 429s, while logged-in pulls are limited per account. Pull request builds get
-no deploy role, so each borrows the PR-only role its repository already has:
-ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni `gp-ai.yml`
-assumes `github-actions-pulumi-plan`. Both carry one extra statement,
-`EcrPublicLogin` (`ecr-public:GetAuthorizationToken`,
-`sts:GetServiceBearerToken`), which mints a login token and reads or pushes
-nothing. Any pull request in those repositories can already assume its role
-by editing the workflow, so the build job holding it exposes nothing new.
+no deploy role, so each uses the PR-only role its repository already has:
+ops `deploy.yml` assumes `github-actions-pulumi-preview`, and omni's
+`gp-ai.yml` and `gp-api.yml` assume `github-actions-preview-deploy`. Both
+grant `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken`
+(`EcrPublicLogin` and `RegistryLogin`), which mint a login token and read or
+push nothing. The plan role no longer does. Any pull request in those
+repositories can already assume its role by editing the workflow, so the
+build job holding it exposes nothing new.
 Main builds log in with `github-actions-pulumi-deploy`.
 
 ## What step 8 found

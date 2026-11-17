@@ -4,8 +4,10 @@ import {
   repliesDueAtOf,
   run,
   taskTextFor,
+  unreadableOf,
   type Deps,
   type Kv,
+  type UnreadablePost,
 } from './panel-waves-tick'
 
 const NOW = Date.parse('2026-11-08T12:00:00Z')
@@ -47,7 +49,10 @@ const claim = (over: Record<string, unknown> = {}) => ({
   ...over,
 })
 
-const harness = (records: Record<string, unknown> = {}) => {
+const harness = (
+  records: Record<string, unknown> = {},
+  unreadable: UnreadablePost[] = [],
+) => {
   const kv = memoryKv()
   for (const [id, record] of Object.entries(records)) {
     kv.data.set(`handoff:${id}`, record)
@@ -59,6 +64,7 @@ const harness = (records: Record<string, unknown> = {}) => {
     now: () => NOW,
     runNewHandoffs: async () => {
       triggers += 1
+      return unreadable
     },
     sendTask: async (args) => {
       sent.push(args)
@@ -308,6 +314,43 @@ describe('panel-waves-tick', () => {
     const record = kv.data.get('handoff:12345') as Record<string, unknown>
     assert.equal(record.attempts, 1)
     assert.equal(record.attemptsFor, 'export_replies')
+  })
+
+  it('carries unreadable hand-off posts into the result', async () => {
+    const unreadable: UnreadablePost[] = [
+      { ts: '1762560000.000100', reason: 'no machine block', posted: true },
+      { ts: '1762560000.000200', reason: 'invalid fields', posted: false },
+    ]
+    const { deps } = harness({}, unreadable)
+
+    const res = await run(deps)
+
+    assert.deepEqual(res.unreadable, unreadable)
+  })
+
+  it('reports no unreadable posts when the new hand-offs script fails', async () => {
+    const { deps } = harness()
+    deps.runNewHandoffs = async () => {
+      throw new Error('boom')
+    }
+
+    const res = await run(deps)
+
+    assert.equal(res.triggerFailed, true)
+    assert.deepEqual(res.unreadable, [])
+  })
+
+  it('reads the unreadable list out of the nested result, or nothing when absent', () => {
+    assert.deepEqual(
+      unreadableOf({
+        handoffs: [],
+        unreadable: [{ ts: '1.1', reason: 'invalid fields' }],
+      }),
+      [{ ts: '1.1', reason: 'invalid fields' }],
+    )
+    assert.deepEqual(unreadableOf({ handoffs: [] }), [])
+    assert.deepEqual(unreadableOf({ unreadable: 'garbage' }), [])
+    assert.deepEqual(unreadableOf(undefined), [])
   })
 
   it('exposes the helpers the skill relies on', () => {

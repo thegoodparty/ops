@@ -4,6 +4,7 @@ import {
   GP_API_PREVIEW_ROLE_BOUNDARY_ARN,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
+  githubActionsPullRequestJobs,
 } from "./components/ci-roles/policies";
 
 const SUBJECT_KEY = "token.actions.githubusercontent.com:sub";
@@ -29,6 +30,7 @@ const allowsWith = (action: string) =>
 const CHECKPOINTS = [
   "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-dev.json",
   "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/gp-api/gp-api-prod.json",
+  "arn:aws:s3:::goodparty-iac-state/.pulumi/stacks/vercel-config/prod.json",
 ];
 
 const DIFF_PROD_RESOURCES = [
@@ -43,15 +45,132 @@ const DIFF_PROD_READS = [
 ];
 
 describe("githubActionsPreviewDeployTrust", () => {
-  it("is assumed by omni pull_request runs alone, under StringEquals", () => {
-    assert.equal(githubActionsPreviewDeployTrust.Statement.length, 1);
-    const [s] = githubActionsPreviewDeployTrust.Statement;
-    assert.equal(s.Action, "sts:AssumeRoleWithWebIdentity");
-    assert.equal(s.Condition.StringLike, undefined);
-    assert.deepEqual(s.Condition.StringEquals, {
+  const [pullRequest, judge] = githubActionsPreviewDeployTrust.Statement;
+
+  it("has two statements, both under StringEquals", () => {
+    assert.equal(githubActionsPreviewDeployTrust.Statement.length, 2);
+    for (const s of githubActionsPreviewDeployTrust.Statement) {
+      assert.equal(s.Action, "sts:AssumeRoleWithWebIdentity");
+      assert.deepEqual(Object.keys(s.Condition), ["StringEquals"]);
+    }
+  });
+
+  it("is assumed by omni pull_request runs", () => {
+    assert.deepEqual(pullRequest.Condition.StringEquals, {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
       [SUBJECT_KEY]: "repo:thegoodparty/omni:pull_request",
     });
+  });
+
+  // The judge runs pull request code from a main-ref workflow. Without the
+  // workflow pin every main job could assume this role; with it, only
+  // judge.yml as it is on main.
+  it("is assumed on main by judge.yml alone", () => {
+    assert.deepEqual(judge.Condition.StringEquals, {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      [SUBJECT_KEY]: "repo:thegoodparty/omni:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:job_workflow_ref":
+        "thegoodparty/omni/.github/workflows/judge.yml@refs/heads/main",
+    });
+  });
+});
+
+describe("githubActionsPullRequestJobs", () => {
+  const statements = githubActionsPullRequestJobs.Statement;
+  const allowStatements = statements.filter((s) => s.Effect === "Allow");
+  const actions = allowStatements.flatMap((s) => ("Action" in s ? asList(s.Action) : []));
+  const resources = allowStatements.flatMap((s) => asList(s.Resource));
+  const deny = (sid: string) => {
+    const found = statements.find((s) => s.Sid === sid);
+    assert.ok(found, `no statement with Sid ${sid}`);
+    assert.equal(found.Effect, "Deny");
+    return found;
+  };
+
+  it("allows no delete and no receive", () => {
+    for (const action of actions) {
+      assert.doesNotMatch(action, /Delete|Receive|\*/, action);
+    }
+  });
+
+  it("writes E2E reports only under gp-webapp/", () => {
+    const writes = allowStatements.filter(
+      (s) =>
+        "Action" in s &&
+        asList(s.Action).includes("s3:PutObject") &&
+        asList(s.Resource).some((r) => r.includes("gp-playwright-reports")),
+    );
+    assert.deepEqual(
+      writes.flatMap((s) => asList(s.Resource)),
+      ["arn:aws:s3:::gp-playwright-reports/gp-webapp/*"],
+    );
+  });
+
+  it("allows only dev resources, the reports bucket and dev Terraform state", () => {
+    for (const r of resources) {
+      assert.match(
+        r,
+        /^arn:aws:s3:::gp-playwright-reports(\/gp-webapp\/\*)?$|-dev(\.fifo)?(\/|$)|^arn:aws:s3:::goodparty-terraform-state-us-west-2(\/\*\/dev\/terraform\.tfstate|\/shared\/slack-notifier\/terraform\.tfstate)?$/,
+        r,
+      );
+    }
+  });
+
+  it("sends to the dispatch queue and looks it up, nothing else", () => {
+    const sqs = actions.filter((a) => a.startsWith("sqs:")).sort();
+    assert.deepEqual(sqs, ["sqs:GetQueueUrl", "sqs:SendMessage"]);
+  });
+
+  it("allows nothing on *", () => {
+    assert.ok(!resources.includes("*"));
+  });
+
+  // ReadOnlyAccess allows s3:GetObject on *. The deny's NotResource is the
+  // real list of what the role can read, so it has to hold every object an
+  // allow names, or that read breaks, and nothing else.
+  it("denies every object read but the ones the role's allows name", () => {
+    const allowed = [...githubActionsPreviewDeploy.Statement, ...statements]
+      .filter((s) => s.Effect === "Allow" && "Action" in s && asList(s.Action).includes("s3:GetObject"))
+      .flatMap((s) => asList(s.Resource))
+      .sort();
+    const objects = deny("DenyOtherObjects");
+    assert.deepEqual("Action" in objects ? objects.Action : undefined, ["s3:GetObject"]);
+    assert.deepEqual(asList(objects.NotResource).sort(), allowed);
+  });
+
+  it("keeps prod Terraform state and other projects' Pulumi state out of reach", () => {
+    const readable = asList(deny("DenyOtherObjects").NotResource);
+    for (const r of readable) {
+      assert.doesNotMatch(r, /\/prod\/terraform\.tfstate|dataplatform/, r);
+      if (r.startsWith("arn:aws:s3:::goodparty-iac-state/.pulumi/")) {
+        assert.match(
+          r,
+          /\/gp-api\/gp-api-pr-\*$|\/meta\.yaml$|\/gp-api-(dev|prod)\.json$|\/vercel-config\/prod\.json$/,
+          r,
+        );
+      }
+    }
+  });
+
+  it("denies every object version", () => {
+    assert.deepEqual(asList(deny("DenyObjectVersions").Resource), ["*"]);
+  });
+
+  it("reads one secret value, GP_API_DEV, even with ReadOnlyAccess", () => {
+    assert.deepEqual(asList(deny("DenyOtherSecretValues").NotResource), [
+      "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    ]);
+  });
+
+  it("reads three SSM parameters, and no history or path", () => {
+    assert.equal(asList(deny("DenyOtherParameters").NotResource).length, 3);
+    assert.deepEqual(asList(deny("DenyParameterPathsAndHistory").Resource), ["*"]);
+  });
+
+  // Managed policies are capped at 6,144 characters, counted without
+  // whitespace. JSON.stringify emits none.
+  it("fits the managed policy quota", () => {
+    assert.ok(JSON.stringify(githubActionsPullRequestJobs).length < 6144);
   });
 });
 
@@ -152,8 +271,9 @@ describe("githubActionsPreviewDeploy", () => {
   // gp-api's dev and prod stacks share the project prefix, and their older
   // copies hold the Aurora master passwords under the shared passphrase.
   // Every write on the state bucket has to stop at the preview stack prefix,
-  // and the diff reads the two current checkpoints by exact name.
-  it("reaches gp-api's preview stacks in the state bucket, and reads two checkpoints", () => {
+  // and the diff reads the two current checkpoints by exact name, beside
+  // vercel-config's one.
+  it("reaches gp-api's preview stacks in the state bucket, and reads three checkpoints", () => {
     const objects = allows()
       .flatMap((s) => asList(s.Resource))
       .filter((r) => r.startsWith("arn:aws:s3:::goodparty-iac-state/"));
@@ -273,32 +393,10 @@ describe("githubActionsPreviewDeploy", () => {
     });
   });
 
-  it("denies everything on a resource tagged Environment=prod, but the diff's two", () => {
-    const deny = statement("DenyProductionTagged");
-    assert.equal(deny.Effect, "Deny");
-    assert.ok("Action" in deny);
-    assert.equal(deny.Action, "*");
-    assert.equal(deny.Resource, undefined);
-    assert.deepEqual(deny.NotResource, DIFF_PROD_RESOURCES);
-    assert.deepEqual(deny.Condition, {
-      StringEquals: { "aws:ResourceTag/Environment": "prod" },
-    });
-  });
-
-  // The tag deny leaves those two out, so this is what holds them to reads.
-  it("denies everything but three reads on the diff's two prod resources", () => {
-    const deny = statement("DiffProdReadsOnly");
-    assert.equal(deny.Effect, "Deny");
-    assert.ok("NotAction" in deny);
-    assert.deepEqual(deny.NotAction, DIFF_PROD_READS);
-    assert.deepEqual(deny.Resource, DIFF_PROD_RESOURCES);
-    assert.equal(deny.Condition, undefined);
-    for (const s of allows()) {
-      if (!asList(s.Resource).some((r) => DIFF_PROD_RESOURCES.includes(r))) continue;
-      for (const action of asList(s.Action)) {
-        assert.ok(DIFF_PROD_READS.includes(action), `${s.Sid}: ${action}`);
-      }
-    }
+  it("holds no deny on prod-tagged resources; the managed policy does", () => {
+    const sids = githubActionsPreviewDeploy.Statement.map((s) => s.Sid);
+    assert.ok(!sids.includes("DenyProductionTagged"));
+    assert.ok(!sids.includes("DiffProdReadsOnly"));
   });
 
   // "*" is for the actions AWS defines no resource for. Anything that takes
@@ -337,5 +435,63 @@ describe("githubActionsPreviewDeploy", () => {
   // managed policy of their own, which does not count against it.
   it("fits the inline policy quota with room to widen", () => {
     assert.ok(JSON.stringify(githubActionsPreviewDeploy).length < 9800);
+  });
+});
+
+describe("githubActionsPullRequestJobs prod denies", () => {
+  const NETWORK = [
+    "arn:aws:ec2:us-west-2:333022194791:vpc/*",
+    "arn:aws:ec2:us-west-2:333022194791:subnet/*",
+    "arn:aws:ec2:us-west-2:333022194791:route-table/*",
+  ];
+  const statement = (sid: string) => {
+    const found = githubActionsPullRequestJobs.Statement.find((s) => s.Sid === sid);
+    assert.ok(found, `no statement with Sid ${sid}`);
+    return found;
+  };
+  const allows = () =>
+    [...githubActionsPreviewDeploy.Statement, ...githubActionsPullRequestJobs.Statement].filter(
+      (s) => s.Effect === "Allow",
+    );
+
+  it("denies everything on a resource tagged Environment=prod, but the diff's two and the network", () => {
+    const deny = statement("DenyProductionTagged");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("Action" in deny);
+    assert.equal(deny.Action, "*");
+    assert.equal(deny.Resource, undefined);
+    assert.deepEqual(deny.NotResource, [...DIFF_PROD_RESOURCES, ...NETWORK]);
+    assert.deepEqual(deny.Condition, {
+      StringEquals: { "aws:ResourceTag/Environment": "prod" },
+    });
+  });
+
+  it("denies everything but three reads on the diff's two prod resources", () => {
+    const deny = statement("DiffProdReadsOnly");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("NotAction" in deny);
+    assert.deepEqual(deny.NotAction, DIFF_PROD_READS);
+    assert.deepEqual(deny.Resource, DIFF_PROD_RESOURCES);
+    assert.equal(deny.Condition, undefined);
+    for (const s of allows()) {
+      if (!asList(s.Resource).some((r) => DIFF_PROD_RESOURCES.includes(r))) continue;
+      for (const action of asList("Action" in s ? s.Action : undefined)) {
+        assert.ok(DIFF_PROD_READS.includes(action), `${s.Sid}: ${action}`);
+      }
+    }
+  });
+
+  it("denies everything but describes on VPCs, subnets and route tables", () => {
+    const deny = statement("NetworkReadsOnly");
+    assert.equal(deny.Effect, "Deny");
+    assert.ok("NotAction" in deny);
+    assert.deepEqual(deny.NotAction, ["ec2:Describe*"]);
+    assert.deepEqual(deny.Resource, NETWORK);
+    for (const s of allows()) {
+      for (const r of asList(s.Resource)) {
+        assert.doesNotMatch(r, /:(vpc|subnet|route-table)\//, `${s.Sid}: ${r}`);
+      }
+    }
+    assert.equal(deny.Condition, undefined);
   });
 });

@@ -43,9 +43,24 @@ export type DirectoryGroup = {
 };
 
 /**
+ * The name fields of a user's public directory profile, as far as this job uses
+ * them. Both are optional because the profile may omit either; the caller falls
+ * back to `deriveDisplayName` when it does.
+ */
+export type DirectoryUserName = {
+  givenName?: string | null;
+  familyName?: string | null;
+};
+
+/**
  * The slice of the Admin SDK Directory API this job reads. `googleapis`
- * exposes `directory.groups.get` and `directory.members.list`; step 3 adapts
- * them to this shape, and the tests implement it directly.
+ * exposes `directory.groups.get`, `directory.members.list` and
+ * `directory.users.get`; step 3 adapts them to this shape, and the tests
+ * implement it directly.
+ *
+ * `getUser` is the one call here that is not a group read: it exists only to
+ * carry a new member's real name into `CreateUser`, and only for the users
+ * about to be created (open question 3).
  */
 export interface DirectoryClient {
   getGroup(request: { groupKey: string }): Promise<DirectoryGroup>;
@@ -53,6 +68,7 @@ export interface DirectoryClient {
     groupKey: string;
     pageToken?: string;
   }): Promise<DirectoryMemberPage>;
+  getUser(request: { userKey: string }): Promise<DirectoryUserName>;
 }
 
 /** The reasons the read itself can abort a pair. */

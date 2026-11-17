@@ -35,10 +35,19 @@ export type TrustPolicyDocument = {
   Statement: TrustStatement[];
 };
 
+// The deploy role. There is one deploy role, this one, for `main` and
+// production-environment runs, and one pull-request role,
+// `github-actions-preview-deploy`. A new workflow assumes one of the two. If
+// it needs more access, widen that role's policy, moving to a managed policy
+// when the inline one nears its size limit, rather than adding a role
+// (decided by swain, 2026-11-12). The other roles in ci-roles.ts predate the
+// rule; docs/deploy-role-trust.md, "One deploy role, one pull-request role",
+// lists them as consolidation candidates.
+//
 // Four repositories in two statements, and every subject is exact. Ops is
 // pinned to `main` and to one workflow file. omni, gp-terraform-dataplatform
-// and gpvpn share the second statement, pinned to `main`, with
-// gp-terraform-dataplatform's `production` environment beside its ref.
+// and gpvpn share the second statement, pinned to `main`, with omni's and
+// gp-terraform-dataplatform's `production` environments beside their refs.
 //
 // Why the ops statement pins `job_workflow_ref` too. `sub` is per-ref, not
 // per-workflow: every workflow on main presents the same subject, so a
@@ -62,8 +71,9 @@ export type TrustPolicyDocument = {
 // use `github-actions-preview-deploy` (gp-api previews, their teardown and
 // the infrastructure diff) and `github-actions-pulumi-plan`, and
 // dataplatform's plan uses the last. Every omni job left on this role runs on
-// `main`, by push, schedule or a dispatch from main, and declares no
-// environment, so it presents the main ref.
+// `main`, by push, schedule or a dispatch from main. Most declare no
+// environment and present the main ref; `vercel-config.yml` runs in
+// `production` and presents that environment.
 export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
   Statement: [
@@ -103,6 +113,11 @@ export const githubActionsPulumiDeployTrust: TrustPolicyDocument = {
           // statement holds them all.
           "token.actions.githubusercontent.com:sub": [
             "repo:thegoodparty/omni:ref:refs/heads/main",
+            // omni's `vercel-config.yml` applies in its `production`
+            // environment, which holds the Vercel token, so its job presents
+            // the environment instead of the ref. That environment admits
+            // only `main`, so this grants nothing beyond the main ref above.
+            "repo:thegoodparty/omni:environment:production",
             "repo:thegoodparty/gp-terraform-dataplatform:ref:refs/heads/main",
             // dataplatform's `tf-apply.yaml` runs in its `production`
             // environment, and a job in an environment presents the
@@ -1064,10 +1079,9 @@ export const githubActionsPulumiPreview: PolicyDocument = {
 // eleven dev roots) and gp-terraform-dataplatform's `on-pull-request.yaml`.
 // Neither applies anything, and neither touches Pulumi.
 //
-// Two subjects on one role, which the rest of this plan argues against for the
-// preview roles. It is right here because the separation that matters is plan
-// versus apply, not repository: both subjects are read-only, and the denies
-// below mean neither can reach anything the other owns.
+// omni's plan has since moved to the pull-request role, so this role serves
+// gp-terraform-dataplatform alone. It is not an omni workflow, so the
+// one-pull-request-role rule does not fold it in.
 //
 // gp-api's diff workflow is deliberately NOT on this role. Its Pulumi program
 // reads secret values at program time, so it cannot run without
@@ -1077,10 +1091,9 @@ const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 
 // Every state object a plan on this role may read, allowed below and used
 // again as the NotResource of the deny that makes the allow meaningful.
-//
-// `shared/slack-notifier` is not a `*/dev/*` key and is easy to miss: gp-ai's
-// dev roots reach it through `data "terraform_remote_state"`. It read fine
-// before the deny existed, because ReadOnlyAccess covered it.
+// gp-terraform-dataplatform reads only its own state. omni's gp-ai plan moved
+// to the pull-request role, which reads gp-ai's dev states itself
+// (`TerraformDevState`).
 //
 // The `.tflock` object is on this list because releasing a lock reads it
 // before deleting it, to check the ID it is about to remove is the one it
@@ -1090,10 +1103,8 @@ const TF_BUCKET = "arn:aws:s3:::goodparty-terraform-state-us-west-2";
 // take the lock and then fail to release it, stranding the lockfile and
 // blocking every later plan until someone removed it by hand.
 const TF_STATE_READABLE = [
-  `${TF_BUCKET}/*/dev/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate`,
   `${TF_BUCKET}/dataplatform/terraform.tfstate.tflock`,
-  `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
 ];
 
 export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
@@ -1116,7 +1127,6 @@ export const githubActionsPulumiPlanTrust: TrustPolicyDocument = {
           // name `@refs/pull/N/merge` and constrain nothing, because the
           // workflow file comes from the pull request too.
           "token.actions.githubusercontent.com:sub": [
-            "repo:thegoodparty/omni:pull_request",
             "repo:thegoodparty/gp-terraform-dataplatform:pull_request",
           ],
         },
@@ -1154,9 +1164,7 @@ export const githubActionsPulumiPlan: PolicyDocument = {
       Resource: TF_BUCKET,
     },
     {
-      // Scoped to the states these two actually plan. gp-ai plans only its
-      // dev roots on a pull request ("Only dev is planned" in gp-ai.yml), so
-      // the prod states are not reachable from here.
+      // Scoped to the one state dataplatform plans.
       Sid: "TerraformStateObjects",
       Effect: "Allow",
       Action: ["s3:GetObject"],
@@ -1248,20 +1256,6 @@ export const githubActionsPulumiPlan: PolicyDocument = {
         "ssm:GetParametersByPath",
         "ssm:GetParameterHistory",
       ],
-      Resource: "*",
-    },
-    {
-      Sid: "EcrPublicLogin",
-      Effect: "Allow",
-      // Not for plans. omni's `gp-ai.yml` assumes this role in its pull
-      // request image builds to log in to ECR Public: anonymous pulls there
-      // are limited per IP and shared runners hit 429s, logged-in pulls are
-      // limited per account. A login token reads nothing and pushes nothing
-      // (pulling public images needs no permission at all), and neither
-      // action can be resource-scoped. Any omni pull request can already
-      // assume this role by editing gp-ai.yml, so handing it to the build job
-      // exposes nothing new.
-      Action: ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
       Resource: "*",
     },
   ],
@@ -1456,6 +1450,12 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // ---------------------------------------------------------------------------
 // The gp-api preview deploy role (step 6 of docs/deploy-role-trust.md)
 //
+// This is the one pull-request role. omni pull request runs that need AWS
+// assume it, and a new pull-request workflow does too: widen this policy, or
+// move part of it to a managed policy when the inline one is near its size
+// limit, rather than adding a role (decided by swain, 2026-11-12; see
+// `githubActionsPulumiDeployTrust` for the deploy half of the rule).
+//
 // Assumed by omni's `gp-api.yml` preview job and `gp-api-teardown-preview.yml`
 // on pull requests, which today assume the shared admin deploy role. Unlike
 // the plan and preview roles above, this one applies: a preview environment is
@@ -1476,12 +1476,18 @@ export const gpApiPreviewRoleBoundary: PolicyDocument = {
 // role trusted on its subject, so a separate role for the diff would separate
 // nothing, and one role keeps what an omni pull request can reach in one
 // document. The diff adds reads only, each named, in the `Diff` statements
-// before `DenyProductionTagged`.
+// at the end. The denies on prod-tagged resources are in
+// `githubActionsPullRequestJobs`, where there was room for them.
 //
 // Sized from the code on omni's main and from CloudTrail for one create, one
 // update and one teardown of a live preview under the shared role
 // (2026-10-28), not by enumerating services. Widened only by observed
 // failures, the discipline `pr-previews.md` step 4 set.
+//
+// It is omni's one pull-request role, so other omni jobs that run pull
+// request code assume it too: the image builds' ECR Public login
+// (`RegistryLogin`), and the E2E report upload and Universal Judge sweep,
+// whose grants are in `githubActionsPullRequestJobs` at the end of this file.
 
 export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
   Version: "2012-10-17",
@@ -1495,11 +1501,33 @@ export const githubActionsPreviewDeployTrust: TrustPolicyDocument = {
       Condition: {
         StringEquals: {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          // omni's pull_request subject exactly, and nothing else ever. Main
-          // runs, including the scheduled preview cleanup, keep the deploy
-          // role. No `job_workflow_ref` pin: it would name
-          // `@refs/pull/N/merge` and constrain nothing.
+          // omni's pull_request subject exactly. Main runs, including the
+          // scheduled preview cleanup, keep the deploy role. No
+          // `job_workflow_ref` pin: it would name `@refs/pull/N/merge` and
+          // constrain nothing.
           "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:pull_request",
+        },
+      },
+    },
+    {
+      Effect: "Allow",
+      Principal: {
+        Federated: "arn:aws:iam::333022194791:oidc-provider/token.actions.githubusercontent.com",
+      },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          // omni's Universal Judge sweep. judge.yml is started from main (a
+          // dispatch, a `/judge` comment, or the guard's
+          // `pull_request_target`), so it presents the main ref, but it runs
+          // the pull request's own code with these credentials in its
+          // environment. That is a pull-request job, and the deploy role's
+          // AdministratorAccess must never reach it. Pinned to the one
+          // workflow file on main, so no other main job can assume this role.
+          "token.actions.githubusercontent.com:sub": "repo:thegoodparty/omni:ref:refs/heads/main",
+          "token.actions.githubusercontent.com:job_workflow_ref":
+            "thegoodparty/omni/.github/workflows/judge.yml@refs/heads/main",
         },
       },
     },
@@ -1586,6 +1614,17 @@ const PROD_SERVICE =
   "arn:aws:ecs:us-west-2:333022194791:service/gp-master-fargateCluster/gp-api-master";
 const PROD_APP_SECRET =
   "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_PROD-??????";
+
+// The network every environment shares. The VPC, its subnets and its route
+// tables are tagged `Environment=prod`, and gp-ai's dev Terraform roots read
+// them: the VPC through `data "aws_vpc"`, the subnets and route tables as
+// references in the resources they plan. Every VPC, subnet and route table,
+// rather than the shared one's ids: the role writes none of them anywhere.
+const NETWORK = [
+  "arn:aws:ec2:us-west-2:333022194791:vpc/*",
+  "arn:aws:ec2:us-west-2:333022194791:subnet/*",
+  "arn:aws:ec2:us-west-2:333022194791:route-table/*",
+];
 
 export const githubActionsPreviewDeploy: PolicyDocument = {
   Version: "2012-10-17",
@@ -1967,7 +2006,7 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       ],
     },
     {
-      // The infrastructure diff, step 5b, from here to `DenyProductionTagged`:
+      // The infrastructure diff, step 5b, from here to the end:
       // `pulumi preview` of gp-api's dev and prod stacks. Sized from
       // CloudTrail for the 21 diff runs on 2026-11-02 and 11-03 under the
       // shared role. The rest of what they called is granted above for
@@ -1978,12 +2017,19 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
       // `stacks/gp-api/*`, whose `.json.bak` files still hold the Aurora
       // master passwords, and this role has no `s3:GetObjectVersion`
       // anywhere. A preview takes no state lock and writes no state.
+      //
+      // The third is omni's `vercel-config-diff.yml`, which previews the one
+      // vercel-config stack under this role. That stack holds no secret by
+      // design (packages/vercel-config/AGENTS.md in omni). In this statement
+      // rather than one of its own because a new statement does not fit the
+      // inline policy quota's headroom (ci-roles-preview-deploy.test.ts).
       Sid: "DiffCheckpoints",
       Effect: "Allow",
       Action: ["s3:GetObject"],
       Resource: [
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-dev.json`,
         `${BUCKET}/.pulumi/stacks/gp-api/gp-api-prod.json`,
+        `${BUCKET}/.pulumi/stacks/vercel-config/prod.json`,
       ],
     },
     {
@@ -2018,6 +2064,134 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
         PROD_SERVICE,
       ],
     },
+  ],
+};
+
+// ---------------------------------------------------------------------------
+// The pull-request role's other jobs
+//
+// A managed policy attached to `github-actions-preview-deploy` beside its
+// inline one, for the omni jobs that moved onto the role from roles of their
+// own. The inline document is within a few hundred characters of the 10,240
+// quota role inline policies share, and a managed policy does not count
+// against it. Its denies, including the ones on prod-tagged resources, hold
+// across every policy on the role, the inline one included.
+//
+// Each statement is what the old role granted and the job still calls,
+// taken from the old role's policy and the workflow, nothing wider:
+//
+// - `E2eReports`, from `web-app-e2e-tests`. gp-webapp.yml's pull request E2E
+//   publishes its HTML report with `aws s3 sync` (no `--delete`) under
+//   `gp-webapp/<pr>/`. The old role also held `sqs:*` on `*`, a PutObject on
+//   `serve-analyze-data-*` and DeleteObject on the reports bucket, all for the
+//   `@dev-only` specs and the main run, which pull requests exclude and which
+//   moved to the deploy role.
+// - The rest, from `github-actions-judge-sweep` (omni gp-ai's
+//   `universal-judge-sweep-policy`), verbatim. The sweep stages an override
+//   config, sends one dispatch, polls for the artifact and keeps its records.
+//   dev only: the broker and the dispatch Lambda refuse a judge override
+//   anywhere else.
+// - `TerraformDevState` and `TerraformStateBucket`, and the denies at the
+//   end, from `github-actions-pulumi-plan`, for gp-ai.yml's pull request
+//   Terraform plan.
+export const PULL_REQUEST_JOBS_POLICY_NAME = "GitHubActionsPullRequestJobs";
+
+const PULL_REQUEST_JOBS_ALLOWS: PolicyStatement[] = [
+    {
+      Sid: "E2eReports",
+      Effect: "Allow",
+      Action: ["s3:PutObject"],
+      Resource: "arn:aws:s3:::gp-playwright-reports/gp-webapp/*",
+    },
+    {
+      Sid: "E2eReportsList",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::gp-playwright-reports",
+      Condition: { StringLike: { "s3:prefix": ["gp-webapp/*"] } },
+    },
+    {
+      Sid: "StageJudgeOverrideConfig",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:GetObject"],
+      Resource: "arn:aws:s3:::agent-experiment-metadata-dev/_judge/*",
+    },
+    {
+      Sid: "KeepJudgeRecords",
+      Effect: "Allow",
+      Action: ["s3:PutObject", "s3:GetObject"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev/_judge/*",
+    },
+    {
+      Sid: "ReadOwnJudgeRunArtifacts",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev/*/_judge-*/*",
+    },
+    {
+      // So a key not written yet returns 404 rather than 403.
+      Sid: "JudgeListMetadata",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::agent-experiment-metadata-dev",
+      Condition: { StringLike: { "s3:prefix": ["_judge/*"] } },
+    },
+    {
+      // The same, while polling for a dispatched run's artifact. Unprefixed,
+      // as on the old role: run artifacts land under `<experiment>/_judge-*/`.
+      Sid: "JudgeListArtifacts",
+      Effect: "Allow",
+      Action: ["s3:ListBucket"],
+      Resource: "arn:aws:s3:::gp-agent-artifacts-dev",
+    },
+    {
+      // Send and look up only. Receiving or deleting would let a job consume
+      // the queue the platform dispatches real runs from.
+      Sid: "DispatchJudgeRuns",
+      Effect: "Allow",
+      Action: ["sqs:SendMessage", "sqs:GetQueueUrl"],
+      Resource: "arn:aws:sqs:us-west-2:333022194791:agent-dispatch-dev.fifo",
+    },
+    {
+      // gp-ai.yml's `terraform-plan` job, moved here from
+      // `github-actions-pulumi-plan`. The same state objects that role reads
+      // for omni: every dev root's own state, and `shared/slack-notifier`,
+      // which the dev roots read through `terraform_remote_state`. gp-ai plans
+      // with `-lock=false`, so no lock object.
+      Sid: "TerraformDevState",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [
+        `${TF_BUCKET}/*/dev/terraform.tfstate`,
+        `${TF_BUCKET}/shared/slack-notifier/terraform.tfstate`,
+      ],
+    },
+    {
+      Sid: "TerraformStateBucket",
+      Effect: "Allow",
+      Action: ["s3:ListBucket", "s3:GetBucketLocation"],
+      Resource: TF_BUCKET,
+    },
+  ];
+
+const asList = (value: string | string[] | undefined): string[] =>
+  value === undefined ? [] : Array.isArray(value) ? value : [value];
+
+// Every object the role reads on purpose: the gp-api preview path's Pulumi
+// state, the diff's checkpoints, the judge's prefixes and the dev Terraform
+// state. Read off the allow statements rather than restated, so a new read
+// granted above is not silently denied below.
+const PULL_REQUEST_READABLE_OBJECTS = [
+  ...githubActionsPreviewDeploy.Statement,
+  ...PULL_REQUEST_JOBS_ALLOWS,
+]
+  .filter((s) => s.Effect === "Allow" && "Action" in s && asList(s.Action).includes("s3:GetObject"))
+  .flatMap((s) => asList(s.Resource));
+
+export const githubActionsPullRequestJobs: PolicyDocument = {
+  Version: "2012-10-17",
+  Statement: [
+    ...PULL_REQUEST_JOBS_ALLOWS,
     {
       // The two prod resources the diff reads are tagged `Environment=prod`,
       // so the deny below leaves them out, and this one holds them to the
@@ -2034,14 +2208,76 @@ export const githubActionsPreviewDeploy: PolicyDocument = {
     },
     {
       // The plan's "no write to any resource carrying the production tags",
-      // as a deny so it holds whatever is later added above. Nothing this role
-      // writes is tagged `Environment=prod`. The shared VPC is, and this role
-      // acts on nothing in it directly: ECS places the tasks.
+      // as a deny so it holds whatever is later added. Nothing this role
+      // writes is tagged `Environment=prod`. It holds everywhere on the role,
+      // inline policy included: an explicit deny beats any allow.
       Sid: "DenyProductionTagged",
       Effect: "Deny",
       Action: "*",
-      NotResource: [PROD_SERVICE, PROD_APP_SECRET],
+      NotResource: [PROD_SERVICE, PROD_APP_SECRET, ...NETWORK],
       Condition: { StringEquals: { "aws:ResourceTag/Environment": "prod" } },
+    },
+    {
+      // gp-ai's dev Terraform plan reads the shared VPC's attributes
+      // (`ec2:DescribeVpcAttribute`), which `DenyProductionTagged` refused
+      // on the first run. So the network is left out of that deny, and this
+      // one holds it to describes, tag or no tag. Nothing on the role acts on
+      // a VPC, subnet or route table otherwise: ECS places preview tasks.
+      Sid: "NetworkReadsOnly",
+      Effect: "Deny",
+      NotAction: ["ec2:Describe*"],
+      Resource: NETWORK,
+    },
+    // The role also carries `ReadOnlyAccess`, attached in ci-roles.ts, for
+    // the Terraform plan: it reads whatever gp-ai's dev roots manage, the
+    // reason the plan role was built on it. The denies below are the plan
+    // role's, adjusted for a role that also runs Pulumi previews: they take
+    // back what `ReadOnlyAccess` adds and the role's own allows do not
+    // grant, so the role reads no more than the plan role and the preview
+    // role between them already let an omni pull request read.
+    {
+      // Without this, `ReadOnlyAccess` reads every object in the account:
+      // every project's Pulumi state, the old copies of gp-api's dev and prod
+      // checkpoints that hold Aurora passwords, and gp-ai's prod Terraform
+      // state, which holds values derived from AI_SECRETS_PROD.
+      Sid: "DenyOtherObjects",
+      Effect: "Deny",
+      Action: ["s3:GetObject"],
+      NotResource: PULL_REQUEST_READABLE_OBJECTS,
+    },
+    {
+      // Content by `versionId`, a separate action. Nothing on the role passes
+      // one, and old versions of the diff's checkpoints hold the passwords.
+      Sid: "DenyObjectVersions",
+      Effect: "Deny",
+      Action: ["s3:GetObjectVersion"],
+      Resource: "*",
+    },
+    {
+      // GP_API_DEV, which the preview program reads, and no other value.
+      Sid: "DenyOtherSecretValues",
+      Effect: "Deny",
+      Action: ["secretsmanager:GetSecretValue"],
+      NotResource: "arn:aws:secretsmanager:us-west-2:333022194791:secret:GP_API_DEV-??????",
+    },
+    {
+      // The passphrase and the diff's two Grafana tokens, and no other
+      // parameter. By path and by history are denied outright: history
+      // returns current SecureString values in plaintext.
+      Sid: "DenyOtherParameters",
+      Effect: "Deny",
+      Action: ["ssm:GetParameter", "ssm:GetParameters"],
+      NotResource: [
+        "arn:aws:ssm:us-west-2:333022194791:parameter/pulumi-state-config-passphrase",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-shared-service-account-token",
+        "arn:aws:ssm:us-west-2:333022194791:parameter/grafana-sm-access-token",
+      ],
+    },
+    {
+      Sid: "DenyParameterPathsAndHistory",
+      Effect: "Deny",
+      Action: ["ssm:GetParametersByPath", "ssm:GetParameterHistory"],
+      Resource: "*",
     },
   ],
 };

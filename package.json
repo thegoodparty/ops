@@ -14,7 +14,9 @@
     "test": "tsx --test 'delegate/framework/*.test.ts' 'delegate/lambdas/*.test.ts' 'delegate/review/*.test.ts' 'delegate/review/eval/*.test.ts' 'delegate/agents/*.test.ts' 'delegate/worker/*.test.ts' 'agent-swarm/host/scripts/*.test.ts' 'deploy/*.test.ts' 'deploy-workbench/*.test.ts' 'deploy-workbench/bifrost/*.test.ts' 'deploy-infrastructure/*.test.ts'",
     "review:eval": "tsx delegate/review/eval/cli.ts",
     "review:expect": "tsx delegate/review/eval/expect.ts",
-    "review:mine": "tsx delegate/review/eval/mine.ts"
+    "review:mine": "tsx delegate/review/eval/mine.ts",
+    "review:from-pr": "tsx delegate/review/eval/from-pr.ts",
+    "review:arms": "tsx delegate/review/eval/arms.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.310",
@@ -38,10 +40,16 @@
     "@slack/web-api": "^7.13.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.19.8",
+    "@types/pg": "8.23.1",
+    "@types/pg-cursor": "2.7.2",
     "axios": "^1.13.4",
     "dayjs": "^1.11.19",
     "es-toolkit": "^1.44.0",
+    "hyparquet": "1.32.0",
+    "hyparquet-writer": "0.18.0",
     "jsonwebtoken": "^9.0.3",
+    "pg": "8.23.1",
+    "pg-cursor": "2.22.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "zod": "^4.6.5"

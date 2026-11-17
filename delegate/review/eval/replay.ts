@@ -12,6 +12,7 @@ import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
 import { GIT_TOOL_NAMES, createGitTool } from "../git-tool";
 import { promptDiff } from "../prompt-diff";
+import { POSTMORTEM_SELECTOR, selectPostmortems, type SelectedPostmortem } from "../postmortems";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
@@ -70,6 +71,8 @@ export interface Result {
   // Kept so lead tracing can be checked and re-run offline against the
   // prompts the orchestrator actually wrote, without paying for a replay.
   subagentCalls?: SubagentCall[];
+  // The post-mortems the replay was shown, as on a production record.
+  postmortems?: { file: string; lessons: string[] }[];
 }
 
 // caseId -> replay number -> result.
@@ -112,36 +115,68 @@ const words = (text: string): Set<string> =>
   new Set(text.toLowerCase().match(/[a-z0-9_]{4,}/g) ?? []);
 
 const MIN_OVERLAP = 0.6;
+const PARTIAL_OVERLAP = 0.3;
 
-const closestCall = (
-  area: string,
-  hypothesis: string,
-  all: SubagentCall[],
-  claimed: Set<SubagentCall>,
-): SubagentCall | undefined => {
-  if (hypothesis === "") return undefined;
-  const calls = all.filter((c) => !claimed.has(c));
-  const verbatim = calls.find((c) => c.prompt.includes(hypothesis));
-  if (verbatim) return verbatim;
-  // The orchestrator rewords the hypothesis but copies the area as written
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const mentions = (prompt: string, path: string): boolean =>
+  path !== "" && new RegExp(`(^|[^\\w./-])${escapeRegExp(path)}(?![\\w-]|\\.\\w)`).test(prompt);
+
+interface LeadKey {
+  area: string;
+  paths: string[];
+  category: string;
+  hypothesis: string;
+}
+
+// How strongly a deep-reviewer prompt looks like it carries this lead, or 0
+// when nothing in it points there. The orchestrator restates leads in its own
+// words and its own layout ("Lead: area ...", "Area:/Paths:/Category:",
+// "File: ... Lead (bugs): ..."), so no single field survives every prompt:
+// a cited file plus some of the hypothesis's words is evidence, either alone
+// rarely is.
+const evidence = (lead: LeadKey, call: SubagentCall, all: SubagentCall[]): number => {
+  const prompt = call.prompt;
+  if (lead.hypothesis !== "" && prompt.includes(lead.hypothesis)) return 100;
+  // The orchestrator copies the area as written more often than anything else
   // (eval run 40882274151: every area in exactly one prompt). Uniqueness is
-  // checked across all prompts, claimed ones too: a short area found in
-  // several says nothing, even after earlier leads claim the others.
-  const byArea = area === "" ? [] : all.filter((c) => c.prompt.includes(area));
-  if (byArea.length === 1 && !claimed.has(byArea[0])) return byArea[0];
-  const wanted = words(hypothesis);
-  if (wanted.size === 0) return undefined;
-  let best: SubagentCall | undefined;
-  let bestScore = MIN_OVERLAP;
-  for (const c of calls) {
-    const have = words(c.prompt);
-    const score = [...wanted].filter((w) => have.has(w)).length / wanted.size;
-    if (score >= bestScore) {
-      best = c;
-      bestScore = score;
-    }
+  // checked across all prompts: a short area found in several says nothing.
+  const uniqueArea = lead.area !== "" && prompt.includes(lead.area) && all.filter((c) => c.prompt.includes(lead.area)).length === 1;
+  const wanted = words(lead.hypothesis);
+  const have = words(prompt);
+  const overlap = wanted.size === 0 ? 0 : [...wanted].filter((w) => have.has(w)).length / wanted.size;
+  // A path counts only on its own, not inside a longer name (`service.ts` in
+  // `text.service.ts`). A bare file name is weaker than the full path: names
+  // like index.ts recur across a repo, so it needs the lead's words to back it.
+  const fullPaths = lead.paths.filter((p) => mentions(prompt, p)).length;
+  const fileNames = lead.paths.filter((p) => !mentions(prompt, p) && mentions(prompt, p.split("/").pop() ?? p)).length;
+  const fileShare = lead.paths.length === 0 ? 0 : (fullPaths + fileNames / 2) / lead.paths.length;
+  const category = lead.category !== "" && new RegExp(`\\b${escapeRegExp(lead.category)}\\b`, "i").test(prompt);
+  const plausible =
+    uniqueArea ||
+    overlap >= MIN_OVERLAP ||
+    (fullPaths > 0 && (overlap >= PARTIAL_OVERLAP || category)) ||
+    (fileNames > 0 && overlap >= PARTIAL_OVERLAP);
+  if (!plausible) return 0;
+  return (uniqueArea ? 50 : 0) + 10 * fileShare + 5 * overlap + (category ? 3 : 0);
+};
+
+// Pairs each lead with at most one call, best evidence first, so an early lead
+// cannot take a call that fits a later lead better (greedy first-match left 5
+// of 10 leads untraced with 10 calls on gp-pi-57, ENG-11526).
+const assignCalls = (leads: LeadKey[], calls: SubagentCall[]): (SubagentCall | undefined)[] => {
+  const pairs = leads.flatMap((lead, li) =>
+    calls.map((call, ci) => ({ li, ci, score: evidence(lead, call, calls) })).filter((p) => p.score > 0),
+  );
+  pairs.sort((a, b) => b.score - a.score || a.li - b.li || a.ci - b.ci);
+  const assigned: (SubagentCall | undefined)[] = leads.map(() => undefined);
+  const taken = new Set<number>();
+  for (const { li, ci } of pairs) {
+    if (assigned[li] || taken.has(ci)) continue;
+    assigned[li] = calls[ci];
+    taken.add(ci);
   }
-  return best;
+  return assigned;
 };
 
 export const traceLeads = (
@@ -154,31 +189,31 @@ export const traceLeads = (
 
   const reported = output?.status === "complete" ? output.findings : [];
   const deep = (calls ?? []).filter((c) => c.subagent === "deep-reviewer");
-  const claimed = new Set<SubagentCall>();
+  const bases = scoutObj.leads.flatMap((raw) => {
+    if (typeof raw !== "object" || raw === null) return [];
+    const lead = raw as Record<string, unknown>;
+    return [
+      {
+        area: typeof lead.area === "string" ? lead.area : "",
+        paths: asStrings(lead.paths),
+        category: typeof lead.category === "string" ? lead.category : "",
+        hypothesis: typeof lead.hypothesis === "string" ? lead.hypothesis : "",
+        ...(typeof lead.lineRange === "string" ? { lineRange: lead.lineRange } : {}),
+      },
+    ];
+  });
+  // The orchestrator restates each lead in the deep-reviewer's prompt in its
+  // own words, so a verbatim match misses (eval run 40754736623 traced all 8
+  // leads as not-investigated).
+  const assigned = assignCalls(bases, deep);
 
   const traces: LeadTrace[] = [];
-  for (const raw of scoutObj.leads) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const lead = raw as Record<string, unknown>;
-    const area = typeof lead.area === "string" ? lead.area : "";
-    const hypothesis = typeof lead.hypothesis === "string" ? lead.hypothesis : "";
-    const base = {
-      area,
-      paths: asStrings(lead.paths),
-      category: typeof lead.category === "string" ? lead.category : "",
-      hypothesis,
-      ...(typeof lead.lineRange === "string" ? { lineRange: lead.lineRange } : {}),
-    };
-
-    // The orchestrator restates each lead in the deep-reviewer's prompt in its
-    // own words, so a verbatim match misses (eval run 40754736623 traced all 8
-    // leads as not-investigated). Most of the hypothesis's words still appear.
-    const call = closestCall(area, hypothesis, deep, claimed);
+  for (const [i, base] of bases.entries()) {
+    const call = assigned[i];
     if (!call) {
       traces.push({ ...base, outcome: "not-investigated", findings: 0 });
       continue;
     }
-    claimed.add(call);
 
     const answer = call.result ? lastObjectWith(call.result, "findings") : undefined;
     if (!answer || !Array.isArray(answer.findings)) {
@@ -297,11 +332,6 @@ const defaultCheckout: CheckoutFn = (bundle, repoDir) => {
     stdio: "pipe",
     timeout: 60_000,
   });
-  execFileSync("git", ["submodule", "update", "--init", "--recursive"], {
-    cwd: repoDir,
-    stdio: "pipe",
-    timeout: 120_000,
-  });
 };
 
 const defaultRunAgentImpl: RunAgentImpl = (config, prompt, overrides) =>
@@ -350,6 +380,7 @@ export const replayCase = async (
   const repoDir = join(workDir, caseId);
   const startMs = Date.now();
   let subagentCalls: SubagentCall[] | undefined;
+  let postmortems: SelectedPostmortem[] = [];
 
   const makeResult = (
     output: ReviewOutput | null,
@@ -370,6 +401,7 @@ export const replayCase = async (
     ...(leads ? { leads } : {}),
     ...(gating !== undefined ? { gating } : {}),
     ...(subagentCalls ? { subagentCalls } : {}),
+    ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
   });
 
   try {
@@ -390,9 +422,26 @@ export const replayCase = async (
     writeFileSync(diffPath, promptDiff(bundle.diff).inline);
   }
 
+  // The suite asks what today's reviewer does with a change, so every case
+  // sees today's post-mortems, with the PR and commit identifiers stripped so
+  // a post-mortem cannot name a case's answer.
+  postmortems = await selectPostmortems(bundle, {
+    redact: true,
+    ask: async (prompt) => {
+      const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
+        cwd: repoDir,
+        mcpServers: {},
+        env: agentEnv(),
+        preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
+      });
+      if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
+      return selection.output;
+    },
+  });
+
   let agentResult: AgentResult;
   try {
-    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath }), {
+    agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: repoDir,
       mcpServers: { git: createGitTool(repoDir) },
       env: agentEnv(),

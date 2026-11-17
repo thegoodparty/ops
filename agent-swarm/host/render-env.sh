@@ -12,8 +12,10 @@ SECRET_JSON="$(aws secretsmanager get-secret-value \
   --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text)"
 
+# No ANTHROPIC_API_KEY: the agents run the Fireworks US router and agent-swarm
+# 2.13.0 readies a pi worker from FIREWORKS_API_KEY, so the key has no consumer
+# here.
 REQUIRED_KEYS=(
-  ANTHROPIC_API_KEY
   API_KEY
   CLICKUP_API_TOKEN
   # The pi harness's only model is Fireworks US-only, so a secret without this
@@ -93,11 +95,12 @@ fi
   echo "# Rendered by render-env.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ) from Secrets Manager:$SECRET_ID. Do not edit."
   echo
   echo "# --- secrets ---"
-  jq -r 'to_entries[]|"\(.key)=\(.value)"' <<<"$SECRET_JSON"
+  # A stale ANTHROPIC_API_KEY in the secret is dropped, never written to .env.
+  jq -r 'to_entries[] | select(.key != "ANTHROPIC_API_KEY") | "\(.key)=\(.value)"' <<<"$SECRET_JSON"
   echo
   echo "# --- static ---"
   cat <<'EOF'
-AGENT_SWARM_VERSION=2.6.0
+AGENT_SWARM_VERSION=2.13.0
 NODE_ENV=production
 HARNESS_PROVIDER=pi
 # One model, Fireworks US-only. The provider id is `fireworks-us`, not the

@@ -269,8 +269,31 @@ describe('agent-swarm inference residency', () => {
     const source = read(COMPOSE)
     assert.match(source, /^\s+FIREWORKS_API_KEY: \$\{FIREWORKS_API_KEY\}$/m)
     assert.match(source, /^\s+PI_CODING_AGENT_DIR: \$\{PI_CODING_AGENT_DIR:-\/workspace\/personal\/\.pi\}$/m)
-    // Anthropic stays for the api service and the fallback path.
-    assert.match(source, /^\s+ANTHROPIC_API_KEY: \$\{ANTHROPIC_API_KEY\}$/m)
+  })
+
+  it('gives no container an Anthropic key', () => {
+    // There is no Anthropic consumer left in the swarm: every agent runs the
+    // Fireworks US router, and agent-swarm 2.13.0 readies a pi worker from
+    // FIREWORKS_API_KEY alone (upstream desplega-ai/agent-swarm#3096). An
+    // ANTHROPIC_API_KEY here would only let a task pin an Anthropic model and
+    // bill ~9x. This asserts absence, so a re-add fails the suite rather than
+    // waiting for the next deploy to reach the host.
+    const compose = read(COMPOSE)
+    assert.doesNotMatch(
+      compose,
+      /^\s+(?:-\s+)?ANTHROPIC_API_KEY[=:]/m,
+      'docker-compose.yml passes ANTHROPIC_API_KEY to a container; the swarm has no Anthropic consumer',
+    )
+    // render-env.sh is the other half: a required key missing from the secret
+    // stops render-env, so naming it there would break the host on a secret
+    // that no longer carries it.
+    const required = read(RENDER_ENV).match(/^REQUIRED_KEYS=\(\n([\s\S]*?)^\)/m)
+    assert.ok(required, 'render-env.sh no longer declares REQUIRED_KEYS; re-check what it requires')
+    assert.doesNotMatch(
+      required[1],
+      /^\s*ANTHROPIC_API_KEY$/m,
+      'render-env.sh requires ANTHROPIC_API_KEY; the swarm has no Anthropic consumer',
+    )
   })
 
   it('marks the model as custom when sync-agent-config.sh writes it through the API', () => {

@@ -4,9 +4,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { S3Client } from "@aws-sdk/client-s3";
 import { ScenarioSchema, loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
-import type { Scenario } from "./cases";
 import type { ReviewRecord } from "../schema";
 
 const makeRecord = (overrides: Partial<ReviewRecord> = {}): ReviewRecord => ({
@@ -50,78 +48,54 @@ const tmpDir = () => {
   return dir;
 };
 
-test("loadCases from dir returns valid records", async () => {
+test("loadCases returns valid records from a dir", () => {
   const dir = tmpDir();
   const record = makeRecord();
   writeFileSync(join(dir, `${record.runId}.json`), JSON.stringify(record));
 
-  const records = await loadCases({ from: dir });
+  const records = loadCases(dir);
   assert.equal(records.length, 1);
   assert.equal(records[0].runId, record.runId);
 });
 
-test("loadCases from dir skips invalid JSON files with a warn", async () => {
+test("loadCases skips invalid JSON files with a warn", () => {
   const dir = tmpDir();
   writeFileSync(join(dir, "bad.json"), "not json");
   const record = makeRecord();
   writeFileSync(join(dir, `${record.runId}.json`), JSON.stringify(record));
 
-  const records = await loadCases({ from: dir });
+  const records = loadCases(dir);
   assert.equal(records.length, 1);
 });
 
-test("loadCases from dir skips invalid schema files with a warn", async () => {
+test("loadCases skips invalid schema files with a warn", () => {
   const dir = tmpDir();
   writeFileSync(join(dir, "bad.json"), JSON.stringify({ notARecord: true }));
   const record = makeRecord();
   writeFileSync(join(dir, `${record.runId}.json`), JSON.stringify(record));
 
-  const records = await loadCases({ from: dir });
+  const records = loadCases(dir);
   assert.equal(records.length, 1);
 });
 
-test("loadCases filters by repo", async () => {
-  const dir = tmpDir();
-  const r1 = makeRecord({ repo: "thegoodparty/ops" });
-  const r2 = makeRecord({ repo: "thegoodparty/gp-webapp" });
-  writeFileSync(join(dir, `${r1.runId}.json`), JSON.stringify(r1));
-  writeFileSync(join(dir, `${r2.runId}.json`), JSON.stringify(r2));
-
-  const records = await loadCases({ from: dir, repo: "thegoodparty/ops" });
-  assert.equal(records.length, 1);
-  assert.equal(records[0].repo, "thegoodparty/ops");
-});
-
-test("loadCases applies limit", async () => {
-  const dir = tmpDir();
-  for (let i = 0; i < 5; i++) {
-    const r = makeRecord();
-    writeFileSync(join(dir, `${r.runId}.json`), JSON.stringify(r));
-  }
-
-  const records = await loadCases({ from: dir, limit: 3 });
-  assert.equal(records.length, 3);
-});
-
-test("loadCases filters onlyComplete", async () => {
+test("loadCases keeps a record whose review failed", () => {
   const dir = tmpDir();
   const complete = makeRecord({ output: { status: "complete", findings: [], summary: "ok" } });
   const failed = makeRecord({ output: { status: "failed", reason: "agent failed" }, verdict: "failed", action: "failed" });
   writeFileSync(join(dir, `${complete.runId}.json`), JSON.stringify(complete));
   writeFileSync(join(dir, `${failed.runId}.json`), JSON.stringify(failed));
 
-  const records = await loadCases({ from: dir, onlyComplete: true });
-  assert.equal(records.length, 1);
-  assert.equal(records[0].runId, complete.runId);
+  const records = loadCases(dir);
+  assert.deepEqual(records.map((r) => r.output?.status).sort(), ["complete", "failed"]);
 });
 
-test("loadCases from dir ignores non-json files", async () => {
+test("loadCases ignores non-json files", () => {
   const dir = tmpDir();
   writeFileSync(join(dir, "README.md"), "# not a record");
   const record = makeRecord();
   writeFileSync(join(dir, `${record.runId}.json`), JSON.stringify(record));
 
-  const records = await loadCases({ from: dir });
+  const records = loadCases(dir);
   assert.equal(records.length, 1);
 });
 
@@ -148,58 +122,6 @@ test("saveCases creates the output dir if it does not exist", () => {
   assert.ok(existsSync(join(dir, `${record.runId}.json`)));
 });
 
-test("loadCases from S3 loads records and skips lock keys", async () => {
-  const record = makeRecord();
-  const calls: string[] = [];
-
-  const fakeClient = {
-    send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
-      const name = cmd.constructor.name;
-      calls.push(name);
-      if (name === "ListObjectsV2Command") {
-        return {
-          Contents: [
-            { Key: `reviews/thegoodparty/ops/42/bbbbbb/${record.runId}.json` },
-            { Key: `reviews/thegoodparty/ops/42/bbbbbb/lock` },
-          ],
-          NextContinuationToken: undefined,
-        };
-      }
-      if (name === "GetObjectCommand") {
-        const body = Buffer.from(JSON.stringify(record));
-        return {
-          Body: (async function* () { yield body; })(),
-        };
-      }
-      return {};
-    },
-  } as unknown as S3Client;
-
-  const records = await loadCases({ from: "s3" }, fakeClient);
-  assert.equal(records.length, 1);
-  assert.equal(records[0].runId, record.runId);
-  assert.ok(calls.includes("ListObjectsV2Command"));
-  assert.ok(calls.includes("GetObjectCommand"));
-});
-
-test("loadCases from S3 skips invalid records with a warn", async () => {
-  const fakeClient = {
-    send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
-      if (cmd.constructor.name === "ListObjectsV2Command") {
-        return {
-          Contents: [{ Key: "reviews/repo/1/sha/runid.json" }],
-          NextContinuationToken: undefined,
-        };
-      }
-      const body = Buffer.from(JSON.stringify({ bad: "data" }));
-      return { Body: (async function* () { yield body; })() };
-    },
-  } as unknown as S3Client;
-
-  const records = await loadCases({ from: "s3" }, fakeClient);
-  assert.equal(records.length, 0);
-});
-
 test("the checked-in scenario manifest parses and core has 23 cases", () => {
   const scenarios = readManifest(join(__dirname, "scenarios.json"));
   assert.equal(scenarios.filter((s) => s.suite === "core").length, 23);
@@ -215,77 +137,97 @@ test("the checked-in scenarios hold out about a third of each suite", () => {
   }
 });
 
-const scenario = (id: string, suite: string, runId: string): Scenario => ({
+const scenarioDir = (records: ReviewRecord[]): string => {
+  const dir = tmpDir();
+  for (const record of records) {
+    writeFileSync(join(dir, `${record.runId}.record.json`), JSON.stringify(record));
+  }
+  return dir;
+};
+
+const scenarioEntry = (id: string, suite: string, recordFile: string) => ({
   id,
   suite,
-  key: `reviews/thegoodparty/ops/42/bbbbbb/${runId}.json`,
+  record: recordFile,
   tests: "t",
-  split: "tune",
-  source: "simulated",
-  kind: "bug",
+  split: "tune" as const,
+  source: "production-caught" as const,
+  kind: "bug" as const,
 });
 
-const clientFor = (records: Map<string, unknown>) =>
-  ({
-    send: async (cmd: { input: { Key: string } }) => {
-      const body = Buffer.from(JSON.stringify(records.get(cmd.input.Key)));
-      return { Body: (async function* () { yield body; })() };
-    },
-  }) as unknown as S3Client;
-
-test("loadScenarios loads only the named suite", async () => {
+test("loadScenarios loads only the named suite", () => {
   const a = makeRecord();
   const b = makeRecord();
-  const scenarios = [scenario("a", "core", a.runId), scenario("b", "re-review", b.runId)];
-  const client = clientFor(new Map([[scenarios[0].key, a], [scenarios[1].key, b]]));
+  const dir = scenarioDir([a, b]);
+  const path = join(dir, "scenarios.json");
+  writeFileSync(
+    path,
+    JSON.stringify([scenarioEntry("a", "core", `${a.runId}.record.json`), scenarioEntry("b", "re-review", `${b.runId}.record.json`)]),
+  );
 
-  const loaded = await loadScenarios(scenarios, { suite: "core" }, client);
+  const loaded = loadScenarios(path, { suite: "core" });
   assert.deepEqual(loaded.map((l) => l.record.runId), [a.runId]);
 });
 
-test("loadScenarios refuses an empty suite and an invalid record", async () => {
+test("loadScenarios refuses an empty suite and an invalid record", () => {
   const a = makeRecord();
-  const scenarios = [scenario("a", "core", a.runId)];
-  await assert.rejects(loadScenarios(scenarios, { suite: "nope" }, clientFor(new Map())), /no scenarios/);
-  await assert.rejects(
-    loadScenarios(scenarios, {}, clientFor(new Map([[scenarios[0].key, { bad: true }]]))),
-    /scenario a: invalid ReviewRecord/,
-  );
+  const dir = scenarioDir([a]);
+  const path = join(dir, "scenarios.json");
+  writeFileSync(path, JSON.stringify([scenarioEntry("a", "core", `${a.runId}.record.json`)]));
+  assert.throws(() => loadScenarios(path, { suite: "nope" }), /no scenarios/);
+
+  writeFileSync(join(dir, "bad.record.json"), JSON.stringify({ bad: true }));
+  const badPath = join(dir, "bad-scenarios.json");
+  writeFileSync(badPath, JSON.stringify([scenarioEntry("a", "core", "bad.record.json")]));
+  assert.throws(() => loadScenarios(badPath), /scenario a: invalid ReviewRecord/);
+});
+
+test("loadScenarios refuses a record file that is not there", () => {
+  const dir = tmpDir();
+  const path = join(dir, "scenarios.json");
+  writeFileSync(path, JSON.stringify([scenarioEntry("a", "core", "missing.record.json")]));
+  assert.throws(() => loadScenarios(path), /ENOENT/);
 });
 
 test("scenarioNames maps a run id to its scenario id", () => {
-  const names = scenarioNames([scenario("omni-1-x", "core", "run-123")]);
-  assert.equal(names.get("run-123"), "omni-1-x");
+  const record = makeRecord();
+  const names = scenarioNames([{ scenario: scenarioEntry("omni-1-x", "core", "r.record.json"), record }]);
+  assert.equal(names.get(record.runId), "omni-1-x");
 });
 
 test("scenarioSplits maps a run id to its split", () => {
-  const holdout = { ...scenario("b", "core", "run-2"), split: "holdout" as const };
-  const splits = scenarioSplits([scenario("a", "core", "run-1"), holdout]);
-  assert.equal(splits.get("run-1"), "tune");
-  assert.equal(splits.get("run-2"), "holdout");
+  const a = makeRecord();
+  const b = makeRecord();
+  const splits = scenarioSplits([
+    { scenario: scenarioEntry("a", "core", "a.record.json"), record: a },
+    { scenario: { ...scenarioEntry("b", "core", "b.record.json"), split: "holdout" as const }, record: b },
+  ]);
+  assert.equal(splits.get(a.runId), "tune");
+  assert.equal(splits.get(b.runId), "holdout");
 });
 
 test("ScenarioSchema rejects a bad kind and a missing split", () => {
-  const ok = scenario("a", "core", "r");
+  const ok = scenarioEntry("a", "core", "a.record.json");
   assert.equal(ScenarioSchema.safeParse(ok).success, true);
   assert.equal(ScenarioSchema.safeParse({ ...ok, kind: "typo" }).success, false);
   const { split: _split, ...noSplit } = ok;
   assert.equal(ScenarioSchema.safeParse(noSplit).success, false);
 });
 
-test("loadScenarios filters by split and refuses an empty or unknown split", async () => {
+test("loadScenarios filters by split and refuses an empty or unknown split", () => {
   const a = makeRecord();
   const b = makeRecord();
-  const scenarios = [
-    scenario("a", "core", a.runId),
-    { ...scenario("b", "core", b.runId), split: "holdout" as const },
-  ];
-  const client = clientFor(new Map([[scenarios[0].key, a], [scenarios[1].key, b]]));
+  const dir = scenarioDir([a, b]);
+  const path = join(dir, "scenarios.json");
+  writeFileSync(
+    path,
+    JSON.stringify([
+      scenarioEntry("a", "core", `${a.runId}.record.json`),
+      { ...scenarioEntry("b", "core", `${b.runId}.record.json`), split: "holdout" },
+    ]),
+  );
 
-  const holdout = await loadScenarios(scenarios, { split: "holdout" }, client);
-  assert.deepEqual(holdout.map((l) => l.scenario.id), ["b"]);
-  const all = await loadScenarios(scenarios, {}, client);
-  assert.deepEqual(all.map((l) => l.scenario.id), ["a", "b"]);
-  await assert.rejects(loadScenarios([scenarios[0]], { split: "holdout" }, client), /no scenarios in split "holdout"/);
-  await assert.rejects(loadScenarios(scenarios, { split: "dev" }, client));
+  assert.deepEqual(loadScenarios(path, { split: "holdout" }).map((l) => l.scenario.id), ["b"]);
+  assert.deepEqual(loadScenarios(path, {}).map((l) => l.scenario.id), ["a", "b"]);
+  assert.throws(() => loadScenarios(path, { split: "dev" }));
 });

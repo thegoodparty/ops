@@ -22,6 +22,8 @@ import {
   gpApiPreviewRoleBoundary,
   githubActionsPreviewDeploy,
   githubActionsPreviewDeployTrust,
+  PULL_REQUEST_JOBS_POLICY_NAME,
+  githubActionsPullRequestJobs,
 } from "./ci-roles/policies";
 
 const ACCOUNT_ID = "333022194791";
@@ -47,6 +49,15 @@ const ADMINISTRATOR_ACCESS_ARN = "arn:aws:iam::aws:policy/AdministratorAccess";
  * update, so a bad edit to the trust policy can still lock CI out of the
  * account. The recovery path is the AdministratorAccess permission set, which
  * a human assumes directly and which does not depend on CI.
+ *
+ * The rule for CI roles (decided by swain, 2026-11-12): one deploy role,
+ * `github-actions-pulumi-deploy`, for `main` and production-environment runs,
+ * and one pull-request role, `github-actions-preview-deploy`, for omni pull
+ * request runs. A new workflow assumes one of them. If it needs more access,
+ * widen that role's policy, moving to a managed policy when the inline one is
+ * near the size limit, rather than adding a role here. The other roles below
+ * predate the rule and are consolidation candidates; docs/deploy-role-trust.md,
+ * "One deploy role, one pull-request role", lists them.
  */
 export const createCiRoles = () => {
   const deployRole = new aws.iam.Role(
@@ -108,7 +119,7 @@ export const createCiRoles = () => {
   //
   // The boundary belongs on who may assume the role, which is the trust
   // policy in ci-roles/policies.ts. Every subject there is an exact `main`
-  // ref, or one deploy environment, and none is a pull request.
+  // ref, or a production environment, and none is a pull request.
   new aws.iam.RolePolicyAttachment(
     "githubActionsPulumiDeployAdminAttachment",
     { role: deployRole.name, policyArn: ADMINISTRATOR_ACCESS_ARN },
@@ -199,8 +210,8 @@ export const createCiRoles = () => {
   });
 
   // The Terraform plan role, step 4 of docs/deploy-role-trust.md. Trusted by
-  // `pull_request` in omni and gp-terraform-dataplatform, which plan Terraform
-  // on PRs and today assume the shared admin role to do it.
+  // `pull_request` in gp-terraform-dataplatform, which plans Terraform on PRs.
+  // omni's plan moved to the pull-request role.
   //
   // Unlike the preview role above, this one carries a managed policy as well
   // as its inline document. `terraform plan` reads whatever its roots manage,
@@ -213,7 +224,7 @@ export const createCiRoles = () => {
   const planRole = new aws.iam.Role("githubActionsPulumiPlan", {
     name: "github-actions-pulumi-plan",
     description:
-      "Read-only Terraform plans from pull_request runs in thegoodparty/omni and thegoodparty/gp-terraform-dataplatform.",
+      "Read-only Terraform plans from pull_request runs in thegoodparty/gp-terraform-dataplatform.",
     assumeRolePolicy: JSON.stringify(githubActionsPulumiPlanTrust),
     maxSessionDuration: 3600,
   });
@@ -292,30 +303,73 @@ export const createCiRoles = () => {
     policy: JSON.stringify(gpApiPreviewRoleBoundary),
   });
 
-  // The gp-api preview deploy role, step 6 of docs/deploy-role-trust.md.
-  // Trusted by `pull_request` runs in omni alone. It applies, unlike the plan
+  // The gp-api preview deploy role, step 6 of docs/deploy-role-trust.md, and
+  // omni's one pull-request role. Trusted by `pull_request` runs in omni, and
+  // by judge.yml on main, which runs pull request code. It applies, unlike the plan
   // and preview roles above, so its policy is scoped to preview names and
   // tags, and the roles it creates must carry the boundary above.
   //
   // It runs omni's gp-api infrastructure diff as well (step 5b), with reads
   // only. Any omni pull request can assume every role trusted on its
-  // subject, so a second role for the diff would separate nothing.
+  // subject, so a second role for the diff would separate nothing. The same
+  // reasoning moved omni's E2E report upload, its pull request image builds'
+  // ECR Public login, gp-ai's pull request Terraform plan and the Universal
+  // Judge sweep onto it.
   //
   // No protect. Nothing depends on it until step 7 points omni's preview and
   // teardown workflows at it.
+  //
+  // Four hours, for the Universal Judge sweep. It dispatches background runs
+  // that take up to an hour each and polls for their artifacts, and asks for
+  // a session that outlasts the poll. Every other job keeps the one-hour
+  // default it asks for.
   const previewDeployRole = new aws.iam.Role("githubActionsPreviewDeploy", {
     name: "github-actions-preview-deploy",
     description:
-      "gp-api preview deploys, teardowns and infrastructure diffs from pull_request runs in thegoodparty/omni.",
+      "omni's pull-request role: gp-api previews, teardowns and infrastructure diffs, E2E reports, image builds, Terraform plans and the Universal Judge sweep.",
     assumeRolePolicy: JSON.stringify(githubActionsPreviewDeployTrust),
-    maxSessionDuration: 3600,
+    maxSessionDuration: 14400,
   });
 
-  new aws.iam.RolePolicy("githubActionsPreviewDeployPolicy", {
-    name: "PreviewDeploy",
-    role: previewDeployRole.id,
-    policy: JSON.stringify(githubActionsPreviewDeploy),
+  // The pull-request role's grants for jobs other than the gp-api preview
+  // path, which do not fit beside the inline document above.
+  const pullRequestJobsPolicy = new aws.iam.Policy("githubActionsPullRequestJobs", {
+    name: PULL_REQUEST_JOBS_POLICY_NAME,
+    description:
+      "omni pull-request role grants beyond gp-api previews: E2E report uploads, the Universal Judge sweep and Terraform plans, with the denies that bound ReadOnlyAccess.",
+    policy: JSON.stringify(githubActionsPullRequestJobs),
   });
+
+  const pullRequestJobsAttachment = new aws.iam.RolePolicyAttachment(
+    "githubActionsPullRequestJobsAttachment",
+    {
+      role: previewDeployRole.name,
+      policyArn: pullRequestJobsPolicy.arn,
+    },
+  );
+
+  // After the managed policy, because the denies on prod-tagged resources
+  // moved there from this document: the role is never without them, not
+  // even for the length of one apply.
+  new aws.iam.RolePolicy(
+    "githubActionsPreviewDeployPolicy",
+    {
+      name: "PreviewDeploy",
+      role: previewDeployRole.id,
+      policy: JSON.stringify(githubActionsPreviewDeploy),
+    },
+    { dependsOn: [pullRequestJobsPolicy, pullRequestJobsAttachment] },
+  );
+
+  // For gp-ai's pull request Terraform plan, which reads whatever its dev
+  // roots manage, as on the plan role. Attached only after the denies in
+  // `githubActionsPullRequestJobs` are in place, so the role never holds
+  // `ReadOnlyAccess` without them, not even for the length of one apply.
+  new aws.iam.RolePolicyAttachment(
+    "githubActionsPreviewDeployReadOnlyAttachment",
+    { role: previewDeployRole.name, policyArn: READ_ONLY_ACCESS_ARN },
+    { dependsOn: [pullRequestJobsPolicy, pullRequestJobsAttachment] },
+  );
 
   return {
     gpApiPreviewBoundary,
