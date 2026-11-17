@@ -127,3 +127,16 @@ test("a missing main baseline run fails the run; one that still errored leaves i
   assert.ok(gateIf.length > 0);
   assert.doesNotMatch(gateIf, /always\(\)|cancelled\(\)|failure\(\)/);
 });
+
+test("every step that scores expected results has the key the block judge needs", () => {
+  const evalPr = readFileSync(join(workflows, "delegate-eval.yml"), "utf-8");
+  let scoring = 0;
+  for (const text of [run, evalPr]) {
+    for (const step of text.split(/\n(?= {6}- name: )/)) {
+      if (!/review:expect[\s\S]*--mode (gate|score|main-short)\b/.test(step)) continue;
+      scoring++;
+      assert.match(step, /\n {10}ANTHROPIC_API_KEY: \$\{\{ secrets\.ANTHROPIC_API_KEY \}\}\n/, step.split("\n")[0]);
+    }
+  }
+  assert.equal(scoring, 7);
+});

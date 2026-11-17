@@ -50,13 +50,20 @@ export interface JudgeResponse {
 
 export type JudgeModel = (request: JudgeRequest) => Promise<JudgeResponse>;
 
+export interface JudgeTool {
+  name: string;
+  description: string;
+  input_schema: { type: "object"; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+}
+
 // The verdict comes back as a tool call. The model cannot be forced to make
 // it (that is a 400 on this model), so the tool is strict and the prompt asks
 // for exactly one call; a reply with no call is a judge failure, not a verdict.
 export const createAnthropicJudgeModel = (
-  args: { apiKey?: string; model?: string } = {},
+  args: { apiKey?: string; model?: string; tool?: JudgeTool } = {},
 ): JudgeModel => {
   const model = args.model ?? DEFAULT_JUDGE_MODEL;
+  const tool = args.tool ?? VERDICT_TOOL;
   return async (request) => {
     const apiKey = args.apiKey ?? process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error("the judge needs an Anthropic API key: pass apiKey or set ANTHROPIC_API_KEY");
@@ -67,7 +74,7 @@ export const createAnthropicJudgeModel = (
         model,
         max_tokens: 16000,
         system: request.system,
-        tools: [{ ...VERDICT_TOOL, strict: true }],
+        tools: [{ ...tool, strict: true }],
         tool_choice: { type: "auto" },
         messages: [{ role: "user", content: request.prompt }],
       }),
@@ -80,7 +87,7 @@ export const createAnthropicJudgeModel = (
       stop_reason?: string;
     };
     const block = parsed.content?.find(
-      (part) => part.type === "tool_use" && part.name === VERDICT_TOOL.name,
+      (part) => part.type === "tool_use" && part.name === tool.name,
     );
     return { toolInput: block?.input ?? null, stopReason: parsed.stop_reason ?? "" };
   };
