@@ -20,7 +20,7 @@ npm run review:arms -- --arms main=.,idea=../ops-arms/idea --base main --out ~/d
 - **`--base <arm>` gates every other arm against that one.** A case the base passed on every run must not get worse. An arm that drops it gets `--runs` more runs and needs 5 of 6, so one unlucky run isn't a regression. `--targets a,b` names cases an arm must pass on every run. The verdict is printed under the table and written to `<out>/gate.json`.
 - `--case a,b` narrows to some tune cases. `--runs` (default 3), `--concurrency` (replays per arm, default 2) and `--parallel-arms` (default 3) set the load. Keep them low on a shared laptop.
 - `--mode score` re-renders the table and the gate from results already on disk, without replaying.
-- Credentials: `ANTHROPIC_API_KEY` if set, otherwise your Claude Code login, for the replays and for the judge that scores block cases. `gh` auth clones the reviewed repos. About half the tune cases are recorded production reviews, which need read access to `REVIEW_BUCKET` (`aws sso login`). A local manifest of bundle cases needs no AWS access.
+- Credentials: `ANTHROPIC_API_KEY` if set, otherwise your Claude Code login, for the replays and for the judge that scores block cases. `gh` auth clones the reviewed repos. Every case, production records included, is a bundle file in this repo, so no AWS access is needed.
 
 ## Hill-climbing
 
@@ -46,14 +46,14 @@ The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of th
 
 Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval <suite>` (for example `delegate eval re-review`) to run another suite from `scenarios.json`. The workflow:
 
-1. Loads the suite's scenarios from `scenarios.json`: fixed production review records in S3, so every eval runs the same cases. If your PR changes `scenarios.json`, its copy is used.
+1. Loads the suite's scenarios from `scenarios.json`, where each entry names a record file under `scenarios/`, so every eval runs the same cases and none of them needs the bucket. If your PR changes `scenarios.json`, its copy and its record files are used.
 2. Replays every scenario twice per side in parallel (`--replays 2`): two replays with main's agent code and two with your PR head's.
 3. Judges the two sides pairwise and posts a single comment to the PR with three verdicts: **Quality (tune)** and **Quality (holdout)** (each Better / Worse / Can't tell, from the sign test over that split's judged cases) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). The holdout line shows only the verdict and counts. The drop-down lists tune cases only; every raw result and the full report, holdout cases included, are on the workflow run as artifacts.
 4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
 **Cost and time:** each replay is a full `claude-opus-5-5` agent run at roughly $1.50, and each side runs every case twice, so the PR side costs about $3 per case. Main's side is cached, so it costs that only after a change to main's agents, framework or review code. The 23-case `core` suite takes about 30 minutes and costs around $69 for the PR side (and the same again for an uncached main) plus a few dollars for judging.
 
-**Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the S3 `key` of the record, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
+**Scenarios:** each entry in `scenarios.json` names an `id`, a `suite`, the `record` file holding the production `ReviewRecord`, and what it `tests`. The report names cases by `id`. `core` is a mix of first reviews and re-reviews across repos, with real bugs production caught or missed and false findings authors refuted. `re-review` covers prior-finding handling.
 
 **Repo settings the workflow needs:**
 
@@ -65,21 +65,13 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 ## Concepts
 
-**Case** — one production `ReviewRecord` stored in S3. The record contains the full `bundle` (diff, changed files, prior findings, PR metadata) that was the agent's complete input. Because the bundle is self-contained, a case can be replayed without calling GitHub — except for checking out the repo at `bundle.headSha` so the agent can read files.
+**Case** — one production `ReviewRecord`, or the bundle alone, committed to this repo. The bundle (diff, changed files, prior findings, PR metadata) was the agent's complete input. Because the bundle is self-contained, a case can be replayed without calling GitHub — except for checking out the repo at `bundle.headSha` so the agent can read files.
 
 **Variant** — the ops git ref the eval was run from. When you run `replay` from a worktree, the variant is `git rev-parse HEAD` of that worktree, or whatever you pass via `--variant`.
 
 **Result** — one replay output: `{ caseId, repo, prNumber, headSha, variant, output, error?, costUsd, wallTimeMs, gating?, leads?, subagentCalls? }`. Stored as `<caseId>/run-<n>.json` in the results directory as each replay completes. `gating` is the gate's outcome (`{ mode, verdict, gates, wouldApprove }`) and is present only for a repo that has adopted gating: the agent's `output` cannot tell a flag from an ordinary comment, because both are a complete review with no findings. Replays of the pr-reviewer also carry `leads`: the scout's leads, each with an `outcome` (`not-investigated`, `dropped`, `raised`, `reported`, `unknown`) telling what the deep-reviewer did with it, so a miss can be told apart as "scout never raised it" or "deep-reviewer dropped it". Absent on production-record results and on files written before it existed. `subagentCalls` keeps each subagent's prompt and answer, so lead tracing can be checked and re-run offline without another paid replay.
 
 ## Commands
-
-### Snapshot a corpus
-
-```sh
-npm run review:eval -- cases snapshot --out ./eval-cases [--repo thegoodparty/gp-api] [--limit 20]
-```
-
-Lists every `ReviewRecord` in S3 (`REVIEW_BUCKET`, default `delegate-reviews`) and writes them to a local directory. Freeze a corpus before running an experiment so both variants are judged on exactly the same cases.
 
 ### Replay from a variant
 
@@ -107,7 +99,7 @@ npm run review:eval -- cache pull --suite core --layout runs --key "$(npm run -s
 npm run review:eval -- cache push --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 ```
 
-`--layout runs` is for `<case>/run-<n>.json` directories, which is what both the pairwise and the expected suites use; the default `flat` is one `<case>.json` per case. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, and a record under `reviews/` is written once, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 run(s); N already had results`.
+`--layout runs` is for `<case>/run-<n>.json` directories, which is what both the pairwise and the expected suites use; the default `flat` is one `<case>.json` per case. Push uploads only results that pull did not bring down, skips any that errored or reported `failed` (retried next eval, in both layouts), and never overwrites a key. A partly finished case caches the runs that completed and retries the rest. The eval role every job in `delegate-eval.yml` assumes is read-only. The cache is written by a second role, `github-actions-delegate-eval-cache-push`, which can only `PutObject` under `eval-cache/*` and only with `If-None-Match` (S3 refuses an overwrite). Its trust accepts only the reusable workflow `delegate-eval-cache-push.yml`; a job in a called workflow presents that file as its `job_workflow_ref`, so no job in `delegate-eval.yml` can assume it, PR-code jobs included. That workflow runs only main's code and uploads the artifact a main-only replay job produced, by the id that job reports: if PR code got to the artifact name first, the replay job's own upload fails, it reports no id and nothing is pushed. Scenario cases are keyed by the recorded run id, which a scenario's record file carries and a case's id never changes, so a cached result cannot go stale against its case. The pairwise comment's cost columns come from each result's recorded cost, so a cached main side still shows what it originally cost; the saving is in the workflow log, where the replay step prints `Replaying 0 run(s); N already had results`.
 
 ### Judge two sets of results
 
@@ -127,8 +119,10 @@ Compares result pairs using a blind pairwise judge (`claude-sonnet-5-5` by defau
 ## Worked example — comparing main vs a branch
 
 ```sh
-# 1. Freeze a corpus (run once from any checkout)
-npm run review:eval -- cases snapshot --out ./eval-cases --limit 20
+# 1. Materialize the pairwise suite's cases as record files
+npm run review:eval -- cases scenarios \
+  --manifest delegate/review/eval/scenarios.json \
+  --out ./eval-cases --suite core
 
 # 2. Replay from main
 git worktree add ../review-eval-main main
@@ -169,7 +163,7 @@ Every `delegate eval` comment also runs this suite as a parallel job and posts t
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY` (score, gate and `main-short` use it for the block judge too), `gh` auth for the target repos, and read access to `REVIEW_BUCKET`. Forty-three cases at three runs costs about $195 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY` (score, gate and `main-short` use it for the block judge too) and `gh` auth for the target repos; the cases themselves are in the repo. Forty-three cases at three runs costs about $195 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
 
 ### Gate
 
@@ -190,7 +184,7 @@ The suite asks what today's reviewer does with a fixed change, so replay always 
 
 Every case, and every scenario in `scenarios.json`, carries three required labels: `split` (`tune` or `holdout`; holdout cases are never shown to whoever tunes the prompt), `source` (`simulated`, `production-caught`, `production-missed` or `refuted`) and `kind` (`bug`, `false-finding`, `scale` or `architecture`). An optional `flakyOnMain` says why main's own result on a case is noise; the gate still scores that case but never counts it as a regression. No filter means every case. `--split` narrows `review:expect`, `cases scenarios` and, with `--manifest`, `replay`.
 
-A case is either a recorded production run (`key`, an object in `REVIEW_BUCKET`) or a simulated PR (`bundle`, a file next to the manifest). A simulated PR's head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
+A case is a `bundle` file next to the manifest. A bundle whose `source` is `simulated` is a PR whose head commit does not exist on GitHub: the replay checks out `baseSha`, applies the bundle's diff and commits it with a fixed author and date, which reproduces the bundle's `headSha` exactly. To add one, make the change on a detached checkout of `baseSha`, commit it with the env in `SYNTHETIC_COMMIT_ENV` (`expect.ts`) and the bundle's title as the message, and record that sha and `git diff <base> HEAD` in the bundle.
 
 ### Dispatched run (`delegate-eval-run.yml`)
 
@@ -228,13 +222,14 @@ npm run review:arms -- --manifest ~/delegate-lab/manifest.json --arms main=.,ide
 ## Mining candidate cases
 
 ```sh
-npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 --out candidates.jsonl
+npm run review:mine -- --repo thegoodparty/omni --kind missed --since 2026-10-05 \
+  --bundles ~/delegate-lab/proposed --out candidates.jsonl
 ```
 
-Read-only. Walks every page of `REVIEW_BUCKET`, keeps the latest non-`eval` record per head sha, and proposes cases for a human to confirm. Needs S3 read access and `gh` auth. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--out` (stdout if omitted).
+Reads production reviews: every page of `REVIEW_BUCKET` is its input, which is the one thing here that still needs S3 read access, alongside `gh` auth. Keeps the latest non-`eval` record per head sha and proposes cases for a human to confirm. A proposal carries its candidate's `bundle` and nothing else about the record: `--bundles <dir>` writes one bundle file per candidate, named after its `id`, which is the file that goes next to the manifest. Flags: `--repo`, `--since`, `--kind missed|refuted`, `--fix-words a,b,c` (replaces the default `fix,bug,revert,hotfix,race,timeout`), `--limit`, `--bundles` (required when anything is proposed), `--out` (the proposal JSONL; stdout if omitted).
 
-- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, key, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
-- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, key, repo, pr, findings, replies, mergedSha }`.
+- **missed**: an approved PR that merged, then a non-merge commit within 14 days removed a line the approved diff added. Output: `{ kind, id, bundle, repo, pr, fixCommit, overlappingPaths, message, overlapLines, score }`, best first. Lines are matched by text per path, not blamed by number.
+- **refuted**: a blocked PR that merged with every flagged line unchanged and a reply from another author on each finding thread. Output: `{ kind, id, bundle, repo, pr, findings, replies, mergedSha }`.
 
 Most hits are noise (about 3.5 good missed-bug cases per 100 approvals), and many real misses need a running system to see, so a person labels each one.
 

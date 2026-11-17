@@ -12,8 +12,8 @@ smallest change). You never measure by opinion, and you never grade your own wor
 There are two ways to measure, with the same loop:
 
 - **Local (the default).** `review:arms` on this machine. Any change to the reviewer, prompt text or
-  structure. Use it when you have local credentials: `ANTHROPIC_API_KEY` or a Claude Code login,
-  `gh` auth, and S3 read access to `REVIEW_BUCKET`.
+  structure. Use it when you have local credentials: `ANTHROPIC_API_KEY` or a Claude Code login, and
+  `gh` auth. The cases are bundles in the repo, so nothing else is needed.
 - **Dispatched.** The `delegate-eval-run.yml` workflow, with a per-run budget. Prompt text only. Use
   it when you have no local credentials.
 

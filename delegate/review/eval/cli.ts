@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { loadCases, loadScenarios, readManifest, saveCases, scenarioNames, scenarioSplits } from "./cases";
+import { loadCases, loadScenarios, saveCases, scenarioNames, scenarioSplits } from "./cases";
 import { pullCache, pullHistory, pushCache, replayKey, sameReviewerAs } from "./cache";
 import type { CacheLayout } from "./cache";
 import { SplitSchema, readManifest as readExpectedManifest, selectCases } from "./expect";
@@ -41,9 +41,8 @@ const usage = () => {
     [
       "Usage:",
       "  review:eval cases scenarios --manifest <scenarios.json> --out <dir> [--suite <name>] [--split tune|holdout]",
-      "  review:eval cases snapshot --out <dir> [--repo <r>] [--limit <n>] [--only-complete]",
-      "  review:eval results from-cases --cases <dir|s3> --out <dir>",
-      "  review:eval replay --cases <dir|s3> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--replays 1] [--force] [--split tune|holdout --manifest <scenarios.json>]",
+      "  review:eval results from-cases --cases <dir> --out <dir>",
+      "  review:eval replay --cases <dir> --out <dir> [--variant <label>] [--concurrency 4] [--work-dir /tmp/review-eval] [--replays 1] [--force] [--split tune|holdout --manifest <scenarios.json>]",
       "  review:eval cache key | cache pull|push --suite <name> --key <replay-key> --out <dir> [--layout flat|runs]",
       "  review:eval cache history --key <replay-key> --suite-prefix <prefix> --out <dir>",
       "  review:eval ledger check --run-id <id> --mode dry-run|inner|tune|gate --budget <usd> --manifest <expected/manifest.json> [--cases <ids>]",
@@ -53,7 +52,7 @@ const usage = () => {
       "  review:eval dispatch allowlist --raw <git-diff-raw.txt>",
       "  review:eval dispatch literals --main-dir <dir> --branch-dir <dir>",
       "  review:eval dispatch publish --manifest <expected/manifest.json> --in <dir> --out <dir>",
-      "  review:eval judge --cases <dir|s3> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
+      "  review:eval judge --cases <dir> --a <dir> --b <dir> [--label-a <x>] [--label-b <y>] [--passes 4] [--concurrency 6] [--model <id>] [--manifest <scenarios.json>] [--out <report.md>] [--pr-comment <comment.md>] [--run-url <url>]",
     ].join("\n"),
   );
   process.exit(1);
@@ -68,37 +67,12 @@ const main = async () => {
     const manifest = flag(flags, "manifest");
     const out = flag(flags, "out");
     if (!manifest || !out) { console.error("--manifest and --out are required"); process.exit(1); }
-    const loaded = await loadScenarios(readManifest(manifest), { suite: flag(flags, "suite"), split: flag(flags, "split") });
+    const loaded = loadScenarios(manifest, { suite: flag(flags, "suite"), split: flag(flags, "split") });
     saveCases(loaded.map((l) => l.record), out);
     for (const { scenario, record } of loaded) {
       console.error(`  ${scenario.id} (${scenario.suite}) ${record.repo}#${record.prNumber} ${record.runId}`);
     }
     console.error(`Saved ${loaded.length} scenario case(s) to ${out}`);
-    return;
-  }
-
-  if (command === "cases") {
-    const subcommand = argv[1];
-    if (subcommand !== "snapshot") usage();
-    const flags = parseFlags(argv.slice(2));
-    const out = flag(flags, "out");
-    if (!out) { console.error("--out is required"); process.exit(1); }
-    const repo = flag(flags, "repo");
-    const limit = flag(flags, "limit") ? parseInt(flag(flags, "limit")!, 10) : undefined;
-    const onlyComplete = boolFlag(flags, "only-complete");
-
-    console.error("Loading cases from S3...");
-    let records = await loadCases({ from: "s3", repo, limit: onlyComplete ? undefined : limit });
-
-    if (onlyComplete) {
-      records = records
-        .filter((r) => r.action === "approved" || r.action === "commented")
-        .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-      if (limit !== undefined) records = records.slice(0, limit);
-    }
-
-    saveCases(records, out);
-    console.error(`Saved ${records.length} case(s) to ${out}`);
     return;
   }
 
@@ -109,7 +83,7 @@ const main = async () => {
     const casesFrom = flag(flags, "cases");
     const out = flag(flags, "out");
     if (!casesFrom || !out) { console.error("--cases and --out are required"); process.exit(1); }
-    const records = await loadCases({ from: casesFrom });
+    const records = loadCases(casesFrom);
     mkdirSync(out, { recursive: true });
     let written = 0;
     for (const record of records) {
@@ -305,13 +279,13 @@ const main = async () => {
     const replays = flag(flags, "replays") ? parseInt(flag(flags, "replays")!, 10) : 1;
     if (!(replays >= 1)) { console.error("--replays must be a positive integer"); process.exit(1); }
 
-    let records = await loadCases({ from: casesFrom });
+    let records = loadCases(casesFrom);
     const splitFlag = flag(flags, "split");
     if (splitFlag) {
       const split = SplitSchema.parse(splitFlag);
       const manifest = flag(flags, "manifest");
       if (!manifest) { console.error("--split needs --manifest <scenarios.json>"); process.exit(1); }
-      const inSplit = scenarioNames(readManifest(manifest).filter((s) => s.split === split));
+      const inSplit = scenarioNames(loadScenarios(manifest, { split }));
       records = records.filter((r) => inSplit.has(r.runId));
     }
     console.error(`Loaded ${records.length} case(s), ${replays} replay(s) each, concurrency ${concurrency}`);
@@ -341,10 +315,10 @@ const main = async () => {
     const prCommentFile = flag(flags, "pr-comment");
     const runUrl = flag(flags, "run-url") ?? "";
     const manifest = flag(flags, "manifest");
-    const scenarios = manifest ? readManifest(manifest) : undefined;
+    const scenarios = manifest ? loadScenarios(manifest) : undefined;
     const names = scenarios && scenarioNames(scenarios);
 
-    const records = await loadCases({ from: casesFrom });
+    const records = loadCases(casesFrom);
     const runsA = loadRunResults(aDirArg);
     const runsB = loadRunResults(bDirArg);
     const splits = scenarios && new Map([...scenarioSplits(scenarios)].filter(([id]) => records.some((r) => r.runId === id)));

@@ -59,8 +59,8 @@ const unmatched: BlockJudgment = { match: false, why: "the findings are about lo
 test("the manifest parses and every simulated bundle matches its diff", () => {
   const cases = readManifest(MANIFEST);
   assert.ok(cases.some((c) => c.expect.verdict === "approve"), "needs an approve case");
-  for (const c of cases.filter((x) => x.bundle)) {
-    const bundle = readBundleFile(MANIFEST, c.bundle!);
+  for (const c of cases) {
+    const bundle = readBundleFile(MANIFEST, c.bundle);
     const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
     assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
   }
@@ -106,8 +106,7 @@ test("the plan cases assert an outcome and keep consistency as a diagnostic", ()
     assert.match(byId.get(id)!.tests, /#41[14]/, `${id} must name the PR it came from`);
   }
   for (const c of cases) {
-    assert.ok(c.bundle, `${c.id} must be a simulated bundle`);
-    const bundle = readBundleFile(MANIFEST, c.bundle!);
+    const bundle = readBundleFile(MANIFEST, c.bundle);
     const inDiff = [...bundle.diff.matchAll(/^diff --git a\/(\S+) b\//gm)].map((m) => m[1]);
     assert.deepEqual([...bundle.changedFiles].sort(), inDiff.sort(), c.id);
     assert.ok(bundle.plan, `${c.id} must carry the plan in its bundle`);

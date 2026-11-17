@@ -13,7 +13,7 @@
   },
   {
     "id": "omni-2713-auth-bypass",
-    "key": "reviews/thegoodparty/omni/2713/4bcac394cac65f994be6d6c4d30b7210c70a657d/dd09a5a3-35e0-4612-9bed-f142cb6c8fdc.json",
+    "bundle": "omni-2713-auth-bypass.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "The owner shortcut in ServiceReadGuard trusts a personId read from the query string, so any signed-in user can pass the guard on list endpoints that take no personId and read data that is not theirs."
@@ -25,7 +25,7 @@
   },
   {
     "id": "omni-2618-missing-slug",
-    "key": "reviews/thegoodparty/omni/2618/fc14cbe36c782623ec5699cb4eb8c661ceb0e81a/e811f0f9-1e83-4486-8fb5-6cc6ada4bbce.json",
+    "bundle": "omni-2618-missing-slug.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "The test-mode create mutation reads data.slug, but POST /v1/test-mode/organizations returns the test-mode state, which has no slug, so a newly created test org is never switched to."
@@ -37,7 +37,7 @@
   },
   {
     "id": "gp-data-platform-1159-docs-fix",
-    "key": "reviews/thegoodparty/gp-data-platform/1159/0b6ca4f7e904911004cfd2af3a7602c7c20430f7/4b406688-57bd-4c2a-89bb-1a9f39a8bc05.json",
+    "bundle": "gp-data-platform-1159-docs-fix.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -61,7 +61,7 @@
   },
   {
     "id": "gp-data-platform-1183-null-regex-guard",
-    "key": "reviews/thegoodparty/gp-data-platform/1183/43a641af7f4d4977eaa820765c345ba9ebff47f8/6334c17a-7fd8-478e-b3b6-7cd5c8066a29.json",
+    "bundle": "gp-data-platform-1183-null-regex-guard.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -196,7 +196,7 @@
   },
   {
     "id": "omni-3004-admin-action-rejects-serve",
-    "key": "reviews/thegoodparty/omni/3004/e21744093841dffd2f8c48fc8b17cfcad8dab661/847e1ab1-3815-4a38-8a8a-ccbcaed30adb.json",
+    "bundle": "omni-3004-admin-action-rejects-serve.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "The new vendor-mocks admin-actions route runs assertOutreachOwner, which 404s any outreach with a null campaignId, so it rejects the org-scoped Serve outreach (campaignId null) it was built to drive."
@@ -208,7 +208,7 @@
   },
   {
     "id": "omni-3298-abandoned-resend-hidden",
-    "key": "reviews/thegoodparty/omni/3298/52fb25fc9c4782ba6690ded20915d627fc6b4432/3d66b647-952c-43ef-a00b-9ea7b1398bb4.json",
+    "bundle": "omni-3298-abandoned-resend-hidden.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "Resending a payment-failed robocall runs convertDraft, which moves settleState from hold_failed to pending_payment before payment, so if the candidate leaves the pay step the send is hidden by findByScope and skipped by the cancel sweep, and it vanishes from history with no way to resend."
@@ -220,7 +220,7 @@
   },
   {
     "id": "omni-2588-hold-skips-free-texts",
-    "key": "reviews/thegoodparty/omni/2588/44a4370a508555f01d81ebc5c850bc7dd20241e1/61d0182f-86c2-4038-bdcd-a119d263fc80.json",
+    "bundle": "omni-2588-hold-skips-free-texts.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "With WIN_SMS_HOLD_BILLING on, the hold path prices a free-texts-eligible P2P send at the undiscounted amount while the review step still calls complete-free-purchase, which purchase.service rejects for a non-zero amount, so the send can never go out."
@@ -232,7 +232,7 @@
   },
   {
     "id": "omni-2702-multi-office-skip",
-    "key": "reviews/thegoodparty/omni/2702/99c785718cbb1e28d374f6c5cadfd67b50f18075/10d1b0d8-c5cc-48f0-bd0f-ef20133a4b9b.json",
+    "bundle": "omni-2702-multi-office-skip.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -243,7 +243,7 @@
   },
   {
     "id": "omni-2986-vitest-undefined-key",
-    "key": "reviews/thegoodparty/omni/2986/27404f2505d3c9bbfa7f34cf1060ed6212ac10b3/89e02f95-e5d9-41a9-9903-7b9c880fcdbd.json",
+    "bundle": "omni-2986-vitest-undefined-key.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -254,7 +254,7 @@
   },
   {
     "id": "gp-data-platform-1235-serve-month-start",
-    "key": "reviews/thegoodparty/gp-data-platform/1235/ba6ccefc0965d3c93ea73de1b5ae0a9d39bb75c8/7abd6ec1-adb2-4313-a25f-545a9822dcc7.json",
+    "bundle": "gp-data-platform-1235-serve-month-start.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -277,7 +277,7 @@
   },
   {
     "id": "omni-2679-starlette-sync-background",
-    "key": "reviews/thegoodparty/omni/2679/d5f718dc6d611135c2923aecb534dba9a2ba64a7/61e03aa3-16e3-461e-b5da-551f25d6fc85.json",
+    "bundle": "omni-2679-starlette-sync-background.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -288,7 +288,7 @@
   },
   {
     "id": "gp-data-platform-1255-json-path-case",
-    "key": "reviews/thegoodparty/gp-data-platform/1255/07a3c20d8529140d8c369be3ec43a6861dd936f4/6c12899f-b82f-40e7-885a-72374e7e8f67.json",
+    "bundle": "gp-data-platform-1255-json-path-case.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -299,7 +299,7 @@
   },
   {
     "id": "gp-data-platform-982-splink-source-dataset",
-    "key": "reviews/thegoodparty/gp-data-platform/982/6778c5fc2763391f3229c681e8bf88f05e43f280/9c8a962e-0cc6-4c46-88ce-151d4d346da7.json",
+    "bundle": "gp-data-platform-982-splink-source-dataset.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -310,7 +310,7 @@
   },
   {
     "id": "omni-2946-hold-free-path-unreachable",
-    "key": "reviews/thegoodparty/omni/2946/58b4da323629ac37983d2cbbb6926928d82166d7/d93f7d4f-3860-49f8-9e6a-54b177d3604b.json",
+    "bundle": "omni-2946-hold-free-path-unreachable.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -321,7 +321,7 @@
   },
   {
     "id": "omni-3126-race-floor-from-frame",
-    "key": "reviews/thegoodparty/omni/3126/5b35345d4ab4310075261f613ff21ca9e5ef6308/f4adcc5a-d9f3-441b-bfb8-a270dc864670.json",
+    "bundle": "omni-3126-race-floor-from-frame.bundle.json",
     "expect": {
       "verdict": "approve"
     },
@@ -401,7 +401,7 @@
   },
   {
     "id": "omni-2977-mrp-per-tract-on-request",
-    "key": "reviews/thegoodparty/omni/2977/6ddbc85430ef0d339bb59e5eba7ca3c30604ab23/573c933f-bb09-424d-b96a-9b78d04ad6a6.json",
+    "bundle": "omni-2977-mrp-per-tract-on-request.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "The priority read fits the MRP model with one parameter per census tract synchronously inside gp-api requests, with no cap on the tract count, so large districts block Node's one thread for minutes."
@@ -413,7 +413,7 @@
   },
   {
     "id": "omni-3023-mrp-read-on-home-load",
-    "key": "reviews/thegoodparty/omni/3023/cb0d89a3dca8c3ff3ed9a6362a7fb459601b92d1/e6b3e609-45e4-4f01-89c7-7dfd909b7311.json",
+    "bundle": "omni-3023-mrp-read-on-home-load.bundle.json",
     "expect": {
       "verdict": "block",
       "reason": "Home card sync now runs the per-tract MRP priority read synchronously inside every Home load request, where its cost grows with district size and can freeze the server."
