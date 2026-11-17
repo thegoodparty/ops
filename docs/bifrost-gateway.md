@@ -264,7 +264,36 @@ question:
   RDS instance, with NAT egress (or VPC endpoints) for the task.
 - A DB subnet group spanning the two private subnets, which RDS requires.
 - Security groups: ALB → task on 8080, task → RDS on 5432, and nothing
-  inbound to the task or the database from anywhere else.
+  inbound to the task or the database from anywhere else **except the named
+  exceptions below**. Both are group references and never CIDRs, so neither
+  admits an address; DNS is not a control and the rule is.
+
+  The task's 8080 ingress is widened twice, by the two VPC-internal callers of
+  the admin API: the virtual-key mint and the reconciler. `/api` through the ALB
+  is behind oauth2-proxy and Google SSO, which a Lambda cannot pass, so they
+  reach the task directly. `bifrost-vk-mint.ts` and `bifrost-vk-janitor.ts` own
+  those rules.
+
+  **The usage export adds the database's first two exceptions.** Both are
+  readers of the gateway's `logs` table, and until they existed the database
+  group admitted one principal: the gateway's own task.
+
+  - The export function holds `SELECT` on **29 named columns**, granted at
+    column level in Postgres, so the projection holds at the source and cannot be
+    widened to a payload column by a careless query. It cannot write.
+  - The bootstrap function, which creates that role and then exists to be
+    removed, runs as the master user. It is invoked on **every** workbench deploy
+    and returns without touching anything once the export's own secret holds a
+    password, so it provisions once and no-ops after that. That is the reason its
+    *resource* is temporary rather than a standing part of the deployment: while
+    it exists, a deploy gives the master credential a path into the database, and
+    removing it is what closes that path for good.
+
+  Neither may read a request or response body: the 29 columns exclude
+  `input_history`, `output_message`, `raw_request` and the rest of the payload
+  set, and the column-level grant is what enforces that rather than the query
+  text. Content logging being off in the gateway is a setting; the grant is a
+  permission, and the second is what survives a change to the first.
 
 A new VPC with a private/`/24`-per-AZ layout is the default plan. Using the
 default VPC is acceptable for a first apply if it is faster, but the end state
