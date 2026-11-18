@@ -424,10 +424,10 @@ Facts discovered during implementation go here as they are learned:
   list imported by the IAM policy that permits them, the script that subscribes
   to them, and Bifrost's own config tests. Every entry selects a `global.`
   cross-region inference profile as of 2026-11-04: `anthropic.claude-opus-5-5`,
-  `anthropic.claude-sonnet-5-5`, `openai.gpt-6.1-sol`,
+  `anthropic.claude-sonnet-5-5`, `openai.gpt-6.2-sol`,
   `openai.gpt-6.1-terra`,
   `anthropic.claude-haiku-5-5`, `xai.grok-4.7`, `zai.glm-5.3` and
-  `moonshotai.kimi-k3`. The outgoing `us.` profile that each entry permitted
+  `moonshotai.kimi-k3.1`. The outgoing `us.` profile that each entry permitted
   through `transitionalInvokeIds` while the fleet rolled over is now gone, so
   the policy names one profile per model and no `us.` ARN appears anywhere. The
   account was on `us.` geo profiles for residency before that; Sonnet 5.5 was

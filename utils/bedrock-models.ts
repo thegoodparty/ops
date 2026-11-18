@@ -112,10 +112,15 @@ export const WORKBENCH_MODELS: BedrockModel[] = [
     note: "replaced kimi-k3 on 2026-11-10; open weight; the model card documents US, India and Global cross-region profiles, and this account selects the global one as it does for every entry",
   },
   {
-    id: "openai.gpt-6.1-sol",
-    invokeId: "global.openai.gpt-6.1-sol",
+    // OpenAI's successor in the Sol line, swapped in on 2026-11-17 at the same
+    // $2.00 / $10.00 per 1M tokens on the global profile. The model card page
+    // was not published when this landed, so the `global.` profile and the
+    // pricing come from Bifrost's catalog and the Bedrock pricing page; see
+    // `docs/workbench-account.md`, "Adding a Bedrock model later".
+    id: "openai.gpt-6.2-sol",
+    invokeId: "global.openai.gpt-6.2-sol",
     crossRegion: true,
-    note: "Marketplace product prod-qco655ut2vn54; replaced gpt-5.6-sol and gpt-5.6-terra",
+    note: "replaced gpt-6.1-sol on 2026-11-17; the Marketplace agreement is created by enable-bedrock-models, so the product id is not recorded here until that run reports it",
   },
   {
     id: "openai.gpt-6.1-terra",
