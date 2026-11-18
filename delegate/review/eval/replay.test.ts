@@ -531,19 +531,6 @@ test("replayAll runs multiple cases with the worker pool", async () => {
   assert.equal(callCount, 3);
 });
 
-test("resultFromRecord carries a record's usage through, and omits it when the record predates it", () => {
-  // A synthesized side is built from a stored production record, so the usage a
-  // record carries has to survive into the eval or a prod-vs-candidate
-  // comparison sees tokens on one side only.
-  const withUsage = resultFromRecord(
-    makeRecord({ usage: { inputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 } }),
-  );
-  assert.deepEqual(withUsage.usage, { inputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 });
-
-  const { usage: _absent, ...older } = makeRecord();
-  assert.equal(resultFromRecord(older as ReviewRecord).usage, undefined);
-});
-
 test("resultFromRecord turns what production posted into a judgeable side", () => {
   const record = makeRecord({ action: "commented", agentVersion: "abcdef1234567" });
   const result = resultFromRecord(record);

@@ -233,21 +233,6 @@ export const PostedFindingSchema = FindingSchema.extend({
 });
 export type PostedFinding = z.infer<typeof PostedFindingSchema>;
 
-// Token counts for one review run, as `delegate/framework/types.ts` records
-// them. Every component is required: a record that carries `usage` at all
-// carries all four, and a field the harness did not report is a zero rather
-// than a missing key, because the point of the field is a comparison across
-// runs and an absent key would compare as "no answer" instead of "none".
-// Negative counts are refused: a negative token count is a harness bug, and it
-// would silently pass a ratio gate that divides by it.
-export const TokenUsageSchema = z.object({
-  inputTokens: z.number().int().nonnegative(),
-  outputTokens: z.number().int().nonnegative(),
-  cacheReadTokens: z.number().int().nonnegative(),
-  cacheWriteTokens: z.number().int().nonnegative(),
-});
-export type StoredTokenUsage = z.infer<typeof TokenUsageSchema>;
-
 export const ReviewRecordSchema = z.object({
   runId: z.string().uuid(),
   repo: z.string(),
@@ -261,15 +246,6 @@ export const ReviewRecordSchema = z.object({
   finishedAt: z.string(),
   wallTimeMs: z.number(),
   costUsd: z.number().nullable(),
-  // What the run spent in tokens, beside the dollar total and deliberately
-  // optional and nullable. Both, because there are two ways a record can carry
-  // no counts and a reader should not have to guess which: `undefined` is a
-  // record written before this field existed (every record in the bucket
-  // today), and `null` is a run that happened after it and was reported no
-  // usage. A schema that required it would make every stored record
-  // unreadable, which is why it is written this way -- see the migration note
-  // in `docs/delegate-harness-migration.md`, S2.
-  usage: TokenUsageSchema.nullable().optional(),
   bundle: BundleSchema,
   output: StoredReviewOutputSchema.nullable(),
   verdict: z.enum(["approve", "comment", "failed"]),

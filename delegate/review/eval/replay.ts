@@ -304,7 +304,6 @@ export const resultFromRecord = (record: ReviewRecord): Result => ({
   output: record.output,
   error: record.error,
   costUsd: record.costUsd,
-  ...(record.usage !== undefined ? { usage: record.usage } : {}),
   wallTimeMs: record.wallTimeMs,
 });
 
