@@ -69,7 +69,11 @@ export type ToolCallDecision = { decision: "allow" } | { decision: "deny"; reaso
 /**
  * A guard over one tool call: the seam `pathGuardHook` and `replayToolGuard`
  * are on. A call runs only if every guard allows it, so a guard that throws
- * fails closed.
+ * fails closed — and each harness has to *make* that true, because a harness
+ * that treats a failed guard as "no objection" turns a bug in a guard into an
+ * allowed call. `toPreToolUseHook` in `agent.ts` catches and denies for that
+ * reason: Claude's SDK documents `onFailure: 'continue'` as the default for a
+ * hook that fails, which is the wrong direction for a confinement check.
  *
  * Nothing in this shape names a harness, which is the point: a guard decides
  * over a tool name and an input object, and the harness it runs under adapts
@@ -163,7 +167,8 @@ export type RunOverrides = {
   env?: Record<string, string | undefined>;
   /**
    * Guards run over every tool call before the tool executes. A call runs only
-   * if every guard allows it, so a guard that throws fails closed.
+   * if every guard allows it, so a guard that throws fails closed (see
+   * `ToolCallHandler`: the harness, not the contract, is what enforces it).
    *
    * The element type is the contract's own, and no harness's is accepted here.
    * S2 carried a type parameter so that running Claude `PreToolUse` hooks under

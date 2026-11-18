@@ -9,6 +9,7 @@ import type {
   SubagentCall,
   SubagentDefinition,
   TokenUsage,
+  ToolCallDecision,
   ToolCallHandler,
   ToolSet,
 } from "./types";
@@ -155,9 +156,13 @@ export const forceSynchronousTaskHook = async (input: unknown) => {
 // "skip the permission system", and the guards are deciding confinement, not
 // granting a bypass.
 //
-// A guard that throws rejects the hook, and the SDK treats a failed hook as a
-// denial rather than an execution, which is the fail-closed behaviour the
-// contract promises.
+// A guard that throws would otherwise reject the hook, and a rejected hook is
+// **not** a denial on this harness: the SDK's documented default for a hook
+// that fails is `onFailure: 'continue'`, which lets the action go ahead, and a
+// callback matcher does not expose `onFailure` to change that. So the adapter
+// catches and denies here rather than relying on the SDK to fail closed. That
+// makes `ToolCallHandler`'s "a guard that throws fails closed" true by
+// construction under this harness instead of true by assumption.
 export const toPreToolUseHook = (guard: ToolCallHandler): HookCallback => async (input) => {
   const i = input as {
     hook_event_name?: string;
@@ -170,7 +175,22 @@ export const toPreToolUseHook = (guard: ToolCallHandler): HookCallback => async 
     typeof raw === "object" && raw !== null && !Array.isArray(raw)
       ? (raw as Record<string, unknown>)
       : {};
-  const decision = await guard({ toolName: i.tool_name ?? "", input: toolInput });
+  let decision: ToolCallDecision;
+  try {
+    decision = await guard({ toolName: i.tool_name ?? "", input: toolInput });
+  } catch (err) {
+    // A guard that threw did not answer the question, so the call is denied:
+    // the same reading as a `deny`, with the error kept as the reason so the
+    // failure is visible rather than silent.
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `Guard failed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    };
+  }
   if (decision.decision === "allow") return { continue: true };
   return {
     continue: true,

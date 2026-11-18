@@ -261,15 +261,28 @@ describe("claudeOptions", () => {
     assert.deepEqual(seen, [{ toolName: "Glob", input: { pattern: "**/*.ts" } }]);
   });
 
-  it("carries a thrown guard through as a rejection, not as an allow", async () => {
+  it("denies a call when the guard throws, rather than letting the SDK continue", async () => {
+    // The SDK documents `onFailure: 'continue'` as the default for a hook that
+    // fails, and a callback matcher cannot set it, so a rejected hook would let
+    // the call through. The adapter denies instead, which is what makes
+    // `ToolCallHandler`'s "a guard that throws fails closed" true here.
     const hook = toPreToolUseHook(() => {
       throw new Error("boom");
     });
-    await assert.rejects(
-      hook({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: {} } as never, undefined, {
-        signal: new AbortController().signal,
-      }),
-      /boom/,
+    assert.deepEqual(
+      await hook(
+        { hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/etc/passwd" } } as never,
+        undefined,
+        { signal: new AbortController().signal },
+      ),
+      {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "Guard failed: boom",
+        },
+      },
     );
   });
 
