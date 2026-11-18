@@ -72,12 +72,15 @@ describe("the datasheet fold", () => {
   });
 
   it("folds the feed's own provider names onto the config's", () => {
-    // `normalizeProvider` (types.go:477).
+    // `normalizeProvider` (types.go:477), for the two providers we configure.
     assert.equal(normalizeProvider("fireworks_ai"), "fireworks");
     assert.equal(normalizeProvider("bedrock"), "bedrock");
     assert.equal(normalizeProvider("bedrock_mantle"), "bedrock");
     assert.equal(normalizeProvider("fireworks"), "fireworks", "a config-side name maps to itself");
     assert.equal(normalizeProvider("some_new_provider"), "some_new_provider");
+    // The one that would bite if the arms were narrowed further: `bedrock_mantle`
+    // rows fold onto `bedrock` only because of the `includes` test.
+    assert.equal(normalizeProvider("oss_bedrock_v2"), "bedrock");
   });
 
   it("drops everything up to the first slash of a feed key", () => {
@@ -207,6 +210,41 @@ describe("resolving a served name", () => {
     assert.equal(!result.priced && result.reason, "zero-rate");
     assert.deepEqual(!result.priced && result.tried, ["zero-model [chat]"]);
   });
+  it("fails a name whose chat row is priced but whose responses request finds a zero row", () => {
+    // The two APIs run the lookup from different starting modes and each finds
+    // its own mode's row first, so a priced chat row says nothing about a
+    // responses request. Checking one starting mode would report this name as
+    // fine while responses billed at zero, which is the permissive error that
+    // makes a checker worse than none.
+    const split = foldDatasheet({
+      "bedrock/split-model": pricedRow({ provider: "bedrock", mode: "chat" }),
+      "bedrock/split-model-responses": row({ provider: "bedrock", mode: "responses" }),
+    });
+    // A name whose alias points at the zero responses row, while its own id is
+    // priced in chat.
+    const result = resolveServedName(split, {
+      provider: "bedrock",
+      name: "split-model",
+      modelName: "split-model-responses",
+    });
+    assert.equal(
+      result.priced,
+      false,
+      "the responses starting mode resolves the alias to a zero-rate row, so the name is not priced for responses requests",
+    );
+    assert.equal(!result.priced && result.reason, "zero-rate");
+  });
+
+  it("is priced when both starting modes resolve to a priced row", () => {
+    const both = foldDatasheet({
+      "bedrock/dual-model": pricedRow({ provider: "bedrock", mode: "chat" }),
+    });
+    // One chat row, and the responses request falls back to chat, which is the
+    // `chatResponsesFallbackMode` rule; so both modes are priced off one row.
+    const result = resolveServedName(both, { provider: "bedrock", name: "dual-model" });
+    assert.equal(result.priced, true);
+  });
+
   it("reports a name whose only row computes nothing as zero-rate", () => {
     const result = resolveServedName(folded, { provider: "bedrock", name: "zero-model" });
     assert.equal(result.priced, false);

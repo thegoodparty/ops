@@ -19,10 +19,13 @@ At the pinned tag (`deploy-workbench/bifrost-image.ts`, `BIFROST_UPSTREAM_TAG`):
    config store and cached in memory keyed `model|provider|mode`. The timer is a
    fixed ticker, so the real cadence is the larger of five minutes and the
    configured interval.
-2. A request is priced by exact lookups on that key, trying in order: the
-   fallback model, the matched alias's `model_name`, the alias's `model_id`, then
-   the model string the caller sent. A short list of provider-specific fallbacks
-   runs after a miss, including the counterpart chat/responses mode.
+2. A request is priced by exact lookups on that key. The candidates are tried in
+   this order: the fallback model, the matched alias's `model_name`, the alias's
+   `model_id`, then the model string the caller sent. Within each candidate, the
+   request's own mode is tried first and the counterpart chat/responses mode
+   after it, and the first row found decides: a chat request and a responses
+   request run the same candidates from different starting modes and can find
+   different rows.
 3. A request type that finds nothing is logged at a cost of zero. Not null, not an
    error. The non-streaming path writes null, but the streaming path — which is
    what we use — writes the zero.
@@ -52,6 +55,12 @@ shape.
 |---|---|---|
 | A served name the datasheet cannot price | `.github/workflows/bifrost-pricing-coverage.yml`, via `deploy-workbench/scripts/check-pricing-coverage.ts` | daily, and on dispatch |
 | Catalog lag on the deploy that adds a model | `convergeConfig` in `bifrost/config-convergence-core.ts`: a pricing re-sync after a `models` write | at that deploy, before the model is used |
+
+The check also runs on a push that changes `config.json`, not only nightly. A
+model added at 00:53 and priced by the datasheet at 01:30 sits between two nightly
+runs that are both green, because nothing is unpriced at either moment of
+checking. Running on the serve list's own change puts a check at the one moment a
+new name is known to exist.
 | A name whose shape can never resolve | `config.test.ts`'s alias rules | at review, on every change to the file |
 
 The check reads the committed `config.json` and the public datasheet, and nothing
@@ -65,6 +74,23 @@ the issue worth reading.
 A datasheet that cannot be fetched is a third outcome and files nothing. "We could
 not check" has a different owner than "a model is unpriced", and a check that
 confused them would teach people to close the issue unread.
+
+## The limit of the deploy-side re-sync, stated plainly
+
+`ForceReloadPricing` re-reads the datasheet **and resets the sync timer**
+(`framework/modelcatalog/main.go:417`), and `SyncFromURL` does not advance the
+"last synced" mark the ticker gates on. So a forced sync that finds nothing
+because the feed has not caught up yet defers the next natural sync by a full
+interval. In exactly the incident this is meant to help with — a model added
+before the feed carries its row — the re-sync can therefore lengthen the zero-cost
+window rather than shorten it.
+
+It is kept because the other case is the common one and it is not affected: when
+the feed already carries the row, the re-sync prices the model in seconds instead
+of up to a day. When it does not, the nightly or on-change check names the model
+and a person can decide, and the timer resets itself on the next run. Removing the
+re-sync entirely would be the simpler answer if the timer reset is judged worse
+than the lag it saves; that is a reviewer's call, not a detail.
 
 ## What we deliberately do not do
 

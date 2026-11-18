@@ -640,10 +640,21 @@ export const modelsChanged = (
  * make a deploy red for a temporary problem at a third party, after
  * `minimumHealthyPercent: 0` has already drained the running task and the config
  * has already been applied: a red run nobody can act on, for a condition that
- * was already the status quo. The nightly coverage check
+ * was already the status quo. The coverage check
  * (`deploy-workbench/scripts/check-pricing-coverage.ts`) is what turns it into
  * something a person sees, and it reports on the result rather than on the
  * attempt.
+ *
+ * **The one case it can hurt, and why it stays.** `ForceReloadPricing` also
+ * resets the sync timer (`framework/modelcatalog/main.go:417`) while
+ * `SyncFromURL` does not advance the last-synced mark the ticker gates on, so a
+ * forced sync that finds nothing defers the next natural one by a full interval.
+ * When the feed has not caught up yet, that lengthens the zero-cost window instead
+ * of shortening it. It is kept because the other case is the common one and it is
+ * unaffected: a row the feed already carries is priced in seconds rather than up
+ * to a day later, and that is the case a model list change usually meets. When the
+ * feed has not caught up, the coverage check names the model and a person decides.
+ * `docs/bifrost-pricing-coverage.md` records this rather than hiding it.
  */
 export const requestPricingSync = async (args: {
   gateway: ConfigGateway;

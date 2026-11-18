@@ -138,13 +138,6 @@ export const render = (
   return lines;
 };
 
-/**
- * The issue's title. Fixed, so a second night of the same outage updates one
- * issue instead of filing another, and so the workflow can find the open one by
- * title alone.
- */
-export const ISSUE_TITLE = "Bifrost: a served model has no price";
-
 export const main = async (argv: string[]): Promise<number> => {
   const args = parseArgs(argv);
 

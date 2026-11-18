@@ -68,8 +68,19 @@
  */
 export const BIFROST_PRICING_TAG = "v2.4.0";
 
-/** The modes a chat-completions request can be priced from, in lookup order. */
-const PRICING_MODES = ["chat", "responses"] as const;
+/** The modes a chat-completions or responses request can be priced from. */
+const STARTING_MODES = ["chat", "responses"] as const;
+
+/**
+ * The mode a request in `startMode` falls back to, per `chatResponsesFallbackMode`.
+ *
+ * Chat and responses are the two modes a model we serve can be requested over,
+ * and each falls back to the other. Keeping the pair explicit rather than
+ * iterating a flat list preserves the order `getBasePricing` uses: within one
+ * candidate, the request's own mode first, then the counterpart.
+ */
+const modeChain = (startMode: (typeof STARTING_MODES)[number]): string[] =>
+  startMode === "chat" ? ["chat", "responses"] : ["responses", "chat"];
 
 /**
  * The standard-tier rate fields a normal request is actually billed at
@@ -139,25 +150,24 @@ export type CoverageResult =
     };
 
 /**
- * `normalizeProvider` (`types.go:477`). Only the arms that can apply to a
- * provider this repo serves are copied — Bedrock, Fireworks — and the rest map a
- * name to itself, which is what the source does for anything it does not fold.
+ * `normalizeProvider` (`types.go:477`), for the two providers this repo serves.
  *
- * Copied rather than simplified to "it is already the provider name": the
- * datasheet's rows carry the *feed's* provider (`bedrock`, `fireworks_ai`,
- * `bedrock_mantle`), which is not always the config's, and the fold only works
- * if both sides are normalised the same way.
+ * The fold only works if both sides are normalised the same way: the datasheet's
+ * rows carry the *feed's* provider (`bedrock`, `bedrock_mantle`, `fireworks_ai`),
+ * which is not always the name in `config.json`. Those three arms are copied
+ * verbatim; every other provider maps to itself, which is what the source does
+ * for anything it does not fold.
+ *
+ * The arms for providers we do not configure (together, vertex, cohere, runway,
+ * github_copilot) are deliberately absent. Copying them would be dead code that
+ * reads like coverage, and adding a provider to `config.json` is a decision that
+ * should bring its normalisation with it — `config.test.ts` already fails on a
+ * provider the model decision does not cover, so a new one cannot arrive
+ * unnoticed.
  */
 export const normalizeProvider = (provider: string): string => {
-  if (provider.includes("together")) return "together_ai";
-  if (provider.includes("vertex_ai") || provider === "google-vertex") {
-    return "vertex";
-  }
   if (provider.includes("bedrock")) return "bedrock";
-  if (provider.includes("cohere")) return "cohere";
-  if (provider.includes("runwayml")) return "runway";
   if (provider.includes("fireworks_ai")) return "fireworks";
-  if (provider.includes("github_copilot")) return "github_copilot";
   return provider;
 };
 
@@ -240,22 +250,28 @@ const lookup = (
 };
 
 /**
- * `resolvePricing` (`cost.go:2479`) for one served name.
+ * `resolvePricing` (`cost.go:2479`) for one served name, once per starting mode.
  *
  * Two levels of nesting, and the order is the whole of it:
  *
  * - **Outer, candidates**, in the gateway's order: the alias's `model_name`, the
  *   alias's `model_id`, then the name the caller sent.
- * - **Inner, modes**: chat, then responses (`chatResponsesFallbackMode`), each
- *   with the lowercase retry (`getBasePricing`, `:2582`).
+ * - **Inner, modes**, from the request's own mode to its counterpart
+ *   (`chatResponsesFallbackMode`), each with the lowercase retry
+ *   (`getBasePricing`, `:2582`).
  *
  * The first row **found** decides, exactly as `getBasePricing` returns on the
  * first map hit and never falls through to a later candidate once it has one.
- * That is the half that has to match: a check more permissive than the gateway
- * would report a model that bills at zero as fine. So the row found is judged by
- * `hasNonZeroRate` and an all-zero row is reported as `zero-rate` against the
- * name that found it, rather than the search continuing to a later candidate the
- * gateway would never have reached.
+ * That is the half that must match: a check more permissive than the gateway
+ * would report a model that bills at zero as fine.
+ *
+ * **Both starting modes are resolved, and either one being unpriced fails the
+ * name.** A chat request and a responses request run the lookup from different
+ * modes, and each finds its own mode's row first; a priced chat row says nothing
+ * about what a responses request would find, because the fallback only runs after
+ * a miss in its own mode. Checking one starting mode would report a name as fine
+ * while requests over the other API billed at zero, which is the permissive error
+ * this module exists to avoid.
  */
 export const resolveServedName = (
   folded: Map<string, FoldCandidate>,
@@ -272,31 +288,78 @@ export const resolveServedName = (
   candidates.push({ name: served.name, pricedBy: "own-id" });
 
   const tried: string[] = [];
+  const misses: Extract<CoverageResult, { priced: false }>[] = [];
+  let priced: Extract<CoverageResult, { priced: true }> | undefined;
+
+  for (const startMode of STARTING_MODES) {
+    const outcome = resolveFromMode(folded, served, provider, candidates, startMode);
+    tried.push(...outcome.tried);
+    if (outcome.result.priced) {
+      // Keep the first priced resolution for the report, but a later starting
+      // mode can still turn this name into a failure, so the loop continues.
+      priced = priced ?? outcome.result;
+    } else {
+      misses.push(outcome.result);
+    }
+  }
+
+  if (misses.length > 0) {
+    // One unpriced starting mode is a name that bills at zero for those
+    // requests. Reported against the first mode that failed, with the reason
+    // it gave; the report's `tried` names every candidate that was consulted.
+    const first = misses[0];
+    return { ...first, tried: [...new Set(tried)] };
+  }
+  return priced as Extract<CoverageResult, { priced: true }>;
+};
+
+/**
+ * One starting mode's lookup, which is `getBasePricing` read literally: try each
+ * candidate in the gateway's order, and within a candidate try its own mode and
+ * then the counterpart.
+ *
+ * Split out so `resolveServedName` can run it once per starting mode and combine
+ * the answers, rather than iterating modes in one flat loop that cannot tell a
+ * chat-shaped answer from a responses-shaped one.
+ */
+const resolveFromMode = (
+  folded: Map<string, FoldCandidate>,
+  served: ServedName,
+  provider: string,
+  candidates: Array<{ name: string; pricedBy: PricedBy }>,
+  startMode: (typeof STARTING_MODES)[number],
+): { result: CoverageResult; tried: string[] } => {
+  const tried: string[] = [];
   for (const candidate of candidates) {
-    for (const mode of PRICING_MODES) {
+    for (const mode of modeChain(startMode)) {
       const found = lookup(folded, candidate.name, provider, mode);
       if (found === undefined) continue;
       tried.push(`${candidate.name} [${mode}]`);
       if (hasNonZeroRate(found.entry)) {
         return {
-          priced: true,
-          served,
-          pricedBy: candidate.pricedBy,
-          resolvedName: candidate.name,
-          mode,
+          result: {
+            priced: true,
+            served,
+            pricedBy: candidate.pricedBy,
+            resolvedName: candidate.name,
+            mode,
+          },
+          tried,
         };
       }
       // Found, and every standard rate on it is zero. The gateway stopped here
-      // and computed a cost of zero, so no later candidate can change the answer.
-      return { priced: false, served, reason: "zero-rate", tried };
+      // and computed a cost of zero, so no later candidate can change it.
+      return { result: { priced: false, served, reason: "zero-rate", tried }, tried };
     }
   }
-
   return {
-    priced: false,
-    served,
-    reason: "no-row",
-    tried: candidates.map((candidate) => candidate.name),
+    result: {
+      priced: false,
+      served,
+      reason: "no-row",
+      tried: candidates.map((candidate) => candidate.name),
+    },
+    tried,
   };
 };
 

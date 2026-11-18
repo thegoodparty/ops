@@ -45,6 +45,19 @@ name: Bifrost pricing coverage
 # pinned Bifrost tag.
 
 on:
+  # On the file that decides what is served, as well as nightly. A model added at
+  # 00:53 and priced by the datasheet at 01:30 sits between two nightly runs, and
+  # the two runs either side of it are both green: nothing is unpriced at either
+  # moment of checking, and requests in between billed at zero. Running on the
+  # push that changes the serve list puts a check at the only moment we know a new
+  # name exists, which is what closes that gap.
+  push:
+    branches: ["main"]
+    paths:
+      - "deploy-workbench/bifrost/config.json"
+      - "deploy-workbench/bifrost/pricing-coverage.ts"
+      - "deploy-workbench/scripts/check-pricing-coverage.ts"
+      - ".github/workflows/bifrost-pricing-coverage.yml"
   schedule:
     # A new model reaches the serve list roughly once or twice a month, and the
     # lag window this catches is at most one datasheet sync, so daily is sized to
@@ -80,9 +93,9 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
 
-      # `npm ci` rather than a bare tsx: the check imports the shared module
-      # under `deploy-workbench/bifrost/`, and installing is what proves the
-      # module graph type-checks in the same way the rest of CI does.
+      # `npm ci` for `tsx` and nothing more: the check imports one module from
+      # `deploy-workbench/bifrost/` and no dependency of its own. Type-checking is
+      # `deploy.yml`'s job, not this one's.
       - run: npm ci
 
       # The script's own exit code is the outcome, so it is captured rather than

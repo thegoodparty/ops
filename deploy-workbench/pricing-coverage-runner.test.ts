@@ -1,14 +1,15 @@
-import { describe, it, after } from "node:test";
+import { describe, it, after, before } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AddressInfo } from "node:net";
 
 import {
   EXIT_PRICED,
   EXIT_UNPRICED,
   EXIT_UNREADABLE,
-  ISSUE_TITLE,
   fetchDatasheet,
   main,
   parseArgs,
@@ -27,8 +28,15 @@ import { checkCoverage, type Datasheet } from "./bifrost/pricing-coverage";
  *
  * The exit codes are the contract with the workflow, which files an issue on 1
  * and only fails the run on 2, so each one is driven end to end through `main`
- * with a temporary config file and a local data source. No network: the datasheet
- * cases use a `data:` URL, which `fetch` serves without a socket.
+ * with a temporary config file and a local data source.
+ *
+ * **Nothing here reaches the network.** The successful cases use a `data:` URL,
+ * which `fetch` serves without a socket, and the failing-status cases use one
+ * local HTTP server that answers a `404` with a JSON body. Both are deliberate:
+ * `npm test` is what every PR runs, and a unit suite that depends on a third
+ * party's CDN is a suite that goes red for a reason the change did not cause. It
+ * would also pass the exit-2 case for the wrong reason on a runner with no
+ * egress, since a DNS failure and a bad status are the same outcome.
  */
 
 const temps: string[] = [];
@@ -58,8 +66,27 @@ const datasheetUrl = (datasheet: Datasheet): string =>
 /** One priced row, with deliberately tiny non-real numbers. */
 const pricedRow = { provider: "bedrock", mode: "chat", input_cost_per_token: 1 };
 
-after(() => {
+/** A local server that answers everything with a `404` and a JSON body. */
+let notFoundBase = "";
+let notFoundServer: http.Server | undefined;
+
+before(async () => {
+  notFoundServer = http.createServer((_req, res) => {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>((resolve) =>
+    notFoundServer?.listen(0, "127.0.0.1", resolve),
+  );
+  const address = notFoundServer?.address() as AddressInfo;
+  notFoundBase = `http://127.0.0.1:${address.port}`;
+});
+
+after(async () => {
   for (const dir of temps) fs.rmSync(dir, { recursive: true, force: true });
+  await new Promise<void>((resolve) =>
+    notFoundServer === undefined ? resolve() : notFoundServer.close(() => resolve()),
+  );
 });
 
 /** `main` with the console silenced, so the run's rc is the only thing read. */
@@ -105,10 +132,19 @@ describe("reading the datasheet", () => {
   it("throws on a non-2xx rather than returning an empty feed", async () => {
     // The distinction that matters: an empty feed would report every served name
     // as unpriced, which is the loudest possible wrong answer, so a bad status
-    // has to be a failure and not a result.
+    // has to be a failure and not a result. A local 404, so this asserts the
+    // status branch rather than a DNS resolver's behaviour.
     await assert.rejects(
-      () => fetchDatasheet("https://getbifrost.ai/definitely-not-a-datasheet"),
-      /answered [45]\d\d|fetch failed|ENOTFOUND|EAI_AGAIN|getaddrinfo/i,
+      () => fetchDatasheet(`${notFoundBase}/datasheet`),
+      /answered 404/,
+    );
+  });
+
+  it("throws on a 200 that is not a JSON object", async () => {
+    const body = "<html>an HTML catch-all page</html>";
+    await assert.rejects(
+      () => fetchDatasheet(`data:text/html,${encodeURIComponent(body)}`),
+      /not JSON/,
     );
   });
 });
@@ -177,7 +213,7 @@ describe("the exit codes, end to end", () => {
       "--config",
       configFile(["a"]),
       "--datasheet-url",
-      "https://getbifrost.ai/definitely-not-a-datasheet",
+      `${notFoundBase}/datasheet`,
     ]);
     assert.equal(code, EXIT_UNREADABLE);
   });
@@ -190,14 +226,5 @@ describe("the exit codes, end to end", () => {
       datasheetUrl({}),
     ]);
     assert.equal(code, EXIT_UNREADABLE);
-  });
-});
-
-describe("the issue title", () => {
-  it("is fixed, so a second night updates one issue", () => {
-    // The workflow finds the open issue by this title. A title built from the
-    // unpriced names would file a new issue every night the set changed, which is
-    // the noise that gets the check muted.
-    assert.equal(ISSUE_TITLE, "Bifrost: a served model has no price");
   });
 });
