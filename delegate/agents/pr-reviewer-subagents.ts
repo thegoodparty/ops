@@ -139,7 +139,7 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 
 **correctness:** Silent failures, swallowed catches, race conditions, missing awaits (where the next statement reads the not-yet-resolved value), null/undefined access, off-by-one. Blocker only when you can name the specific input that triggers the bug.
 
-**security:** Missing authz on new endpoints, injection vectors (SQL, XSS, command), secret exposure in logs or responses, broken S2S JWT verification (PEOPLE_API_S2S_SECRET, Clerk M2M), CORS/cookie misconfiguration, email-domain substring checks without a delimiter guard. Blocker only when you can describe the attacker and exploit in one sentence.
+**security:** Missing authz on new endpoints, injection vectors (SQL, XSS, command), secret exposure in logs or responses, broken S2S JWT verification (PEOPLE_API_S2S_SECRET, Clerk M2M), CORS/cookie misconfiguration, email-domain substring checks without a delimiter guard. Blocker only when you can describe the attacker and exploit in one sentence. A check the repo's docs, comments or plan say the code must make, or a guard whose stated purpose an input defeats, is blocker-grade when the diff omits or breaks it: name the input that gets through. That no caller holds the permission yet, or that a later step adds the grant, is not falsifying evidence; the code being merged is what will run.
 
 **tests:** New behavior without tests, tautological assertions (test passes for the wrong reason), test files that won't compile. Blocker only when the gap leaves a non-trivial path totally untested or the assertion is provably wrong. A test that the repo's written testing guide (linked from the nearest CLAUDE.md or AGENTS.md) says not to write is also blocker-grade: quote the guide's section and name the test that breaks it. The guide is the evidence; it does not also need a CI or runtime failure.
 
@@ -156,6 +156,8 @@ Before emitting any finding, answer in your scratch:
 2. Is that evidence present in the code you have read?
 
 If evidence falsifies the finding, drop it. If not, emit it and include the falsification check in the body as a parenthetical: "(Falsification check: no upstream guard exists on this path.)"
+
+Drop a finding only when the falsifying evidence is in the code you read. Once you have confirmed a defect against the lens, do not talk yourself out of it afterwards: "not a regression", "low impact", "not reachable yet", "the author probably meant it" and "a later PR may fix it" are not falsifying evidence. The lens decides whether a defect is blocker-grade; this pass only decides whether it is real.
 
 If you cannot name a concrete falsification check, the finding is speculation — drop it.
 
