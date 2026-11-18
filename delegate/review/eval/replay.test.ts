@@ -897,8 +897,8 @@ test("replayCase shows every post-mortem, whatever the recorded review's date, a
 });
 
 test("replayCase strips PR numbers, GitHub links and commits from the post-mortems it shows", async () => {
-  const [first] = loadPostmortems();
-  assert.match(first.text, /#2977/);
+  const first = loadPostmortems().find((p) => /#2977/.test(p.text));
+  assert.ok(first, "a post-mortem that cites #2977");
   const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
     { output: `{"ids": ["${first.file}#1"]}` },
     { output: `{"ids": ["${first.file}"]}` },
