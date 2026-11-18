@@ -121,6 +121,20 @@ export type ConfigConvergenceResult = {
   unchanged: number;
   applied: Array<{ section: ConfigSection; fields: string[] }>;
   skipped: Array<{ path: string; reason: ConfigSkipReason }>;
+  /**
+   * What the pricing re-sync did, when this run had reason to ask for one.
+   *
+   * `not-needed` is the steady state: no key's model list changed, so no name
+   * that was not being served a moment ago is served now, and the catalog is
+   * asked for nothing. `ran` means the gateway re-read the datasheet. `failed`
+   * means it refused or the call could not complete, and the gateway kept the
+   * pricing table it already had.
+   *
+   * A `failed` here is deliberately not a failed convergence: see the note on
+   * `requestPricingSync` below for why a transient fetch of a third party's CDN
+   * must not turn a deploy red after the task has already been drained.
+   */
+  pricingSync: "ran" | "not-needed" | "failed";
 };
 
 /** The live client config, as `config.json` declares it. */
@@ -183,6 +197,22 @@ export type ConfigGateway = {
     keyId: string,
     body: Record<string, unknown>,
   ) => Promise<void>;
+  /**
+   * `POST /api/pricing/force-sync`: re-read the pricing datasheet now instead of
+   * waiting out the interval (`handlers/config.go:133`, `ForceReloadPricing` at
+   * `framework/modelcatalog/main.go:376`, which also resets the sync timer).
+   *
+   * On this interface because it is the same credential and the same admin
+   * surface as the rest: the reconciliation already holds the setup token and
+   * already writes the running process's configuration, and a model added to a
+   * key's list is served from the moment that write lands. Asking the catalog to
+   * catch up is the one part of "a new model is priced" this job can do, and it
+   * needs nothing new: no IAM, no secret, no network path.
+   *
+   * It changes no price. It asks the gateway to re-read the feed it already
+   * reads.
+   */
+  forcePricingSync: () => Promise<void>;
 };
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -577,7 +607,56 @@ export const configConvergenceNotRun = (): ConfigConvergenceResult => ({
   unchanged: 0,
   applied: [],
   skipped: [],
+  pricingSync: "not-needed",
 });
+
+/**
+ * Whether this run put a name into the serve list that was not there before.
+ *
+ * A key's `models` array is the serve list, so a write that changed it is the one
+ * event that can introduce a model the gateway has never had to price. Nothing
+ * else in the loop can: an alias change moves which row a name prices from, a
+ * weight changes routing, and a client or provider field is not about models. So
+ * the re-sync hangs off this and nothing else, which is what keeps it a
+ * once-per-model-change call rather than a fetch on every deploy.
+ */
+export const modelsChanged = (
+  applied: ReadonlyArray<{ section: ConfigSection; fields: string[] }>,
+): boolean =>
+  applied.some(
+    (entry) => entry.section.startsWith("key:") && entry.fields.includes("models"),
+  );
+
+/**
+ * Ask the catalog to re-read the datasheet, when a model list just changed.
+ *
+ * **Not fatal, and that is a decision.** The gateway's price comes from one
+ * remote document that it re-reads on a 24-hour timer. A served model whose row
+ * the document does not carry yet bills at zero until the next sync, which is
+ * the window this collapses to seconds on the deploy that adds the model.
+ *
+ * If the call fails, the gateway keeps the table it already had, which is exactly
+ * where it would have been without this. Failing the convergence over that would
+ * make a deploy red for a temporary problem at a third party, after
+ * `minimumHealthyPercent: 0` has already drained the running task and the config
+ * has already been applied: a red run nobody can act on, for a condition that
+ * was already the status quo. The nightly coverage check
+ * (`deploy-workbench/scripts/check-pricing-coverage.ts`) is what turns it into
+ * something a person sees, and it reports on the result rather than on the
+ * attempt.
+ */
+export const requestPricingSync = async (args: {
+  gateway: ConfigGateway;
+  applied: ReadonlyArray<{ section: ConfigSection; fields: string[] }>;
+}): Promise<ConfigConvergenceResult["pricingSync"]> => {
+  if (!modelsChanged(args.applied)) return "not-needed";
+  try {
+    await args.gateway.forcePricingSync();
+    return "ran";
+  } catch {
+    return "failed";
+  }
+};
 
 /**
  * The loop: one `GET` and at most one `PUT` per live section, in the order the
@@ -599,6 +678,7 @@ export const convergeConfig = async (args: {
     unchanged: 0,
     applied: [],
     skipped: [...desired.skipped],
+    pricingSync: "not-needed",
   };
 
   const fail = (what: string): never => {
@@ -722,6 +802,12 @@ export const convergeConfig = async (args: {
     });
     result.changed++;
   }
+
+  // Last, and only when a model list moved. A served name is priced from the
+  // moment the write above lands, so a name the datasheet has not caught up to
+  // bills at zero until the next sync; this asks for that sync now. See
+  // `requestPricingSync` for why a failure here is reported and not thrown.
+  result.pricingSync = await requestPricingSync({ gateway, applied: result.applied });
 
   return result;
 };

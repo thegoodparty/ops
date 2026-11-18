@@ -104,6 +104,36 @@ describe("the config gateway over real HTTP", () => {
     assert.equal(requests[2].url, "/api/providers/custom%2Fprovider/keys");
   });
 
+  it("posts the pricing re-sync to the route that reloads the catalog", async () => {
+    // `POST /api/pricing/force-sync` (`handlers/config.go:133`) is the runtime
+    // route for `ForceReloadPricing`. A `PUT` would be the wrong verb and a
+    // `/api/config` body would be the wrong route: this asserts both, because a
+    // 404 from the wrong verb is the failure that looks like a gateway problem.
+    reset([{ status: 200, body: { status: "success", message: "pricing synced successfully" } }]);
+    await gateway().forcePricingSync();
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "POST");
+    assert.equal(requests[0].url, "/api/pricing/force-sync");
+    assert.equal(requests[0].body, "", "the route takes no body");
+    assert.equal(
+      requests[0].headers["x-bifrost-setup-token"],
+      "the-setup-token",
+      "the admin surface is gated by the same setup token as every other route here",
+    );
+  });
+
+  it("throws on a refused pricing re-sync, carrying only the status", async () => {
+    // `requestPricingSync` turns this into a reported `failed`, so what matters
+    // here is that a non-200 is not silently a success and that nothing from the
+    // response body can reach a log line.
+    reset([{ status: 500, body: { error: "failed to force pricing sync: boom" } }]);
+    await assert.rejects(
+      () => gateway().forcePricingSync(),
+      (error: unknown) => error instanceof GatewayFailure && error.status === 500,
+    );
+  });
+
   it("answers null for a provider the gateway does not have, rather than throwing", async () => {
     // A provider in the file and not in the running task is a boot-only change
     // -- adding one needs its key values -- so it is a skip, not an outage.

@@ -2,11 +2,13 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  configConvergenceNotRun,
   convergeConfig,
   differingClientFields,
   differingKeyFields,
   differingProviderFields,
   liveConfigDesiredState,
+  modelsChanged,
   type ConfigGateway,
 } from "./config-convergence-core";
 import { JanitorFailure } from "./vk-janitor-core";
@@ -98,10 +100,13 @@ const harness = (options: {
   failPutConfig?: boolean;
   failPutProvider?: boolean;
   failPutKey?: boolean;
+  failPricingSync?: boolean;
 }) => {
   const configPuts: Array<Record<string, unknown>> = [];
   const providerPuts: Array<{ provider: string; body: Record<string, unknown> }> = [];
   const keyPuts: Array<{ provider: string; id: string; body: Record<string, unknown> }> = [];
+  /** Every `POST /api/pricing/force-sync`, so a test can count them, not just see one. */
+  const pricingSyncs: number[] = [];
 
   const gateway: ConfigGateway = {
     getConfig: async () => ({
@@ -131,9 +136,13 @@ const harness = (options: {
       if (options.failPutKey) throw new Error("PUT /api/providers/keys refused");
       keyPuts.push({ provider, id, body });
     },
+    forcePricingSync: async () => {
+      if (options.failPricingSync) throw new Error("POST /api/pricing/force-sync refused");
+      pricingSyncs.push(Date.now());
+    },
   };
 
-  return { gateway, configPuts, providerPuts, keyPuts };
+  return { gateway, configPuts, providerPuts, keyPuts, pricingSyncs };
 };
 
 /** A file whose only live content is the client config, so a test can isolate it. */
@@ -643,5 +652,143 @@ describe("a provider the running gateway does not have", () => {
       (error: unknown) =>
         error instanceof JanitorFailure && error.code === "config-unavailable",
     );
+  });
+});
+
+describe("the pricing re-sync after a model list moves", () => {
+  /**
+   * The gateway prices from one remote datasheet on a 24-hour timer, so a name
+   * added to a key's `models` list bills at zero until the next sync. This loop is
+   * the only job that already holds the admin credential at the moment the model
+   * list changes, so it is where the sync is asked for. The bounds are the tests
+   * below: once per change, never on a run that changed no model list, and never
+   * fatal.
+   */
+
+  it("asks once when a key's model list changed", async () => {
+    const { gateway, keyPuts, pricingSyncs } = harness({
+      // The gateway serves one model fewer than the file does, so the key loop
+      // writes `models` and nothing else.
+      keys: {
+        fireworks: [{ id: "key-id-1", name: "fireworks-primary", models: ["m-1"] }],
+        bedrock: [{ id: "key-id-2", name: "bedrock-task-role", models: [] }],
+      },
+    });
+
+    const result = await convergeConfig({
+      gateway,
+      desired: liveConfigDesiredState(configText()),
+    });
+
+    assert.ok(
+      keyPuts.some((put) => Array.isArray(put.body.models)),
+      "the case is only meaningful if a models write happened",
+    );
+    assert.equal(pricingSyncs.length, 1, "one re-sync, not one per key and not one per run");
+    assert.equal(result.pricingSync, "ran");
+  });
+
+  it("does not ask when nothing about a model list changed", async () => {
+    // The steady state, and the one that must stay cheap: a deploy that changes a
+    // client field or a weight has not introduced a name, so there is nothing for
+    // the catalog to catch up to.
+    const { gateway, pricingSyncs } = harness({
+      observedClient: { enable_logging: false, disable_content_logging: true, log_retention_days: 90 },
+      keys: {
+        fireworks: [
+          {
+            id: "key-id-1",
+            name: "fireworks-primary",
+            models: ["m-1", "m-2"],
+            aliases: { "worker-default": { model_id: "m-1", model_name: "m-1" } },
+            weight: 1,
+          },
+        ],
+        bedrock: [
+          {
+            id: "key-id-2",
+            name: "bedrock-task-role",
+            models: ["us.anthropic.claude-sonnet-5-5"],
+            weight: 1,
+            bedrock_key_config: { region: "us-west-2" },
+          },
+        ],
+      },
+    });
+
+    const result = await convergeConfig({
+      gateway,
+      desired: liveConfigDesiredState(configText()),
+    });
+
+    assert.equal(pricingSyncs.length, 0, "a client-only change must not fetch the datasheet");
+    assert.equal(result.pricingSync, "not-needed");
+  });
+
+  it("does not ask when only an alias changed", async () => {
+    // An alias edit moves which row a name prices from; it does not add a name.
+    // The catalog has no new row to find, so a sync would be a wasted fetch.
+    const { gateway, pricingSyncs } = harness({
+      keys: {
+        fireworks: [
+          {
+            id: "key-id-1",
+            name: "fireworks-primary",
+            models: ["m-1", "m-2"],
+            aliases: { "worker-default": { model_id: "m-2", model_name: "m-2" } },
+            weight: 1,
+          },
+        ],
+        bedrock: [
+          {
+            id: "key-id-2",
+            name: "bedrock-task-role",
+            models: ["us.anthropic.claude-sonnet-5-5"],
+            weight: 1,
+            bedrock_key_config: { region: "us-west-2" },
+          },
+        ],
+      },
+    });
+
+    const result = await convergeConfig({
+      gateway,
+      desired: liveConfigDesiredState(configText()),
+    });
+
+    assert.equal(pricingSyncs.length, 0);
+    assert.equal(result.pricingSync, "not-needed");
+  });
+
+  it("reports a refused re-sync as failed rather than failing the convergence", async () => {
+    // The decision: a transient problem at a third party must not turn a deploy
+    // red after the task has already been drained and the config applied. The
+    // outcome is recorded so the run log and the nightly check can say so.
+    const { gateway } = harness({
+      keys: {
+        fireworks: [{ id: "key-id-1", name: "fireworks-primary", models: ["m-1"] }],
+        bedrock: [{ id: "key-id-2", name: "bedrock-task-role", models: [] }],
+      },
+      failPricingSync: true,
+    });
+
+    const result = await convergeConfig({
+      gateway,
+      desired: liveConfigDesiredState(configText()),
+    });
+
+    assert.equal(result.outcome, "converged", "a failed fetch is not a failed convergence");
+    assert.equal(result.pricingSync, "failed");
+  });
+
+  it("is not part of a scheduled run, which converges no config at all", () => {
+    assert.equal(configConvergenceNotRun().pricingSync, "not-needed");
+  });
+
+  it("recognises a models change from the applied sections", () => {
+    assert.equal(modelsChanged([]), false);
+    assert.equal(modelsChanged([{ section: "key:fireworks/fireworks-primary", fields: ["weight"] }]), false);
+    assert.equal(modelsChanged([{ section: "client", fields: ["models"] }]), false, "a client field named models is not a model list");
+    assert.equal(modelsChanged([{ section: "key:bedrock/bedrock-task-role", fields: ["models"] }]), true);
   });
 });

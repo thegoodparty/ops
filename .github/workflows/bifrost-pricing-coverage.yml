@@ -1,0 +1,179 @@
+name: Bifrost pricing coverage
+
+# Is every model the gateway serves priced by the catalog it prices from?
+#
+# The gateway prices a request from one remote datasheet, matched exactly on
+# `model|provider|mode`, and a miss is logged as a cost of zero rather than as an
+# error. An unpriced model is also invisible to a per-provider budget, because
+# budgets are charged only when the computed cost is above zero. So a model added
+# to the serve list before the datasheet carries its row bills at zero, silently,
+# until somebody happens to read the logs.
+#
+# This check asks the question the gateway cannot: for every name a key in
+# `deploy-workbench/bifrost/config.json` serves, is there a row that would price
+# it? It reads the public datasheet and the committed file, and nothing else.
+#
+# ## No credentials, and that is the design
+#
+# No AWS role, no `id-token: write`, no repository secret. The datasheet is
+# public; the config is in the repo. `issues: write` is the only permission, and
+# the only thing it is used for is the issue below. That is also why the check
+# cannot simply ask the gateway whether it has a price: its admin surface needs
+# the setup token, which is a deployment-wide credential, and a scheduled job
+# that reads a public URL has no business holding one.
+#
+# ## Two failures, two outcomes
+#
+# The script exits 0 (every served model priced), 1 (a served model is not) or 2
+# (the datasheet could not be read). Only 1 files an issue. "We could not check"
+# is not the same fact as "a model is unpriced", has a different owner and a
+# different fix, and a check that conflated them would train everyone to close
+# the issue without reading it. Both 1 and 2 fail the run.
+#
+# ## Green closes the issue
+#
+# When the check comes back clean and the issue is open, this comments one line
+# naming the run and closes it. A lag-window issue left open after the datasheet
+# has caught up is worse than no issue at all: the next person learns that a red
+# issue does not mean anything, and stops reading them. The comment goes first so
+# the reason is on the issue rather than inferred from who closed it.
+#
+# `deploy-workbench/bifrost/pricing-coverage.test.ts`,
+# `deploy-workbench/pricing-coverage-runner.test.ts` and
+# `deploy-workbench/bifrost/pricing-coverage.ts` are the check itself; the
+# runner's own doc comment has the source:line of every rule it copies out of the
+# pinned Bifrost tag.
+
+on:
+  schedule:
+    # A new model reaches the serve list roughly once or twice a month, and the
+    # lag window this catches is at most one datasheet sync, so daily is sized to
+    # the event rather than to the symptom. 13:17 UTC, off the hour so it does not
+    # queue behind everything else scheduled at :00.
+    - cron: "17 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# One run at a time, and a superseded run is worth cancelling: the job reports on
+# the current state of the feed, so the newer run's answer is the true one.
+concurrency:
+  group: bifrost-pricing-coverage
+  cancel-in-progress: true
+
+env:
+  # Named once, used by both the check step and the issue body, so the run's
+  # annotation and the issue cannot describe different checks.
+  CHECK_LOG: pricing-coverage.txt
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # `npm ci` rather than a bare tsx: the check imports the shared module
+      # under `deploy-workbench/bifrost/`, and installing is what proves the
+      # module graph type-checks in the same way the rest of CI does.
+      - run: npm ci
+
+      # The script's own exit code is the outcome, so it is captured rather than
+      # allowed to fail the step here: the issue has to be filed before the run
+      # goes red, or the failure is a red X nobody has an action for. `set +e`
+      # around the call keeps the code without swallowing it.
+      - name: Check every served model for a price
+        id: check
+        run: |
+          set +e
+          npx --no-install tsx deploy-workbench/scripts/check-pricing-coverage.ts | tee "$CHECK_LOG"
+          code="${PIPESTATUS[0]}"
+          set -e
+          echo "exit-code=${code}" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 0 ]; then
+            echo "Every served model is priced."
+          elif [ "$code" -eq 1 ]; then
+            echo "::error::A served model has no price in the datasheet; the gateway logs its requests at a cost of zero."
+          else
+            echo "::error::The datasheet could not be read, so coverage was not checked. This is not the same as an unpriced model."
+          fi
+
+      # The unpriced branch. The body carries the run's own report so the issue
+      # says which names and how it was decided, without anybody opening the log.
+      # `gh` is preinstalled on the runner and authenticates with GITHUB_TOKEN.
+      #
+      # The title is fixed on purpose: a second night of the same outage updates
+      # the issue it already has rather than filing another, and a search by
+      # title is how this finds the open one.
+      - name: File or update the issue when a model is unpriced
+        if: steps.check.outputs.exit-code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Bifrost: a served model has no price"
+          {
+            echo "The scheduled pricing check found a served model with no row in the pricing datasheet."
+            echo
+            echo "The gateway records a request with no matching row at a cost of zero, and a zero-cost request is not charged to a per-provider budget, so this model is both unbilled and uncapped while it stays unpriced. Nothing writes a price here on purpose: the row is either the catalog's or a person's."
+            echo
+            echo '```'
+            grep 'UNPRICED' "$CHECK_LOG" || true
+            echo '```'
+            echo
+            echo "What to do: if the model was added to the serve list recently, the datasheet may catch up on its next sync, and this issue closes itself on the first green run. If it stays open, the name cannot resolve and needs a structural fix in \`deploy-workbench/bifrost/config.json\` rather than a price."
+            echo
+            echo "Run: $RUN_URL"
+          } > body.md
+          # Matched by exact title from an enumerated list, not by a search query:
+          # the title contains a colon, and search qualifiers are the kind of
+          # parsing that fails quietly by returning nothing, which would file a
+          # duplicate issue every night.
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body-file body.md
+            echo "Updated issue #$number."
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+          fi
+
+      # The green branch, and the half that keeps the issue worth reading. A run
+      # that could not read the datasheet is neither green nor red about coverage,
+      # so it closes nothing.
+      - name: Close the issue when every model is priced
+        if: steps.check.outputs.exit-code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Bifrost: a served model has no price"
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,title \
+            --jq "[.[] | select(.title == \"$title\")][0].number // empty")"
+          if [ -z "$number" ]; then
+            echo "No open coverage issue; nothing to close."
+            exit 0
+          fi
+          # Comment before closing, so the reason lives on the issue rather than
+          # only in whoever closed it.
+          gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "Every served model is priced again as of this run, so this closes: $RUN_URL"
+          gh issue close "$number" --repo "$GITHUB_REPOSITORY" --reason completed
+          echo "Closed issue #$number."
+
+      # The red finally happens here, after the issue has been filed or closed,
+      # so a failed run always corresponds to a filed issue or an unreadable
+      # datasheet rather than to a bookkeeping error.
+      - name: Fail the run unless every model is priced
+        if: steps.check.outputs.exit-code != '0'
+        run: |
+          echo "pricing coverage check exited ${{ steps.check.outputs.exit-code }}"
+          exit 1

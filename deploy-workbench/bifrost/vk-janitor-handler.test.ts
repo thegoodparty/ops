@@ -102,6 +102,10 @@ const harness = (options: {
     putProvider: async () => {},
     listProviderKeys: async () => [],
     putProviderKey: async () => {},
+    // Never reached by the shapes these tests drive, which change no model list.
+    // The re-sync's own cases are in `config-convergence-core.test.ts`, where the
+    // decision lives.
+    forcePricingSync: async () => {},
   };
 
   const deps: JanitorDeps = {
