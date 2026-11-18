@@ -302,12 +302,29 @@ irrelevant when the tool list starts empty and the loop is ours.
 - **The `EACCES` on a read-only agent directory.** There is no agent directory.
 - **The cwd-scoped `--session-id` resume for the repair turn.** There is no session.
 
+> **Amendment (step 3, ops#564).** The `@`-strip and unicode-space items above are moot only from
+S5, when the read tool is ours. They are **not** moot in the window this step opens: S3 applies the
+pi-style normalisation to the guard while the tool underneath is still the Claude Agent SDK's, which
+resolves the string it was given rather than a normalised copy of it. A guard that checks only the
+normalised spelling there is a live bypass — a PR author owns the checkout and can commit a symlink
+*named* `@l` pointing at `/`, so `@l/proc/1/environ` normalises to a nonexistent `l/proc/1/environ`
+(inside the prefix, allow) while the SDK opens `@l/…` through the link. That is what happened on this
+step's first push, found by the reviewer and by Bugbot. **The fix is to test both spellings** — a
+candidate must resolve inside the root as written *and* after normalisation — which is correct
+whichever resolver is underneath, so the guard does not depend on when the claim above becomes true.
+S5 inherits the same both-spellings guard and can drop the literal check only once the guard and the
+tool opening the file share one implementation.
+
 **What replaces it.** `runAgent` passes an explicit `tools` object, built with `tool()`, containing
 only read, grep, glob and the git tools. Each tool carries its own path guard inside its `execute()`,
 and the guard normalises **before** the prefix test — unicode spaces, strip a leading `@`, `resolve`,
 `realpath`, prefix test — because a guard that trusts the model's string is the bug, whichever
-implementation reads the file. The seven-case adversarial table is still the property, and it now
-pins *our* implementation rather than describing pi's bug:
+implementation reads the file. **It tests the literal spelling too**, until the tool underneath is
+ours (`inside()` in `delegate/review/run.ts`, and the amendment above): the normalisation is only safe
+once the resolver and the guard agree, and testing both is what makes it safe before they do. The
+seven-case adversarial table is still the property, and it now pins *our* implementation rather than
+describing pi's bug — **with an eighth row added at step 3**, the symlink whose *name* the
+normalisation would rewrite:
 
 | case | input | expected |
 |---|---|---|
@@ -318,6 +335,7 @@ pins *our* implementation rather than describing pi's bug:
 | at-prefixed traversal | `@../../etc/passwd` | **denied** |
 | unicode space | `\u00a0/etc/hostname` | **denied** |
 | symlink out | a link inside the checkout to `/etc` | denied |
+| symlink out, reached only by the literal name | a link *named* `@l` to `/`, read as `@l/proc/1/environ` | **denied** (added at step 3) |
 
 Both guard call sites stay, `pathGuardHook` in `delegate/review/run.ts` and `replayToolGuard` in
 `delegate/review/eval/replay.ts`, and the existing denial assertions are **rewritten, never
@@ -629,7 +647,7 @@ until S11 restores it.
 |---|---|---|---|---|
 | **S1** | — | **Delete the dead CLI install.** `delegate/worker/Dockerfile:4` is proven dead: nothing sets `pathToClaudeCodeExecutable` (0 hits repo-wide) and the SDK resolves its own platform binary by `require.resolve`, never `PATH`. ~346 MB, no behavioural risk. | revert + rebuild | `deploy.yml` builds and pushes; **one real review posted end to end** from the new image; image size recorded before/after. |
 | **S2** | — | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` matching the new call layer, a structured-output ask, a step and usage result — the six SDK-derived fields leave `types.ts` (`AgentConfig`'s `permissionMode`, `agents`, `tools`, `outputFormat`, and `RunOverrides`' `preToolUseHooks`, `resume`), replaced by AI SDK shapes (`tools: ToolSet`, a `prepareStep`-shaped hook, `output: { schema }` — **amended at step 2**: this row said `output: Output.object(...)`, which cannot be the field's *shape*, because `Output.object({ schema })` returns `{ name, responseFormat, parseCompleteOutput, parsePartialOutput, … }` and carries no `schema` member (checked against `ai` 6.0.333), so it is not assignable to a `{ schema }` ask. The ask is `{ schema }`; S5 wraps `Output.object` around it at the call site, which is one line in `runAgent`). Split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `AgentResult` and `Result` gain the token `usage` the Claude SDK already reports (`agent.ts:208`) and the replay already discards, so the baseline side records counts and not only a dollar total. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green; a replay result file carries non-null `usage` beside `costUsd`. |
-| **S3** | — | **The security seam.** Both guards on the new handler type — `pathGuardHook` (`run.ts:78`) and `replayToolGuard` (`replay.ts:358`) — with the normalisation described above applied *before* the prefix test. Symbol names rather than line ranges, deliberately: the ranges differ between the PR base and `main`, and the drift is what made the first version of this document stale. | yes | The adversarial table above passes; every existing denial assertion kept; the `agentEnv` / `pathGuardHook` tests in `run.test.ts` and the `replayToolGuard` pair in `replay.test.ts` rewritten, never deleted. |
+| **S3** | — | **The security seam.** Both guards on the new handler type — `pathGuardHook` (`run.ts:78`) and `replayToolGuard` (`replay.ts:358`) — with the normalisation described above applied *before* the prefix test — **amended at step 3**: the guard must also test the literal spelling it was given, not only the normalised one, for as long as the tool opening the file is not ours (see the amendment in section 3; checking only the normalised spelling is a live symlink bypass at this step). Symbol names rather than line ranges, deliberately: the ranges differ between the PR base and `main`, and the drift is what made the first version of this document stale. | yes | The adversarial table above passes; every existing denial assertion kept; the `agentEnv` / `pathGuardHook` tests in `run.test.ts` and the `replayToolGuard` pair in `replay.test.ts` rewritten, never deleted. |
 | **S4** | — | **Take the merge authority away: flip to `shadow`.** One line in `deploy/components/worker.ts` (`DELEGATE_GATING_MODE`), which is a **human-owned carve-out** in `.github/CODEOWNERS`, so this is a human-approved infra PR the bot cannot approve for itself. It merges **before S5 does**. Under `shadow` nothing is ever approved — `verdict` is `approve` only when `gating.mode === "enforce"` (`gates.ts:150-152`) — and the status line reports what the gate *would* have done, so the canary's numbers come from the deployed task rather than from a side run. | revert (flip back to `enforce`) | `pulumi preview` shows only the env value changing; one review from the deployed task carries a `Shadow: would approve` or `Shadow: would comment (…)` status and **no** approval verdict. |
 | **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. **`delegate/pricing/models.json` lands here with the Anthropic rows**, because the spend cap this step ships cannot fire against an empty table. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model. **`costRatio` is gated on token counts, not dollars** — see the gate below — since only this side is table-priced. Deployed under `shadow`, so S4's canary window opens here. |
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
