@@ -309,6 +309,41 @@ test("pathGuard does not read a sibling of the checkout as inside it", async () 
   assert.equal(denied(await guardCall(guard, "Read", { file_path: join(evil, "a.ts") })), true);
 });
 
+test("pathGuard denies a symlink reached only by the literal, unprefixed spelling", async () => {
+  // Review finding on this PR's first push, and it was right: a PR author
+  // controls the checkout, so they can commit a symlink *named* `@l` (or
+  // `<nbsp>m`) pointing anywhere, have the model ask for `@l/proc/1/environ`,
+  // and have a guard that tests only the normalised `l/proc/1/environ` find a
+  // path that does not exist — inside the prefix, so **allow** — while the tool
+  // opens the literal `@l/…` through the link and reads the worker's environ.
+  //
+  // Neither plain `l` nor plain `m` exists here on purpose: that is what makes
+  // these rows fail if the literal spelling stops being checked.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  symlinkSync("/", join(root, "@l"));
+  symlinkSync("/", join(root, "\u00a0m"));
+  const guard = pathGuardHook(root);
+
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "@l/proc/1/environ" })), true);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "\u00a0m/proc/1/environ" })), true);
+  // An `@`-prefixed path that stays inside is still allowed, so the strip did
+  // not simply turn every `@` argument into a denial.
+  mkdirSync(join(root, "src"));
+  writeFileSync(join(root, "src", "a.ts"), "x");
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "@src/a.ts" })), false);
+});
+
+test("pathGuard denies a symlink reached only by its normalised spelling", async () => {
+  // The mirror image, for the period after S5 when the tools do their own
+  // normalising: a link named `l` with the model asking for `@l/...` normalises
+  // to `l/...`, which is outside. Checking both spellings covers both harnesses
+  // rather than guessing which one is underneath.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  symlinkSync("/", join(root, "l"));
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "@l/proc/1/environ" })), true);
+});
+
 test("normalizeGuardPath strips one leading @ and every unicode space", () => {
   assert.equal(normalizeGuardPath("src/a.ts"), "src/a.ts");
   assert.equal(normalizeGuardPath("@src/a.ts"), "src/a.ts");

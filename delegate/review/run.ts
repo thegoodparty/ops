@@ -81,16 +81,20 @@ export const agentEnv = (
 // (`toPreToolUseHook` in `framework/agent.ts`).
 //
 // **The normalisation is the guard.** A path the model sends is not a path the
-// file tool will open: pi's read tool strips a leading `@` and folds unicode
-// spaces to ordinary ones *before* resolving, so `@/etc/hostname` and
-// `\u00a0/etc/hostname` both reach `/etc/hostname` while a naive prefix test
-// reads them as relative strings inside the checkout. So every candidate is
-// normalised first — unicode spaces out, then one leading `@` off, then
-// `resolve` against the review directory, then `realpath` (a symlink inside the
-// checkout pointing at `/etc` is not inside) — and only then tested against the
-// prefix. Dropping any one of those steps is a bypass, which is what the
-// adversarial table in `run.test.ts` pins.
-
+// file tool will open: a resolver that strips a leading `@` and folds unicode
+// spaces before resolving (pi's `resolveToCwd` does, which is where the bypasses
+// were found) reads `@/etc/hostname` and `\u00a0/etc/hostname` as `/etc/hostname`,
+// while a naive prefix test reads them as relative strings inside the checkout.
+// So every candidate is normalised first — unicode spaces out, then one leading
+// `@` off, then `resolve` against the review directory, then `realpath` (a
+// symlink inside the checkout pointing at `/etc` is not inside) — and only then
+// tested against the prefix. Dropping any one of those steps is a bypass, which
+// is what the adversarial table in `run.test.ts` pins.
+//
+// The normalised path is checked **alongside** the literal one, never instead of
+// it: until S5 the tool opening the file is the Claude SDK's, which resolves the
+// string it was given, so the guard cannot assume the two agree. See `inside()`.
+//
 // The unicode space characters a filesystem and a person can disagree about:
 // no-break, en quad through hair space, narrow no-break, medium mathematical,
 // ideographic. The same set pi normalises (`UNICODE_SPACES` in
@@ -112,8 +116,7 @@ export const normalizeGuardPath = (p: string): string => {
 
 export const pathGuardHook = (reviewDir: string): ToolCallHandler => {
   const root = realpathSync(reviewDir);
-  const inside = (raw: string) => {
-    const p = normalizeGuardPath(raw);
+  const resolvesInside = (p: string) => {
     const abs = isAbsolute(p) ? p : resolve(root, p);
     let real: string;
     try {
@@ -125,6 +128,20 @@ export const pathGuardHook = (reviewDir: string): ToolCallHandler => {
     // `/checkout-evil` reads as inside `/checkout`.
     return real === root || real.startsWith(root + sep);
   };
+  // **Both spellings, and a candidate has to pass both.** The normalised path
+  // is what a resolver that strips `@` and unicode spaces would open; the
+  // literal path is what one that does not would open. Under S3 that second
+  // tool is the real one — the Claude Agent SDK's Read/Grep/Glob resolve the
+  // string they are given — so testing only the normalised path lets a PR
+  // author commit a symlink *named* `@l` or `<nbsp>l` pointing at `/`, have the
+  // model ask for `@l/proc/1/environ`, and have this guard realpath
+  // `<root>/l/proc/1/environ` (nonexistent, so inside) while the tool opens
+  // `<root>/@l/…` through the link and reads the worker's environ. Checking the
+  // literal path too is what makes the normalisation safe to apply before the
+  // tool underneath agrees with it. A path `realpath` cannot resolve is neither
+  // spelling's escape, so it keeps its old `resolve` fallback.
+  const inside = (raw: string) =>
+    resolvesInside(normalizeGuardPath(raw)) && resolvesInside(raw);
   return (call) => {
     if (!["Read", "Grep", "Glob"].includes(call.toolName)) return { decision: "allow" };
     const ti = call.input;
