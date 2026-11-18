@@ -669,7 +669,7 @@ export const runReview = async (args: {
       abortController: args.abortController,
       mcpServers: { git: createGitTool(reviewDir) },
       env: agentEnv(),
-      preToolUseHooks: [pathGuardHook(reviewDir)],
+      toolCallGuards: [pathGuardHook(reviewDir)],
     });
   } catch (err) {
     return fail(`agent crashed: ${err instanceof Error ? err.message : String(err)}`, {});
@@ -702,8 +702,8 @@ export const runReview = async (args: {
           abortController: args.abortController,
           mcpServers: { git: createGitTool(reviewDir) },
           env: agentEnv(),
-          preToolUseHooks: [pathGuardHook(reviewDir)],
-          resume: result.sessionId,
+          toolCallGuards: [pathGuardHook(reviewDir)],
+          continuation: result.sessionId,
         },
       );
       costUsd = (costUsd ?? 0) + (repair.costUsd ?? 0);

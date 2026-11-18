@@ -160,6 +160,7 @@ test("a gated record carries the findings verdict beside the gating result", () 
   assert.equal(ReviewRecordSchema.parse(older).findingsVerdict, undefined);
 });
 
+
 // The bug this pins: `statusForRecord` knew what a gated comment was gated on,
 // but the terminal status re-derived its own "Commented: N finding(s)" string,
 // so the description a reader actually sees never mentioned the gate. One

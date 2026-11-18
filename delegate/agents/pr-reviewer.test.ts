@@ -523,7 +523,13 @@ describe("architect subagent", () => {
   it("runs on read-only tools and emits architecture findings the schema accepts", () => {
     const architect = prReviewerSubagents.architect;
     assert.ok(architect);
-    assert.deepEqual(architect.tools?.filter((t: string) => !t.startsWith("mcp__git__")), ["Read", "Grep", "Glob"]);
+    // `tools` is a set now, not a list of names, so the assertion reads the
+    // keys. The names are the contract: the harness implements these itself in
+    // S2, and S5 gives each one a `tool()` we write.
+    assert.deepEqual(
+      Object.keys(architect.tools ?? {}).filter((t) => !t.startsWith("mcp__git__")),
+      ["Read", "Grep", "Glob"],
+    );
     assert.equal(architect.model, "claude-sonnet-5-5");
     assert.ok(architect.prompt.includes("category: one of bugs | security | tests | conventions | cross-file | thematic | architecture"));
     assert.ok(FindingSchema.safeParse({ path: "a.ts", line: 1, body: "b", category: "architecture", confidence: "high" }).success);

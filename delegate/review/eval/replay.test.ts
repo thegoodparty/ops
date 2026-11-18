@@ -8,6 +8,7 @@ import { replayCase, replayAll, replayToolGuard, resultFromRecord, loadRunResult
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
+import { toolSet } from "../../framework";
 import type { SubagentCall } from "../../framework/types";
 import { loadPostmortems } from "../postmortems";
 
@@ -63,6 +64,21 @@ const fakeRunAgent: RunAgentImpl = async (_config, _prompt, _overrides) => ({
   costUsd: 0.01,
   structuredOutput: { status: "complete", findings: [], summary: "ok from fake" },
 });
+
+// A fake whose spend is knowable, so the usage assertions below can tell the
+// two calls apart from a constant.
+const spendingAgent =
+  (usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }): RunAgentImpl =>
+  async (config, prompt) => ({
+    agent: config.name,
+    output: config.name === "postmortem-selector" ? '{"ids":[]}' : JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+    durationMs: 1,
+    costUsd: 0.01,
+    usage,
+    ...(config.name === "postmortem-selector"
+      ? {}
+      : { structuredOutput: { status: "complete", findings: [], summary: "s" } }),
+  });
 
 // A simulated PR in a gated repo, carrying the plan the model is judged
 // against. The bundle shape is what step 1 put on the two plan cases.
@@ -382,6 +398,76 @@ test("replayAll writes result JSON files for each replayed case", async () => {
   assert.equal(written.caseId, record.runId);
 });
 
+// The plan's gate for S2 is a replay result file carrying non-null `usage`
+// beside `costUsd`. This is that assertion, over the file rather than the
+// value in memory, because the file is what a baseline side is assembled from.
+test("a written result file carries usage beside costUsd", async () => {
+  const out = tmpDir();
+  const record = makeRecord();
+  await replayAll(
+    [record],
+    { out, workDir: tmpDir(), variant: "v1" },
+    { concurrency: 1 },
+    spendingAgent({ inputTokens: 11, outputTokens: 22, cacheReadTokens: 33, cacheWriteTokens: 44 }),
+    fakeCheckout,
+  );
+
+  const written = JSON.parse(
+    readFileSync(join(out, record.runId, "run-1.json"), "utf-8"),
+  ) as Result;
+  assert.notEqual(written.costUsd, null, "costUsd must be recorded");
+  assert.notEqual(written.usage, null, "usage must be recorded");
+  // The counts are the review call's alone, which is the same call `costUsd`
+  // prices. The post-mortem selection pass before it is two more calls; folding
+  // its tokens in here would describe a different set of calls than the dollars
+  // beside it, so it is deliberately not counted in either field.
+  assert.deepEqual(written.usage, {
+    inputTokens: 11,
+    outputTokens: 22,
+    cacheReadTokens: 33,
+    cacheWriteTokens: 44,
+  });
+});
+
+test("a result's usage and costUsd describe the same call", async () => {
+  // The invariant the previous test's shape depends on. A case whose review
+  // call answered no usage but whose selector did would otherwise carry a token
+  // count with a null cost, which reads as spend that was never priced.
+  const out = tmpDir();
+  const record = makeRecord();
+  const selectorOnly: RunAgentImpl = async (config) =>
+    config.name === "postmortem-selector"
+      ? {
+          agent: config.name,
+          output: '{"ids":[]}',
+          durationMs: 1,
+          usage: { inputTokens: 7, outputTokens: 8, cacheReadTokens: 9, cacheWriteTokens: 10 },
+        }
+      : {
+          agent: config.name,
+          output: JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+          durationMs: 1,
+          costUsd: 0.02,
+          structuredOutput: { status: "complete", findings: [], summary: "s" },
+        };
+  await replayAll([record], { out, workDir: tmpDir(), variant: "v1" }, { concurrency: 1 }, selectorOnly, fakeCheckout);
+  const written = JSON.parse(readFileSync(join(out, record.runId, "run-1.json"), "utf-8")) as Result;
+  assert.equal(written.usage, null, "the review call reported no usage, so there are no counts");
+  assert.equal(written.costUsd, 0.02);
+});
+
+test("a fake that reports no usage writes null rather than omitting the field", async () => {
+  // `undefined` in a result file means "written before S2", so a run this code
+  // made has to say `null`: otherwise a reader cannot tell an old file from a
+  // run the harness told nothing.
+  const out = tmpDir();
+  const record = makeRecord();
+  await replayAll([record], { out, workDir: tmpDir(), variant: "v1" }, { concurrency: 1 }, fakeRunAgent, fakeCheckout);
+  const written = JSON.parse(readFileSync(join(out, record.runId, "run-1.json"), "utf-8")) as Result;
+  assert.equal(written.usage, null);
+  assert.ok("usage" in written, "the key is present, so the file answers the question");
+});
+
 test("replayAll writes one result file per replay and skips the ones that exist", async () => {
   const out = tmpDir();
   const workDir = tmpDir();
@@ -682,7 +768,10 @@ test("loadRunResults still parses a result file written without leads", () => {
     wallTimeMs: 1,
   };
   writeFileSync(join(dir, "c1", "run-1.json"), JSON.stringify(old));
-  assert.equal(loadRunResults(dir).get("c1")?.get(1)?.leads, undefined);
+  const loaded = loadRunResults(dir).get("c1")?.get(1);
+  assert.equal(loaded?.leads, undefined);
+  // A file written before S2 has no `usage` key at all, and must keep loading.
+  assert.equal(loaded?.usage, undefined);
 });
 
 const toolCall = (tool: string) =>
@@ -702,13 +791,19 @@ test("replayToolGuard allows only the reviewer's read-only tools", async () => {
 });
 
 test("replayCase denies Bash even when the reviewer config allows it", async () => {
-  let hooks: HookCallback[] = [];
+  let guards: HookCallback[] = [];
   const capture: RunAgentImpl = async (config, prompt, overrides) => {
-    hooks = overrides.preToolUseHooks ?? [];
-    return fakeRunAgent({ ...config, tools: ["Bash"], allowedTools: ["Bash"] }, prompt, overrides);
+    guards = [...(overrides.toolCallGuards ?? [])];
+    // A config that names Bash is the case the guard has to survive: the tool
+    // list a candidate branch may edit must not be able to widen the replay.
+    return fakeRunAgent(
+      { ...config, tools: toolSet("Bash"), allowedTools: ["Bash"] },
+      prompt,
+      overrides,
+    );
   };
   await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, capture, fakeCheckout);
-  const outs = await Promise.all(hooks.map((h) => h(toolCall("Bash"), undefined, hookOpts)));
+  const outs = await Promise.all(guards.map((g) => g(toolCall("Bash"), undefined, hookOpts)));
   assert.ok(outs.some(isDenied));
 });
 
@@ -861,7 +956,7 @@ const postmortemAgent = (selectorReplies: { output: string; errorSubtype?: strin
   const reviewPrompts: string[] = [];
   const agent: RunAgentImpl = async (config, prompt, overrides) => {
     if (config.name === "postmortem-selector") {
-      assert.deepEqual(config.tools, []);
+      assert.deepEqual(config.tools, {});
       assert.equal(config.model, "claude-sonnet-5-5");
       selectorPrompts.push(prompt);
       return { agent: config.name, durationMs: 1, ...selectorReplies[selectorPrompts.length - 1] };
@@ -897,8 +992,14 @@ test("replayCase shows every post-mortem, whatever the recorded review's date, a
 });
 
 test("replayCase strips PR numbers, GitHub links and commits from the post-mortems it shows", async () => {
-  const [first] = loadPostmortems();
-  assert.match(first.text, /#2977/);
+  // Pick the post-mortem that carries the identifiers rather than the first in
+  // the folder. The assertion needs a file whose text actually has a PR number
+  // and a GitHub link to strip, and which file that is depends on what the
+  // folder holds: #549 added two earlier-dated post-mortems, so the first file
+  // is no longer the read freeze and this failed on `main` without this test's
+  // subject changing at all.
+  const first = loadPostmortems().find((p) => /#2977/.test(p.text));
+  assert.ok(first, "no post-mortem carries a PR number, so there is nothing to strip");
   const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
     { output: `{"ids": ["${first.file}#1"]}` },
     { output: `{"ids": ["${first.file}"]}` },

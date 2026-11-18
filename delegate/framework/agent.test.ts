@@ -1,11 +1,303 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { forceSynchronousTaskHook } from "./agent";
+import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import {
+  claudeOptions,
+  forceSynchronousTaskHook,
+  toTokenUsage,
+  totalTokenUsage,
+} from "./agent";
+import { toolSet } from "./types";
+import type { AgentConfig, McpServerConfig } from "./types";
+import { prReviewerSubagents } from "../agents/pr-reviewer-subagents";
+import prReviewer from "../agents/pr-reviewer";
+import { POSTMORTEM_SELECTOR } from "../review/postmortems";
 
 const preToolUse = (tool_name: string, tool_input: Record<string, unknown>) => ({
   hook_event_name: "PreToolUse",
   tool_name,
   tool_input,
+});
+
+// A value-level marker for functions, so an options object can be compared as
+// data. Two different functions are still two functions here: the point is
+// which slots are occupied, not which closure is in them.
+const mark = (value: unknown): unknown => {
+  if (typeof value === "function") return "[fn]";
+  if (Array.isArray(value)) return value.map(mark);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, mark(v)]),
+    );
+  }
+  return value;
+};
+
+// Claude's own option construction, written out as it stood before S2, with
+// the six SDK-derived fields supplied from the harness side rather than the
+// contract. This is the spec the refactor has to reproduce: `claudeOptions`
+// translates a neutral config into exactly this, so a difference here is a
+// behaviour change wearing a refactor's clothes.
+const sdkOptionsAsTheyWere = (
+  config: {
+    systemPrompt: string;
+    model: string;
+    tools: string[];
+    allowedTools: string[];
+    maxTurns: number;
+    maxBudgetUsd: number;
+    outputFormat?: Options["outputFormat"];
+    agents?: Options["agents"];
+    mcpServers?: Record<string, McpServerConfig>;
+  },
+  overrides: {
+    cwd?: string;
+    env?: Record<string, string | undefined>;
+    resume?: string;
+    abortController?: AbortController;
+    preToolUseHooks?: unknown[];
+    mcpServers?: Record<string, McpServerConfig>;
+  } = {},
+) => ({
+  abortController: overrides.abortController,
+  resume: overrides.resume,
+  systemPrompt: config.systemPrompt,
+  model: config.model,
+  mcpServers:
+    config.mcpServers || overrides.mcpServers
+      ? { ...config.mcpServers, ...overrides.mcpServers }
+      : undefined,
+  env: overrides.env,
+  tools: config.tools,
+  outputFormat: config.outputFormat,
+  agents: config.agents,
+  allowedTools: config.allowedTools,
+  maxTurns: config.maxTurns,
+  maxBudgetUsd: config.maxBudgetUsd,
+  permissionMode: "bypassPermissions" as const,
+  cwd: overrides.cwd,
+  hooks: {
+    PreToolUse: [
+      { hooks: [forceSynchronousTaskHook, ...(overrides.preToolUseHooks ?? [])] },
+    ],
+  },
+  stderr: "[fn]",
+});
+
+// The configs, as the six fields they left behind. `pr-reviewer` is the only
+// agent that sets all of them; the selector and the three subagents are here
+// because they are the ones that pass `tools` most narrowly (an empty list for
+// the selector) and would silently lose that if the translation were wrong.
+const configs = [
+  {
+    label: "pr-reviewer",
+    neutral: prReviewer,
+    sdk: {
+      systemPrompt: prReviewer.systemPrompt,
+      model: prReviewer.model,
+      tools: ["Read", "Grep", "Glob", "Task", "StructuredOutput"],
+      allowedTools: prReviewer.allowedTools!,
+      maxTurns: 80,
+      maxBudgetUsd: 10,
+      outputFormat: { type: "json_schema", schema: prReviewer.output!.schema as Record<string, unknown> },
+      agents: {
+        scout: {
+          description: prReviewerSubagents.scout.description,
+          prompt: prReviewerSubagents.scout.prompt,
+          model: prReviewerSubagents.scout.model,
+          tools: Object.keys(prReviewerSubagents.scout.tools!),
+        },
+        architect: {
+          description: prReviewerSubagents.architect.description,
+          prompt: prReviewerSubagents.architect.prompt,
+          model: prReviewerSubagents.architect.model,
+          tools: Object.keys(prReviewerSubagents.architect.tools!),
+        },
+        "deep-reviewer": {
+          description: prReviewerSubagents["deep-reviewer"].description,
+          prompt: prReviewerSubagents["deep-reviewer"].prompt,
+          model: prReviewerSubagents["deep-reviewer"].model,
+          tools: Object.keys(prReviewerSubagents["deep-reviewer"].tools!),
+        },
+      },
+    },
+  },
+  {
+    label: "postmortem-selector",
+    neutral: POSTMORTEM_SELECTOR,
+    sdk: {
+      systemPrompt: POSTMORTEM_SELECTOR.systemPrompt,
+      model: POSTMORTEM_SELECTOR.model,
+      tools: [],
+      allowedTools: [],
+      maxTurns: 2,
+      maxBudgetUsd: 3,
+    },
+  },
+] satisfies { label: string; neutral: AgentConfig; sdk: Parameters<typeof sdkOptionsAsTheyWere>[0] }[];
+
+describe("claudeOptions", () => {
+  for (const { label, neutral, sdk } of configs) {
+    it(`translates ${label} into exactly the options the SDK was given before`, () => {
+      const overrides = {
+        cwd: "/app/review",
+        env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-ant" },
+      };
+      assert.deepEqual(
+        mark(claudeOptions(neutral, overrides, () => undefined)),
+        mark(sdkOptionsAsTheyWere(sdk, overrides)),
+      );
+    });
+  }
+
+  it("keeps the SDK's defaults for an agent that sets neither cap", () => {
+    const minimal: AgentConfig = { name: "x", systemPrompt: "s", model: "m" };
+    const options = claudeOptions(minimal, {}, () => undefined);
+    assert.equal(options.maxTurns, 50);
+    assert.equal(options.maxBudgetUsd, 5);
+    assert.equal(options.permissionMode, "bypassPermissions");
+    assert.deepEqual(options.allowedTools, [
+      "mcp__*",
+      "Read",
+      "Write",
+      "Edit",
+      "Bash",
+      "Glob",
+      "Grep",
+      "Task",
+      "Skill",
+    ]);
+  });
+
+  it("carries continuation into the harness's own resume field", () => {
+    // The rename is the one place a contract field could be dropped without a
+    // type error, because both sides are an optional string.
+    const options = claudeOptions(
+      { name: "x", systemPrompt: "s", model: "m" },
+      { continuation: "session-abc" },
+      () => undefined,
+    );
+    assert.equal(options.resume, "session-abc");
+  });
+
+  it("defaults the guard list to the synchronous-task hook alone", () => {
+    const options = claudeOptions({ name: "x", systemPrompt: "s", model: "m" }, {}, () => undefined);
+    assert.deepEqual(mark(options.hooks?.PreToolUse), [
+      { hooks: ["[fn]"] },
+    ]);
+  });
+
+  it("puts the caller's guards after the synchronous-task hook, in order", () => {
+    const first = async () => ({ continue: true }) as const;
+    const second = async () => ({ continue: true }) as const;
+    const options = claudeOptions(
+      { name: "x", systemPrompt: "s", model: "m" },
+      { toolCallGuards: [first, second] },
+      () => undefined,
+    );
+    const hooks = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
+    assert.equal(hooks.length, 3);
+    assert.equal(hooks[0], forceSynchronousTaskHook);
+    assert.equal(hooks[1], first);
+    assert.equal(hooks[2], second);
+  });
+
+  it("passes a tool set through as names, in the order it was declared", () => {
+    // Order matters: the reviewer's prompt names its tools in this order, and a
+    // set that came back sorted would be a different prompt.
+    const options = claudeOptions(
+      { name: "x", systemPrompt: "s", model: "m", tools: toolSet("Read", "Grep", "Task") },
+      {},
+      () => undefined,
+    );
+    assert.deepEqual(options.tools, ["Read", "Grep", "Task"]);
+  });
+
+  it("leaves tools undefined rather than empty when the contract sets none", () => {
+    // The distinction is load-bearing: an empty list disables the harness's
+    // built-ins, and `undefined` leaves them alone. Only an agent that asks for
+    // no tools gets `[]`, and it asks with an empty set.
+    const noTools = claudeOptions({ name: "x", systemPrompt: "s", model: "m" }, {}, () => undefined);
+    assert.equal(noTools.tools, undefined);
+    const emptySet = claudeOptions(
+      { name: "x", systemPrompt: "s", model: "m", tools: toolSet() },
+      {},
+      () => undefined,
+    );
+    assert.deepEqual(emptySet.tools, []);
+  });
+});
+
+describe("token usage", () => {
+  it("maps Claude's usage onto the neutral shape without folding the cache into the prompt count", () => {
+    // The mapping S5 depends on: the AI SDK's `inputTokens` is the prompt
+    // total, Claude's is the uncached remainder. Folding them here would make
+    // the two sides incomparable in exactly the way Stage A's token gate exists
+    // to measure.
+    assert.deepEqual(
+      toTokenUsage({
+        input_tokens: 12,
+        output_tokens: 34,
+        cache_read_input_tokens: 560,
+        cache_creation_input_tokens: 78,
+      }),
+      { inputTokens: 12, outputTokens: 34, cacheReadTokens: 560, cacheWriteTokens: 78 },
+    );
+  });
+
+  it("reads nulls as zero, because a null count is a harness answer and not a missing one", () => {
+    assert.deepEqual(
+      toTokenUsage({
+        input_tokens: 1,
+        output_tokens: null,
+        cache_read_input_tokens: null,
+        cache_creation_input_tokens: null,
+      }),
+      { inputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    );
+  });
+
+  it("is undefined when the harness reported no usage at all", () => {
+    assert.equal(toTokenUsage(undefined), undefined);
+  });
+
+  it("sums modelUsage when it is present, because usage excludes subagents", () => {
+    // `usage` on a result message is the main loop only. The subagents are the
+    // expensive half of a review, so the recorded total has to come from
+    // modelUsage when the harness supplies it.
+    assert.deepEqual(
+      totalTokenUsage({
+        usage: { input_tokens: 1, output_tokens: 2 },
+        modelUsage: {
+          "claude-opus-5-5": {
+            inputTokens: 100,
+            outputTokens: 200,
+            cacheReadInputTokens: 1000,
+            cacheCreationInputTokens: 2000,
+          },
+          "claude-sonnet-5-5": {
+            inputTokens: 10,
+            outputTokens: 20,
+            cacheReadInputTokens: 100,
+            cacheCreationInputTokens: 200,
+          },
+        },
+      }),
+      {
+        inputTokens: 110,
+        outputTokens: 220,
+        cacheReadTokens: 1100,
+        cacheWriteTokens: 2200,
+      },
+    );
+  });
+
+  it("falls back to usage when modelUsage is empty", () => {
+    assert.deepEqual(
+      totalTokenUsage({ usage: { input_tokens: 7, output_tokens: 9 }, modelUsage: {} }),
+      { inputTokens: 7, outputTokens: 9, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    );
+  });
 });
 
 describe("forceSynchronousTaskHook", () => {
