@@ -389,18 +389,37 @@ written about Bifrost's task role in the workbench account, and what the reviewe
 is a separate decision that S7 has to state. That is the one thing about Stage 2 this document cannot
 settle from the files, and it is flagged here rather than discovered in the implementation PR.
 
-**Stage 2's credential does almost all the IAM work by itself, and the residual is why S7 exists.**
-`deploy/bedrock-invoke-principals.test.ts` pins that invoke actions appear as an `Allow` in exactly
-one policy in the repo — Bifrost's task role — and as a `Deny` in exactly one, `WorkbenchAccess`. A
-bearer token (`AWS_BEARER_TOKEN_BEDROCK`, which `@ai-sdk/amazon-bedrock` reads natively) adds no
-policy line at all: it is one more key in `agentEnv`'s allowlist, so the invariant is untouched and
-the task role gains nothing. That is the whole reason this route is acceptable where a SigV4 grant was
-not, and it is why the bearer token is the only shape S7 declares. What it does not do is make the
-reviewer's own account able to invoke anything, which is the open question above.
+**Stage 2's credential keeps the grant off the task role, and that is the whole claim — a bearer token
+is not a way to avoid having an IAM principal.** AWS is explicit that a Bedrock API key belongs to one:
+a short-term key "inherits permissions from the IAM principal used to generate it", and a long-term key
+"creates an IAM user with attached policies". So the invoke grant still exists and still has to be
+scoped; what changes is *which* principal holds it. The task role — the identity of the container that
+parses untrusted PR content — keeps nothing, and a separate principal holds exactly the two profiles
+this reviewer needs. That separation is the security property, and it is why a dedicated principal is
+better here than a SigV4 grant on the role rather than merely different.
+
+**Two things follow that the earlier draft of this section got wrong.** First, the token cannot be
+described as adding no policy: it adds a principal and a policy, managed in IaC, scoped to
+`global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` plus their
+foundation-model ARNs — the same shape `bedrockInvokeResources` (`utils/bedrock-models.ts`) already
+composes for Bifrost's role. `deploy/bedrock-invoke-principals.test.ts` pins the interesting property — that invoke
+is `Allow`ed in exactly one policy in the repo, and that the files mentioning the invoke family are an
+explicit reviewed list — so the new principal is added to that list **deliberately** and the test is
+extended to assert its policy is scoped, rather than staying green because it never looks at a
+credential somebody made by hand in the console.
+
+Second, **the key is long-term or it is not a static secret at all.** A short-term key expires within
+12 hours and only works in the region that minted it, and the worker reads `DELEGATES` at task start
+with no refresh path, so the only key that fits `agentEnv`'s allowlist is a long-term one — the type
+AWS recommends "only for exploration". That does not sink the route, but it removes the easy version
+of it: a long-term key is a standing credential with no expiry to lean on, so its scope is the only
+thing containing it. S7 therefore scopes the principal to the two profiles and nothing else, and the
+scoping is a reviewed IaC change rather than a console setting.
 
 S5 shapes `agentEnv` for a non-role credential precisely so S7 can declare this one, and S7 declares
 it **additively** while `ANTHROPIC_API_KEY` stays, on the same rule as the Fireworks key. SigV4 and
-the instance credential chain remain out: either puts the grant back on the role.
+the instance credential chain remain out, and for a sharper reason than before: they would put the
+grant back on the task role, which is the one identity in this system that must not have it.
 
 **Model ids and region become explicit, and structured output stops being transparent.** Ids move from
 `claude-sonnet-5-5` to `global.anthropic.claude-sonnet-5-5`, and the provider takes a region where the
@@ -496,7 +515,7 @@ until S11 restores it.
 | **S4** | — | **Take the merge authority away: flip to `shadow`.** One line in `deploy/components/worker.ts` (`DELEGATE_GATING_MODE`), which is a **human-owned carve-out** in `.github/CODEOWNERS`, so this is a human-approved infra PR the bot cannot approve for itself. It merges **before S5 does**. Under `shadow` nothing is ever approved — `verdict` is `approve` only when `gating.mode === "enforce"` (`gates.ts:150-152`) — and the status line reports what the gate *would* have done, so the canary's numbers come from the deployed task rather than from a side run. | revert (flip back to `enforce`) | `pulumi preview` shows only the env value changing; one review from the deployed task carries a `Shadow: would approve` or `Shadow: would comment (…)` status and **no** approval verdict. |
 | **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. **`delegate/pricing/models.json` lands here with the Anthropic rows**, because the spend cap this step ships cannot fire against an empty table. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model. **`costRatio` is gated on token counts, not dollars** — see the gate below — since only this side is table-priced. Deployed under `shadow`, so S4's canary window opens here. |
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
-| **S7** | **2. The route** | **Declare the Bedrock credential, additively.** The bearer token's value goes into the live `DELEGATES` secret out of band first; then `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**, and that deploys. **No IAM change and no `worker.ts` change**: a bearer token is a key, not a grant, so `deploy/bedrock-invoke-principals.test.ts`'s file list is untouched — that is the whole reason this route is acceptable. It also **states, in the PR body, which account the reviewer's task runs in and which inference profiles this token may invoke** — the one thing this document cannot settle from the repo, because `utils/bedrock-models.ts` and `bedrock-invoke-principals.test.ts` describe the workbench account and Bifrost's task role, not the reviewer's. No agent code changes, so the running reviewer is untouched. Human-owned carve-out, its own PR. | yes | `deploy.yml` reaches `./deploy.sh`; `pulumi preview` shows exactly one added entry in the task's `secrets` and nothing else; `check-secret-keys.ts` passes with both keys declared; `bedrock-invoke-principals.test.ts` still passes unchanged; the PR body names the account and the profiles; a real review still posts, still on Anthropic direct. |
+| **S7** | **2. The route** | **Create the Bedrock principal and declare its key, additively.** The step does four things, because a bearer token is a credential for an IAM principal and that principal has to be built: (1) a **dedicated IAM user and its policy in Pulumi** (`aws.iam.User`, `aws.iam.UserPolicy`, available in the pinned provider), scoped to the two profiles this reviewer uses — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` — and to their foundation-model ARNs, composed with `bedrockInvokeResources` (`utils/bedrock-models.ts`) so the scoping is one function and not a hand-typed ARN list; (2) `deploy/bedrock-invoke-principals.test.ts` **extended to name that principal deliberately**, so the file list grows by exactly one reviewed entry instead of the test staying green by never looking at a console-made key; (3) the key itself minted as a **long-term** Bedrock API key, since a short-term one expires within 12 hours and the worker has no refresh path, with the value put into the live `DELEGATES` secret out of band first; (4) `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**. **No `worker.ts` change** — the token reaches the child through `agentEnv`'s allowlist, not the task role, so the task role still holds no invoke grant. It also **states, in the PR body, which account the reviewer's task runs in and which profiles the principal may invoke**, the one thing this document cannot settle from the repo. Human-owned carve-out, its own PR. | yes | `pulumi preview` shows the new user, its policy and the one added entry in the task's `secrets`, and nothing else — explicitly **no** change to the task role's inline policy; `bedrock-invoke-principals.test.ts` passes **with the new principal named in it**; the policy's resource list is the two profiles and their foundation-model ARNs, asserted in Pulumi preview output; `check-secret-keys.ts` passes with both keys declared; the PR body names the account and the profiles; a real review still posts, still on Anthropic direct. |
 | **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. **`delegate/pricing/models.json` gains the Bedrock rows here**, so the stage's nonzero `costUsd` gate has a rate to compute from. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. |
 | **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. **`delegate/pricing/models.json` gains the Fireworks row here**, the last provider it needs. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
 | **S10** | 3 | **The model move, to Fireworks.** Point the orchestrator and the subagents at the Fireworks provider and its model. Code only — the key it needs was declared and deployed in S9, and both earlier keys are still declared, so the rollback actually works. | yes (flip back to the Bedrock provider, with no deploy-ordering problem) | `npm run build` and `npm test`; **Stage C** of the gate below; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
@@ -741,12 +760,13 @@ the step that depends on them**, none of them asserted anywhere above:
    something the docs exercise, and provider-specific content parts (thinking signatures, cache
    markers, Anthropic's `container`) are where it would break. This is after Stage C, since mixing is
    configured only once the three stages are done.
-2. **Whether the reviewer's own account may invoke Bedrock models.** `utils/bedrock-models.ts`
-   answers this for the workbench account, and `deploy/bedrock-invoke-principals.test.ts` pins that
-   Bifrost's task role is the only principal in the repo with an `Allow`. The delegate worker is a
-   different account running a different workload, and neither the model list nor its residency
-   reasoning transfers automatically. S7 has to state which account and which profiles, and the bearer
-   token makes that a configuration question rather than an IAM one.
+2. **Which account the reviewer's Bedrock principal lives in, and what its residency decision is.**
+   `utils/bedrock-models.ts` answers both for the workbench account, and
+   `deploy/bedrock-invoke-principals.test.ts` pins that Bifrost's task role is the only principal in
+   the repo with an `Allow`. The delegate worker is a different account running a different workload,
+   so neither the model list nor its "carries no product or voter data" reasoning transfers. S7 states
+   the account and the profiles and creates the principal, but *which* account is a decision this
+   document cannot make from the repo, and it is the last thing S7 needs from a human.
 3. **That `Output.object` against `ReviewOutputSchema` works on Bedrock's JSON-tool path and on
    Fireworks.** Bedrock's own documentation warns native structured output can be unreliable across
    workloads and accounts and defaults to `auto`, which falls back to a JSON tool; Fireworks' own
