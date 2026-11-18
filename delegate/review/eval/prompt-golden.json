@@ -1,0 +1,181 @@
+{
+  "_comment": [
+    "Pinned prompt hashes for delegate/review/eval/prompt-golden.test.ts.",
+    "",
+    "These were computed from the code as it stood before S2 changed runAgent's",
+    "contract, so a diff in them means a prompt changed. That is the point: it is",
+    "what makes \"behaviour-identical\" checkable rather than claimed.",
+    "",
+    "Regenerate with UPDATE_GOLDEN=1 npx tsx --test delegate/review/eval/prompt-golden.test.ts,",
+    "then READ THE DIFF. A hash moving is a prompt moving, and a prompt moving",
+    "changes what the reviewer is asked. Regenerating without reading it turns this",
+    "file into a rubber stamp."
+  ],
+  "cases": {
+    "gp-data-platform-1162-zip-leading-zeros": {
+      "review": "d0fb27c99f432dda",
+      "chars": 23826,
+      "selector": "0e95505d2dec2a04"
+    },
+    "gp-data-platform-1181-one-carried-one-new": {
+      "review": "ab56a47d86a49717",
+      "chars": 90743,
+      "selector": "321ce7e32c23bcfe"
+    },
+    "gp-data-platform-1184-off-list-is-false": {
+      "review": "4ccf7a37ec9054e3",
+      "chars": 50071,
+      "selector": "fb7564a00fddb326"
+    },
+    "gp-data-platform-1285-overlapping-age-bands": {
+      "review": "f938b4ca41deb5bf",
+      "chars": 56641,
+      "selector": "24a4743bdb03a009"
+    },
+    "gp-marketing-418-takedown-bypass": {
+      "review": "8f059c88de4f473e",
+      "chars": 22886,
+      "selector": "a0744a18fe8d4fdf"
+    },
+    "gp-marketing-424-metadata-raw-name": {
+      "review": "fca376e1e4be0009",
+      "chars": 32781,
+      "selector": "f136524b5b93c86b"
+    },
+    "gp-marketing-443-four-priors-all-fixed": {
+      "review": "79448f87889d6249",
+      "chars": 45802,
+      "selector": "7427deba1d2aa701"
+    },
+    "omni-2453-proposal-key-race": {
+      "review": "fdcdc24f30d48c08",
+      "chars": 11244,
+      "selector": "b6bd118c00b0953d"
+    },
+    "omni-2461-fenced-json": {
+      "review": "78afc0b472ee3e7f",
+      "chars": 44075,
+      "selector": "868faecfbf491689"
+    },
+    "omni-2461-prose-checking-prior": {
+      "review": "d46e90fa088f989f",
+      "chars": 44557,
+      "selector": "07968e276c16f807"
+    },
+    "omni-2474-dependabot-major-bump": {
+      "review": "20cb0ad7a964620a",
+      "chars": 38319,
+      "selector": "f0648bdf23e7e5e9"
+    },
+    "omni-2506-greeting-without-name": {
+      "review": "7d20854d9cf4d0b9",
+      "chars": 29463,
+      "selector": "4cf0ec77de3a19d6"
+    },
+    "omni-2522-two-priors-fixed": {
+      "review": "b372e49dbdaf3004",
+      "chars": 10869,
+      "selector": "8a3e273dd5bb74e2"
+    },
+    "omni-2581-three-priors-oversized-diff": {
+      "review": "5cfe7b170f1d870d",
+      "chars": 21222,
+      "selector": "2edd839a793bdac4"
+    },
+    "omni-2589-draft-backstop-asymmetry": {
+      "review": "2ced4c830bf23aeb",
+      "chars": 27808,
+      "selector": "199c2715bc74eb1a"
+    },
+    "omni-2655-last-attempt-strands-purchase": {
+      "review": "78dfd58fd97ec49d",
+      "chars": 7446,
+      "selector": "928eafffeb2774f4"
+    },
+    "omni-2655-one-fixed-one-open": {
+      "review": "d2858a7ed66dd07a",
+      "chars": 17608,
+      "selector": "bc505fa836bf7b03"
+    },
+    "omni-2671-ecr-public-login": {
+      "review": "c458f346a8db3db4",
+      "chars": 15775,
+      "selector": "14e70118f5f856f3"
+    },
+    "omni-2679-starlette-background-task": {
+      "review": "e64aabedacdfa028",
+      "chars": 57622,
+      "selector": "bd99d6a774cd0d2f"
+    },
+    "omni-2701-docs-addition": {
+      "review": "8c7aa8c20ac434cb",
+      "chars": 5407,
+      "selector": "f0c6f3a675eb31ff"
+    },
+    "omni-2709-double-counted-respondents": {
+      "review": "c3516d37c6113473",
+      "chars": 11492,
+      "selector": "5ced9cd3dee1c983"
+    },
+    "omni-2824-cancel-without-claim": {
+      "review": "725d9fa964eb43aa",
+      "chars": 5866,
+      "selector": "95aafc1b09659d32"
+    },
+    "omni-2830-cutoff-general-only": {
+      "review": "db2ecc797620d96f",
+      "chars": 18360,
+      "selector": "3d90351b761c704c"
+    },
+    "omni-3154-reconcile-window-misses-stale": {
+      "review": "7e55a179c2521897",
+      "chars": 10264,
+      "selector": "14cfbf23aca49e1c"
+    },
+    "omni-3276-self-set-internal-email": {
+      "review": "0730cc13127dbc80",
+      "chars": 12814,
+      "selector": "9cdb471e299b82ec"
+    },
+    "ops-244-prose-instead-of-json": {
+      "review": "20cbee873dbd130a",
+      "chars": 66070,
+      "selector": "1c6315e0f3e19b6b"
+    },
+    "ops-255-workflow-shell-injection": {
+      "review": "07193008d62269cf",
+      "chars": 45849,
+      "selector": "ddbfc6072dd9e473"
+    },
+    "ops-271-re-raised-without-link": {
+      "review": "c6765f6db188895c",
+      "chars": 57546,
+      "selector": "11ff82e8e0056ca7"
+    },
+    "ops-302-mangled-prior-id": {
+      "review": "58eef166336e1ac3",
+      "chars": 13450,
+      "selector": "c016cdcc35642339"
+    },
+    "ops-302-two-priors-still-open": {
+      "review": "c2d5d6fb3bd401fc",
+      "chars": 13450,
+      "selector": "cfe3c744246e3b93"
+    },
+    "ops-343-rolling-deploy-two-gateways": {
+      "review": "69138955251005be",
+      "chars": 67853,
+      "selector": "426229bd82669eb0"
+    },
+    "ops-377-config-arn-never-redeploys": {
+      "review": "c9f959447532027b",
+      "chars": 69613,
+      "selector": "626ca48f1a1b144e"
+    },
+    "ops-379-alb-kills-slow-boot": {
+      "review": "87f0cce3329452dd",
+      "chars": 14987,
+      "selector": "9b6f33aa49b8ade1"
+    }
+  }
+}
