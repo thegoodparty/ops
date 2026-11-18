@@ -53,15 +53,18 @@ shape.
 
 | Failure | Caught by | When |
 |---|---|---|
-| A served name the datasheet cannot price | `.github/workflows/bifrost-pricing-coverage.yml`, via `deploy-workbench/scripts/check-pricing-coverage.ts` | daily, and on dispatch |
-| Catalog lag on the deploy that adds a model | `convergeConfig` in `bifrost/config-convergence-core.ts`: a pricing re-sync after a `models` write | at that deploy, before the model is used |
-
-The check also runs on a push that changes `config.json`, not only nightly. A
-model added at 00:53 and priced by the datasheet at 01:30 sits between two nightly
-runs that are both green, because nothing is unpriced at either moment of
-checking. Running on the serve list's own change puts a check at the one moment a
-new name is known to exist.
+| A served name the datasheet cannot price | `.github/workflows/bifrost-pricing-coverage.yml`, via `deploy-workbench/scripts/check-pricing-coverage.ts` | daily, on dispatch, and on a push that changes the serve list |
 | A name whose shape can never resolve | `config.test.ts`'s alias rules | at review, on every change to the file |
+
+The check runs on a push that changes `config.json`, not only nightly, because
+nightly alone has a gap: a model added at 00:53 and priced by the datasheet at
+01:30 sits between two nightly runs that are both green, since nothing is unpriced
+at either moment of checking. Running on the serve list's own change puts a check
+at the one moment a new name is known to exist.
+
+Catalog lag is therefore **reported**, not prevented. Nothing in this repo can
+make the gateway price a model the datasheet has no row for: the only price source
+is that document. The check's job is that the window is known rather than silent.
 
 The check reads the committed `config.json` and the public datasheet, and nothing
 else: no AWS role, no OIDC token, no repository secret, one permission
@@ -75,22 +78,25 @@ A datasheet that cannot be fetched is a third outcome and files nothing. "We cou
 not check" has a different owner than "a model is unpriced", and a check that
 confused them would teach people to close the issue unread.
 
-## The limit of the deploy-side re-sync, stated plainly
+## Why the deploy does not force a sync
 
+The gateway exposes `POST /api/pricing/force-sync`, and a deploy is the one moment
+a new model is known to exist, so forcing a sync there looks like the obvious way
+to close the window. It is not done, and the reason is in the source:
 `ForceReloadPricing` re-reads the datasheet **and resets the sync timer**
-(`framework/modelcatalog/main.go:417`), and `SyncFromURL` does not advance the
+(`framework/modelcatalog/main.go:417`), while `SyncFromURL` never advances the
 "last synced" mark the ticker gates on. So a forced sync that finds nothing
 because the feed has not caught up yet defers the next natural sync by a full
-interval. In exactly the incident this is meant to help with — a model added
-before the feed carries its row — the re-sync can therefore lengthen the zero-cost
-window rather than shorten it.
+interval.
 
-It is kept because the other case is the common one and it is not affected: when
-the feed already carries the row, the re-sync prices the model in seconds instead
-of up to a day. When it does not, the nightly or on-change check names the model
-and a person can decide, and the timer resets itself on the next run. Removing the
-re-sync entirely would be the simpler answer if the timer reset is judged worse
-than the lag it saves; that is a reviewer's call, not a detail.
+That is exactly backwards in the case it would be added for. When the datasheet
+already carries the row the two cases look the same from outside — we cannot tell
+which one a deploy is in — and when it does not, the force turns a window of hours
+into one of about a day. A version that forced only when the datasheet already
+prices the new name would have to read the public datasheet from the deploy, which
+is a new network path on a credentialed job, and the gain over the nightly check
+does not pay for it. So it is left out, and recorded here so the next person does
+not add it back without reading `main.go:417`.
 
 ## What we deliberately do not do
 
@@ -113,16 +119,18 @@ two genuinely new models a month) does not justify one.
 
 ## The warehouse side
 
-`bifrost_request_log` lands in the warehouse with the gateway's own `cost`, and
-the cost model carries an `unpriced_request_count` per model per day: rows that
-produced tokens and were recorded at a cost of zero. That is the durable record of
-a window like this one, and it is the number to look at when asking how much of a
-period was affected. The check in this repo is the alert; the warehouse column is
-the history.
+`bifrost_request_log` lands in the warehouse with the gateway's own `cost`, so a
+zero-cost window is measurable after the fact even though nothing alerted at the
+time. The cost model in gp-data-platform #1397 carries an `unpriced_request_count`
+column per model per day, which is the durable record of a window like this one;
+**#1397 has not merged**, so until it does the record is a query over the export's
+own cost column. The check in this repo is the alert that sits in front of it; the
+warehouse is the history.
 
 ## Adding a model
 
-Serve the catalog-named id with an alias rather than the wire id, add it to
-`utils/bedrock-models.ts` if it is a Bedrock profile, and let the deploy's
-re-sync run. The nightly check will name it if the datasheet has not caught up,
-and that issue closes itself on the first night it has.
+Serve the catalog-named id with an alias rather than the wire id, and add it to
+`utils/bedrock-models.ts` if it is a Bedrock profile. If the datasheet does not
+carry the model yet, the check names it as soon as it runs after the change, and
+the issue closes itself on the first run after the feed catches up. Requests
+served in that window bill at zero, and the warehouse is where to look afterwards.

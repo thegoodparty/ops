@@ -425,17 +425,6 @@ const logConfig = (deps: JanitorDeps, result: ConfigConvergenceResult): void => 
       reason: entry.reason,
     });
   }
-  // The pricing re-sync, when a model list moved. `not-needed` is the steady
-  // state and stays silent; `failed` is worth a line even though it does not fail
-  // the run, because it is the one outcome the nightly coverage check will report
-  // on later and a reader should be able to connect the two.
-  if (result.pricingSync !== "not-needed") {
-    deps.log({
-      event: "bifrost-config-reconciler",
-      outcome: result.pricingSync === "ran" ? "pricing-resynced" : "pricing-resync-failed",
-      pricingSync: result.pricingSync,
-    });
-  }
 };
 
 /** A run's revocation summary and its per-key lines. */
@@ -657,16 +646,6 @@ export const createJanitorGateway = (args: {
 };
 
 /**
- * The client-side cap on the pricing re-sync, in milliseconds.
- *
- * 30s: far longer than the datasheet's normal fetch, far shorter than the 120s
- * `VK_JANITOR_TIMEOUT_SECONDS` this run has to fit inside. See
- * `forcePricingSync` for why aborting is safe — it leaves the gateway on the
- * table it already had, because the fetch derives from the request context.
- */
-const PRICING_SYNC_TIMEOUT_MS = 30_000;
-
-/**
  * The config half's client, over the same `fetch` and the same setup-token
  * header as `createJanitorGateway`, on the routes config convergence uses.
  *
@@ -691,10 +670,9 @@ export const createConfigGateway = (args: {
   const base = args.baseUrl.replace(/\/+$/, "");
 
   const call = async (
-    method: "GET" | "PUT" | "POST",
+    method: "GET" | "PUT",
     path: string,
     body?: Record<string, unknown>,
-    timeoutMs?: number,
   ): Promise<{ status: number; json: unknown }> => {
     const response = await fetch(`${base}${path}`, {
       method,
@@ -703,7 +681,6 @@ export const createConfigGateway = (args: {
         ...(body ? { "content-type": "application/json" } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
-      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
     });
     const text = await response.text();
     let parsed: unknown;
@@ -775,28 +752,6 @@ export const createConfigGateway = (args: {
         `/api/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(keyId)}`,
         body,
       );
-      if (status !== 200) throw new GatewayFailure(status);
-    },
-
-    /**
-     * `POST /api/pricing/force-sync` (`handlers/config.go:133`), the route that
-     * calls `ForceReloadPricing` (`framework/modelcatalog/main.go:376`).
-     *
-     * **Bounded at 30s, and the bound cancels the work.** The handler passes the
-     * request context into the reload (`handlers/config.go:1297`) and the
-     * datasheet fetch underneath derives from it (`sync.go:54`, with
-     * `DefaultPricingTimeout` of 60s over the fetch and its retries), so an abort
-     * here does not merely stop waiting: the gateway keeps the pricing table it
-     * already had. That is the right failure. It is also why the cap is well above
-     * the document's normal fetch time and well below the janitor's own 120s
-     * budget (`vk-janitor-contract.ts`), so this call cannot be what makes a run
-     * overrun the interval it has to stay inside.
-     *
-     * A non-200 throws, and `requestPricingSync` turns that into a reported
-     * `failed` rather than a failed convergence.
-     */
-    forcePricingSync: async () => {
-      const { status } = await call("POST", "/api/pricing/force-sync", undefined, PRICING_SYNC_TIMEOUT_MS);
       if (status !== 200) throw new GatewayFailure(status);
     },
   };
