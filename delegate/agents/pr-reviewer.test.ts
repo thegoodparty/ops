@@ -30,11 +30,18 @@ const baseBundle: Bundle = {
 
 describe("buildReviewPrompt", () => {
   it("names the repo and both shas but not the PR number", () => {
-    const prompt = buildReviewPrompt(baseBundle);
+    // A fixed boundary, because the assertion below is about what the prompt
+    // says and not about the tag token. The default boundary is 24 random hex
+    // characters, and "42" is a substring of one in about 1 run in 12, which
+    // made this test fail for a reason that had nothing to do with the PR
+    // number. The boundary itself is covered by the escaping suite below.
+    const prompt = buildReviewPrompt(baseBundle, { boundary: "tok" });
     assert.ok(prompt.includes("<repo>thegoodparty/gp-api</repo>"));
     assert.ok(prompt.includes("<base_sha>aabbcc</base_sha>"));
     assert.ok(prompt.includes("<head_sha>ddeeff</head_sha>"));
-    assert.doesNotMatch(prompt, /pr_number|42/);
+    // \b42\b, not 42: the point is that the number is not in the prompt, and a
+    // bare "42" also matches the digits inside a hex tag or a line number.
+    assert.doesNotMatch(prompt, /pr_number|\b42\b/);
     assert.doesNotMatch(prReviewer.systemPrompt, /pr_number/);
   });
 
