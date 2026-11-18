@@ -4,6 +4,8 @@ import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import { getAgent, runAgent } from "../framework";
+import { addUsage } from "../framework/types";
+import type { TokenUsage } from "../framework/types";
 import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
 import { POSTMORTEM_SELECTOR, selectPostmortems } from "./postmortems";
 import { promptDiff } from "./prompt-diff";
@@ -570,7 +572,12 @@ export const runReview = async (args: {
 
   const finish = (
     partial: Pick<ReviewRecord, "output" | "verdict" | "action" | "gates" | "findings"> &
-      Partial<Pick<ReviewRecord, "reviewId" | "tipMovedTo" | "error" | "costUsd" | "model" | "droppedFindings">>,
+      Partial<
+        Pick<
+          ReviewRecord,
+          "reviewId" | "tipMovedTo" | "error" | "costUsd" | "model" | "droppedFindings" | "usage"
+        >
+      >,
   ): ReviewRecord => {
     const finishedAt = new Date();
     return {
@@ -586,6 +593,7 @@ export const runReview = async (args: {
       finishedAt: finishedAt.toISOString(),
       wallTimeMs: finishedAt.getTime() - startedAt.getTime(),
       costUsd: partial.costUsd ?? null,
+      usage: partial.usage ?? null,
       bundle,
       output: partial.output,
       verdict: partial.verdict,
@@ -602,7 +610,10 @@ export const runReview = async (args: {
     };
   };
 
-  const fail = async (reason: string, extra: { output?: ReviewOutput | null; costUsd?: number }) => {
+  const fail = async (
+    reason: string,
+    extra: { output?: ReviewOutput | null; costUsd?: number; usage?: TokenUsage },
+  ) => {
     console.error(`review failed: ${reason}`);
     await github
       .postReview(repo, prNumber, {
@@ -627,6 +638,7 @@ export const runReview = async (args: {
       findings: [],
       error: reason,
       costUsd: extra.costUsd,
+      usage: extra.usage,
     });
     await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
     emit("review_failed", {
@@ -636,6 +648,8 @@ export const runReview = async (args: {
       run_id: runId,
       reason,
       cost_usd: extra.costUsd ?? null,
+      input_tokens: extra.usage?.inputTokens ?? null,
+      output_tokens: extra.usage?.outputTokens ?? null,
     });
     return record;
   };
@@ -669,7 +683,7 @@ export const runReview = async (args: {
       abortController: args.abortController,
       mcpServers: { git: createGitTool(reviewDir) },
       env: agentEnv(),
-      preToolUseHooks: [pathGuardHook(reviewDir)],
+      toolCallGuards: [pathGuardHook(reviewDir)],
     });
   } catch (err) {
     return fail(`agent crashed: ${err instanceof Error ? err.message : String(err)}`, {});
@@ -678,11 +692,13 @@ export const runReview = async (args: {
   if (result.errorSubtype) {
     return fail(`agent error (${result.errorSubtype}): ${result.output.slice(0, 300)}`, {
       costUsd: result.costUsd,
+      usage: result.usage,
     });
   }
 
   let parsed = parseReviewOutput(result);
   let costUsd = result.costUsd;
+  let usage = result.usage;
 
   // One bounded repair turn. A schema failure must not throw away a review
   // that was otherwise complete: resume the session with the specific
@@ -702,11 +718,12 @@ export const runReview = async (args: {
           abortController: args.abortController,
           mcpServers: { git: createGitTool(reviewDir) },
           env: agentEnv(),
-          preToolUseHooks: [pathGuardHook(reviewDir)],
-          resume: result.sessionId,
+          toolCallGuards: [pathGuardHook(reviewDir)],
+          continuation: result.sessionId,
         },
       );
       costUsd = (costUsd ?? 0) + (repair.costUsd ?? 0);
+      usage = addUsage(usage, repair.usage);
       if (repair.errorSubtype) {
         console.error(
           `repair pass errored (${repair.errorSubtype}): ${repair.output.slice(0, 300)}`,
@@ -728,11 +745,11 @@ export const runReview = async (args: {
   }
 
   if ("error" in parsed) {
-    return fail(parsed.error, { costUsd });
+    return fail(parsed.error, { costUsd, usage });
   }
   const output = parsed.output;
   if (output.status === "failed") {
-    return fail(output.reason, { output, costUsd });
+    return fail(output.reason, { output, costUsd, usage });
   }
 
   // Placement comes before the decision so a gated run can record the findings
@@ -845,6 +862,7 @@ export const runReview = async (args: {
       droppedFindings: dropped,
       tipMovedTo: liveBeforePost,
       costUsd,
+      usage,
     });
     await store.putRecord(record).catch((err: unknown) => console.error("putRecord failed:", err));
     emit("review_skipped", {
@@ -855,6 +873,8 @@ export const runReview = async (args: {
       reason: "superseded",
       tip: liveBeforePost,
       cost_usd: costUsd ?? null,
+      input_tokens: usage?.inputTokens ?? null,
+      output_tokens: usage?.outputTokens ?? null,
     });
     return record;
   }
@@ -881,7 +901,7 @@ export const runReview = async (args: {
   } catch (err) {
     return fail(
       `posting the review failed: ${err instanceof Error ? err.message : String(err)}`,
-      { output, costUsd },
+      { output, costUsd, usage },
     );
   }
 
@@ -995,6 +1015,7 @@ export const runReview = async (args: {
     reviewId: posted.reviewId,
     tipMovedTo,
     costUsd,
+    usage,
   });
 
   await github
@@ -1023,6 +1044,14 @@ export const runReview = async (args: {
     findings_dropped: dropped.length,
     tip_moved: Boolean(tipMovedTo),
     cost_usd: costUsd ?? null,
+    // Counts, beside the dollar total, so a baseline side records what it spent
+    // and not only what it was charged. `costUsd` is the harness's own estimate
+    // in S2 and will be the price table's in S5; the counts are the neutral
+    // quantity a later stage gates on.
+    input_tokens: usage?.inputTokens ?? null,
+    output_tokens: usage?.outputTokens ?? null,
+    cache_read_tokens: usage?.cacheReadTokens ?? null,
+    cache_write_tokens: usage?.cacheWriteTokens ?? null,
     wall_time_ms: record.wallTimeMs,
     ...(decision.gating !== undefined
       ? {

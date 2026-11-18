@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { toolSet } from "../framework";
 import type { AgentConfig } from "../framework";
 import type { Bundle } from "./schema";
 
@@ -28,7 +29,8 @@ export const POSTMORTEM_SELECTOR: AgentConfig = {
   name: "postmortem-selector",
   systemPrompt: "You choose which past post-mortems a code reviewer reads. Answer with only the JSON object you are asked for.",
   model: "claude-sonnet-5-5",
-  tools: [],
+  // No tools at all: it reads the lessons in its prompt and answers with JSON.
+  tools: toolSet(),
   allowedTools: [],
   maxTurns: 2,
   maxBudgetUsd: 3,

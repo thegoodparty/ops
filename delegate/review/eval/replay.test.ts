@@ -8,6 +8,7 @@ import { replayCase, replayAll, replayToolGuard, resultFromRecord, loadRunResult
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type { Result, RunAgentImpl, CheckoutFn } from "./replay";
 import type { Bundle, ReviewRecord } from "../schema";
+import { toolSet } from "../../framework";
 import type { SubagentCall } from "../../framework/types";
 import { loadPostmortems } from "../postmortems";
 
@@ -63,6 +64,21 @@ const fakeRunAgent: RunAgentImpl = async (_config, _prompt, _overrides) => ({
   costUsd: 0.01,
   structuredOutput: { status: "complete", findings: [], summary: "ok from fake" },
 });
+
+// A fake whose spend is knowable, so the usage assertions below can tell the
+// two calls apart from a constant.
+const spendingAgent =
+  (usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }): RunAgentImpl =>
+  async (config, prompt) => ({
+    agent: config.name,
+    output: config.name === "postmortem-selector" ? '{"ids":[]}' : JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+    durationMs: 1,
+    costUsd: 0.01,
+    usage,
+    ...(config.name === "postmortem-selector"
+      ? {}
+      : { structuredOutput: { status: "complete", findings: [], summary: "s" } }),
+  });
 
 // A simulated PR in a gated repo, carrying the plan the model is judged
 // against. The bundle shape is what step 1 put on the two plan cases.
@@ -382,6 +398,47 @@ test("replayAll writes result JSON files for each replayed case", async () => {
   assert.equal(written.caseId, record.runId);
 });
 
+// The plan's gate for S2 is a replay result file carrying non-null `usage`
+// beside `costUsd`. This is that assertion, over the file rather than the
+// value in memory, because the file is what a baseline side is assembled from.
+test("a written result file carries usage beside costUsd", async () => {
+  const out = tmpDir();
+  const record = makeRecord();
+  await replayAll(
+    [record],
+    { out, workDir: tmpDir(), variant: "v1" },
+    { concurrency: 1 },
+    spendingAgent({ inputTokens: 11, outputTokens: 22, cacheReadTokens: 33, cacheWriteTokens: 44 }),
+    fakeCheckout,
+  );
+
+  const written = JSON.parse(
+    readFileSync(join(out, record.runId, "run-1.json"), "utf-8"),
+  ) as Result;
+  assert.notEqual(written.costUsd, null, "costUsd must be recorded");
+  assert.notEqual(written.usage, null, "usage must be recorded");
+  // The post-mortem selection call spends too, and it is part of what this case
+  // cost. Two calls at the same counts is the whole spend.
+  assert.deepEqual(written.usage, {
+    inputTokens: 22,
+    outputTokens: 44,
+    cacheReadTokens: 66,
+    cacheWriteTokens: 88,
+  });
+});
+
+test("a fake that reports no usage writes null rather than omitting the field", async () => {
+  // `undefined` in a result file means "written before S2", so a run this code
+  // made has to say `null`: otherwise a reader cannot tell an old file from a
+  // run the harness told nothing.
+  const out = tmpDir();
+  const record = makeRecord();
+  await replayAll([record], { out, workDir: tmpDir(), variant: "v1" }, { concurrency: 1 }, fakeRunAgent, fakeCheckout);
+  const written = JSON.parse(readFileSync(join(out, record.runId, "run-1.json"), "utf-8")) as Result;
+  assert.equal(written.usage, null);
+  assert.ok("usage" in written, "the key is present, so the file answers the question");
+});
+
 test("replayAll writes one result file per replay and skips the ones that exist", async () => {
   const out = tmpDir();
   const workDir = tmpDir();
@@ -472,6 +529,19 @@ test("replayAll runs multiple cases with the worker pool", async () => {
 
   assert.equal(results.length, 3);
   assert.equal(callCount, 3);
+});
+
+test("resultFromRecord carries a record's usage through, and omits it when the record predates it", () => {
+  // A synthesized side is built from a stored production record, so the usage a
+  // record carries has to survive into the eval or a prod-vs-candidate
+  // comparison sees tokens on one side only.
+  const withUsage = resultFromRecord(
+    makeRecord({ usage: { inputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 } }),
+  );
+  assert.deepEqual(withUsage.usage, { inputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 });
+
+  const { usage: _absent, ...older } = makeRecord();
+  assert.equal(resultFromRecord(older as ReviewRecord).usage, undefined);
 });
 
 test("resultFromRecord turns what production posted into a judgeable side", () => {
@@ -682,7 +752,10 @@ test("loadRunResults still parses a result file written without leads", () => {
     wallTimeMs: 1,
   };
   writeFileSync(join(dir, "c1", "run-1.json"), JSON.stringify(old));
-  assert.equal(loadRunResults(dir).get("c1")?.get(1)?.leads, undefined);
+  const loaded = loadRunResults(dir).get("c1")?.get(1);
+  assert.equal(loaded?.leads, undefined);
+  // A file written before S2 has no `usage` key at all, and must keep loading.
+  assert.equal(loaded?.usage, undefined);
 });
 
 const toolCall = (tool: string) =>
@@ -702,13 +775,19 @@ test("replayToolGuard allows only the reviewer's read-only tools", async () => {
 });
 
 test("replayCase denies Bash even when the reviewer config allows it", async () => {
-  let hooks: HookCallback[] = [];
+  let guards: HookCallback[] = [];
   const capture: RunAgentImpl = async (config, prompt, overrides) => {
-    hooks = overrides.preToolUseHooks ?? [];
-    return fakeRunAgent({ ...config, tools: ["Bash"], allowedTools: ["Bash"] }, prompt, overrides);
+    guards = [...(overrides.toolCallGuards ?? [])];
+    // A config that names Bash is the case the guard has to survive: the tool
+    // list a candidate branch may edit must not be able to widen the replay.
+    return fakeRunAgent(
+      { ...config, tools: toolSet("Bash"), allowedTools: ["Bash"] },
+      prompt,
+      overrides,
+    );
   };
   await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v" }, capture, fakeCheckout);
-  const outs = await Promise.all(hooks.map((h) => h(toolCall("Bash"), undefined, hookOpts)));
+  const outs = await Promise.all(guards.map((g) => g(toolCall("Bash"), undefined, hookOpts)));
   assert.ok(outs.some(isDenied));
 });
 
@@ -861,7 +940,7 @@ const postmortemAgent = (selectorReplies: { output: string; errorSubtype?: strin
   const reviewPrompts: string[] = [];
   const agent: RunAgentImpl = async (config, prompt, overrides) => {
     if (config.name === "postmortem-selector") {
-      assert.deepEqual(config.tools, []);
+      assert.deepEqual(config.tools, {});
       assert.equal(config.model, "claude-sonnet-5-5");
       selectorPrompts.push(prompt);
       return { agent: config.name, durationMs: 1, ...selectorReplies[selectorPrompts.length - 1] };

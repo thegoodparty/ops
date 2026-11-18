@@ -5,12 +5,14 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
-import type { SubagentCall } from "../../framework/types";
+import { addUsage } from "../../framework/types";
+import type { SubagentCall, TokenUsage } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
 import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
-import { GIT_TOOL_NAMES, createGitTool } from "../git-tool";
+import { createGitTool } from "../git-tool";
+import { GIT_TOOL_NAMES } from "../tool-names";
 import { promptDiff } from "../prompt-diff";
 import { POSTMORTEM_SELECTOR, selectPostmortems, type SelectedPostmortem } from "../postmortems";
 import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
@@ -60,6 +62,13 @@ export interface Result {
   output: ReviewOutput | StoredReviewOutput | null;
   error?: string;
   costUsd: number | null;
+  // Token counts for the run that produced this result, beside `costUsd`.
+  // Present only on results recorded after S2: a result file written before it
+  // has no `usage` key at all, which is `undefined` here and is the reason the
+  // field is optional rather than nullable. `null` is the other absence — a run
+  // this code made and the harness reported no usage for — so a reader can tell
+  // "the old code did not record this" from "this run did not report it".
+  usage?: TokenUsage | null;
   wallTimeMs: number;
   // Absent on results written before this existed and on production records,
   // which do not keep the scout's output. An empty array is a real answer: the
@@ -295,6 +304,7 @@ export const resultFromRecord = (record: ReviewRecord): Result => ({
   output: record.output,
   error: record.error,
   costUsd: record.costUsd,
+  ...(record.usage !== undefined ? { usage: record.usage } : {}),
   wallTimeMs: record.wallTimeMs,
 });
 
@@ -305,7 +315,7 @@ export type RunAgentImpl = (
     cwd: string;
     mcpServers: Record<string, McpServerConfig>;
     env: Record<string, string | undefined>;
-    preToolUseHooks?: HookCallback[];
+    toolCallGuards?: HookCallback[];
   },
 ) => Promise<AgentResult>;
 
@@ -388,6 +398,7 @@ export const replayCase = async (
     error?: string,
     leads?: LeadTrace[],
     gating?: ResultGating,
+    usage?: TokenUsage | null,
   ): Result => ({
     caseId,
     repo: bundle.repo,
@@ -397,6 +408,11 @@ export const replayCase = async (
     output,
     ...(error !== undefined ? { error } : {}),
     costUsd,
+    // Always written, even as `null`, so a result file records what the run
+    // answered about its own spend instead of leaving the question open. That
+    // is the whole point of the field: a baseline side with `usage` populated
+    // and `costUsd` beside it is what S5's token gate compares.
+    usage: usage ?? null,
     wallTimeMs: Date.now() - startMs,
     ...(leads ? { leads } : {}),
     ...(gating !== undefined ? { gating } : {}),
@@ -412,6 +428,9 @@ export const replayCase = async (
   }
 
   const config = getAgent("pr-reviewer");
+  // The post-mortem selection pass is two more calls whose spend belongs to
+  // this case, so its usage is carried into the result as well.
+  let selectorUsage: TokenUsage | undefined;
   // Same as production: a diff too large for the first message goes to a
   // file under .git/ for the agent to read in parts.
   let diffPath: string | undefined;
@@ -432,8 +451,9 @@ export const replayCase = async (
         cwd: repoDir,
         mcpServers: {},
         env: agentEnv(),
-        preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
+        toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
       });
+      selectorUsage = addUsage(selectorUsage, selection.usage);
       if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
       return selection.output;
     },
@@ -445,14 +465,15 @@ export const replayCase = async (
       cwd: repoDir,
       mcpServers: { git: createGitTool(repoDir) },
       env: agentEnv(),
-      preToolUseHooks: [replayToolGuard, pathGuardHook(repoDir)],
+      toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return makeResult(null, null, `agent threw: ${message}`);
+    return makeResult(null, null, `agent threw: ${message}`, undefined, undefined, selectorUsage);
   }
 
   subagentCalls = agentResult.subagentCalls;
+  const usage = addUsage(selectorUsage, agentResult.usage);
 
   if (agentResult.errorSubtype) {
     return makeResult(
@@ -460,6 +481,8 @@ export const replayCase = async (
       agentResult.costUsd ?? null,
       `agent error (${agentResult.errorSubtype}): ${agentResult.output.slice(0, 300)}`,
       traceLeads(agentResult.subagentCalls, null),
+      undefined,
+      usage,
     );
   }
 
@@ -470,6 +493,8 @@ export const replayCase = async (
       agentResult.costUsd ?? null,
       parsed.error,
       traceLeads(agentResult.subagentCalls, null),
+      undefined,
+      usage,
     );
   }
 
@@ -483,6 +508,7 @@ export const replayCase = async (
     undefined,
     traceLeads(agentResult.subagentCalls, parsed.output),
     gating,
+    usage,
   );
 };
 

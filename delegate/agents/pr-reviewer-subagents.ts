@@ -1,5 +1,6 @@
-import { GIT_TOOL_NAMES } from "../review/git-tool";
-import type { AgentConfig } from "../framework";
+import { GIT_TOOL_NAMES } from "../review/tool-names";
+import { toolSet } from "../framework";
+import type { SubagentDefinition } from "../framework";
 
 const DEEP_REVIEWER_OUTPUT = `
 ## Output
@@ -31,7 +32,10 @@ Emit a finding only if you would block merge on it alone. Drop everything else s
 If you have no blocker-grade findings, return {"findings":[]}.
 `;
 
-export const prReviewerSubagents: NonNullable<AgentConfig["agents"]> = {
+// Each subagent is described the same way whether the harness spawns it with a
+// Task tool or as its own call, so the contract carries the description, the
+// prompt, the model and the tools, and nothing vendor-shaped.
+export const prReviewerSubagents: Record<string, SubagentDefinition> = {
   scout: {
     description:
       "First-pass scout. Reads the diff from context and skims the checkout, identifies 0–10 suspicious areas worth deep verification, and emits structured leads. Never emits findings itself.",
@@ -77,7 +81,7 @@ Fields:
 - hypothesis: 1–2 sentences as a suspicion, not a claim
 
 If you have no leads: {"leads":[],"summary":"<one sentence on why the diff is low-risk>"}`,
-    tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
+    tools: toolSet("Read", "Grep", "Glob", ...GIT_TOOL_NAMES),
     model: "claude-sonnet-5-5",
   },
 
@@ -109,7 +113,7 @@ If evidence falsifies the finding, drop it. If not, emit it and include the fals
 Anchor each finding on the changed line that makes the design choice (the call, the await, the cache, the loop). The body names the design choice, the production facts it depends on with file:line, and the failure. Use category architecture.
 
 ${DEEP_REVIEWER_OUTPUT}`,
-    tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
+    tools: toolSet("Read", "Grep", "Glob", ...GIT_TOOL_NAMES),
     model: "claude-sonnet-5-5",
   },
 
@@ -167,7 +171,7 @@ Examples that PASS:
 If a prior finding's anchor (path + line) overlaps your candidate, read what the prior round recommended. If the current code follows that guidance, do NOT emit a contradictory blocker. The bot does not reverse itself across rounds.
 
 ${DEEP_REVIEWER_OUTPUT}`,
-    tools: ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES],
+    tools: toolSet("Read", "Grep", "Glob", ...GIT_TOOL_NAMES),
     model: "claude-sonnet-5-5",
   },
 };

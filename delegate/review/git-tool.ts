@@ -2,12 +2,7 @@ import { execFileSync } from "child_process";
 import { tool, createSdkMcpServer } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
-export const GIT_TOOL_NAMES = [
-  "mcp__git__git_log",
-  "mcp__git__git_show",
-  "mcp__git__git_diff",
-  "mcp__git__git_blame",
-] as const;
+export { GIT_TOOL_NAMES } from "./tool-names";
 
 const REF_RE = /^[A-Za-z0-9._/~^-]+$/;
 
