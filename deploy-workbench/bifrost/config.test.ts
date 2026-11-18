@@ -164,19 +164,19 @@ const ENV_REFERENCE = /^env\.([A-Z][A-Z0-9_]*)$/;
  * profile at all, global or geographic. Removed on 2026-11-04; see
  * `docs/bifrost-gateway.md`, "Inference residency".
  *
- * Kimi K3.1 replaced Kimi K3 on 2026-11-10 as its vendor's successor, which is
- * the only change to this list. Claude Fable 5.2 was proposed for Grok 4.7's
- * slot and held back: the review that opened the set to it asked for the
- * Fable/Astra class to sit behind a tier of its own rather than in the default
- * eight, so Grok 4.7 also stays. The class stays at eight either way, which is
- * the size the weekly review aims for.
+ * Kimi K3.1 replaced Kimi K3 on 2026-11-10 and GPT-6.2 Sol replaced GPT-6.1 Sol
+ * on 2026-11-17, both as their vendor's successor. Claude Fable 5.2 was
+ * proposed for Grok 4.7's slot and held back: the review that opened the set to
+ * it asked for the Fable/Astra class to sit behind a tier of its own rather
+ * than in the default eight, so Grok 4.7 also stays. The class stays at eight
+ * either way, which is the size the weekly review aims for.
  */
 const SERVED_MODEL_CLASSES: Record<string, string[]> = {
   bedrock: [
     "global.anthropic.claude-sonnet-5-5",
     "global.anthropic.claude-opus-5-5",
     "global.moonshotai.kimi-k3.1",
-    "global.openai.gpt-6.1-sol",
+    "global.openai.gpt-6.2-sol",
     "global.openai.gpt-6.1-terra",
     "global.anthropic.claude-haiku-5-5",
     "global.xai.grok-4.7",
