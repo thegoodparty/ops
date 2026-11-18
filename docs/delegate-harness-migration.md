@@ -349,7 +349,9 @@ reviewer's authority, not about the call layer, and the review agreed.
    `claude-opus-5-5` / `claude-sonnet-5-5`. One variable changes.
 2. **The route.** Same two Claude models, reached through Bedrock instead of `api.anthropic.com`.
    Still one variable: the provider, with the model ids held constant.
-3. **The model.** Bedrock's Claude out, Fireworks' DeepSeek in, where it is acceptable.
+3. **The model.** Bedrock's Claude out of the subagents and Fireworks' DeepSeek in. The orchestrator
+   stays on Bedrock's `global.anthropic.claude-opus-5-5`, so the verdict does not move — only the
+   reading does. The reasoning is in the **decided here** passage on Stage 3 below.
 
 The ordering argument is the same at each hop: a failure names its own cause. Stage 1 is the call
 layer at constant provider and model, Stage 2 is the provider at constant model, Stage 3 is the
@@ -431,12 +433,14 @@ fallback changes which application tools are available on the step — under `js
 design below relies on. S8 pins `structuredOutputMode` explicitly rather than leaving it on `auto`,
 and the Stage B gate is what proves the pinned value works for this schema.
 
-**Fireworks US-only direct is the Stage 3 destination.** `FIREWORKS_API_KEY` replaces the worker's
-Anthropic key. This touches **one** human-owned file, `deploy/delegate-secret.ts`
-(`DELEGATE_SECRET_KEYS`, where `ANTHROPIC_API_KEY` is the first entry), and **no** change to
-`deploy/components/worker.ts`: the task already runs in public subnets (`deploy/index.ts:38`), so any
-HTTPS endpoint is reachable and no IAM or egress change is needed — which answers open questions 1
-and 7 of the old plan.
+**Fireworks US-only direct is the Stage 3 destination for the subagents, and Bedrock stays for the
+orchestrator.** `FIREWORKS_API_KEY` is added for the three reading agents; it does not replace the
+Bedrock token, because the verdict keeps `global.anthropic.claude-opus-5-5` for the reasons above.
+This touches **one** human-owned file, `deploy/delegate-secret.ts` (`DELEGATE_SECRET_KEYS`, where
+`ANTHROPIC_API_KEY` is the first entry), and **no** change to `deploy/components/worker.ts`: the task
+already runs in public subnets (`deploy/index.ts:38`), so any HTTPS endpoint is reachable and no IAM
+or egress change is needed — which answers open questions 1 and 7 of the old plan. `ANTHROPIC_API_KEY`
+stays declared for the judge regardless, so this is three keys live, not one replacing another.
 
 **Bifrost: rejected for this worker, though it is the gp-pi path.**
 `docs/bifrost-virtual-keys.md` §"Non-human callers" calls a shared worker key "a separate
@@ -447,19 +451,75 @@ costs money and is rotatable — it cannot read a bucket, a secret or a repo.
 `DELEGATE_GATING_MODE=enforce` is deployed (`deploy/components/worker.ts:159`), four Pulumi trees
 are unowned in `CODEOWNERS`, and so the reviewer merges code.
 
+**Decided here: Stage 3 moves the three subagents to Fireworks and leaves the orchestrator on Bedrock.**
+The verdict stays on `global.anthropic.claude-opus-5-5`; `scout`, `architect` and `deep-reviewer` move
+to DeepSeek V4.1 Flash 1017 US. Three facts decide it, and the first is that the plan would otherwise
+silently undo a split it already ships.
+
+- **A two-tier split already exists, and it is per agent rather than per step.** The orchestrator runs
+  `claude-opus-5-5` (`pr-reviewer.ts:220`) and every subagent runs `claude-sonnet-5-5`
+  (`pr-reviewer-subagents.ts:81,113,171`), each with its own `model` field on `AgentConfig["agents"]`.
+  Fireworks US-only serves **exactly one** model —
+  `accounts/fireworks/routers/deepseek-v4p1-flash-1017-us` is the only entry in the `fireworks-us`
+  provider (`agent-swarm/host/global-setup-script.sh`). So pointing all four agents at it does not
+  preserve the split; it collapses both tiers onto one model. That is a change nobody asked for and
+  Stage C would not notice, because it only looks at the aggregate.
+- **The two tiers do different work, and only one of them is a formatting risk.** The orchestrator
+  produces the structured verdict through `outputFormat` (`pr-reviewer.ts:236`) against
+  `REVIEW_OUTPUT_JSON_SCHEMA`, which is the schema the whole conformance question turns on. The
+  subagents do not: they answer in JSON on their final text line and the orchestrator parses it
+  (`pr-reviewer.ts:266,268`), so their contract is one recoverable line, not a validated object. Moving
+  the agents whose output shape is cheap to get wrong onto the unproven provider, while leaving the
+  validated-schema call on the provider Stage B just proved, is the ordering that keeps the risk where
+  it is recoverable.
+- **The split is reached per agent, not by `prepareStep`, which is what makes it safe to plan.** Each
+  subagent is a separate invocation with its own model field, so pointing them at Fireworks is a
+  config change per agent and nothing else. This matters because per-step cross-provider mixing over a
+  shared history is one of the four things this document lists as **unverifiable** — it must not
+  become load-bearing. Nothing here needs it: no single run spans two providers, because the
+  orchestrator and each subagent are already separate calls.
+
+**What this costs, stated plainly.** Two providers stay live, so `AWS_BEARER_TOKEN_BEDROCK` (S7) and
+`FIREWORKS_API_KEY` (S9) are both declared and both in use — S9's "the last provider it needs" and the
+old S10 rollback text were wrong, because they assumed Fireworks replaced Bedrock. It does not;
+Bedrock keeps the orchestrator. `delegate/pricing/models.json` therefore keeps both its Bedrock rows
+and its Fireworks row live rather than one superseding the other, and the Anthropic direct rows stay
+for the judge. Three rate sources, three live consumers, which is what the table was built for.
+
+**Why not mix inside the orchestrator's own run instead.** `prepareStep` returning `{ model }` is the
+primitive the earlier sections sell, and for the orchestrator's own loop — cheap model over the
+read/grep grind, strong one for the verdict — it is the right tool. It is not needed to answer this
+question, and using it here would put an unverified cross-provider behaviour on the critical path when
+a per-agent split already reaches the same place. **Mixing is still deferred past Stage C**, as S5
+says; the per-agent split is not mixing and does not wait for it.
+
+**What would change this answer.** If Flash carried the structured verdict as well as Opus does — same
+findings, same approve rate, no schema failures — then the orchestrator could move too and the split
+would retire. **That is not Stage C, and it is not in this plan.** Stage C holds the orchestrator's
+model constant precisely so its result is about the subagents and nothing else; re-measuring the
+verdict on a new model is a separate round against a separate question, because "can a cheaper model
+read a diff as well" and "can a cheaper model decide whether to merge" are not the same risk and
+should not share a gate. Until someone chooses to run that round, the verdict side keeps the model
+Stage B proved, which is what makes Stage 3's fallback a revert of three config lines rather than a
+revert of the review's judgement.
+
 **Both quality fallbacks are named now, not mid-migration.** Each stage has its own, and they
 point different ways, which is the benefit of staging.
 
-Fireworks US-only serves one model family — DeepSeek V4.1 Flash 1017 US — so Stage 3's provider
-choice *is* the model choice *is* a quality gate: can Flash approve and merge where Opus did? That
-question is asked only after Stages 1 and 2 have been proven with the models unchanged, which is what
-makes the answer interpretable. If it says no, **the fallback is the Bedrock route Stage B already
-proved**: Opus and Sonnet stay reachable through the bearer token declared in S7, at zero
-`worker.ts` cost and with no new key to declare, in a PR that touches one provider import. The
-reviewer then runs on the new call layer, over the route Stage B measured, with the models it has
-today, and the migration still lands its actual goal. **S10's rollback is that same move**, so the
-fallback is the revert rather than a second piece of work. Nothing in it reaches for Bifrost, which
-stays rejected for this worker on the blast-radius grounds above.
+Fireworks US-only serves one model family — DeepSeek V4.1 Flash 1017 US — so for the agents that move,
+Stage 3's provider choice *is* the model choice *is* a quality gate: can Flash read a diff as well as
+Sonnet did? That question is asked only after Stages 1 and 2 have been proven with the models
+unchanged, which is what makes the answer interpretable. **The question is now scoped to the
+subagents**, because the orchestrator does not move: the verdict's model is held constant through
+Stage C, so a subagent regression cannot be confused with a verdict regression and a verdict failure
+has already been ruled out by Stage B.
+
+If it says no, **the fallback is three config lines**: point `scout`, `architect` and
+`deep-reviewer` back at Bedrock's `global.anthropic.claude-sonnet-5-5`, which the bearer token from S7
+still authorises and which S8 already proved on that route. No new key, no `worker.ts` change, no
+`delegate-secret.ts` change, and the orchestrator is untouched because it never left. **S10's rollback
+is that same move**, so the fallback is the revert rather than a second piece of work. Nothing in it
+reaches for Bifrost, which stays rejected for this worker on the blast-radius grounds above.
 
 Stage 2's failure mode is different and cheaper, because the previous route is still deployed:
 Bedrock's Claude is not Anthropic's Claude at this task, or `claude-opus-5-5` is not there at all,
@@ -503,10 +563,14 @@ presented instead of a signature, so attribution may land in invocation logs and
 S8's gate is one real invocation plus a Cost Explorer read naming the reviewer's principal, because
 that is the only thing distinguishing "attributed" from "logged".
 
-**Cost is pinned in the repo, one provider at a time:** `delegate/pricing/models.json` carries the
-rates the shipped code spends. Its **Anthropic** rows land in S5, its **Bedrock** rows in S8, and its
-**Fireworks** row in S9 — in each case before the step whose code uses it, so the spend cap is never
-reading a table that has no row for the call it is bounding. The Fireworks numbers are the US 1.5×
+**Cost is pinned in the repo, one provider at a time, and every row stays live.** `delegate/pricing/models.json`
+carries the rates the shipped code spends. Its **Anthropic** rows land in S5, its **Bedrock** rows in
+S8, and its **Fireworks** row in S9 — in each case before the step whose code uses it, so the spend cap
+is never reading a table that has no row for the call it is bounding. Because S10 moves only the
+subagents, **no row supersedes another**: the Anthropic rows price the judge, the Bedrock rows price
+the orchestrator, and the Fireworks row prices the three subagents, all at once. A `costUsd` is now the
+sum over three tables, and the per-step attribution already needed for the cap is what makes that
+sum computable rather than a blended guess. The Fireworks numbers are the US 1.5×
 rate — `input: 0.45, output: 1.8, cacheRead: 0.009, cacheWrite: 0`, the figures in
 `agent-swarm/host/global-setup-script.sh` — **not** pi's catalog figure of 0.3/1.2 (verified in the
 installed `fireworks.json`; under-reports by a third), and not zero. This is no longer a patch to a
@@ -553,8 +617,8 @@ until S11 restores it.
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
 | **S7** | **2. The route** | **Create the Bedrock principal and declare its key, additively.** The step does four things, because a bearer token is a credential for an IAM principal and that principal has to be built: (1) a **dedicated IAM user and its policy in Pulumi** (`aws.iam.User`, `aws.iam.UserPolicy`, available in the pinned provider), scoped to the two profiles this reviewer uses — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` — and to their foundation-model ARNs, composed with `bedrockInvokeResources` (`utils/bedrock-models.ts`) so the scoping is one function and not a hand-typed ARN list; (2) `deploy/bedrock-invoke-principals.test.ts` **extended to name that principal deliberately**, so the file list grows by exactly one reviewed entry instead of the test staying green by never looking at a console-made key; (3) the key itself minted as a **long-term** Bedrock API key, since a short-term one expires within 12 hours and the worker has no refresh path, with the value put into the live `DELEGATES` secret out of band first; (4) `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**. **No `worker.ts` change** — the token reaches the child through `agentEnv`'s allowlist, not the task role, so the task role still holds no invoke grant. It also **states, in the PR body, which account the reviewer's task runs in and which profiles the principal may invoke**, the one thing this document cannot settle from the repo. Human-owned carve-out, its own PR. | yes | `pulumi preview` shows the new user, its policy and the one added entry in the task's `secrets`, and nothing else — explicitly **no** change to the task role's inline policy; `bedrock-invoke-principals.test.ts` passes **with the new principal named in it**; the policy's resource list is the two profiles and their foundation-model ARNs, asserted in Pulumi preview output; `check-secret-keys.ts` passes with both keys declared; the PR body names the account and the profiles; a real review still posts, still on Anthropic direct. |
 | **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. **`delegate/pricing/models.json` gains the Bedrock rows here**, so the stage's nonzero `costUsd` gate has a rate to compute from. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. And **one Bedrock Cost Explorer read naming the reviewer's principal**, checked against a single invocation from that task — the test of whether a bearer-token call is attributed in Cost and Usage the way a SigV4 call is, which the section above records as unverified rather than assumes. |
-| **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. **`delegate/pricing/models.json` gains the Fireworks row here**, the last provider it needs. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
-| **S10** | 3 | **The model move, to Fireworks.** Point the orchestrator and the subagents at the Fireworks provider and its model. Code only — the key it needs was declared and deployed in S9, and both earlier keys are still declared, so the rollback actually works. | yes (flip back to the Bedrock provider, with no deploy-ordering problem) | `npm run build` and `npm test`; **Stage C** of the gate below; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
+| **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. **`delegate/pricing/models.json` gains the Fireworks row here.** It is **not** the last provider the plan uses: S10 moves only the subagents, so the Bedrock rows added in S8 stay live for the orchestrator and the Anthropic rows stay live for the judge. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
+| **S10** | 3 | **The model move, for the subagents only.** `scout`, `architect` and `deep-reviewer` move to Fireworks' `deepseek-v4p1-flash-1017-us`; **the orchestrator stays on Bedrock's `global.anthropic.claude-opus-5-5`**, so the structured verdict keeps the model Stage B proved. Per-agent, because each subagent already carries its own `model` field — no `prepareStep`, and no run spanning two providers. Fireworks US-only serves exactly one model, so pointing all four at it would collapse the two-tier split the reviewer ships today. Code only — both keys were declared in S7 and S9 and both stay declared, so the rollback is three config lines. | yes (point the three subagents back at Bedrock's `global.anthropic.claude-sonnet-5-5`) | `npm run build` and `npm test`; **Stage C** of the gate below, which now gates the subagents' quality and records the orchestrator as unchanged; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
 | **S11** | — | **Restore `enforce`, once the canary has passed.** One line in the same human-owned carve-out as S4. Blocked until the canary reports zero false approves and `review_failed` at or below baseline. | revert (flip back to `shadow`) | The canary's numbers, plus a review from the deployed task that carries a real approval verdict again. |
 | **S12** | — | **Docs and the plan amendment.** `CLAUDE.md:14,145`, `delegate/README.md:3,26,30`, `eval/README.md`, `docs/pr-previews.md:123` (also `getSecretVersion`→`getSecret`), and `docs/plan-gated-merges.md:378` as a **plan amendment, not a checklist edit**, because its "`anyOf` … because that is the keyword Anthropic's structured-output dialect supports" becomes false. | yes | Docs only; the amendment PR names its plan and step. |
 
@@ -566,8 +630,10 @@ S5 is parity at a constant provider and a constant model, and turning mixing on 
 proven would make Stage A uninterpretable: a regression would have two candidate causes again. The
 capability lands in S5; the configuration is deliberately deferred until after Stage C.
 
-**Effort: ~14 engineering days** (S1 0.5, S2 2, S3 1, S4 0.25, S5 5, S6 1.5, S7 0.5, S8 1.5, S9 0.5,
-S10 0.5, S11 0.25, S12 0.5) plus ~25% contingency, so **~18 days**. The three-stage sequence costs
+**Effort: ~14.25 engineering days** (S1 0.5, S2 2, S3 1, S4 0.25, S5 5, S6 1.5, S7 0.5, S8 1.5, S9 0.5,
+S10 0.75, S11 0.25, S12 0.5) plus ~25% contingency, so **~18 days** — unchanged to the day, because
+S10 grows a quarter day for per-agent model wiring and the scoped Stage C read, and that is inside
+the contingency the plan already carries. The three-stage sequence costs
 about two and a half days over the two-stage one, and none of it is padding: **S8 is a new step at
 1.5 days** for a provider swap with its own model-id, region and structured-output work; **S7 and S9
 add a day between them** for a credential declared and deployed twice; and **S4 and S11 add half a
@@ -587,13 +653,22 @@ where a running review lacks a key it needs. `deploy.yml` deploys on every push 
 `check-secret-keys.ts` notices only a *declared* key that is absent — so "add one, drop the other" in
 a single infra PR takes every review down with no error anywhere.
 
+**Nothing is ever dropped, because two providers stay live.** S10 moves only the subagents, so after
+Stage 3 the worker runs on `AWS_BEARER_TOKEN_BEDROCK` for the orchestrator and `FIREWORKS_API_KEY` for
+the three subagents, in the same task, at the same time. Both must be declared and injected for as
+long as the split exists. There is no step in this plan that undeclares a provider key, and S9's "the
+last provider it needs" is corrected above — it was the assumption that Fireworks replaced Bedrock,
+which the orchestrator decision reverses.
+
 `ANTHROPIC_API_KEY` therefore leaves the worker in three later PRs, none of them in this plan: it
 stops being *used* at S8, when the Bedrock bearer token takes over, while staying declared; it is
 *undeclared* after the canary, which is what makes it inert since the task definition injects only
 declared keys; and its *value* is deleted weeks later — the one irreversible act. Until the second of
 those, S8's rollback is real: the key is still declared and injected, so flipping the agent back to
 Anthropic direct works with no deploy-ordering problem. The judge stays on Anthropic permanently
-(above), so this key never fully goes away; only the worker's copy does.
+(above), so this key never fully goes away; only the worker's copy does. **The two keys that survive
+Stage 3 are the other two**: the Bedrock token because the orchestrator runs on it, and the Fireworks
+key because the subagents do.
 
 **Two things deliberately not done.** `ReviewRecord` does not change (above). And
 `.claude/skills/hill-climb/` does not move: `eval/arms.ts:45-47` reads its `targets/*.json` at
@@ -632,13 +707,19 @@ indistinguishable, from the evidence, from one that is not portable at all. It a
 `structuredOutputMode` for a schema this shape, which is the one place Bedrock's `auto` behaviour
 could quietly change the call.
 
-**Stage C — the model** (gates S10). `results-ai-sdk-bedrock` (Stage B's new side, reused) against
-`results-ai-sdk-fireworks`, one variable changed: ~$90–170, since only the model differs. If it
-fails, **the fallback is S10's own revert**: flip the provider import back to Bedrock, using the
-bearer token S7 already declared, and the reviewer keeps the models Stage B proved on the route Stage
-B measured. Stages A and B stand — the call layer and the provider route are both already proven — so
-a failure here is a model decision, not a plan restart, and it costs no new credential and no
-`delegate-secret.ts` change.
+**Stage C — the subagents' model** (gates S10). `results-ai-sdk-bedrock` (Stage B's new side, reused)
+against `results-ai-sdk-fireworks`, one variable changed: ~$90–170, since only the subagents' model
+differs. **What it gates, per side**: the three subagents' contribution — whether `scout` still raises
+the leads that lead to the findings, `deep-reviewer` still confirms them, and `architect` still adds
+what it added — scored the same way Stages A and B score it. The orchestrator is **not** varied, so it
+is not gated here; its model is unchanged from Stage B, and its structured-output conformance was
+settled there. If the subagents fail, **the fallback is S10's own revert**: point them back at
+Bedrock's `global.anthropic.claude-sonnet-5-5`, which S7's token already authorises. Stages A and B
+stand — the call layer and the provider route are both already proven — so a failure here is a model
+decision, not a plan restart, and it costs no new credential and no `delegate-secret.ts` change.
+**Extending it to the orchestrator is a separate question** and deliberately not in this round: it
+would re-measure the verdict on a new model, which is a decision about the reviewer's judgement and
+not about portability.
 
 **What every round gates on:** no case main passed on every run regresses; holdout counts only, never
 holdout ids; the judge's pairwise verdict not-worse; `--final true` so a rerun that never happened
@@ -803,13 +884,14 @@ the step that depends on them**, none of them asserted anywhere above:
    so neither the model list nor its "carries no product or voter data" reasoning transfers. S7 states
    the account and the profiles and creates the principal, but *which* account is a decision this
    document cannot make from the repo, and it is the last thing S7 needs from a human.
-3. **That `Output.object` against `ReviewOutputSchema` works on Bedrock's JSON-tool path and on
-   Fireworks.** Bedrock's own documentation warns native structured output can be unreliable across
-   workloads and accounts and defaults to `auto`, which falls back to a JSON tool; Fireworks' own
-   capability table lists object generation per model and names none of the router ids the worker
-   uses, so support for `deepseek-v4p1-flash-1017-us` is unstated either way — and the schema here is
-   a two-branch discriminated union nested inside another union, which is the shape most likely to
-   hit a fallback. Stages B and C measure it, not this document.
+3. **That `Output.object` against `ReviewOutputSchema` works on Bedrock's JSON-tool path.** Bedrock's
+   own documentation warns native structured output can be unreliable across workloads and accounts
+   and defaults to `auto`, which falls back to a JSON tool, and the schema here is a two-branch
+   discriminated union nested inside another union — the shape most likely to hit that fallback. This
+   is the orchestrator's call, which stays on Bedrock, so Stage B measures it and Stage C does not
+   touch it. **Fireworks no longer carries this risk**, because the subagents that move there answer in
+   a single JSON line the orchestrator parses rather than through a validated object; whether Flash
+   produces that line reliably is what Stage C measures.
 4. **That a major-version `ai` upgrade stays contained behind `runAgent`.** The seam is designed for
    it, but AI SDK 7 already renames things AI SDK 6 documents (`stepCountIs`→`isStepCount`,
    `system`→`instructions`), and whether the next one lands inside one file is unproven.
