@@ -976,8 +976,14 @@ test("replayCase shows every post-mortem, whatever the recorded review's date, a
 });
 
 test("replayCase strips PR numbers, GitHub links and commits from the post-mortems it shows", async () => {
-  const [first] = loadPostmortems();
-  assert.match(first.text, /#2977/);
+  // Pick the post-mortem that carries the identifiers rather than the first in
+  // the folder. The assertion needs a file whose text actually has a PR number
+  // and a GitHub link to strip, and which file that is depends on what the
+  // folder holds: #549 added two earlier-dated post-mortems, so the first file
+  // is no longer the read freeze and this failed on `main` without this test's
+  // subject changing at all.
+  const first = loadPostmortems().find((p) => /#2977/.test(p.text));
+  assert.ok(first, "no post-mortem carries a PR number, so there is nothing to strip");
   const { agent, selectorPrompts, reviewPrompts } = postmortemAgent([
     { output: `{"ids": ["${first.file}#1"]}` },
     { output: `{"ids": ["${first.file}"]}` },

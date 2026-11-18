@@ -28,44 +28,47 @@ import { agentEnv } from "../run";
 // cover the harness's own rendering of the options object; that is
 // `framework/agent.test.ts`'s job.
 
-// The review prompt, and the one selection prompt that follows it, for each
-// case: sha256/16 of the boundary-normalised text, and its length. Computed
-// from `main` at a8b5108, the commit S2 branched from, so a difference is this
-// branch's doing and not a coincidence.
-const GOLDEN: [id: string, promptHash: string, promptChars: number][] = [
-  ["gp-data-platform-1162-zip-leading-zeros", "d0fb27c99f432dda", 23826],
-  ["gp-data-platform-1181-one-carried-one-new", "ab56a47d86a49717", 90743],
-  ["gp-data-platform-1184-off-list-is-false", "4ccf7a37ec9054e3", 50071],
-  ["gp-data-platform-1285-overlapping-age-bands", "f938b4ca41deb5bf", 56641],
-  ["gp-marketing-418-takedown-bypass", "8f059c88de4f473e", 22886],
-  ["gp-marketing-424-metadata-raw-name", "fca376e1e4be0009", 32781],
-  ["gp-marketing-443-four-priors-all-fixed", "79448f87889d6249", 45802],
-  ["omni-2453-proposal-key-race", "fdcdc24f30d48c08", 11244],
-  ["omni-2461-fenced-json", "78afc0b472ee3e7f", 44075],
-  ["omni-2461-prose-checking-prior", "d46e90fa088f989f", 44557],
-  ["omni-2474-dependabot-major-bump", "20cb0ad7a964620a", 38319],
-  ["omni-2506-greeting-without-name", "7d20854d9cf4d0b9", 29463],
-  ["omni-2522-two-priors-fixed", "b372e49dbdaf3004", 10869],
-  ["omni-2581-three-priors-oversized-diff", "5cfe7b170f1d870d", 21222],
-  ["omni-2589-draft-backstop-asymmetry", "2ced4c830bf23aeb", 27808],
-  ["omni-2655-last-attempt-strands-purchase", "78dfd58fd97ec49d", 7446],
-  ["omni-2655-one-fixed-one-open", "d2858a7ed66dd07a", 17608],
-  ["omni-2671-ecr-public-login", "c458f346a8db3db4", 15775],
-  ["omni-2679-starlette-background-task", "e64aabedacdfa028", 57622],
-  ["omni-2701-docs-addition", "8c7aa8c20ac434cb", 5407],
-  ["omni-2709-double-counted-respondents", "c3516d37c6113473", 11492],
-  ["omni-2824-cancel-without-claim", "725d9fa964eb43aa", 5866],
-  ["omni-2830-cutoff-general-only", "db2ecc797620d96f", 18360],
-  ["omni-3154-reconcile-window-misses-stale", "7e55a179c2521897", 10264],
-  ["omni-3276-self-set-internal-email", "0730cc13127dbc80", 12814],
-  ["ops-244-prose-instead-of-json", "20cbee873dbd130a", 66070],
-  ["ops-255-workflow-shell-injection", "07193008d62269cf", 45849],
-  ["ops-271-re-raised-without-link", "c6765f6db188895c", 57546],
-  ["ops-302-mangled-prior-id", "58eef166336e1ac3", 13450],
-  ["ops-302-two-priors-still-open", "c2d5d6fb3bd401fc", 13450],
-  ["ops-343-rolling-deploy-two-gateways", "69138955251005be", 67853],
-  ["ops-377-config-arn-never-redeploys", "c9f959447532027b", 69613],
-  ["ops-379-alb-kills-slow-boot", "87f0cce3329452dd", 14987],
+// The review prompt and the selection prompt, per case: sha256/16 of the
+// boundary-normalised text, and the review prompt's length. Computed from
+// `main` at 6e002e4, the commit this branch merged before the comparison, so a
+// difference is this branch's doing and not a coincidence.
+// [id, review prompt hash, review prompt length, selector prompt hash] —
+// computed from origin/main at 6e002e4 (this branch's base after #549 moved the
+// post-mortem folder), so a difference is this branch's doing.
+const GOLDEN: [id: string, reviewHash: string, reviewChars: number, selectorHash: string][] = [
+  ["gp-data-platform-1162-zip-leading-zeros", "d0fb27c99f432dda", 23826, "0e95505d2dec2a04"],
+  ["gp-data-platform-1181-one-carried-one-new", "ab56a47d86a49717", 90743, "321ce7e32c23bcfe"],
+  ["gp-data-platform-1184-off-list-is-false", "4ccf7a37ec9054e3", 50071, "fb7564a00fddb326"],
+  ["gp-data-platform-1285-overlapping-age-bands", "f938b4ca41deb5bf", 56641, "24a4743bdb03a009"],
+  ["gp-marketing-418-takedown-bypass", "8f059c88de4f473e", 22886, "a0744a18fe8d4fdf"],
+  ["gp-marketing-424-metadata-raw-name", "fca376e1e4be0009", 32781, "f136524b5b93c86b"],
+  ["gp-marketing-443-four-priors-all-fixed", "79448f87889d6249", 45802, "7427deba1d2aa701"],
+  ["omni-2453-proposal-key-race", "fdcdc24f30d48c08", 11244, "b6bd118c00b0953d"],
+  ["omni-2461-fenced-json", "78afc0b472ee3e7f", 44075, "868faecfbf491689"],
+  ["omni-2461-prose-checking-prior", "d46e90fa088f989f", 44557, "07968e276c16f807"],
+  ["omni-2474-dependabot-major-bump", "20cb0ad7a964620a", 38319, "f0648bdf23e7e5e9"],
+  ["omni-2506-greeting-without-name", "7d20854d9cf4d0b9", 29463, "4cf0ec77de3a19d6"],
+  ["omni-2522-two-priors-fixed", "b372e49dbdaf3004", 10869, "8a3e273dd5bb74e2"],
+  ["omni-2581-three-priors-oversized-diff", "5cfe7b170f1d870d", 21222, "2edd839a793bdac4"],
+  ["omni-2589-draft-backstop-asymmetry", "2ced4c830bf23aeb", 27808, "199c2715bc74eb1a"],
+  ["omni-2655-last-attempt-strands-purchase", "78dfd58fd97ec49d", 7446, "928eafffeb2774f4"],
+  ["omni-2655-one-fixed-one-open", "d2858a7ed66dd07a", 17608, "bc505fa836bf7b03"],
+  ["omni-2671-ecr-public-login", "c458f346a8db3db4", 15775, "14e70118f5f856f3"],
+  ["omni-2679-starlette-background-task", "e64aabedacdfa028", 57622, "bd99d6a774cd0d2f"],
+  ["omni-2701-docs-addition", "8c7aa8c20ac434cb", 5407, "f0c6f3a675eb31ff"],
+  ["omni-2709-double-counted-respondents", "c3516d37c6113473", 11492, "5ced9cd3dee1c983"],
+  ["omni-2824-cancel-without-claim", "725d9fa964eb43aa", 5866, "95aafc1b09659d32"],
+  ["omni-2830-cutoff-general-only", "db2ecc797620d96f", 18360, "3d90351b761c704c"],
+  ["omni-3154-reconcile-window-misses-stale", "7e55a179c2521897", 10264, "14cfbf23aca49e1c"],
+  ["omni-3276-self-set-internal-email", "0730cc13127dbc80", 12814, "9cdb471e299b82ec"],
+  ["ops-244-prose-instead-of-json", "20cbee873dbd130a", 66070, "1c6315e0f3e19b6b"],
+  ["ops-255-workflow-shell-injection", "07193008d62269cf", 45849, "ddbfc6072dd9e473"],
+  ["ops-271-re-raised-without-link", "c6765f6db188895c", 57546, "11ff82e8e0056ca7"],
+  ["ops-302-mangled-prior-id", "58eef166336e1ac3", 13450, "c016cdcc35642339"],
+  ["ops-302-two-priors-still-open", "c2d5d6fb3bd401fc", 13450, "cfe3c744246e3b93"],
+  ["ops-343-rolling-deploy-two-gateways", "69138955251005be", 67853, "426229bd82669eb0"],
+  ["ops-377-config-arn-never-redeploys", "c9f959447532027b", 69613, "626ca48f1a1b144e"],
+  ["ops-379-alb-kills-slow-boot", "87f0cce3329452dd", 14987, "9b6f33aa49b8ade1"],
 ];
 
 const SCENARIOS = join(__dirname, "scenarios");
@@ -115,17 +118,19 @@ test("the post-mortem selector's config is what its prompt assumes", () => {
   assert.equal(POSTMORTEM_SELECTOR.maxTurns, 2);
 });
 
-test("every recorded bundle builds the review prompt it built before the contract changed", async () => {
+test("every recorded bundle builds the prompts it built before the contract changed", async () => {
   const seen = new Set<string>();
-  for (const [id, promptHash, promptChars] of GOLDEN) {
+  for (const [id, promptHash, promptChars, selectorHash] of GOLDEN) {
     seen.add(id);
     const { prompt, selectorPrompts } = await reviewPromptFor(id);
     assert.equal(prompt.length, promptChars, `${id}: prompt length changed`);
     assert.equal(digest(prompt), promptHash, `${id}: prompt bytes changed`);
-    // The stand-in never picks anything, so every case takes the same single
-    // selection call. Asserting the count keeps a second call from appearing
-    // unnoticed: the second prompt is only built when something was picked.
+    // The selection prompt is model input too, and it carries the diff, the
+    // title, the body and the lessons, so it is asserted rather than counted.
+    // The stand-in never picks anything, so every case takes exactly one call;
+    // the second prompt is only built when something was picked.
     assert.equal(selectorPrompts.length, 1, `${id}: selection prompt count changed`);
+    assert.equal(digest(selectorPrompts[0]), selectorHash, `${id}: selection prompt bytes changed`);
   }
   assert.equal(seen.size, GOLDEN.length);
 });
