@@ -495,6 +495,49 @@ test("scoreDir never asks the judge about approve or flag cases", async () => {
   assert.match(reports[1].scores[0].outcome, /^flagged: /);
 });
 
+const noFinding: Expect = { verdict: "no-finding", paths: ["refuted.ts"] };
+
+test("no-finding fails on a finding in a pinned path", () => {
+  const scored = scoreRun(noFinding, withFindings([finding("other.ts"), finding("refuted.ts")]));
+  assert.equal(scored.pass, false);
+  assert.match(scored.outcome, /^blocked on the refuted path: refuted\.ts:10/);
+});
+
+test("no-finding passes a block elsewhere, even when the gate commented on it", () => {
+  const elsewhere = withFindings([finding("other.ts")]);
+  const gated = {
+    ...elsewhere,
+    gating: { mode: "enforce" as const, verdict: "comment" as const, gates: [], wouldApprove: false },
+  };
+  assert.equal(scoreRun(noFinding, elsewhere).pass, true);
+  assert.equal(scoreRun(noFinding, gated).pass, true);
+  assert.match(scoreRun(noFinding, gated).outcome, /^blocked elsewhere: other\.ts:10/);
+});
+
+test("no-finding passes an approval, and a run with no review still fails", () => {
+  assert.deepEqual(scoreRun(noFinding, result()), { pass: true, outcome: "approved" });
+  const failed = result({ output: null, error: "agent returned no JSON" });
+  assert.equal(scoreRun(noFinding, failed).pass, false);
+});
+
+test("the manifest rejects a no-finding expectation without paths", () => {
+  const c = readManifest(MANIFEST)[0];
+  assert.throws(() => ManifestSchema.parse([{ ...c, expect: { verdict: "no-finding" } }]));
+  assert.throws(() => ManifestSchema.parse([{ ...c, expect: { verdict: "no-finding", paths: [] } }]));
+});
+
+test("the two refuted omni cases pin the file production's false finding was on", () => {
+  const byId = new Map(readManifest(MANIFEST).map((c) => [c.id, c]));
+  assert.deepEqual(byId.get("omni-2702-multi-office-skip")?.expect, {
+    verdict: "no-finding",
+    paths: ["packages/gp-api/src/priorities/services/priorityOnboarding.service.ts"],
+  });
+  assert.deepEqual(byId.get("omni-2679-starlette-sync-background")?.expect, {
+    verdict: "no-finding",
+    paths: ["packages/gp-ai/broker/page_replay.py"],
+  });
+});
+
 test("a run that produced no review fails either way", () => {
   const failed = result({ output: null, error: "agent returned no JSON" });
   assert.equal(scoreRun({ verdict: "approve" }, failed).pass, false);
