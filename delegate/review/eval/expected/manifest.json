@@ -234,12 +234,13 @@
     "id": "omni-2702-multi-office-skip",
     "bundle": "omni-2702-multi-office-skip.bundle.json",
     "expect": {
-      "verdict": "no-finding",
-      "paths": [
+      "verdict": "block",
+      "reason": "With serve-citizen-panels on, the webapp saves 'priorities' as the Serve onboarding checkpoint, but gp-api's SERVE_ONBOARDING_STEPS enum in electedOffice.schema.ts has no 'priorities', so the step's PUT is rejected and an official cannot get past that step.",
+      "noFindingIn": [
         "packages/gp-api/src/priorities/services/priorityOnboarding.service.ts"
       ]
     },
-    "tests": "Production blocked on a multi-office org silently skipping a community issue in priorityOnboarding.service.ts. ElectedOffice.organizationSlug is @unique, so an org holds one office and the path cannot happen; the reviewer's own earlier run at this sha falsified the same lead. Nothing to block in that file. The PR has a real defect elsewhere (gp-api's SERVE_ONBOARDING_STEPS lacks the 'priorities' checkpoint the webapp saves), so a block there is not a miss.",
+    "tests": "Production blocked on a multi-office org silently skipping a community issue in priorityOnboarding.service.ts. ElectedOffice.organizationSlug is @unique, so an org holds one office and the path cannot happen; the reviewer's own earlier run at this sha falsified the same lead. Any finding in that file fails the case. The PR's real defect is elsewhere: the webapp now saves a 'priorities' onboarding checkpoint that gp-api's SERVE_ONBOARDING_STEPS does not accept.",
     "split": "tune",
     "source": "refuted",
     "kind": "false-finding"
@@ -282,12 +283,13 @@
     "id": "omni-2679-starlette-sync-background",
     "bundle": "omni-2679-starlette-sync-background.bundle.json",
     "expect": {
-      "verdict": "no-finding",
-      "paths": [
+      "verdict": "block",
+      "reason": "test_caps_are_shared_by_every_broker_task sets the per-run cap to 2 and then makes only two fetches across two broker tasks, so it asserts 2 stored objects whether or not the tasks share the cap; it cannot fail.",
+      "noFindingIn": [
         "packages/gp-ai/broker/page_replay.py"
       ]
     },
-    "tests": "Production blocked on record_fetch and record_head in packages/gp-ai/broker/page_replay.py blocking the event loop with boto3 calls. They are sync callables run as BackgroundTasks, and the Starlette the broker locks (1.3.1, uv.lock) sends sync callables to the threadpool. Nothing to block in that file. The PR has a real defect elsewhere (test_caps_are_shared_by_every_broker_task in tests/test_page_replay.py cannot fail), so a block there is not a miss.",
+    "tests": "Production blocked on record_fetch and record_head in packages/gp-ai/broker/page_replay.py blocking the event loop with boto3 calls. They are sync callables run as BackgroundTasks, and the Starlette the broker locks (1.3.1, uv.lock) sends sync callables to the threadpool. Any finding in that file fails the case. The PR's real defect is elsewhere: test_caps_are_shared_by_every_broker_task in tests/test_page_replay.py cannot fail.",
     "split": "tune",
     "source": "refuted",
     "kind": "false-finding"

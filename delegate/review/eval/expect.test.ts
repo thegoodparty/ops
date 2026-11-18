@@ -495,47 +495,32 @@ test("scoreDir never asks the judge about approve or flag cases", async () => {
   assert.match(reports[1].scores[0].outcome, /^flagged: /);
 });
 
-const noFinding: Expect = { verdict: "no-finding", paths: ["refuted.ts"] };
+const blockNotOn: Expect = { ...block, noFindingIn: ["refuted.ts"] };
 
-test("no-finding fails on a finding in a pinned path", () => {
-  const scored = scoreRun(noFinding, withFindings([finding("other.ts"), finding("refuted.ts")]));
+test("a block case with noFindingIn fails on a finding in a refuted path, even when the reason is caught", () => {
+  const scored = scoreRun(blockNotOn, withFindings([finding("other.ts"), finding("refuted.ts")]), matched);
   assert.equal(scored.pass, false);
   assert.match(scored.outcome, /^blocked on the refuted path: refuted\.ts:10/);
 });
 
-test("no-finding passes a block elsewhere, even when the gate commented on it", () => {
-  const elsewhere = withFindings([finding("other.ts")]);
-  const gated = {
-    ...elsewhere,
-    gating: { mode: "enforce" as const, verdict: "comment" as const, gates: [], wouldApprove: false },
-  };
-  assert.equal(scoreRun(noFinding, elsewhere).pass, true);
-  assert.equal(scoreRun(noFinding, gated).pass, true);
-  assert.match(scoreRun(noFinding, gated).outcome, /^blocked elsewhere: other\.ts:10/);
+test("a block case with noFindingIn passes on the reason caught elsewhere, and still fails an approval", () => {
+  assert.equal(scoreRun(blockNotOn, withFindings([finding("other.ts")]), matched).pass, true);
+  assert.deepEqual(scoreRun(blockNotOn, result(), matched), { pass: false, outcome: "approved" });
 });
 
-test("no-finding passes an approval, and a run with no review still fails", () => {
-  assert.deepEqual(scoreRun(noFinding, result()), { pass: true, outcome: "approved" });
-  const failed = result({ output: null, error: "agent returned no JSON" });
-  assert.equal(scoreRun(noFinding, failed).pass, false);
-});
-
-test("the manifest rejects a no-finding expectation without paths", () => {
+test("the manifest rejects an empty noFindingIn", () => {
   const c = readManifest(MANIFEST)[0];
-  assert.throws(() => ManifestSchema.parse([{ ...c, expect: { verdict: "no-finding" } }]));
-  assert.throws(() => ManifestSchema.parse([{ ...c, expect: { verdict: "no-finding", paths: [] } }]));
+  assert.throws(() => ManifestSchema.parse([{ ...c, expect: { verdict: "block", reason: "r", noFindingIn: [] } }]));
 });
 
-test("the two refuted omni cases pin the file production's false finding was on", () => {
+test("the two refuted omni cases block on the PR's real defect and pin the file production's false finding was on", () => {
   const byId = new Map(readManifest(MANIFEST).map((c) => [c.id, c]));
-  assert.deepEqual(byId.get("omni-2702-multi-office-skip")?.expect, {
-    verdict: "no-finding",
-    paths: ["packages/gp-api/src/priorities/services/priorityOnboarding.service.ts"],
-  });
-  assert.deepEqual(byId.get("omni-2679-starlette-sync-background")?.expect, {
-    verdict: "no-finding",
-    paths: ["packages/gp-ai/broker/page_replay.py"],
-  });
+  const e2702 = byId.get("omni-2702-multi-office-skip")?.expect;
+  const e2679 = byId.get("omni-2679-starlette-sync-background")?.expect;
+  assert.equal(e2702?.verdict, "block");
+  assert.deepEqual(e2702?.verdict === "block" && e2702.noFindingIn, ["packages/gp-api/src/priorities/services/priorityOnboarding.service.ts"]);
+  assert.equal(e2679?.verdict, "block");
+  assert.deepEqual(e2679?.verdict === "block" && e2679.noFindingIn, ["packages/gp-ai/broker/page_replay.py"]);
 });
 
 test("a run that produced no review fails either way", () => {
