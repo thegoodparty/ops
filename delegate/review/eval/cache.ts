@@ -32,19 +32,25 @@ export const replayKey = (repoDir: string): string => {
   return git(["hash-object", "--stdin"], `${ids}\n`);
 };
 
+// Replay hands every case the latest post-mortems, so they and the code that
+// selects and redacts them shape the review as much as the agent does.
+const REVIEWER_INPUTS = ["delegate/agents", "delegate/review/postmortems", "delegate/review/postmortems.ts"];
+
 // Whether a cached result came from a main commit with this checkout's
 // reviewer. A result's variant is `main-<sha>`; the reviewer is the
-// `delegate/agents` tree at that sha. A sha the checkout can't resolve is not
-// the same reviewer. Needs full history.
+// REVIEWER_INPUTS at that sha. A sha the checkout can't resolve, or one missing
+// any of them, is not the same reviewer. Needs full history.
 export const sameReviewerAs = (repoDir: string): ((result: Result) => boolean) => {
   const tree = (rev: string): string | null => {
     try {
-      return execFileSync("git", ["rev-parse", "--verify", "--quiet", `${rev}:delegate/agents`], {
-        cwd: repoDir,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 30_000,
-      }).trim();
+      return REVIEWER_INPUTS.map((p) =>
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", `${rev}:${p}`], {
+          cwd: repoDir,
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 30_000,
+        }).trim(),
+      ).join(" ");
     } catch {
       return null;
     }
