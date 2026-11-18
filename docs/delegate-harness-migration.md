@@ -242,6 +242,15 @@ a `totalUsage`, and `stopWhen` is the condition that bounds them); the spend cou
 step's `usage` by `delegate/pricing/models.json`; one `abortSignal` past either limit ends the run. A
 test asserts the abort fires at N and that the failed review carries a reason.
 
+**The price table is created in S5, not when the first non-Anthropic provider arrives.** The spend
+cap exists from S5, and a cap that reads `$0` can never fire, so `delegate/pricing/models.json` ships
+in S5 with the **Anthropic** rows — the rates both sides of Stage A run at. S8 adds the **Bedrock**
+rows when the route moves, and S9 adds the **Fireworks** row. Each step commits the rate that step
+makes the code spend, before the code spends it, on the same rule the credentials follow.
+`delegate/pricing/` joins the `replayKey` inputs (`eval/cache.ts:26`) for the same reason: a rate
+change re-keys the cache, because a cached `costUsd` computed under an older table is not comparable
+to a new one.
+
 **The price is delegate's because the SDK reports tokens and not USD.** `LanguageModelUsage` carries
 `inputTokens`, `outputTokens`, `totalTokens` and a `inputTokenDetails` breakdown for cache reads and
 writes, and no money at all (verified in the 6.0.209 type). That is *stronger* than the position the
@@ -249,6 +258,14 @@ old plan was in, where a harness catalog was a second rate source that could sil
 ours. A missing row in our own table is a bug in a file this repo tests, and **a replay whose
 `costUsd` is `0` while it reported tokens is a failure, not a zero-cost win.** A cap that reads $0
 can never fire.
+
+**Token usage has to be persisted, and today it is not.** `Result` (`eval/replay.ts`) carries
+`costUsd: number | null` and no token counts, so a recorded baseline holds one dollar figure and
+nothing else. The Claude SDK does report the counts — `agent.ts:208` logs `msg.usage` beside
+`total_cost_usd` — but `AgentResult` (`delegate/framework/types.ts`) drops them and the replay never
+writes them down. That makes `usage` a **new field on `Result` and `AgentResult`**, added in S2 while
+the Claude implementation is still in place, because the old side is the one that has to start
+recording it. S2 proves `usage` is captured and written; S5 is what starts pricing from it.
 
 **The `@aantenore/pi-budget` retrospective, kept as a record.** The previous version recommended
 against depending on it, and the reasons were measured: created 2026-10-20, last pushed 2026-10-23,
@@ -339,8 +356,9 @@ layer at constant provider and model, Stage 2 is the provider at constant model,
 model. The version of this document that went straight from Anthropic to Fireworks collapsed the
 last two, so a regression there had two candidate causes — and the portability claim the whole plan
 rests on was never measured by a gate at all, only by an ad-hoc side run. Inserting Stage 2 replaces
-that side run with a real gate: same models, two routes, one variable, ordinary `costRatio`. That is
-what the middle stage buys, and it is worth the extra hop.
+that side run with a real gate: same models, two routes, one variable, and a quality verdict the
+canary and the judge can be held to. That is what the middle stage buys, and it is worth the extra
+hop. Cost is recorded rather than gated there, for the reason the gate section gives.
 
 **Stage 1 needs nothing but a provider package and a key.** The two models are reachable through
 `@ai-sdk/anthropic`, so the reviewer moves to the new call layer while still calling the API it
@@ -416,11 +434,13 @@ point different ways, which is the benefit of staging.
 Fireworks US-only serves one model family — DeepSeek V4.1 Flash 1017 US — so Stage 3's provider
 choice *is* the model choice *is* a quality gate: can Flash approve and merge where Opus did? That
 question is asked only after Stages 1 and 2 have been proven with the models unchanged, which is what
-makes the answer interpretable. If it says no, **the fallback is a Bifrost service key**, keeping Opus
-and Sonnet reachable at zero `worker.ts` cost and one more line in `delegate-secret.ts`; the
-reviewer then runs on the new call layer, over the Bedrock route, with the models it has today, and
-the migration still lands its actual goal. **S10's rollback is that same move**, so the fallback is
-the revert rather than a second piece of work.
+makes the answer interpretable. If it says no, **the fallback is the Bedrock route Stage B already
+proved**: Opus and Sonnet stay reachable through the bearer token declared in S7, at zero
+`worker.ts` cost and with no new key to declare, in a PR that touches one provider import. The
+reviewer then runs on the new call layer, over the route Stage B measured, with the models it has
+today, and the migration still lands its actual goal. **S10's rollback is that same move**, so the
+fallback is the revert rather than a second piece of work. Nothing in it reaches for Bifrost, which
+stays rejected for this worker on the blast-radius grounds above.
 
 Stage 2's failure mode is different and cheaper, because the previous route is still deployed:
 Bedrock's Claude is not Anthropic's Claude at this task, or `claude-opus-5-5` is not there at all,
@@ -428,12 +448,14 @@ and S8's revert returns the reviewer to `api.anthropic.com` with the same models
 layer. Nothing in this plan depends on Stage 2 succeeding; it depends on Stage 2 being *tried*, because
 it is the only thing that turns "provider-agnostic" into a measurement.
 
-**Cost is pinned in the repo:** `delegate/pricing/models.json` at the US 1.5× rate — `input: 0.45,
-output: 1.8, cacheRead: 0.009, cacheWrite: 0`, the numbers in
+**Cost is pinned in the repo, one provider at a time:** `delegate/pricing/models.json` carries the
+rates the shipped code spends. Its **Anthropic** rows land in S5, its **Bedrock** rows in S8, and its
+**Fireworks** row in S9 — in each case before the step whose code uses it, so the spend cap is never
+reading a table that has no row for the call it is bounding. The Fireworks numbers are the US 1.5×
+rate — `input: 0.45, output: 1.8, cacheRead: 0.009, cacheWrite: 0`, the figures in
 `agent-swarm/host/global-setup-script.sh` — **not** pi's catalog figure of 0.3/1.2 (verified in the
 installed `fireworks.json`; under-reports by a third), and not zero. This is no longer a patch to a
 harness catalog; it is delegate's own price table, used to turn `usage` into dollars.
-`delegate/pricing/` joins the `replayKey` inputs (`eval/cache.ts:26`).
 
 **The judge stays on Anthropic.** `judge.ts` is a raw `fetch` to `api.anthropic.com`, not Claude
 Code. Deliberately: it is the frozen instrument (changing it invalidates every recorded verdict) and
@@ -469,14 +491,14 @@ until S11 restores it.
 | # | Stage | Step | Reversible? | Evidence gate |
 |---|---|---|---|---|
 | **S1** | — | **Delete the dead CLI install.** `delegate/worker/Dockerfile:4` is proven dead: nothing sets `pathToClaudeCodeExecutable` (0 hits repo-wide) and the SDK resolves its own platform binary by `require.resolve`, never `PATH`. ~346 MB, no behavioural risk. | revert + rebuild | `deploy.yml` builds and pushes; **one real review posted end to end** from the new image; image size recorded before/after. |
-| **S2** | — | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` matching the new call layer, a structured-output ask, a step and usage result — the six SDK-derived fields leave `types.ts` (`AgentConfig`'s `permissionMode`, `agents`, `tools`, `outputFormat`, and `RunOverrides`' `preToolUseHooks`, `resume`), replaced by AI SDK shapes (`tools: ToolSet`, a `prepareStep`-shaped hook, `output: Output.object(...)`). Split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green. |
+| **S2** | — | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` matching the new call layer, a structured-output ask, a step and usage result — the six SDK-derived fields leave `types.ts` (`AgentConfig`'s `permissionMode`, `agents`, `tools`, `outputFormat`, and `RunOverrides`' `preToolUseHooks`, `resume`), replaced by AI SDK shapes (`tools: ToolSet`, a `prepareStep`-shaped hook, `output: Output.object(...)`). Split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `AgentResult` and `Result` gain the token `usage` the Claude SDK already reports (`agent.ts:208`) and the replay already discards, so the baseline side records counts and not only a dollar total. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green; a replay result file carries non-null `usage` beside `costUsd`. |
 | **S3** | — | **The security seam.** Both guards on the new handler type — `pathGuardHook` (`run.ts:78`) and `replayToolGuard` (`replay.ts:358`) — with the normalisation described above applied *before* the prefix test. Symbol names rather than line ranges, deliberately: the ranges differ between the PR base and `main`, and the drift is what made the first version of this document stale. | yes | The adversarial table above passes; every existing denial assertion kept; the `agentEnv` / `pathGuardHook` tests in `run.test.ts` and the `replayToolGuard` pair in `replay.test.ts` rewritten, never deleted. |
 | **S4** | — | **Take the merge authority away: flip to `shadow`.** One line in `deploy/components/worker.ts` (`DELEGATE_GATING_MODE`), which is a **human-owned carve-out** in `.github/CODEOWNERS`, so this is a human-approved infra PR the bot cannot approve for itself. It merges **before S5 does**. Under `shadow` nothing is ever approved — `verdict` is `approve` only when `gating.mode === "enforce"` (`gates.ts:150-152`) — and the status line reports what the gate *would* have done, so the canary's numbers come from the deployed task rather than from a side run. | revert (flip back to `enforce`) | `pulumi preview` shows only the env value changing; one review from the deployed task carries a `Shadow: would approve` or `Shadow: would comment (…)` status and **no** approval verdict. |
-| **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model, `costRatio` gated because both sides price the same table rows. Deployed under `shadow`, so S4's canary window opens here. |
+| **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. **`delegate/pricing/models.json` lands here with the Anthropic rows**, because the spend cap this step ships cannot fire against an empty table. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model. **`costRatio` is gated on token counts, not dollars** — see the gate below — since only this side is table-priced. Deployed under `shadow`, so S4's canary window opens here. |
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
-| **S7** | **2. The route** | **Declare the Bedrock credential, additively.** The bearer token's value goes into the live `DELEGATES` secret out of band first; then `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**, and that deploys. **No IAM change and no `worker.ts` change**: a bearer token is a key, not a grant, so `deploy/bedrock-invoke-principals.test.ts`'s file list is untouched — that is the whole reason this route is acceptable. No agent code changes, so the running reviewer is untouched. Human-owned carve-out, its own PR. | yes | `deploy.yml` reaches `./deploy.sh`; `pulumi preview` shows exactly one added entry in the task's `secrets` and nothing else; `check-secret-keys.ts` passes with both keys declared; `bedrock-invoke-principals.test.ts` still passes unchanged; a real review still posts, still on Anthropic direct. |
-| **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. |
-| **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. `delegate/pricing/models.json` lands here too, so the rate is committed before anything spends it. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
+| **S7** | **2. The route** | **Declare the Bedrock credential, additively.** The bearer token's value goes into the live `DELEGATES` secret out of band first; then `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**, and that deploys. **No IAM change and no `worker.ts` change**: a bearer token is a key, not a grant, so `deploy/bedrock-invoke-principals.test.ts`'s file list is untouched — that is the whole reason this route is acceptable. It also **states, in the PR body, which account the reviewer's task runs in and which inference profiles this token may invoke** — the one thing this document cannot settle from the repo, because `utils/bedrock-models.ts` and `bedrock-invoke-principals.test.ts` describe the workbench account and Bifrost's task role, not the reviewer's. No agent code changes, so the running reviewer is untouched. Human-owned carve-out, its own PR. | yes | `deploy.yml` reaches `./deploy.sh`; `pulumi preview` shows exactly one added entry in the task's `secrets` and nothing else; `check-secret-keys.ts` passes with both keys declared; `bedrock-invoke-principals.test.ts` still passes unchanged; the PR body names the account and the profiles; a real review still posts, still on Anthropic direct. |
+| **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. **`delegate/pricing/models.json` gains the Bedrock rows here**, so the stage's nonzero `costUsd` gate has a rate to compute from. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. |
+| **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. **`delegate/pricing/models.json` gains the Fireworks row here**, the last provider it needs. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
 | **S10** | 3 | **The model move, to Fireworks.** Point the orchestrator and the subagents at the Fireworks provider and its model. Code only — the key it needs was declared and deployed in S9, and both earlier keys are still declared, so the rollback actually works. | yes (flip back to the Bedrock provider, with no deploy-ordering problem) | `npm run build` and `npm test`; **Stage C** of the gate below; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
 | **S11** | — | **Restore `enforce`, once the canary has passed.** One line in the same human-owned carve-out as S4. Blocked until the canary reports zero false approves and `review_failed` at or below baseline. | revert (flip back to `shadow`) | The canary's numbers, plus a review from the deployed task that carries a real approval verdict again. |
 | **S12** | — | **Docs and the plan amendment.** `CLAUDE.md:14,145`, `delegate/README.md:3,26,30`, `eval/README.md`, `docs/pr-previews.md:123` (also `getSecretVersion`→`getSecret`), and `docs/plan-gated-merges.md:378` as a **plan amendment, not a checklist edit**, because its "`anyOf` … because that is the keyword Anthropic's structured-output dialect supports" becomes false. | yes | Docs only; the amendment PR names its plan and step. |
@@ -557,15 +579,33 @@ could quietly change the call.
 
 **Stage C — the model** (gates S10). `results-ai-sdk-bedrock` (Stage B's new side, reused) against
 `results-ai-sdk-fireworks`, one variable changed: ~$90–170, since only the model differs. If it
-fails, the named Bifrost fallback applies and Stages A and B stand — the call layer and the provider
-route are both already proven, so a failure here is a model decision, not a plan restart.
+fails, **the fallback is S10's own revert**: flip the provider import back to Bedrock, using the
+bearer token S7 already declared, and the reviewer keeps the models Stage B proved on the route Stage
+B measured. Stages A and B stand — the call layer and the provider route are both already proven — so
+a failure here is a model decision, not a plan restart, and it costs no new credential and no
+`delegate-secret.ts` change.
 
 **What every round gates on:** no case main passed on every run regresses; holdout counts only, never
 holdout ids; the judge's pairwise verdict not-worse; `--final true` so a rerun that never happened
-cannot pass. **`costRatio` is gated in Stage A and only recorded in Stages B and C.** In Stage A both
-sides are priced from the same table rows, so `COST_LIMIT = 1.1` (`eval/expect.ts:335`) is a real
-comparison of the two call layers' token use. In Stages B and C the two sides price from different
-rows — Bedrock's Claude rates are not Anthropic's, and Fireworks' are not either — so a human reads
+cannot pass.
+
+**Decided here: Stage A gates on token counts, not on `costRatio`.** The two sides are not priced the
+same way and cannot be made to be from the artifacts that exist. Only the new side is table-priced;
+the old Claude Agent SDK side reports `total_cost_usd` itself (`delegate/framework/agent.ts:203`, and
+`:223` on the error path) and every recorded baseline carries that number. A ratio of two differently
+computed totals could move because of how cache reads, cache writes or a rate are accounted, rather
+than because either call layer used more tokens — which is exactly the confound `COST_LIMIT` exists
+to avoid. The alternative was re-pricing the old side through the table, and **it is not available
+against the baselines that exist**: `Result` (`eval/replay.ts`) stores `costUsd` and no token counts,
+so there is nothing to re-price with. It becomes available only for runs recorded after S2 starts
+persisting `usage`, which is one more reason S2 does that.
+
+So Stage A compares `inputTokens`, `outputTokens`, `cacheReadTokens` and `cacheWriteTokens` per case,
+side by side, from the `usage` both sides now record; the gate is a token ratio with the same 1.1
+ceiling `COST_LIMIT` already uses, and a human reads the dollar consequence rather than gating on it.
+Stage A therefore does **not** claim the two sides "price the same table rows", because they do not.
+Stages B and C record `costUsd` and gate nothing on it, since their two sides price from different
+rows — Bedrock's Claude rates are not Anthropic's, and Fireworks' are not either — and a human reads
 the first three production `costUsd` values against a billing line instead. The
 zero-cost-with-tokens assertion runs automatically in all three.
 
@@ -576,6 +616,24 @@ under `enforce`. The requirement is the same one: **zero false approves and `rev
 below baseline**, measured on the whole window from S4 through S10. S11 restores `enforce` only after
 that holds, and it is a separate human-owned PR, so the flip back is a decision someone makes after
 reading the numbers rather than something that rides along with a code change.
+
+**How a false approve is counted.** Under `shadow` there is no approval to audit after the fact, so
+the count is taken from two things the run already writes rather than from a human reading PRs:
+
+- **A false approve is a record whose gate *would* have approved and whose merge was wrong.** The
+  first half is mechanical: under `shadow` the status line reads `Shadow: would approve` exactly when
+  `record.action === "commented"` and `record.gates` is empty (`statusForRecord`, `run.ts:137`), so
+  every would-approve is already labelled in the check output as the window runs. The second half is
+  the only judgement: for each `Shadow: would approve` PR, a human records whether a later finding,
+  revert or hotfix showed the change should not have merged. `ReviewRecord` already carries the
+  target, the reviewed sha and the verdict, so that list is a filter over stored records, not a
+  separate ledger.
+- **`review_failed` is counted straight from the records** — every record with no verdict — so the
+  baseline comparison is record-to-record against the same window length before S4.
+
+"Zero false approves" therefore means zero would-approves on that list, over 10–20 labelled
+would-approves, and the canary is not declared passed on an empty window: if `Shadow: would approve`
+never appears at all, the window has not exercised the approval path and does not count.
 
 That ordering is the whole argument for splitting S4 out of S5. A canary cannot retroactively
 un-merge an approval, so it has to be running before the first reviewer nobody has measured can
@@ -705,6 +763,6 @@ the step that depends on them**, none of them asserted anywhere above:
 
 **Whether Flash can carry the review is unmeasured by design** — that is Stage C, and the fallback is
 named. **Whether Bedrock's Claude is as good as Anthropic's Claude at this task is also unmeasured
-by design** — that is Stage B, and it is the one stage whose failure does not fall back to Bifrost but
-to staying on Anthropic direct, which S8's rollback already allows. And **the arms harness's refusal
+by design** — that is Stage B, and it is the one stage whose failure falls back to staying on
+Anthropic direct, which S8's rollback already allows. And **the arms harness's refusal
 was read from source**, not reproduced.
