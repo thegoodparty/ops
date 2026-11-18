@@ -37,7 +37,10 @@ const GateNameSchema = z.custom<GatingFlag>(
 // is a comment and the named gate fired. An outcome case may also carry
 // `consistency` as a diagnostic: when it does, the model's answer has to be
 // right as well, which is how a wrong outcome is attributed to the model
-// rather than to the gate.
+// rather than to the gate. `no-finding` is the negation of `block`: no
+// finding lands in `paths`, whatever the review says elsewhere. It is for a
+// refuted finding in a PR that also has real defects, where `approve` would
+// fail the case for catching them.
 const ExpectSchema = z.discriminatedUnion("verdict", [
   z.strictObject({
     verdict: z.literal("approve"),
@@ -46,6 +49,11 @@ const ExpectSchema = z.discriminatedUnion("verdict", [
   z.strictObject({
     verdict: z.literal("block"),
     reason: z.string().trim().min(1),
+    consistency: ConsistencySchema.optional(),
+  }),
+  z.strictObject({
+    verdict: z.literal("no-finding"),
+    paths: z.array(z.string().min(1)).min(1),
     consistency: ConsistencySchema.optional(),
   }),
   z.strictObject({
@@ -272,6 +280,16 @@ export const scoreRun = (expect: Expect, result: Result, judgment?: BlockJudgmen
           ? { pass: true, outcome: "approved" }
           : { pass: false, outcome: `blocked: ${listed}` };
     }
+  } else if (expect.verdict === "no-finding") {
+    // The gate is not consulted: a comment here comes from findings on other
+    // paths, which are the PR's own defects and not what the case is about.
+    const pinned = findings.filter((f) => expect.paths.includes(f.path));
+    if (pinned.length > 0) {
+      const on = pinned.map((f) => `${f.path}:${f.line} [${f.category}]`).join(", ");
+      outcome = { pass: false, outcome: `blocked on the refuted path: ${on}` };
+    } else {
+      outcome = { pass: true, outcome: findings.length === 0 ? "approved" : `blocked elsewhere: ${listed}` };
+    }
   } else if (!blockingFindings(result)) {
     outcome = { pass: false, outcome: "approved" };
   } else if (!judgment) {
@@ -304,6 +322,9 @@ const describeExpect = (e: Expect): string => {
   const diagnostic = e.consistency ? ` (diagnostic: planConsistency: ${e.consistency})` : "";
   if (e.verdict === "approve") return `approve${diagnostic}`;
   if (e.verdict === "flag") return `flag \`${e.reason}\`${diagnostic}`;
+  if (e.verdict === "no-finding") {
+    return `no finding in ${e.paths.map((p) => `\`${p.split("/").pop()}\``).join(" or ")}${diagnostic}`;
+  }
   return `block: ${e.reason.replace(/\|/g, "/")}${diagnostic}`;
 };
 
