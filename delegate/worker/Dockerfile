@@ -1,7 +1,6 @@
 FROM public.ecr.aws/docker/library/node:22.23.4-alpine
 
 RUN apk add --no-cache git curl github-cli uv bash aws-cli jq ripgrep
-RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 COPY package*.json ./
