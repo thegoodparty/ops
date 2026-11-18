@@ -345,6 +345,24 @@ reviewer's authority, not about the call layer, and the review agreed.
 
 **The migration is three stages, and the middle one is what makes the claim measurable.**
 
+> **Amendment (step 2, ops#561).** These three are *stages*, and they are numbered 1–3 beside a
+table numbered `S1`–`S12`, which two different things then call "step 1". That collision has a
+consequence this document did not anticipate, and it is recorded here because it is a defect in *this
+document*, not in the code: `findPlanSteps` (`delegate/review/gating.ts`) locates a step's own text
+for the reviewer's prompt, and it prefers a heading or a list under a step-shaped section, falling
+back to **the first numbered list item in the document** when neither exists. This document has no
+step-shaped heading at all, so every `Step: N` from 1 to 5 binds to the wrong text — `Step: 1..3` to
+these stages, `Step: 4` and `5` to the "what this document could not verify" list — and the prompt
+presents that as the step the PR implements. It happens on ops#561 itself: `Step: 2` put "The route"
+(S8) in front of the reviewer as step 2's spec, and the reviewer's own note repeated it back.
+
+The wording below is deliberately not changed: “stage” already distinguishes these from the table's
+`S` steps, and S12 is the step that amends prose. What changes is the claim under "How an
+implementation PR binds to this plan" that `Step:` "never affects the verdict" — it does, because
+the located step is model input (below). Until either the numbering or `findPlanSteps` changes,
+treat a `Step:` line as a hint that may bind wrong rather than as a reliable pointer, and read the
+reviewer's plan-consistency answer with that in mind.
+
 1. **The call layer.** Claude Code out, the AI SDK in, still on the Anthropic API and still on
    `claude-opus-5-5` / `claude-sonnet-5-5`. One variable changes.
 2. **The route.** Same two Claude models, reached through Bedrock instead of `api.anthropic.com`.
@@ -861,7 +879,11 @@ Step: 5
 (`gating.ts:91`) — so this document's `S5` label must be written `Step: 5`, not `Step: S5`. A
 malformed or duplicated `Step:` is silently ignored (`gating.ts:108-111`), which leaves the step's
 status where it was rather than failing loudly, so getting this wrong is invisible. `Plan:` is what
-the gate reads; `Step:` only advances status and never affects the verdict.
+the gate reads. `Step:` advances status **and** reaches the verdict: the harness locates that step's
+text in this document and puts it in the reviewer's prompt as the spec the diff is judged against
+(`pr-reviewer.ts`, `findPlanSteps`), so a `Step:` line that binds to the wrong list changes what the
+model is asked. This document's own numbering collides in exactly that way — see the amendment
+under "Provider and model: settled".
 
 ## What this document could not verify
 
