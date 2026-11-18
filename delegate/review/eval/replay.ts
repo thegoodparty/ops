@@ -1,10 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
-import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
+import type { AgentConfig, AgentResult, McpServerConfig, ToolCallHandler } from "../../framework";
 import type { SubagentCall, TokenUsage } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
@@ -313,7 +312,7 @@ export type RunAgentImpl = (
     cwd: string;
     mcpServers: Record<string, McpServerConfig>;
     env: Record<string, string | undefined>;
-    toolCallGuards?: HookCallback[];
+    toolCallGuards?: readonly ToolCallHandler[];
   },
 ) => Promise<AgentResult>;
 
@@ -363,18 +362,10 @@ const getVariant = (): string => {
 // would otherwise reach the run's result files and the holdout manifest.
 const REPLAY_TOOLS = new Set<string>(["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", ...GIT_TOOL_NAMES]);
 
-export const replayToolGuard: HookCallback = async (input) => {
-  const i = input as { hook_event_name?: string; tool_name?: string };
-  if (i.hook_event_name !== "PreToolUse" || REPLAY_TOOLS.has(i.tool_name ?? "")) return { continue: true };
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: `Tool not allowed in replay: ${i.tool_name}`,
-    },
-  };
-};
+export const replayToolGuard: ToolCallHandler = (call) =>
+  REPLAY_TOOLS.has(call.toolName)
+    ? { decision: "allow" }
+    : { decision: "deny", reason: `Tool not allowed in replay: ${call.toolName}` };
 
 export const replayCase = async (
   record: ReviewRecord,

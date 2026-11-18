@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
+import type { ToolCallDecision, ToolCallHandler } from "../framework/types";
+import { agentEnv, gatingFor, latestCompletedRecord, normalizeGuardPath, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
 import { decide } from "./gates";
 import { priorFindingsFrom } from "./bundle";
 import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema, lockKey, recordKey } from "./schema";
@@ -209,16 +210,12 @@ test("agentEnv drops anything it was not told about", () => {
   assert.deepEqual(Object.keys(env), ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]);
 });
 
-const hookCall = async (hook: ReturnType<typeof pathGuardHook>, tool: string, input: unknown) =>
-  hook(
-    { hook_event_name: "PreToolUse", tool_name: tool, tool_input: input } as never,
-    undefined,
-    { signal: new AbortController().signal },
-  );
+// A guard is asked about one tool call now, not handed a Claude hook event, so
+// the helper builds the call and reads the contract's own decision.
+const guardCall = async (guard: ToolCallHandler, tool: string, input: unknown) =>
+  guard({ toolName: tool, input: input as Record<string, unknown> });
 
-const denied = (out: unknown) =>
-  (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput
-    ?.permissionDecision === "deny";
+const denied = (out: ToolCallDecision) => out.decision === "deny";
 
 test("pathGuardHook confines Read/Grep/Glob to the review checkout", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
@@ -226,16 +223,98 @@ test("pathGuardHook confines Read/Grep/Glob to the review checkout", async () =>
   writeFileSync(join(root, "src", "a.ts"), "x");
   const hook = pathGuardHook(root);
 
-  assert.equal(denied(await hookCall(hook, "Read", { file_path: join(root, "src/a.ts") })), false);
-  assert.equal(denied(await hookCall(hook, "Read", { file_path: "src/a.ts" })), false);
-  assert.equal(denied(await hookCall(hook, "Grep", { pattern: "x", path: root })), false);
-  assert.equal(denied(await hookCall(hook, "Glob", { pattern: "**/*.ts" })), false);
+  assert.equal(denied(await guardCall(hook, "Read", { file_path: join(root, "src/a.ts") })), false);
+  assert.equal(denied(await guardCall(hook, "Read", { file_path: "src/a.ts" })), false);
+  assert.equal(denied(await guardCall(hook, "Grep", { pattern: "x", path: root })), false);
+  assert.equal(denied(await guardCall(hook, "Glob", { pattern: "**/*.ts" })), false);
 
-  assert.equal(denied(await hookCall(hook, "Read", { file_path: "/proc/1/environ" })), true);
-  assert.equal(denied(await hookCall(hook, "Read", { file_path: "../../etc/passwd" })), true);
-  assert.equal(denied(await hookCall(hook, "Grep", { pattern: "x", path: "/" })), true);
-  assert.equal(denied(await hookCall(hook, "Glob", { pattern: "*", path: "/proc" })), true);
-  assert.equal(denied(await hookCall(hook, "Task", { prompt: "/proc/1/environ" })), false);
+  assert.equal(denied(await guardCall(hook, "Read", { file_path: "/proc/1/environ" })), true);
+  assert.equal(denied(await guardCall(hook, "Read", { file_path: "../../etc/passwd" })), true);
+  assert.equal(denied(await guardCall(hook, "Grep", { pattern: "x", path: "/" })), true);
+  assert.equal(denied(await guardCall(hook, "Glob", { pattern: "*", path: "/proc" })), true);
+  // A tool the guard does not police is allowed through, input and all.
+  assert.equal(denied(await guardCall(hook, "Task", { prompt: "/proc/1/environ" })), false);
+});
+
+// The adversarial table from `docs/delegate-harness-migration.md`, section 3.
+// The `@` and unicode-space rows are the normalisation: before it, both were a
+// string the prefix test read as somewhere else, and the file tool underneath
+// (pi's, whose `resolveToCwd` strips `@` and folds unicode spaces) would open
+// the path the guard had just compared. Each row is its own test so a failure
+// names the bypass rather than one big assertion's line number.
+test("pathGuard allows a path inside the checkout", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  mkdirSync(join(root, "src"));
+  writeFileSync(join(root, "src", "a.ts"), "x");
+  const guard = pathGuardHook(root);
+  assert.deepEqual(await guardCall(guard, "Read", { file_path: "src/a.ts" }), { decision: "allow" });
+});
+
+test("pathGuard denies an absolute path outside the checkout", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "/proc/1/environ" })), true);
+});
+
+test("pathGuard denies a relative traversal out of the checkout", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "../../etc/passwd" })), true);
+});
+
+test("pathGuard denies an @-prefixed absolute path", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "@/etc/hostname" })), true);
+});
+
+test("pathGuard denies an @-prefixed traversal", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "@../../etc/passwd" })), true);
+});
+
+test("pathGuard denies a path with a leading unicode space", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const guard = pathGuardHook(root);
+  for (const space of ["\u00a0", "\u2007", "\u202f", "\u3000"]) {
+    assert.equal(
+      denied(await guardCall(guard, "Read", { file_path: `${space}/etc/hostname` })),
+      true,
+      `U+${space.codePointAt(0)!.toString(16)}`,
+    );
+  }
+});
+
+test("pathGuard denies a symlink inside the checkout that points outside it", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  symlinkSync("/etc", join(root, "etc-link"));
+  const guard = pathGuardHook(root);
+  // Both spellings: the absolute path to the link and the checkout-relative
+  // one. `realpath` is what makes either of them a denial, which is why
+  // dropping it is a bypass and not a tidy-up.
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: join(root, "etc-link/hostname") })), true);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: "etc-link/hostname" })), true);
+});
+
+test("pathGuard does not read a sibling of the checkout as inside it", async () => {
+  // The `root + sep` comparison: `/checkout-evil` starts with `/checkout` and
+  // is a different directory. A bare `startsWith(root)` passes it.
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), "review-guard-")));
+  const root = join(parent, "checkout");
+  const evil = join(parent, "checkout-evil");
+  mkdirSync(root);
+  mkdirSync(evil);
+  const guard = pathGuardHook(root);
+  assert.equal(denied(await guardCall(guard, "Read", { file_path: join(evil, "a.ts") })), true);
+});
+
+test("normalizeGuardPath strips one leading @ and every unicode space", () => {
+  assert.equal(normalizeGuardPath("src/a.ts"), "src/a.ts");
+  assert.equal(normalizeGuardPath("@src/a.ts"), "src/a.ts");
+  assert.equal(normalizeGuardPath("@@src/a.ts"), "@src/a.ts");
+  assert.equal(normalizeGuardPath("\u00a0/etc/hostname"), "/etc/hostname");
+  assert.equal(normalizeGuardPath("src/a\u00a0b.ts"), "src/ab.ts");
 });
 
 const recordStub = (action: ReviewRecord["action"], finishedAt: string): ReviewRecord =>

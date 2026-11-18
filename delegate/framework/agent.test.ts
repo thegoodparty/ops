@@ -4,11 +4,12 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import {
   claudeOptions,
   forceSynchronousTaskHook,
+  toPreToolUseHook,
   toTokenUsage,
   totalTokenUsage,
 } from "./agent";
 import { toolSet } from "./types";
-import type { AgentConfig, McpServerConfig } from "./types";
+import type { AgentConfig, McpServerConfig, ToolCallHandler } from "./types";
 import { prReviewerSubagents } from "../agents/pr-reviewer-subagents";
 import prReviewer from "../agents/pr-reviewer";
 import { POSTMORTEM_SELECTOR } from "../review/postmortems";
@@ -187,19 +188,89 @@ describe("claudeOptions", () => {
     ]);
   });
 
-  it("puts the caller's guards after the synchronous-task hook, in order", () => {
-    const first = async () => ({ continue: true }) as const;
-    const second = async () => ({ continue: true }) as const;
+  it("puts the caller's guards after the synchronous-task hook, in order", async () => {
+    // Guards are the contract's own (a decision over a tool call); the harness
+    // adapts each one to a `PreToolUse` hook at this boundary. So there are
+    // three function slots here — the synchronous-task hook and one adapter per
+    // guard — and the order the caller gave is the order they are asked in.
+    const tags: string[] = [];
+    const tagging = (tag: string): ToolCallHandler => () => {
+      tags.push(tag);
+      return { decision: "allow" };
+    };
     const options = claudeOptions(
       { name: "x", systemPrompt: "s", model: "m" },
-      { toolCallGuards: [first, second] },
+      { toolCallGuards: [tagging("first"), tagging("second")] },
       () => undefined,
     );
     const hooks = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
     assert.equal(hooks.length, 3);
     assert.equal(hooks[0], forceSynchronousTaskHook);
-    assert.equal(hooks[1], first);
-    assert.equal(hooks[2], second);
+    const event = { hook_event_name: "PreToolUse", tool_name: "Read", tool_input: {} };
+    for (const hook of hooks.slice(1)) {
+      await hook(event as never, undefined, { signal: new AbortController().signal });
+    }
+    assert.deepEqual(tags, ["first", "second"]);
+  });
+
+  it("adapts a guard's allow to a pass-through and its deny to a deny envelope", async () => {
+    const call = { hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/etc/passwd" } };
+    const allow = await toPreToolUseHook(() => ({ decision: "allow" }))(
+      call as never,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    // Not `permissionDecision: "allow"`: a guard grants confinement, not a
+    // permission-system bypass.
+    assert.deepEqual(allow, { continue: true });
+
+    const deny = await toPreToolUseHook(() => ({
+      decision: "deny",
+      reason: "Path is outside the review checkout: /etc/passwd",
+    }))(call as never, undefined, { signal: new AbortController().signal });
+    assert.deepEqual(deny, {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "Path is outside the review checkout: /etc/passwd",
+      },
+    });
+  });
+
+  it("asks a guard only about tool calls, and hands it the call's own input", async () => {
+    const seen: unknown[] = [];
+    const hook = toPreToolUseHook((c) => {
+      seen.push(c);
+      return { decision: "allow" };
+    });
+    // A non-`PreToolUse` event never reaches the guard: the guard's vocabulary
+    // has no events in it.
+    assert.deepEqual(
+      await hook({ hook_event_name: "Stop" } as never, undefined, {
+        signal: new AbortController().signal,
+      }),
+      { continue: true },
+    );
+    assert.deepEqual(seen, []);
+    await hook(
+      { hook_event_name: "PreToolUse", tool_name: "Glob", tool_input: { pattern: "**/*.ts" } } as never,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+    assert.deepEqual(seen, [{ toolName: "Glob", input: { pattern: "**/*.ts" } }]);
+  });
+
+  it("carries a thrown guard through as a rejection, not as an allow", async () => {
+    const hook = toPreToolUseHook(() => {
+      throw new Error("boom");
+    });
+    await assert.rejects(
+      hook({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: {} } as never, undefined, {
+        signal: new AbortController().signal,
+      }),
+      /boom/,
+    );
   });
 
   it("passes a tool set through as names, in the order it was declared", () => {

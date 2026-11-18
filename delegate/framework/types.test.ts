@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { addUsage, toolSet } from "./types";
-import type { AgentConfig, ToolCallHandler, ToolSet } from "./types";
+import type { AgentConfig, RunOverrides, ToolCallHandler, ToolSet } from "./types";
 import { prReviewerSubagents } from "../agents/pr-reviewer-subagents";
 import prReviewer from "../agents/pr-reviewer";
 import { REVIEW_OUTPUT_JSON_SCHEMA } from "../agents/pr-reviewer";
@@ -86,12 +86,11 @@ test("addUsage treats a missing usage as unknown, never as zero", () => {
 });
 
 test("ToolCallHandler can express what the existing guards decide", () => {
-  // `pathGuardHook` and `replayToolGuard` decide allow or deny-with-a-reason
-  // today, in Claude's `PreToolUse` vocabulary. S3 moves them onto this type,
-  // so the point of pinning it here is that nothing they express is lost in the
-  // move: an allowance, and a denial that carries the sentence the model is
-  // shown. If this needed a third arm, S3 would be a behaviour question rather
-  // than a shape change.
+  // `pathGuardHook` and `replayToolGuard` are both on this type since S3, so the
+  // point of pinning it here is that nothing they express was lost in the move:
+  // an allowance, and a denial that carries the sentence the model is shown. If
+  // this needed a third arm, the move would have been a behaviour question
+  // rather than a shape change.
   const allow: ToolCallHandler = () => ({ decision: "allow" });
   const deny: ToolCallHandler = () => ({
     decision: "deny",
@@ -102,4 +101,29 @@ test("ToolCallHandler can express what the existing guards decide", () => {
   const denial = deny({ toolName: "Read", input: { file_path: "/proc/1/environ" } });
   assert.equal((denial as { decision: string }).decision, "deny");
   assert.match((denial as { reason: string }).reason, /^Path is outside the review checkout: /);
+});
+
+test("RunOverrides is no longer generic over the guard type", async () => {
+  // Mostly a type assertion, so `npm run build` is what checks the load-bearing
+  // half and `tsx --test` only runs the last line. S2 gave `RunOverrides` a type
+  // parameter so that running Claude `PreToolUse` hooks under the contract was
+  // visible instead of a cast at the call site; S3 moved both guards onto
+  // `ToolCallHandler` and the parameter went with them. If it came back, the
+  // `RunOverrides<…>` below would typecheck, this `@ts-expect-error` would
+  // become the error, and the build would fail.
+  // @ts-expect-error `RunOverrides` takes no type parameter since S3
+  type GuardParameterRemoved = RunOverrides<ToolCallHandler>;
+  const removed: GuardParameterRemoved[] = [];
+  assert.equal(removed.length, 0);
+  const overrides: RunOverrides = {
+    toolCallGuards: [
+      ({ toolName }) =>
+        toolName === "Read" ? { decision: "allow" } : { decision: "deny", reason: toolName },
+    ],
+  };
+  // The element type is the contract's, so a guard here is the same function
+  // `pathGuardHook` and `replayToolGuard` are.
+  const guard: ToolCallHandler | undefined = overrides.toolCallGuards?.[0];
+  assert.ok(guard !== undefined);
+  assert.equal((await guard({ toolName: "Bash", input: {} })).decision, "deny");
 });

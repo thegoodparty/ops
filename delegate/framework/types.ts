@@ -68,8 +68,13 @@ export type ToolCallDecision = { decision: "allow" } | { decision: "deny"; reaso
 
 /**
  * A guard over one tool call: the seam `pathGuardHook` and `replayToolGuard`
- * move onto in S3. A call runs only if every guard allows it, so a guard that
- * throws fails closed.
+ * are on. A call runs only if every guard allows it, so a guard that throws
+ * fails closed.
+ *
+ * Nothing in this shape names a harness, which is the point: a guard decides
+ * over a tool name and an input object, and the harness it runs under adapts
+ * itself to that (`toPreToolUseHook` in `agent.ts`) rather than the other way
+ * round. A guard is therefore the same code under either implementation.
  */
 export type ToolCallHandler = (call: ToolCall) => ToolCallDecision | PromiseLike<ToolCallDecision>;
 
@@ -151,21 +156,24 @@ export type AgentConfig = {
   output?: StructuredOutputAsk;
 };
 
-export type RunOverrides<Guard = ToolCallHandler> = {
+export type RunOverrides = {
   cwd?: string;
   abortController?: AbortController;
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   /**
-   * Guards run over every tool call before the tool executes.
+   * Guards run over every tool call before the tool executes. A call runs only
+   * if every guard allows it, so a guard that throws fails closed.
    *
-   * The element type is the harness's, because S2's Claude implementation runs
-   * Claude `PreToolUse` hooks and can run nothing else. `runAgent`'s type
-   * parameter is what makes that honest instead of a cast at the call site; S3
-   * rewrites both guards onto `ToolCallHandler`, and once one harness is left
-   * the parameter has exactly one value and goes away.
+   * The element type is the contract's own, and no harness's is accepted here.
+   * S2 carried a type parameter so that running Claude `PreToolUse` hooks under
+   * this contract was visible instead of a cast; S3 moved both guards onto
+   * `ToolCallHandler` and the parameter went with them. A harness that has
+   * hooks of its own adapts this shape at its own boundary, in one place
+   * (`toPreToolUseHook` in `agent.ts`), which is what keeps a guard from
+   * knowing which harness is underneath it.
    */
-  toolCallGuards?: readonly Guard[];
+  toolCallGuards?: readonly ToolCallHandler[];
   /**
    * Continue the conversation whose handle the last run returned as
    * `AgentResult.sessionId`, instead of starting a fresh one: the prompt is
