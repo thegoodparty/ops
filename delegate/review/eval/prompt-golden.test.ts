@@ -73,6 +73,18 @@ const GOLDEN: [id: string, reviewHash: string, reviewChars: number, selectorHash
 
 const SCENARIOS = join(__dirname, "scenarios");
 
+// The post-mortem folder is frozen here, at the bytes the hashes below were
+// computed from, rather than read from `delegate/review/postmortems/`.
+//
+// Reading the live folder made this test fail on content rather than on code:
+// the selector prompt lists every lesson in the folder, so the weekly sync that
+// adds a post-mortem — or any edit to one — moved all 33 hashes and turned
+// `npm test` red for a PR that changed no code at all. That is ops#549's
+// shape, and it would have made the sync PR the thing that broke the suite.
+// A fixture is the same trick `reviewPromptFor` already uses for the model's
+// selection: hold everything but the code still.
+const POSTMORTEM_FIXTURES = join(__dirname, "prompt-fixtures", "postmortems");
+
 const normalise = (text: string): string =>
   text
     .replace(/boundary="[0-9a-f]{24}"/g, 'boundary="TOKEN"')
@@ -92,6 +104,7 @@ const reviewPromptFor = async (id: string) => {
   // selection ask is model input too.
   const selectorPrompts: string[] = [];
   const postmortems = await selectPostmortems(bundle, {
+    dir: POSTMORTEM_FIXTURES,
     redact: true,
     ask: async (prompt) => {
       selectorPrompts.push(normalise(prompt));

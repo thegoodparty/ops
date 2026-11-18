@@ -5,7 +5,6 @@ import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
 import type { AgentConfig, AgentResult, McpServerConfig } from "../../framework";
-import { addUsage } from "../../framework/types";
 import type { SubagentCall, TokenUsage } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
@@ -427,9 +426,6 @@ export const replayCase = async (
   }
 
   const config = getAgent("pr-reviewer");
-  // The post-mortem selection pass is two more calls whose spend belongs to
-  // this case, so its usage is carried into the result as well.
-  let selectorUsage: TokenUsage | undefined;
   // Same as production: a diff too large for the first message goes to a
   // file under .git/ for the agent to read in parts.
   let diffPath: string | undefined;
@@ -452,7 +448,6 @@ export const replayCase = async (
         env: agentEnv(),
         toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
       });
-      selectorUsage = addUsage(selectorUsage, selection.usage);
       if (selection.errorSubtype) throw new Error(`${selection.errorSubtype}: ${selection.output.slice(0, 300)}`);
       return selection.output;
     },
@@ -468,11 +463,20 @@ export const replayCase = async (
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return makeResult(null, null, `agent threw: ${message}`, undefined, undefined, selectorUsage);
+    return makeResult(null, null, `agent threw: ${message}`, undefined, undefined, null);
   }
 
   subagentCalls = agentResult.subagentCalls;
-  const usage = addUsage(selectorUsage, agentResult.usage);
+  // `usage` covers exactly the same call as `costUsd`: this run's review call.
+  //
+  // The post-mortem selection pass before it is two more calls, and counting its
+  // tokens here would make the two fields describe different sets of calls -- a
+  // result whose tokens include the selector but whose dollars do not, and, when
+  // the review call answers no usage, a case with a token count and a null cost.
+  // `costUsd` is the harness's own estimate and is unchanged by this step, so
+  // the field that is new is the one that has to match it. A later step that
+  // wants a case's whole spend has to change both together.
+  const usage = agentResult.usage;
 
   if (agentResult.errorSubtype) {
     return makeResult(

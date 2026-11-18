@@ -417,14 +417,43 @@ test("a written result file carries usage beside costUsd", async () => {
   ) as Result;
   assert.notEqual(written.costUsd, null, "costUsd must be recorded");
   assert.notEqual(written.usage, null, "usage must be recorded");
-  // The post-mortem selection call spends too, and it is part of what this case
-  // cost. Two calls at the same counts is the whole spend.
+  // The counts are the review call's alone, which is the same call `costUsd`
+  // prices. The post-mortem selection pass before it is two more calls; folding
+  // its tokens in here would describe a different set of calls than the dollars
+  // beside it, so it is deliberately not counted in either field.
   assert.deepEqual(written.usage, {
-    inputTokens: 22,
-    outputTokens: 44,
-    cacheReadTokens: 66,
-    cacheWriteTokens: 88,
+    inputTokens: 11,
+    outputTokens: 22,
+    cacheReadTokens: 33,
+    cacheWriteTokens: 44,
   });
+});
+
+test("a result's usage and costUsd describe the same call", async () => {
+  // The invariant the previous test's shape depends on. A case whose review
+  // call answered no usage but whose selector did would otherwise carry a token
+  // count with a null cost, which reads as spend that was never priced.
+  const out = tmpDir();
+  const record = makeRecord();
+  const selectorOnly: RunAgentImpl = async (config) =>
+    config.name === "postmortem-selector"
+      ? {
+          agent: config.name,
+          output: '{"ids":[]}',
+          durationMs: 1,
+          usage: { inputTokens: 7, outputTokens: 8, cacheReadTokens: 9, cacheWriteTokens: 10 },
+        }
+      : {
+          agent: config.name,
+          output: JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+          durationMs: 1,
+          costUsd: 0.02,
+          structuredOutput: { status: "complete", findings: [], summary: "s" },
+        };
+  await replayAll([record], { out, workDir: tmpDir(), variant: "v1" }, { concurrency: 1 }, selectorOnly, fakeCheckout);
+  const written = JSON.parse(readFileSync(join(out, record.runId, "run-1.json"), "utf-8")) as Result;
+  assert.equal(written.usage, null, "the review call reported no usage, so there are no counts");
+  assert.equal(written.costUsd, 0.02);
 });
 
 test("a fake that reports no usage writes null rather than omitting the field", async () => {
