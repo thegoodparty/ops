@@ -9,17 +9,13 @@ import type {
   SubagentCall,
   SubagentDefinition,
   TokenUsage,
+  ToolCallDecision,
   ToolCallHandler,
   ToolSet,
 } from "./types";
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
-
-// The guard element in S2 is a Claude `PreToolUse` hook — see
-// `RunOverrides.toolCallGuards` for why the contract's generic parameter
-// exists and why it disappears in S3.
-type ClaudeGuards = HookCallback;
 
 // The contract carries tools as a set, because that is what the AI SDK wants:
 // `{ name: { description, inputSchema, execute } }`. The Claude harness takes
@@ -150,6 +146,62 @@ export const forceSynchronousTaskHook = async (input: unknown) => {
   };
 };
 
+// The contract's guard, expressed as the one hook this harness can run.
+//
+// Every piece of Claude vocabulary a guard used to carry lives here and only
+// here: the `PreToolUse` event check (a guard is only asked about tool calls,
+// so an event that is not one is a pass), the `tool_name` / `tool_input`
+// unpacking, and the deny envelope. `allow` maps to a plain pass-through
+// rather than to `permissionDecision: "allow"`: Claude reads the latter as
+// "skip the permission system", and the guards are deciding confinement, not
+// granting a bypass.
+//
+// A guard that throws would otherwise reject the hook, and a rejected hook is
+// **not** a denial on this harness: the SDK's documented default for a hook
+// that fails is `onFailure: 'continue'`, which lets the action go ahead, and a
+// callback matcher does not expose `onFailure` to change that. So the adapter
+// catches and denies here rather than relying on the SDK to fail closed. That
+// makes `ToolCallHandler`'s "a guard that throws fails closed" true by
+// construction under this harness instead of true by assumption.
+export const toPreToolUseHook = (guard: ToolCallHandler): HookCallback => async (input) => {
+  const i = input as {
+    hook_event_name?: string;
+    tool_name?: string;
+    tool_input?: unknown;
+  };
+  if (i.hook_event_name !== "PreToolUse") return { continue: true };
+  const raw = i.tool_input;
+  const toolInput =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : {};
+  let decision: ToolCallDecision;
+  try {
+    decision = await guard({ toolName: i.tool_name ?? "", input: toolInput });
+  } catch (err) {
+    // A guard that threw did not answer the question, so the call is denied:
+    // the same reading as a `deny`, with the error kept as the reason so the
+    // failure is visible rather than silent.
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `Guard failed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    };
+  }
+  if (decision.decision === "allow") return { continue: true };
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: decision.reason,
+    },
+  };
+};
+
 // The contract describes a tool server without naming a harness, so its `sdk`
 // variant carries the live instance as `unknown`. The Claude transport wants
 // the SDK's own `McpServer` there, and every value that reaches this point was
@@ -166,7 +218,7 @@ const toSdkMcpServers = (
 // implementation it belongs to.
 export const claudeOptions = (
   config: AgentConfig,
-  overrides: RunOverrides<ClaudeGuards> = {},
+  overrides: RunOverrides = {},
   stderr: (data: string) => void = (data: string) => console.error("[claude stderr]", data),
 ): Options => ({
   abortController: overrides.abortController,
@@ -203,7 +255,14 @@ export const claudeOptions = (
   permissionMode: "bypassPermissions",
   cwd: overrides.cwd,
   hooks: {
-    PreToolUse: [{ hooks: [forceSynchronousTaskHook, ...(overrides.toolCallGuards ?? [])] }],
+    PreToolUse: [
+      {
+        hooks: [
+          forceSynchronousTaskHook,
+          ...(overrides.toolCallGuards ?? []).map(toPreToolUseHook),
+        ],
+      },
+    ],
   },
   stderr,
 });
@@ -211,7 +270,7 @@ export const claudeOptions = (
 export const runAgent = async (
   config: AgentConfig,
   message: string,
-  overrides: RunOverrides<ClaudeGuards> = {},
+  overrides: RunOverrides = {},
 ): Promise<AgentResult> => {
   const start = Date.now();
   let output = "";
