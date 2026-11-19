@@ -23,7 +23,23 @@ export type CacheLayout = "flat" | "runs";
 // The agent, the framework and review code it runs through, and the pinned
 // SDK. The whole review tree is hashed, so an eval-code edit costs a replay
 // but a stale baseline is never served.
-const REPLAY_INPUTS = ["delegate/agents", "delegate/framework", "delegate/review", "package-lock.json"];
+// The agent, the framework and the review code it runs through, the pinned SDK,
+// and **the price table**. The whole review tree is hashed, so an eval-code edit
+// costs a replay but a stale baseline is never served.
+//
+// `delegate/pricing` joins the inputs in S5, when the table first carries a rate
+// the shipped code spends. A rate change re-keys the cache for the same reason a
+// prompt change does: a cached `costUsd` computed under an older table is not
+// comparable to a new one, and the spend gate reads those numbers. The directory
+// is hashed rather than the one file so a row added beside `models.json` (an
+// override, a per-provider file) is covered without an edit here.
+const REPLAY_INPUTS = [
+  "delegate/agents",
+  "delegate/framework",
+  "delegate/review",
+  "delegate/pricing",
+  "package-lock.json",
+];
 
 export const replayKey = (repoDir: string): string => {
   const git = (args: string[], input?: string) =>

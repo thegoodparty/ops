@@ -776,12 +776,20 @@ test("loadRunResults still parses a result file written without leads", () => {
 const isDenied = (out: ToolCallDecision) => out.decision === "deny";
 
 test("replayToolGuard allows only the reviewer's read-only tools", async () => {
-  for (const tool of ["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", "mcp__git__git_show"]) {
+  for (const tool of ["Read", "Grep", "Glob", "Task", "Agent", "mcp__git__git_show"]) {
     assert.equal(isDenied(await replayToolGuard({ toolName: tool, input: {} })), false, tool);
   }
   for (const tool of ["Bash", "Write", "Edit", "WebFetch", "mcp__other__x"]) {
     assert.equal(isDenied(await replayToolGuard({ toolName: tool, input: {} })), true, tool);
   }
+});
+
+test("replayToolGuard no longer allows StructuredOutput, because nothing implements it", async () => {
+  // Under the Claude harness the answer arrived through a tool the harness
+  // provided, so a candidate branch that asked for it was asking for something
+  // real. The object call replaced it, and a tool name nothing implements is a
+  // name the guard should refuse rather than wave through.
+  assert.equal(isDenied(await replayToolGuard({ toolName: "StructuredOutput", input: {} })), true);
 });
 
 test("replayCase denies Bash even when the reviewer config allows it", async () => {

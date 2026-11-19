@@ -195,7 +195,13 @@ test("the replay key changes when any input main's replay executes changes", () 
     mkdirSync(join(repo, path, ".."), { recursive: true });
     writeFileSync(join(repo, path), body);
   };
-  const inputs = ["delegate/agents/a.ts", "delegate/framework/f.ts", "delegate/review/r.ts", "package-lock.json"];
+  const inputs = [
+    "delegate/agents/a.ts",
+    "delegate/framework/f.ts",
+    "delegate/review/r.ts",
+    "delegate/pricing/models.json",
+    "package-lock.json",
+  ];
   git("init", "-q");
   for (const f of inputs) write(f, "v1");
   write("README.md", "v1");

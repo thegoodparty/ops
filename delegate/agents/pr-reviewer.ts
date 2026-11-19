@@ -4,52 +4,35 @@ import { defineAgent, toolSet } from "../framework";
 import { findPlanSteps, parsePlanBinding } from "../review/gating";
 import { GIT_TOOL_NAMES } from "../review/tool-names";
 import { promptDiff } from "../review/prompt-diff";
-import {
-  FindingSchema,
-  PlanConsistencySchema,
-  type Bundle,
-} from "../review/schema";
+import { ReviewOutputSchema, type Bundle } from "../review/schema";
 import { prReviewerSubagents } from "./pr-reviewer-subagents";
 
-// The Anthropic API requires a tool input_schema to be `type: "object"` with no
-// top-level oneOf/anyOf, and StructuredOutput is a tool. So the model sees one
-// flat object; ReviewOutputSchema (the discriminated union) still validates what
-// comes back in review/run.ts, which enforces the per-status required fields.
-const ReviewModelOutputSchema = z.object({
-  status: z.enum(["complete", "failed"]),
-  findings: z
-    .array(FindingSchema)
-    .optional()
-    .describe('Required when status is "complete"; may be empty.'),
-  summary: z
-    .string()
-    .optional()
-    .describe('Required when status is "complete".'),
-  planConsistency: PlanConsistencySchema.optional(),
-  reason: z.string().optional().describe('Required when status is "failed".'),
-});
-
-// Anthropic's structured-output grammar supports `anyOf`, `allOf` and `const`;
-// `oneOf` is not in its supported-features list, and zod emits `oneOf` for a
-// discriminated union. The branches of `planConsistency` are mutually exclusive
-// by their `verdict` literal, so `anyOf` is the same constraint in the dialect
-// the API compiles. The rewrite is applied to the whole schema and the test
-// below rejects any `oneOf` left in it.
-const toSupportedDialect = (value: unknown): unknown => {
-  if (Array.isArray(value)) return value.map(toSupportedDialect);
-  if (value === null || typeof value !== "object") return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-    out[key === "oneOf" ? "anyOf" : key] = toSupportedDialect(v);
-  }
-  return out;
-};
-
-export const REVIEW_OUTPUT_JSON_SCHEMA = toSupportedDialect(
-  z.toJSONSchema(ReviewModelOutputSchema, {
-    target: "draft-7",
-  }),
-) as ReturnType<typeof z.toJSONSchema>;
+// **The flat, model-facing schema and the dialect rewrite are gone.** They
+// existed for one vendor's constraints, and neither survives the object call:
+//
+// - `ReviewModelOutputSchema` was a single flat object because the Anthropic API
+//   requires a tool's `input_schema` to be `type: "object"` with no top-level
+//   `oneOf`, and under the Claude harness the answer arrived through
+//   `StructuredOutput`, which is a tool. The AI SDK's `Output.object` takes the
+//   schema itself, and `@ai-sdk/anthropic` normalises what it sends, so the union
+//   needs no flattening.
+// - `toSupportedDialect` rewrote `oneOf` to `anyOf` for that same tool schema.
+//   `@ai-sdk/anthropic`'s own `sanitizeDefinition` maps `oneOf` to `anyOf`
+//   itself (checked in the 3.0.143 tarball), so the rewrite is now a second
+//   translation of the same construct.
+//
+// **`ReviewOutputSchema` stays the authority.** It is what the object call is
+// given (`output: { schema: REVIEW_OUTPUT_SCHEMA }` below), what the child
+// validates the answer against before it reports success (`schemaValidator` in
+// `framework/child/schema-validator.ts`), and what `parseReviewOutput` re-parses
+// in `run.ts`. One schema, three readers, and no per-vendor copy between them.
+//
+// The JSON Schema form is what crosses into the child, because the contract's ask
+// is `{ schema: object }` (`StructuredOutputAsk`, S2) and a Zod value does not
+// survive `JSON.stringify`. Derived here, from the schema above, so a change to
+// the union cannot leave a stale dialect behind.
+export const REVIEW_OUTPUT_SCHEMA = ReviewOutputSchema;
+export const REVIEW_OUTPUT_JSON_SCHEMA = z.toJSONSchema(ReviewOutputSchema, { target: "draft-7" });
 
 // Author-controlled text, and model output that processed it, cannot be
 // allowed to close its own wrapper.
@@ -221,26 +204,23 @@ export default defineAgent({
   subagents: prReviewerSubagents,
   maxTurns: 80,
   maxBudgetUsd: 10,
-  // StructuredOutput is the built-in tool the SDK's outputFormat routes the
-  // final answer through; restricting `tools` without it leaves the model no
-  // way to return structured_output and it falls back to prose.
+  // **`StructuredOutput` is gone with the tool it routed through.** It was never
+  // a capability: it was how the Claude harness let the model answer, and under
+  // the AI SDK the answer is an object call (`output: { schema }`), not a tool the
+  // model has to choose. Leaving it in the list would advertise a tool nothing
+  // implements — the child answers such a name with a sentence — so it goes, and
+  // the prompt's tool section goes with it.
   //
-  // The harness implements these names itself, so S2's set is the names alone;
-  // `Object.keys` of it is the list the SDK is handed. S5 replaces each entry
-  // with the `tool()` we write.
-  tools: toolSet("Read", "Grep", "Glob", "Task", "StructuredOutput"),
-  allowedTools: [
-    "Read",
-    "Grep",
-    "Glob",
-    "Task",
-    "StructuredOutput",
-    ...GIT_TOOL_NAMES,
-  ],
-  // The ask, not the vendor's encoding of it: `schema` is what the answer has to
-  // satisfy, and the JSON Schema the Claude API compiles is what S2 puts there.
-  // S5 passes `Output.object({ schema: ReviewOutputSchema })` and the
-  // `REVIEW_OUTPUT_JSON_SCHEMA` draft-07 rewrite goes with it.
+  // Each remaining entry is a `tool()` this repo writes, or a name the child
+  // builds an implementation for (`Task` for the subagents, the four
+  // `mcp__git__*` from `review/git-tools.ts`). `allowedTools` is what makes the
+  // list the ceiling as well as the offer: `agent.ts` takes the intersection, the
+  // same authority the SDK's `tools` + `allowedTools` pair gave.
+  tools: toolSet("Read", "Grep", "Glob", "Task"),
+  allowedTools: ["Read", "Grep", "Glob", "Task", ...GIT_TOOL_NAMES],
+  // The ask S2 declared and S5 implements: `runAgent` wraps `Output.object` around
+  // this at the call site (`output: { schema: ReviewOutputSchema }`). The JSON
+  // Schema form is what crosses into the child.
   output: { schema: REVIEW_OUTPUT_JSON_SCHEMA },
   systemPrompt: `You are the PR-review orchestrator for GoodParty's engineering team. You receive a <bundle> in your user message and emit a single JSON object matching ReviewOutputSchema. You have no network access and no GitHub token — a deterministic layer built your input and will post the result.
 

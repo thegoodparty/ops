@@ -395,7 +395,9 @@ model. The version of this document that went straight from Anthropic to Firewor
 last two, so a regression there had two candidate causes — and the portability claim the whole plan
 rests on was never measured by a gate at all, only by an ad-hoc side run. Inserting Stage 2 replaces
 that side run with a real gate: same models, two routes, one variable, and a quality verdict the
-canary and the judge can be held to. That is what the middle stage buys, and it is worth the extra
+judge can be held to. (This said "the canary and the judge"; the canary is cancelled at step 5, and
+nothing about Stage B's argument rests on it — the judge is the measurement here.) That is what the
+middle stage buys, and it is worth the extra
 hop. Cost is recorded rather than gated there, for the reason the gate section gives.
 
 **Stage 1 needs nothing but a provider package and a key.** The two models are reachable through
@@ -634,6 +636,18 @@ why every credential step declares a key, additively, **before** the step whose 
 `DELEGATE_GATING_MODE` is `enforce` in the deployed task definition (`deploy/components/worker.ts:159`),
 so the reviewer keeps its merge authority through every stage unless something takes it away first.
 
+> **Amendment (step 5, this PR).** The paragraph below was the argument for splitting S4 out of S5,
+> and **S4 is cancelled**: `DELEGATE_GATING_MODE` stays `enforce` through every remaining step, and
+> `deploy/components/worker.ts` is not touched. The reasoning is kept verbatim underneath because the
+> trade it records is the thing a reader needs to weigh, not a mistake to erase. What replaces it,
+> and what cancelling it costs, is in **"S4 is cancelled"** below this table. The short version: the
+> premise was that a canary is the only signal against a false approve, and that premise was true —
+> the correction is that **S5 cannot create a false-approve risk it does not already have**, because
+> `delegate/review/**` is not on the `CODEOWNERS` opt-out list, so an S5 PR needs a human code owner
+> whatever the gating mode is. Under `enforce` that human is a second opinion instead of the only
+> one. That is a real loss of production measurement against a risk that has not moved, not a
+> measurement that was replaced.
+
 **The canary comes before the first unmeasured reviewer, not after the last one.** The previous
 version flipped to `shadow` only for a canary after the final stage, which meant the call-layer swap
 and both provider moves all deployed under `enforce`: an approval from a reviewer nobody had measured
@@ -643,19 +657,77 @@ those paths — so the only protection against a false approve is the canary, an
 last cannot protect anything. **S4 takes the authority away before S5 exists**, and it stays away
 until S11 restores it.
 
+> **Superseded at step 5.** The last sentence is no longer what happens: S4 was cancelled before it
+> merged, so the authority is never taken away and S11 has nothing to restore. The paragraph is also
+> the clearest statement of what the cancellation gives up — read it as the cost, not as the plan.
+> The de-owned Pulumi trees still exist and a bot approval on one of them still decides a merge; that
+> residual is named in **"S4 is cancelled, and what that trades"** immediately below.
+
+### S4 is cancelled, and what that trades
+
+**Decided by the engineer at step 5, before S4 merged and before S5 opened: `DELEGATE_GATING_MODE`
+stays `enforce`, step S4 is cancelled, and the reviewer keeps its merge authority through every
+remaining step.** `deploy/components/worker.ts` is not touched by this step or by S11. Three facts,
+verified rather than inherited, each of which has to hold for the cancellation to be reasonable:
+
+1. **The per-PR eval this plan needed does not exist.** `delegate-eval.yml` triggers on an
+   `issue_comment` (`delegate eval`), and `delegate-eval-run.yml` is `workflow_dispatch` only. Nothing
+   measures a PR when it opens, and the only required status check on `main` is `["deploy"]`
+   (ruleset 12708817, re-read while writing this). A canary window would have had to be assembled by
+   hand from stored records in any case.
+2. **Neither harness can grade this step.** `CANDIDATE_FILES` (`delegate/review/eval/dispatch.ts:10`)
+   lets a candidate branch differ in only `delegate/agents/pr-reviewer.ts` and
+   `delegate/agents/pr-reviewer-subagents.ts`, and the arms harness's `neverTouch` list
+   (`.claude/skills/hill-climb/targets/delegate-pr-reviewer.json`) covers `delegate/review/`,
+   `delegate/framework/`, `delegate/review/eval/`, `.github/`, `package.json` and `package-lock.json`.
+   S5 changes exactly those paths. This is the plan's own "The evidence gate" argument, and the
+   cancellation does not weaken it: it is the reason no *automated* grade exists, and therefore the
+   reason a canary was the only remaining signal, which is why losing it is a real loss.
+3. **S4's stated premise does not hold for S5.** The `shadow` window existed so the offline-unmeasured
+   call layer could not approve a merge. But `delegate/review/**` is **not** on the `CODEOWNERS`
+   opt-out list — only `/deploy/`, `/deploy-org/`, `/deploy-workbench/` and `/deploy-infrastructure/`
+   are, and every `deploy/` carve-out within those is re-owned explicitly. With
+   `require_code_owner_review: true` and `require_last_push_approval: true` in the ruleset, **an S5 PR
+   needs a human code owner whatever the gating mode is.** `enforce` therefore costs nothing on the
+   step it was aimed at, and keeps the reviewer's approval as a second opinion on it.
+
+**What is lost, and it is not nothing.** The canary would have produced 10–20 production
+*would-approve* decisions inside the Stage A/B/C windows — the only evidence about the deployed
+reviewer's judgement that no offline round can give, because the offline rounds hold the prompt, the
+schema and the models fixed and measure what the reviewer *finds*, not whether it *approves* what it
+should not. **Cancelling S4 removes that signal and creates none.** The Stage A/B/C cold A/B rounds are
+unaffected and remain the primary measurement for S5, S8 and S10; they were never a substitute for
+it, and this document does not now claim they are. The engineer accepted the trade on facts 1–3: the
+canary was the plan's *only* protection against a false approve, and the step it was protecting is
+already covered by a required human approval.
+
+**The case the canary was really for, and where it now sits.** The premise bites when a bot approval
+genuinely decides a merge, which means a PR touching only an unowned Pulumi tree — and those are
+exactly the human-owned carve-outs the later steps touch: S7 creates an IAM user and its policy, S9
+declares a key. A human reviews those anyway, which is what makes the residual small rather than nil.
+It is recorded here rather than dropped, and S11 is the read that would find it after the fact: an
+approval on a de-owned tree that a human later had to correct. **A canary could have stopped that
+approval; S11 can only find it.**
+
+**What this does not change.** S5–S12 keep their numbers and their scopes. S4's row is struck through
+in place rather than deleted, so the `Step: N` binding (below) is unaffected, and S11 keeps its slot
+while changing from a deploy to a read. Nothing else in the ordering argument moves: the call layer
+still precedes the provider, and the provider the model, because that argument was always about which
+stage caused a regression.
+
 | # | Stage | Step | Reversible? | Evidence gate |
 |---|---|---|---|---|
 | **S1** | — | **Delete the dead CLI install.** `delegate/worker/Dockerfile:4` is proven dead: nothing sets `pathToClaudeCodeExecutable` (0 hits repo-wide) and the SDK resolves its own platform binary by `require.resolve`, never `PATH`. ~346 MB, no behavioural risk. | revert + rebuild | `deploy.yml` builds and pushes; **one real review posted end to end** from the new image; image size recorded before/after. |
 | **S2** | — | **Neutral runner contract.** Local `McpServerConfig`, a `ToolCallHandler` matching the new call layer, a structured-output ask, a step and usage result — the six SDK-derived fields leave `types.ts` (`AgentConfig`'s `permissionMode`, `agents`, `tools`, `outputFormat`, and `RunOverrides`' `preToolUseHooks`, `resume`), replaced by AI SDK shapes (`tools: ToolSet`, a `prepareStep`-shaped hook, `output: { schema }` — **amended at step 2**: this row said `output: Output.object(...)`, which cannot be the field's *shape*, because `Output.object({ schema })` returns `{ name, responseFormat, parseCompleteOutput, parsePartialOutput, … }` and carries no `schema` member (checked against `ai` 6.0.333), so it is not assignable to a `{ schema }` ask. The ask is `{ schema }`; S5 wraps `Output.object` around it at the call site, which is one line in `runAgent`). Split `GIT_TOOL_NAMES` (`git-tool.ts:5-10`) into a constants module with no SDK import. `AgentResult` and `Result` gain the token `usage` the Claude SDK already reports (`agent.ts:208`) and the replay already discards, so the baseline side records counts and not only a dollar total. `agent.ts` keeps a behaviour-identical Claude implementation. | yes (refactor) | `npm run build` (the only full typecheck; `tsx --test` does not typecheck) plus `npm test`; a byte-identical review prompt for a recorded bundle; `agentEnv` and both guard tests unchanged and green; a replay result file carries non-null `usage` beside `costUsd`. |
 | **S3** | — | **The security seam.** Both guards on the new handler type — `pathGuardHook` (`run.ts:78`) and `replayToolGuard` (`replay.ts:358`) — with the normalisation described above applied *before* the prefix test — **amended at step 3**: the guard must also test the literal spelling it was given, not only the normalised one, for as long as the tool opening the file is not ours (see the amendment in section 3; checking only the normalised spelling is a live symlink bypass at this step). Symbol names rather than line ranges, deliberately: the ranges differ between the PR base and `main`, and the drift is what made the first version of this document stale. | yes | The adversarial table above passes; every existing denial assertion kept; the `agentEnv` / `pathGuardHook` tests in `run.test.ts` and the `replayToolGuard` pair in `replay.test.ts` rewritten, never deleted. |
-| **S4** | — | **Take the merge authority away: flip to `shadow`.** One line in `deploy/components/worker.ts` (`DELEGATE_GATING_MODE`), which is a **human-owned carve-out** in `.github/CODEOWNERS`, so this is a human-approved infra PR the bot cannot approve for itself. It merges **before S5 does**. Under `shadow` nothing is ever approved — `verdict` is `approve` only when `gating.mode === "enforce"` (`gates.ts:150-152`) — and the status line reports what the gate *would* have done, so the canary's numbers come from the deployed task rather than from a side run. | revert (flip back to `enforce`) | `pulumi preview` shows only the env value changing; one review from the deployed task carries a `Shadow: would approve` or `Shadow: would comment (…)` status and **no** approval verdict. |
-| **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. **`delegate/pricing/models.json` lands here with the Anthropic rows**, because the spend cap this step ships cannot fire against an empty table. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model. **`costRatio` is gated on token counts, not dollars** — see the gate below — since only this side is table-priced. Deployed under `shadow`, so S4's canary window opens here. |
+| **S4** | — | ~~**Take the merge authority away: flip to `shadow`.**~~ **CANCELLED at step 5** (the engineer's decision, recorded in "S4 is cancelled" below). No `worker.ts` change, ever: `DELEGATE_GATING_MODE` stays `enforce`. The row is kept, struck through, so `S5`–`S12` keep their numbers and so a reader can see what the slot was for. The text below is what it would have been, unedited. Under `shadow` nothing is ever approved — `verdict` is `approve` only when `gating.mode === "enforce"` (`gates.ts:150-152`) — and the status line reports what the gate *would* have done, so the canary's numbers come from the deployed task rather than from a side run. | — (nothing to revert) | None. Superseded by the evidence the cancellation records: the per-PR eval cannot grade this, neither offline harness can, and the code-owner rule already requires a human here. |
+| **S5** | **1. The call layer** | **The call-layer swap, on Anthropic.** `runAgent` over the AI SDK in a spawned Node child with the explicit allowlist env, still on `claude-opus-5-5` / `claude-sonnet-5-5` through `@ai-sdk/anthropic` — **neither provider nor model changes**. Tools are the `tool()` set we write (read, grep, glob, `git-tool`), each guarding its own paths; subagents stay child invocations returning usage to the parent; **the step and spend caps as delegate's own counters plus one abort**, with a test that each fires; `git-tool` keeps `isSafeRef` / `isSafePath` / truncation verbatim; `agentEnv` gains the provider key and drops `CLAUDE_`/`DISABLE_`, and is **shaped for a non-role credential** so S7 and S8 can add a bearer token without reshaping it. **`delegate/pricing/models.json` lands here with the Anthropic rows**, because the spend cap this step ships cannot fire against an empty table. | revert + deploy (image tag retained) | **Stage A**: call-layer parity at constant provider and model. **`costRatio` is gated on token counts, not dollars** — see the gate below — since only this side is table-priced. Deployed under **`enforce`** — S4 is cancelled at step 5, so there is no canary window, and a review from the deployed task after this step is a live reviewer with real merge authority. Its first approvals are therefore the second opinion a human already had to give (`delegate/review/**` is human-owned), not a canary. |
 | **S6** | 1 | **Dependency removal.** `package.json:22`, regenerated lockfile, the 20 `CLAUDE_CODE_DISABLE_*` lines, `Skill` out of the default allowlist (`agent.ts:80`), `eval/cache.ts:26`'s comment. Also `delegate/review/eval/block-judge.ts`, which imports `query()` from the SDK for the no-API-key local path and has to move to the AI SDK's judge or be deleted. Now safe: nothing runs on the SDK any more. | revert | `npm test` and `npm run build` green; a full cold `delegate eval` after the lockfile change (every cached run is re-keyed); image size after. |
 | **S7** | **2. The route** | **Create the Bedrock principal and declare its key, additively.** The step does four things, because a bearer token is a credential for an IAM principal and that principal has to be built: (1) a **dedicated IAM user and its policy in Pulumi** (`aws.iam.User`, `aws.iam.UserPolicy`, available in the pinned provider), scoped to the two profiles this reviewer uses — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` — and to their foundation-model ARNs, composed with `bedrockInvokeResources` (`utils/bedrock-models.ts`) so the scoping is one function and not a hand-typed ARN list; (2) `deploy/bedrock-invoke-principals.test.ts` **extended to name that principal deliberately**, so the file list grows by exactly one reviewed entry instead of the test staying green by never looking at a console-made key; (3) the key itself minted as a **long-term** Bedrock API key, since a short-term one expires within 12 hours and the worker has no refresh path, with the value put into the live `DELEGATES` secret out of band first; (4) `deploy/delegate-secret.ts` gains `AWS_BEARER_TOKEN_BEDROCK` and **keeps `ANTHROPIC_API_KEY`**. **No `worker.ts` change** — the token reaches the child through `agentEnv`'s allowlist, not the task role, so the task role still holds no invoke grant. It also **states, in the PR body, which account the reviewer's task runs in and which profiles the principal may invoke**, the one thing this document cannot settle from the repo. Human-owned carve-out, its own PR. | yes | `pulumi preview` shows the new user, its policy and the one added entry in the task's `secrets`, and nothing else — explicitly **no** change to the task role's inline policy; `bedrock-invoke-principals.test.ts` passes **with the new principal named in it**; the policy's resource list is the two profiles and their foundation-model ARNs, asserted in Pulumi preview output; `check-secret-keys.ts` passes with both keys declared; the PR body names the account and the profiles; a real review still posts, still on Anthropic direct. |
 | **S8** | 2 | **The provider move, to Bedrock, at constant model.** `@ai-sdk/amazon-bedrock` replaces `@ai-sdk/anthropic`; model ids become the `global.` profiles `utils/bedrock-models.ts` already lists and the region becomes explicit; `agentEnv` allowlists the bearer token and the region. **The models do not change** — `global.anthropic.claude-opus-5-5` and `global.anthropic.claude-sonnet-5-5` are both in that list. `structuredOutputMode` is **pinned** rather than left on Bedrock's `auto`, which switches between native output and a JSON tool per model and schema. **`delegate/pricing/models.json` gains the Bedrock rows here**, so the stage's nonzero `costUsd` gate has a rate to compute from. | yes (flip the provider import back, with both keys declared) | **Stage B**: same models, two routes, one variable. Quality gated; `costRatio` recorded, not gated, because the two sides price from different table rows. One review from the **deployed task** recording nonzero `costUsd`. And **one Bedrock Cost Explorer read naming the reviewer's principal**, checked against a single invocation from that task — the test of whether a bearer-token call is attributed in Cost and Usage the way a SigV4 call is, which the section above records as unverified rather than assumes. |
 | **S9** | **3. The model** | **Declare the Fireworks key, additively.** The same pattern as S7, applied to the third provider: value into the secret out of band, then `FIREWORKS_API_KEY` added to the declared list while both earlier keys stay. **`delegate/pricing/models.json` gains the Fireworks row here.** It is **not** the last provider the plan uses: S10 moves only the subagents, so the Bedrock rows added in S8 stay live for the orchestrator and the Anthropic rows stay live for the judge. No code change. Human-owned carve-out, its own PR. | yes | As S7, and `check-secret-keys.ts` passes with three keys declared. |
 | **S10** | 3 | **The model move, for the subagents only.** `scout`, `architect` and `deep-reviewer` move to Fireworks' `deepseek-v4p1-flash-1017-us`; **the orchestrator stays on Bedrock's `global.anthropic.claude-opus-5-5`**, so the structured verdict keeps the model Stage B proved. Per-agent, because each subagent already carries its own `model` field — no `prepareStep`, and no run spanning two providers. Fireworks US-only serves exactly one model, so pointing all four at it would collapse the two-tier split the reviewer ships today. Code only — both keys were declared in S7 and S9 and both stay declared, so the rollback is three config lines. | yes (point the three subagents back at Bedrock's `global.anthropic.claude-sonnet-5-5`) | `npm run build` and `npm test`; **Stage C** of the gate below, which now gates the subagents' quality and records the orchestrator as unchanged; and one review from the **deployed task**, not a local smoke prompt, recording nonzero `costUsd` — a smoke prompt cannot see the task definition's `secrets` and would pass on a key the task does not have. |
-| **S11** | — | **Restore `enforce`, once the canary has passed.** One line in the same human-owned carve-out as S4. Blocked until the canary reports zero false approves and `review_failed` at or below baseline. | revert (flip back to `shadow`) | The canary's numbers, plus a review from the deployed task that carries a real approval verdict again. |
+| **S11** | — | **Post-Stage-C production read, instead of restoring `enforce`.** **Amended at step 5**: there is nothing to restore, because S4 is cancelled and the mode never leaves `enforce`. The slot keeps its number and becomes the point where a human reads what the deployed reviewer did across the three stages: the `ReviewRecord`s for the whole S5→S10 window, with `action`, `gates` and `review_failed` counted against the same window length before S5. No deploy, no `worker.ts` change; this is a read, and if it goes badly the revert is the stage that regressed. | — (a read, nothing to revert) | The window's counts — approvals, comments, `review_failed` — against the pre-S5 baseline of the same length, and a named human who read the approvals made on the de-owned Pulumi trees. **This is not the S4 canary**: it observes a reviewer that is already deciding merges, so it cannot prevent a false approve, only find one, and the finding is a revert of a stage rather than a flip of a mode. |
 | **S12** | — | **Docs and the plan amendment.** `CLAUDE.md:14,145`, `delegate/README.md:3,26,30`, `eval/README.md`, `docs/pr-previews.md:123` (also `getSecretVersion`→`getSecret`), and `docs/plan-gated-merges.md:378` as a **plan amendment, not a checklist edit**, because its "`anyOf` … because that is the keyword Anthropic's structured-output dialect supports" becomes false. | yes | Docs only; the amendment PR names its plan and step. |
 
 **What S5 delivers that the old call-layer step did not.** Two things at once: **the provider seam** — a
@@ -666,16 +738,19 @@ S5 is parity at a constant provider and a constant model, and turning mixing on 
 proven would make Stage A uninterpretable: a regression would have two candidate causes again. The
 capability lands in S5; the configuration is deliberately deferred until after Stage C.
 
-**Effort: ~14.25 engineering days** (S1 0.5, S2 2, S3 1, S4 0.25, S5 5, S6 1.5, S7 0.5, S8 1.5, S9 0.5,
-S10 0.75, S11 0.25, S12 0.5) plus ~25% contingency, so **~18 days** — unchanged to the day, because
-S10 grows a quarter day for per-agent model wiring and the scoped Stage C read, and that is inside
-the contingency the plan already carries. The three-stage sequence costs
-about two and a half days over the two-stage one, and none of it is padding: **S8 is a new step at
-1.5 days** for a provider swap with its own model-id, region and structured-output work; **S7 and S9
-add a day between them** for a credential declared and deployed twice; and **S4 and S11 add half a
-day** for two one-line human-owned PRs that have to be sequenced around the code. Two of those three
-are needed in any version of this plan that takes the merge authority away before measuring — which
-the previous version did not do.
+**Effort: ~14.0 engineering days** — **amended at step 5**: the previous figure was 14.25 (S1 0.5,
+S2 2, S3 1, S4 0.25, S5 5, S6 1.5, S7 0.5, S8 1.5, S9 0.5, S10 0.75, S11 0.25, S12 0.5). S4's 0.25
+is cancelled with the step and comes straight off: 14.25 − 0.25 = **14.0**. **S11 keeps its 0.25** and
+changes meaning rather than size: it was a one-line human-owned PR, and it is now a read of a reviewed
+window — not smaller, because the human who signs it makes the judgement the canary would have made.
+That is the whole saving, and it is a quarter day: **the cancellation does not shorten the plan by
+any other amount.** Plus the ~25% contingency the plan already carries, so **~17.5 days** rather than
+~18. The contingency sentence stays honest for the same reason it did before — **S10's quarter day**
+for per-agent model wiring and the scoped Stage C read, **S8's 1.5** for a provider swap with its own
+model-id, region and structured-output work, and **S7 and S9's day between them** for a credential
+declared and deployed twice are all still in the number, and none is affected by the cancellation.
+**What it does not save** is the two-and-a-half-day premium for a three-stage sequence over a
+two-stage one: that is Stage B's, and Stage B is still gated.
 
 **Eval spend is three rounds and still lower than it was.** Stage A ~$330, Stage B ~$90–170, Stage C
 ~$90–170: roughly **$520–670**, against ~$840 for the previous two rounds plus its ad-hoc portability
@@ -781,37 +856,73 @@ rows — Bedrock's Claude rates are not Anthropic's, and Fireworks' are not eith
 the first three production `costUsd` values against a billing line instead. The
 zero-cost-with-tokens assertion runs automatically in all three.
 
-**The canary runs *under* the three rounds, not after them.** `DELEGATE_GATING_MODE=shadow` is
-deployed from S4, before the call layer lands, so 10–20 production reviews accumulate inside every
+> **Amendment (step 5): the canary is cancelled, and here is what that costs.** Three passages below —
+> "The canary runs *under* the three rounds", "How a false approve is counted", and the paragraph
+> that argues the ordering from them — described a window that will not open. They are kept, struck
+> through at the head, because the argument for a canary is the argument against cancelling one, and a
+> reader who only sees the decision cannot price it. The decision and its three verifying facts are in
+> "S4 is cancelled, and what that trades". **What replaces them is
+> nothing**: cancelling S4 removes a signal and creates none. The Stage A/B/C cold A/B rounds still
+> gate S5, S8 and S10 and are unaffected — those are the primary measurement and they were always
+> the thing that told you whether the reviewer still *finds* what it found before. What is lost is
+> the production *would-approve* window: the only evidence about the reviewer's judgement on real
+> PRs, at a real head SHA, with the deployed task's own configuration. No offline round covers that,
+> and this document does not claim it does.
+>
+> **Why the engineer cancelled it, verified rather than assumed.** The per-PR eval does not exist:
+> `delegate-eval.yml` triggers on an `issue_comment` (`delegate eval`) and `delegate-eval-run.yml` is
+> `workflow_dispatch` only, so nothing measures a PR automatically; the only required status check on
+> `main` is `["deploy"]` (ruleset 12708817, verified while writing this). Neither offline harness can
+> grade the step — `CANDIDATE_FILES` (`eval/dispatch.ts:10`) lets a candidate differ in only the two
+> prompt files, and the arms harness's `neverTouch` list (`targets/delegate-pr-reviewer.json`) covers
+> `delegate/review/`, `delegate/framework/`, `package.json` and the lockfile. And **S4's stated
+> premise does not hold for S5**: `delegate/review/**` is *not* on the `CODEOWNERS` opt-out list (only
+> `/deploy/`, `/deploy-org/`, `/deploy-workbench/` and `/deploy-infrastructure/` are), so with
+> `require_code_owner_review: true` and `require_last_push_approval: true` an S5 PR needs a human code
+> owner whatever the gating mode is. `enforce` therefore costs nothing on the step it was aimed at and
+> keeps a second opinion on it. The premise was aimed correctly for the case that *does* bite — a PR
+> touching only an unowned Pulumi tree, where a bot approval genuinely decides the merge — but those
+> are the human-owned carve-outs the later steps touch (S7's IAM user, S9's key declaration), which is
+> where a human is already required. That case is the residual risk and it is named below rather than
+> dropped.
+>
+> **What a human should watch after S5 deploys**, since nothing automates it. The reviewer is live with
+> merge authority on the de-owned Pulumi trees from the first merge, so: (1) check each review's
+> `ReviewRecord` action against what a human reviewer did on the same PR — an approval on a PR a human
+> then asked to change is the failure this step can now produce and the canary would have caught;
+> (2) watch `review_failed` against the pre-S5 rate, because a call-layer bug surfaces first as runs
+> that never produce a verdict, and a failed run posts a failure comment rather than an approval;
+> (3) watch the `costUsd` and step counts, which are new counters this step introduced, for a run
+> that hits the step or spend cap on an ordinary PR — parity failure looks like a loop, not like a
+> crash; (4) read the first few reviews on PRs touching `delegate/` itself, where the reviewer's
+> findings are checkable against the diff by hand. None of that is a gate. It is the substitute for
+> one, and it is weaker.
+
+~~**The canary runs *under* the three rounds, not after them.**~~ `DELEGATE_GATING_MODE=shadow` was to
+be deployed from S4, before the call layer lands, so 10–20 production reviews accumulate inside every
 stage's window — no merge outcome can change by construction, because `decide` returns `approve` only
-under `enforce`. The requirement is the same one: **zero false approves and `review_failed` at or
-below baseline**, measured on the whole window from S4 through S10. S11 restores `enforce` only after
-that holds, and it is a separate human-owned PR, so the flip back is a decision someone makes after
-reading the numbers rather than something that rides along with a code change.
+under `enforce`. The requirement was the same one: **zero false approves and `review_failed` at or
+below baseline**, measured on the whole window from S4 through S10. S11 was to restore `enforce` only
+after that holds. **Cancelled at step 5**: S4 never merged, so the window never opened.
 
-**How a false approve is counted.** Under `shadow` there is no approval to audit after the fact, so
-the count is taken from two things the run already writes rather than from a human reading PRs:
+~~**How a false approve is counted.**~~ Kept because it is the shape of the observation S11 now makes
+without the `shadow` labelling: a **false approve is a record whose gate approved and whose merge was
+wrong**. Under `shadow` the first half was mechanical — the status line read `Shadow: would approve`
+exactly when `record.action === "commented"` and `record.gates` was empty (`statusForRecord`,
+`run.ts:137`). Under `enforce` it is `record.action === "approved"`, which is the same filter over the
+same stored records. The second half was always the judgement: for each approval, whether a later
+finding, revert or hotfix showed the change should not have merged. `review_failed` is counted the
+same either way — every record with no verdict — against the baseline of the same window length. What
+changed is that an approval is now a real one, so a false approve has already merged by the time S11
+counts it.
 
-- **A false approve is a record whose gate *would* have approved and whose merge was wrong.** The
-  first half is mechanical: under `shadow` the status line reads `Shadow: would approve` exactly when
-  `record.action === "commented"` and `record.gates` is empty (`statusForRecord`, `run.ts:137`), so
-  every would-approve is already labelled in the check output as the window runs. The second half is
-  the only judgement: for each `Shadow: would approve` PR, a human records whether a later finding,
-  revert or hotfix showed the change should not have merged. `ReviewRecord` already carries the
-  target, the reviewed sha and the verdict, so that list is a filter over stored records, not a
-  separate ledger.
-- **`review_failed` is counted straight from the records** — every record with no verdict — so the
-  baseline comparison is record-to-record against the same window length before S4.
-
-"Zero false approves" therefore means zero would-approves on that list, over 10–20 labelled
-would-approves, and the canary is not declared passed on an empty window: if `Shadow: would approve`
-never appears at all, the window has not exercised the approval path and does not count.
-
-That ordering is the whole argument for splitting S4 out of S5. A canary cannot retroactively
-un-merge an approval, so it has to be running before the first reviewer nobody has measured can
-approve anything. Which is also why the offline gate and the canary are not alternatives: the cold
-A/Bs say whether the reviewer still *finds* what it found before, and the canary says whether it
-*approves* what it should not.
+> That is the whole cost in one sentence: **the canary could stop a bad approval; S11 can only find
+> one.** The offline gate and the canary were never alternatives — the cold A/Bs say whether the
+> reviewer still *finds* what it found before, the canary said whether it *approves* what it should
+> not — and cancelling S4 leaves the first intact and the second without a replacement. The engineer
+> accepted that deliberately, on the evidence that the per-PR eval does not exist and that a human
+> code owner is required on every path S5 touches. It is recorded as a **trade**, not as a
+> simplification.
 
 `replayKey` (`eval/cache.ts:26-33`) hashes `delegate/agents`, `delegate/framework`, `delegate/review`
 and the lockfile, so S2, S5 and S6 each re-key the cache. Budget the cold sides in one calendar
@@ -937,7 +1048,17 @@ the step that depends on them**, none of them asserted anywhere above:
    `system`→`instructions`), and whether the next one lands inside one file is unproven.
 5. **That a spawned Node child is enough isolation for the AI SDK path** — that no in-process
    provider fetch, retry or telemetry path reads something outside the allowlist. The child gives the
-   boundary; whether the library respects it is measured, not assumed.
+   boundary; whether the library respects it is measured, not assumed. **Partly answered at step 5**:
+   the child path was exercised at runtime (spawned, spec over stdin, provider constructed from the
+   allowlisted env, structured failure and result over stdout), which shows the boundary is *reached*
+   with that environment. It does not show what the library does with it over a long run, which is
+   still Stage A's to measure, and this document does not claim otherwise.
+
+**And one thing the cancellation added to this list: how the reviewer's judgement moves under a live
+`enforce` deploy.** S4's canary would have answered it before any approval counted. With S4
+cancelled, the answer arrives as real approvals on real PRs, and the first place a wrong one shows is
+the de-owned Pulumi trees where nobody else's approval stands beside the bot's. There is no offline
+measurement of it and no canary — only the reading named under S11. That is the deliberate gap.
 
 **Whether Flash can carry the review is unmeasured by design** — that is Stage C, and the fallback is
 named. **Whether Bedrock's Claude is as good as Anthropic's Claude at this task is also unmeasured

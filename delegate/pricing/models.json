@@ -1,0 +1,20 @@
+{
+  "unit": "USD per 1M tokens",
+  "note": "The rates the shipped code spends. A row lands in the step whose code makes the call, before that code spends anything: Anthropic direct here, Bedrock in S8, Fireworks in S9. No row supersedes another -- the Anthropic rows price the judge and (from S5) this reviewer, the Bedrock rows price the orchestrator from S8, the Fireworks row prices the three subagents from S9 -- so every row stays live.",
+  "models": {
+    "claude-opus-5-5": {
+      "input": 4,
+      "output": 20,
+      "cacheRead": 0.2,
+      "cacheWrite": 5,
+      "source": "Anthropic's published rate for claude-opus-5-5, as carried in pi's anthropic-messages catalog (/home/pi/.pi/agent/models-store.json at the time this row was written); cacheWrite is the 5m-cache rate"
+    },
+    "claude-sonnet-5-5": {
+      "input": 2,
+      "output": 10,
+      "cacheRead": 0.1,
+      "cacheWrite": 2.5,
+      "source": "Anthropic's published rate for claude-sonnet-5-5, same catalog; cacheWrite is the 5m-cache rate"
+    }
+  }
+}

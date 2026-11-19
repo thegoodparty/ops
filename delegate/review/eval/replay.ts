@@ -3,17 +3,20 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
-import type { AgentConfig, AgentResult, McpServerConfig, ToolCallHandler } from "../../framework";
+import type { AgentConfig, AgentResult, ToolCallHandler, ToolSet } from "../../framework";
+import type { GuardHandler } from "../../framework/guards";
+import { replayToolGuard as replayGuard } from "../guards";
 import type { SubagentCall, TokenUsage } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
 import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
-import { createGitTool } from "../git-tool";
+import { createGitTools } from "../git-tools";
 import { GIT_TOOL_NAMES } from "../tool-names";
 import { promptDiff } from "../prompt-diff";
 import { POSTMORTEM_SELECTOR, selectPostmortems, type SelectedPostmortem } from "../postmortems";
-import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
+import { agentEnv, extractJsonObjects, parseReviewOutput } from "../run";
+import { pathGuardHook } from "../guards";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
 
@@ -310,7 +313,7 @@ export type RunAgentImpl = (
   prompt: string,
   overrides: {
     cwd: string;
-    mcpServers: Record<string, McpServerConfig>;
+    gitTools?: ToolSet;
     env: Record<string, string | undefined>;
     toolCallGuards?: readonly ToolCallHandler[];
   },
@@ -360,12 +363,14 @@ const getVariant = (): string => {
 // The tool lists in pr-reviewer.ts are string literals a candidate branch may
 // change, so replay holds its own list. A candidate that names Bash or Write
 // would otherwise reach the run's result files and the holdout manifest.
-const REPLAY_TOOLS = new Set<string>(["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", ...GIT_TOOL_NAMES]);
+//
+// `StructuredOutput` left this list with the tool it named: the answer is an
+// object call now, and a candidate that still asked for the old terminator would
+// be asking for a tool nothing implements. It is *not* replaced by anything — the
+// guard is a ceiling over the tools that exist, and the object call is not one.
+const REPLAY_TOOLS = ["Read", "Grep", "Glob", "Task", "Agent", ...GIT_TOOL_NAMES] as const;
 
-export const replayToolGuard: ToolCallHandler = (call) =>
-  REPLAY_TOOLS.has(call.toolName)
-    ? { decision: "allow" }
-    : { decision: "deny", reason: `Tool not allowed in replay: ${call.toolName}` };
+export const replayToolGuard: GuardHandler = replayGuard(REPLAY_TOOLS);
 
 export const replayCase = async (
   record: ReviewRecord,
@@ -435,7 +440,6 @@ export const replayCase = async (
     ask: async (prompt) => {
       const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
         cwd: repoDir,
-        mcpServers: {},
         env: agentEnv(),
         toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
       });
@@ -448,7 +452,7 @@ export const replayCase = async (
   try {
     agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: repoDir,
-      mcpServers: { git: createGitTool(repoDir) },
+      gitTools: createGitTools({ root: repoDir }),
       env: agentEnv(),
       toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
     });

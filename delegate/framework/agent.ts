@@ -1,451 +1,387 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { HookCallback, Options } from "@anthropic-ai/claude-agent-sdk";
-import { SUBAGENT_TOOLS, recordSubagentResults, recordSubagentUses } from "./subagent-calls";
+import { spawnChild } from "./child/spawn";
+import type { SpawnOptions } from "./child/spawn";
+import { guardSpecs } from "./guards";
+import { costUsdFor } from "../pricing";
+import type { GuardSpec } from "./guards";
+import type { ChildRequest, ChildResult, ChildSpec, ChildStepEvent, ChildToolCall, ParentResponse } from "./protocol";
 import type {
   AgentConfig,
   AgentResult,
-  McpServerConfig,
   RunOverrides,
   SubagentCall,
   SubagentDefinition,
   TokenUsage,
-  ToolCallDecision,
-  ToolCallHandler,
-  ToolSet,
 } from "./types";
+
+// `runAgent` on the Vercel AI SDK, in a spawned child.
+//
+// Three things move and one does not. Move: the model call (`generateText` over a
+// provider package, in a child process), the tool list (the `tool()` set this repo
+// writes, in `tools.ts`), and the caps (delegate's own step and spend counters,
+// with one abort). Does not move: this function's signature and `AgentResult`,
+// because S2 made the contract neutral on purpose and S6 is where the old
+// implementation's dependency goes.
+//
+// **The credential boundary is `spawn`.** The worker holds the whole `DELEGATES`
+// bundle; in-process, `/proc/self/environ` is the worker's own environ and no path
+// guard applies to it. So the model call and the tools that read files happen in a
+// child holding only what `agentEnv()` allowed across. Everything this side can
+// decide without the model — the caps, the abort, the logging, the pricing — stays
+// here, and a subagent is a request the child makes of the parent so that its own
+// model and its own spend are the parent's numbers.
 
 const log = (agent: string, event: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ agent, event, ...data }));
 
-// The contract carries tools as a set, because that is what the AI SDK wants:
-// `{ name: { description, inputSchema, execute } }`. The Claude harness takes
-// the same list as names and implements the tools itself, so the names are the
-// whole translation and every key survives in order. `Object.keys` of a name-keyed
-// set is exactly the list this SDK's `tools`/`agents[].tools` wants, which is
-// why the config declares names rather than definitions in S2.
-const toolNames = (tools: ToolSet | undefined): string[] | undefined =>
-  tools === undefined ? undefined : Object.keys(tools);
+/**
+ * The failure vocabulary.
+ *
+ * The Claude SDK's `subtype` strings have no AI SDK equivalent, so a run that hits
+ * a bound needs a closed set of its own or every cap becomes a generic `error`
+ * status. `run.ts` puts `errorSubtype` in the failure reason, so these names are
+ * what a reader sees. A step is not a turn — `num_turns` and an AI SDK step count
+ * different things — which is why these are new names rather than the old
+ * spellings, and why the caps are re-tuned from measurement rather than assumed
+ * equivalent.
+ */
+export type RunnerError = "error_max_steps" | "error_max_budget_usd" | "error_aborted" | "error_agent";
 
-// The subagents the orchestrator may spawn. The contract describes each one as
-// a prompt, a model and its tools; the harness's own `AgentDefinition` is the
-// same list plus fields this repo does not set.
-const toAgentDefinitions = (
+/**
+ * What this run spent, as the operator's `usage` line and the caps' input.
+ *
+ * `costUsd` is `undefined` when the price table has no row for a model the run
+ * called, and that is not zero: a cap reading `$0` can never fire, so an unpriced
+ * run has to be visibly unpriced. `run.ts` asserts the distinction downstream — a
+ * run that reported tokens and a `costUsd` of 0 is a failure, not a free win.
+ */
+export type Spend = {
+  usage: TokenUsage;
+  costUsd: number | undefined;
+  /** Models this run called that `delegate/pricing/models.json` cannot price. */
+  unpriced: string[];
+};
+
+export const emptyUsage = (): TokenUsage => ({
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+});
+
+/** Sum `from` into `into`, which is what the run's total is built from. */
+export const addUsageInto = (into: TokenUsage, from: TokenUsage): TokenUsage => {
+  into.inputTokens += from.inputTokens;
+  into.outputTokens += from.outputTokens;
+  into.cacheReadTokens += from.cacheReadTokens;
+  into.cacheWriteTokens += from.cacheWriteTokens;
+  return into;
+};
+
+/** Price one step into the running spend, as each step lands so the cap reads live numbers. */
+export const addStepSpend = (spend: Spend, model: string, usage: TokenUsage): void => {
+  addUsageInto(spend.usage, usage);
+  const cost = costUsdFor(model, usage);
+  if (cost === undefined) {
+    if (!spend.unpriced.includes(model)) spend.unpriced.push(model);
+    return;
+  }
+  spend.costUsd = (spend.costUsd ?? 0) + cost;
+};
+
+/**
+ * The caps, as delegate's own counters.
+ *
+ * `maxTurns` and `maxBudgetUsd` keep the contract's names because they are what
+ * the agents set and renaming them here would be a config change for no gain. What
+ * changes is who enforces them: the Claude SDK capped between turns, and here the
+ * parent counts steps as they arrive, prices each one against
+ * `delegate/pricing/models.json`, and aborts the child the first time either bound
+ * is crossed. `stopWhen` in the child is the cooperative half only.
+ *
+ * **A cap that fires is a failed run, never an approval**: `errorSubtype` is set,
+ * which `run.ts` turns into a `failed` record and an `error` status, exactly the
+ * way `error_max_turns` did.
+ */
+export type Caps = { maxSteps: number; maxBudgetUsd: number };
+
+export const capsFor = (config: AgentConfig): Caps => ({
+  maxSteps: config.maxTurns ?? 50,
+  maxBudgetUsd: config.maxBudgetUsd ?? 5,
+});
+
+/**
+ * The subagents a config declares, as the spec wants them: a prompt, a description
+ * and a model. The child turns each into a `Task` tool and asks the parent to run
+ * the call, which is what keeps a subagent's own `model` field meaningful (S10
+ * moves the three subagents without touching the orchestrator).
+ */
+export const toChildSubagents = (
   subagents: Record<string, SubagentDefinition> | undefined,
-): Options["agents"] =>
+): ChildSpec["subagents"] =>
   subagents === undefined
     ? undefined
     : Object.fromEntries(
-        Object.entries(subagents).map(([name, s]) => [
-          name,
-          {
-            description: s.description,
-            prompt: s.prompt,
-            ...(s.model !== undefined ? { model: s.model } : {}),
-            ...(s.tools !== undefined ? { tools: toolNames(s.tools) } : {}),
-          },
-        ]),
+        Object.entries(subagents).map(([name, s]) => [name, { description: s.description, prompt: s.prompt }]),
       );
 
-// The structured-output ask. In S2 the schema handed over is the JSON Schema
-// `REVIEW_OUTPUT_JSON_SCHEMA` builds, because the Claude harness routes the
-// answer through a tool whose input schema the API compiles; S5 hands the Zod
-// schema itself. The `type` wrapper is the harness's, not the contract's.
-const toOutputFormat = (output: AgentConfig["output"]): Options["outputFormat"] =>
-  output === undefined
-    ? undefined
-    : { type: "json_schema", schema: output.schema as Record<string, unknown> };
-
-// Claude reports token counts twice, in two spellings. `usage` on the result
-// message is the main loop only — it excludes Task subagents and sidechains —
-// and it is snake_case (`input_tokens`, `cache_read_input_tokens`). `modelUsage`
-// is the same numbers per model, subagents included, in camelCase
-// (`inputTokens`, `cacheReadInputTokens`), and the SDK's own docs call it "the
-// correct field for token/cost accounting". A review's subagent spend is
-// invisible in `usage` and visible in `modelUsage`, so `modelUsage` is summed
-// when the result carries it and `usage` is the fallback.
-//
-// Both spellings map onto the neutral shape the same way, and the mapping is
-// the part that matters for S5: the AI SDK's `inputTokens` is the prompt total
-// (uncached + cache reads + cache writes), while Claude's `input_tokens` is
-// only the uncached part. So the neutral `inputTokens` is Claude's
-// `input_tokens` unchanged and the two cache counts keep their own names.
-// Getting this backwards would make S5 compare a total against a remainder.
-type ClaudeUsage = {
-  input_tokens?: number | null;
-  output_tokens?: number | null;
-  cache_read_input_tokens?: number | null;
-  cache_creation_input_tokens?: number | null;
-};
-
-type ClaudeModelUsage = {
-  inputTokens?: number;
-  outputTokens?: number;
-  cacheReadInputTokens?: number;
-  cacheCreationInputTokens?: number;
-};
-
-const n = (v: number | null | undefined) =>
-  typeof v === "number" && Number.isFinite(v) ? v : 0;
-
-export const toTokenUsage = (usage: ClaudeUsage | undefined): TokenUsage | undefined => {
-  if (usage === undefined) return undefined;
-  return {
-    inputTokens: n(usage.input_tokens),
-    outputTokens: n(usage.output_tokens),
-    cacheReadTokens: n(usage.cache_read_input_tokens),
-    cacheWriteTokens: n(usage.cache_creation_input_tokens),
-  };
-};
-
-export const totalTokenUsage = (result: {
-  usage?: ClaudeUsage;
-  modelUsage?: Record<string, ClaudeModelUsage>;
-}): TokenUsage | undefined => {
-  const perModel = result.modelUsage === undefined ? [] : Object.values(result.modelUsage);
-  if (perModel.length === 0) return toTokenUsage(result.usage);
-  return perModel.reduce<TokenUsage>(
-    (acc, u) => ({
-      inputTokens: acc.inputTokens + n(u.inputTokens),
-      outputTokens: acc.outputTokens + n(u.outputTokens),
-      cacheReadTokens: acc.cacheReadTokens + n(u.cacheReadInputTokens),
-      cacheWriteTokens: acc.cacheWriteTokens + n(u.cacheCreationInputTokens),
-    }),
-    { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
-  );
-};
-
-// Force every Task spawn to be synchronous. Background-mode Task lets the
-// model proceed before subagents finish — for pr-reviewer this caused
-// reviews to publish on partial specialist results, dropping late blockers
-// and producing duplicate / contradictory reviews on the same SHA.
-// Synchronous Task blocks the parent turn until the subagent's final result
-// returns, which is what every existing agent prompt assumes anyway.
-export const forceSynchronousTaskHook = async (input: unknown) => {
-  const i = input as {
-    hook_event_name?: string;
-    tool_name?: string;
-    tool_input?: Record<string, unknown>;
-  };
-  if (i.hook_event_name !== "PreToolUse" || !SUBAGENT_TOOLS.has(i.tool_name ?? "")) {
-    return { continue: true } as const;
+/**
+ * The tools the child may offer, by name.
+ *
+ * `config.tools` is a `ToolSet` since S2 and its keys are the names the model uses,
+ * so the starting point is `Object.keys`. The git tools and the subagent tool are
+ * named here because the run was given an implementation for them, and
+ * `allowedTools` is the outer bound when an agent sets one — the same intersection
+ * the Claude harness saw, where `tools` said which existed and `allowedTools` said
+ * which were pre-approved. One list here, and it is the narrower of the two.
+ */
+export const toolNamesFor = (config: AgentConfig, overrides: RunOverrides): string[] => {
+  const names = new Set<string>(Object.keys(config.tools ?? {}));
+  for (const name of Object.keys(overrides.gitTools ?? {})) names.add(name);
+  if (config.subagents !== undefined && Object.keys(config.subagents).length > 0) {
+    names.add("Task");
+    names.add("Agent");
   }
-  const ti = (i.tool_input ?? {}) as Record<string, unknown>;
-  if (ti.run_in_background === false) {
-    return { continue: true } as const;
-  }
-  // The Agent tool runs in the background when the flag is omitted, so it is
-  // set to false rather than stripped.
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse" as const,
-      updatedInput: { ...ti, run_in_background: false },
-      additionalContext:
-        "Subagent calls are forced synchronous in this runtime. Wait for this call's result before issuing the next tool call.",
-    },
-  };
+  const declared = config.allowedTools;
+  if (declared === undefined) return [...names];
+  return [...names].filter((name) => declared.includes(name));
 };
 
-// The contract's guard, expressed as the one hook this harness can run.
-//
-// Every piece of Claude vocabulary a guard used to carry lives here and only
-// here: the `PreToolUse` event check (a guard is only asked about tool calls,
-// so an event that is not one is a pass), the `tool_name` / `tool_input`
-// unpacking, and the deny envelope. `allow` maps to a plain pass-through
-// rather than to `permissionDecision: "allow"`: Claude reads the latter as
-// "skip the permission system", and the guards are deciding confinement, not
-// granting a bypass.
-//
-// A guard that throws would otherwise reject the hook, and a rejected hook is
-// **not** a denial on this harness: the SDK's documented default for a hook
-// that fails is `onFailure: 'continue'`, which lets the action go ahead, and a
-// callback matcher does not expose `onFailure` to change that. So the adapter
-// catches and denies here rather than relying on the SDK to fail closed. That
-// makes `ToolCallHandler`'s "a guard that throws fails closed" true by
-// construction under this harness instead of true by assumption.
-export const toPreToolUseHook = (guard: ToolCallHandler): HookCallback => async (input) => {
-  const i = input as {
-    hook_event_name?: string;
-    tool_name?: string;
-    tool_input?: unknown;
-  };
-  if (i.hook_event_name !== "PreToolUse") return { continue: true };
-  const raw = i.tool_input;
-  const toolInput =
-    typeof raw === "object" && raw !== null && !Array.isArray(raw)
-      ? (raw as Record<string, unknown>)
-      : {};
-  let decision: ToolCallDecision;
-  try {
-    decision = await guard({ toolName: i.tool_name ?? "", input: toolInput });
-  } catch (err) {
-    // A guard that threw did not answer the question, so the call is denied:
-    // the same reading as a `deny`, with the error kept as the reason so the
-    // failure is visible rather than silent.
-    return {
-      continue: true,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: `Guard failed: ${err instanceof Error ? err.message : String(err)}`,
-      },
-    };
-  }
-  if (decision.decision === "allow") return { continue: true };
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: decision.reason,
-    },
-  };
+/** One tool call, summarised for the `step` log line. */
+export const summariseCall = (call: ChildToolCall): Record<string, unknown> => {
+  const summary: Record<string, unknown> = { tool: call.toolName };
+  const input = call.input;
+  if (typeof input.file_path === "string") summary.file = input.file_path;
+  else if (typeof input.pattern === "string") summary.pattern = input.pattern;
+  else if (typeof input.path === "string") summary.path = input.path;
+  else if (typeof input.subagent_type === "string") summary.subagent = input.subagent_type;
+  else if (Object.keys(input).length > 0) summary.input = JSON.stringify(input).slice(0, 200);
+  return summary;
 };
 
-// The contract describes a tool server without naming a harness, so its `sdk`
-// variant carries the live instance as `unknown`. The Claude transport wants
-// the SDK's own `McpServer` there, and every value that reaches this point was
-// built by that SDK's `createSdkMcpServer` — the cast is the translation
-// boundary, in one place, rather than a loosening of the harness's own types.
-const toSdkMcpServers = (
-  servers: Record<string, McpServerConfig> | undefined,
-): Options["mcpServers"] => servers as Options["mcpServers"];
+/** Pair a subagent tool call with its result, for `AgentResult.subagentCalls`. */
+export const recordSubagentCall = (calls: Map<string, SubagentCall>, call: ChildToolCall): void => {
+  if (call.toolName !== "Task" && call.toolName !== "Agent") return;
+  calls.set(`${call.toolName}:${calls.size}`, {
+    subagent: String(call.input.subagent_type ?? ""),
+    prompt: String(call.input.prompt ?? ""),
+    ...(call.result !== undefined ? { result: call.result } : {}),
+  });
+};
 
-// The whole translation from the contract to this harness, in one function so
-// that "behaviour identical" is an assertion over a value rather than a claim
-// about a diff: `claudeOptions` is what S2's refactor has to preserve, and
-// `agent.test.ts` pins it. It stays exported only until S5 deletes it with the
-// implementation it belongs to.
-export const claudeOptions = (
-  config: AgentConfig,
-  overrides: RunOverrides = {},
-  stderr: (data: string) => void = (data: string) => console.error("[claude stderr]", data),
-): Options => ({
-  abortController: overrides.abortController,
-  // The contract calls it `continuation`; this harness calls it `resume`. The
-  // value is the `sessionId` the previous run returned.
-  resume: overrides.continuation,
-  systemPrompt: config.systemPrompt,
-  model: config.model,
-  mcpServers: toSdkMcpServers(
-    config.mcpServers || overrides.mcpServers
-      ? { ...config.mcpServers, ...overrides.mcpServers }
-      : undefined,
-  ),
-  env: overrides.env,
-  tools: toolNames(config.tools),
-  outputFormat: toOutputFormat(config.output),
-  agents: toAgentDefinitions(config.subagents),
-  allowedTools: config.allowedTools ?? [
-    "mcp__*",
-    "Read",
-    "Write",
-    "Edit",
-    "Bash",
-    "Glob",
-    "Grep",
-    "Task",
-    "Skill",
-  ],
-  maxTurns: config.maxTurns ?? 50,
-  maxBudgetUsd: config.maxBudgetUsd ?? 5,
-  // The one SDK-only setting no agent sets and none of the contract's six
-  // fields replaced: every caller wants an agent that cannot stop to ask, and
-  // it was never a per-agent decision.
-  permissionMode: "bypassPermissions",
-  cwd: overrides.cwd,
-  hooks: {
-    PreToolUse: [
-      {
-        hooks: [
-          forceSynchronousTaskHook,
-          ...(overrides.toolCallGuards ?? []).map(toPreToolUseHook),
-        ],
-      },
-    ],
-  },
-  stderr,
-});
+export type RunAgentDeps = {
+  /** How the child is executed. Production resolves `child/main.js`; a test points it at a fixture. */
+  /** How the child is executed. Always given both arguments, so a fixture need not guard for an absent options object. */
+  spawn?: (spec: ChildSpec, options: SpawnOptions) => Promise<ChildResult>;
+  /** The clock, so a test can pin `durationMs`. */
+  now?: () => number;
+};
 
+/**
+ * Run one agent.
+ *
+ * The sequence, which is the part worth reading:
+ *
+ * 1. Build the child spec and the guard specs from the config and the overrides.
+ *    The environment is `overrides.env` — the caller's allowlist — and never
+ *    `process.env`, because that is the whole boundary.
+ * 2. Spawn. Each model step arrives as an event; the parent prices it, logs it,
+ *    and adds its tokens to the run's `usage`.
+ * 3. When a step reaches `maxTurns`, or the spend so far reaches `maxBudgetUsd`,
+ *    abort the child and return a capped failure with its own `errorSubtype`. The
+ *    spend accumulated so far is still reported: a capped run spent real money.
+ * 4. A subagent request is answered by a nested `runAgent`, and its spend is added
+ *    to this run's, so the total is the whole tree's.
+ */
 export const runAgent = async (
   config: AgentConfig,
   message: string,
   overrides: RunOverrides = {},
+  deps: RunAgentDeps = {},
 ): Promise<AgentResult> => {
-  const start = Date.now();
-  let output = "";
-  let sessionId: string | undefined;
-  let turnCount = 0;
-  let costUsd: number | undefined;
-  let usage: TokenUsage | undefined;
-  let resultTurns: number | undefined;
-  let structuredOutput: unknown;
-  let errorSubtype: string | undefined;
+  const start = (deps.now ?? Date.now)();
+  const caps = capsFor(config);
+  const spawn = deps.spawn ?? spawnChild;
+
+  // Built before anything starts: a guard that cannot describe itself fails the
+  // run here rather than running unguarded.
+  const specs: GuardSpec[] = guardSpecs(overrides.toolCallGuards ?? []);
+
+  const spend: Spend = { usage: emptyUsage(), costUsd: undefined, unpriced: [] };
   const subagentCalls = new Map<string, SubagentCall>();
-
-  for await (const msg of query({ prompt: message, options: claudeOptions(config, overrides) })) {
-    if (msg.type === "system" && msg.subtype === "init") {
-      sessionId = msg.session_id;
-      log(config.name, "session_init", { sessionId });
-
-      const connected = msg.mcp_servers?.filter(
-        (s: { status: string; name: string }) => s.status === "connected",
-      );
-      const failed = msg.mcp_servers?.filter(
-        (s: { status: string; name: string }) => s.status !== "connected",
-      );
-      if (connected?.length) {
-        log(config.name, "mcp_connected", {
-          servers: connected.map((s: { name: string }) => s.name),
-        });
-      }
-      if (failed?.length) {
-        log(config.name, "mcp_failed", { servers: failed });
-      }
-    }
-
-    if (msg.type === "assistant") {
-      turnCount++;
-
-      const blocks = msg.message.content as Array<{
-        type: string;
-        id?: string;
-        name?: string;
-        input?: Record<string, unknown>;
-        text?: string;
-        thinking?: string;
-      }>;
-
-      const thinking = blocks
-        .filter((b) => b.type === "thinking" && b.thinking)
-        .map((b) => b.thinking!.slice(0, 200))
-        .join(" ");
-
-      const text = blocks
-        .filter((b) => b.type === "text" && b.text)
-        .map((b) => b.text!.slice(0, 200))
-        .join(" ");
-
-      const tools = blocks
-        .filter((b) => b.type === "tool_use")
-        .map((b) => {
-          const summary: Record<string, unknown> = { tool: b.name };
-          if (b.input) {
-            if (b.name === "Bash" && b.input.command)
-              summary.command = (b.input.command as string).slice(0, 200);
-            else if (b.name === "Read" && b.input.file_path)
-              summary.file = b.input.file_path;
-            else if (b.name === "Grep" && b.input.pattern)
-              summary.pattern = b.input.pattern;
-            else if (b.name === "Glob" && b.input.pattern)
-              summary.pattern = b.input.pattern;
-            else if (b.name === "Edit" && b.input.file_path)
-              summary.file = b.input.file_path;
-            else if (b.name === "Write" && b.input.file_path)
-              summary.file = b.input.file_path;
-            else if (b.name?.startsWith("mcp__"))
-              summary.input = JSON.stringify(b.input).slice(0, 300);
-            else if (b.name && SUBAGENT_TOOLS.has(b.name)) {
-              if (b.input.subagent_type)
-                summary.subagent = b.input.subagent_type;
-              if (b.input.run_in_background)
-                summary.run_in_background = b.input.run_in_background;
-            }
-          }
-          return summary;
-        });
-
-      recordSubagentUses(subagentCalls, blocks);
-
-      log(config.name, "turn", {
-        turn: turnCount,
-        model: msg.message.model,
-        ...(thinking && { thinking: thinking.slice(0, 300) }),
-        ...(text && { text: text.slice(0, 300) }),
-        ...(tools.length > 0 && { tools }),
-      });
-    }
-
-    if (msg.type === "user" && msg.message.role === "user") {
-      const parts = (
-        msg.message.content as Array<{
-          type: string;
-          tool_use_id?: string;
-          content?: unknown;
-        }>
-      )
-        .filter((b) => b.type === "tool_result")
-        .map((b) => {
-          const content =
-            typeof b.content === "string"
-              ? b.content.slice(0, 500)
-              : JSON.stringify(b.content).slice(0, 500);
-          return { tool_use_id: b.tool_use_id, result: content };
-        });
-      if (parts.length > 0) {
-        log(config.name, "tool_results", { results: parts });
-      }
-      recordSubagentResults(
-        subagentCalls,
-        msg.message.content as Array<{ type: string; tool_use_id?: string; content?: unknown }>,
-      );
-    }
-
-    if (msg.type === "result" && msg.subtype === "success") {
-      output = msg.result;
-      costUsd = msg.total_cost_usd;
-      resultTurns = msg.num_turns;
-      structuredOutput = msg.structured_output;
-      usage = totalTokenUsage(msg);
-      log(config.name, "completed", {
-        turns: msg.num_turns,
-        costUsd: msg.total_cost_usd,
-        durationMs: msg.duration_ms,
-        durationApiMs: msg.duration_api_ms,
-        usage: msg.usage,
-        tokenUsage: usage,
-      });
-    }
-
-    if (msg.type === "result" && msg.subtype !== "success") {
-      // The error variant carries `usage` and `modelUsage` exactly as the
-      // success one does, and a run that hit the turn cap or the budget cap
-      // spent real tokens. Recording them is what makes a failed review's spend
-      // comparable to a completed one rather than a gap.
-      const err = msg as {
-        subtype: string;
-        errors?: string[];
-        num_turns?: number;
-        total_cost_usd?: number;
-        usage?: ClaudeUsage;
-        modelUsage?: Record<string, ClaudeModelUsage>;
-      };
-      output = `Agent error: ${err.errors ?? "unknown error"}`;
-      costUsd = err.total_cost_usd;
-      resultTurns = err.num_turns;
-      usage = totalTokenUsage(err);
-      errorSubtype = err.subtype;
-      log(config.name, "error", {
-        subtype: err.subtype,
-        errors: err.errors,
-        turns: err.num_turns,
-        costUsd: err.total_cost_usd,
-        usage: err.usage,
-        tokenUsage: usage,
-      });
-    }
+  const controller = new AbortController();
+  const callerAbort = overrides.abortController;
+  const onCallerAbort = () => controller.abort();
+  if (callerAbort !== undefined) {
+    if (callerAbort.signal.aborted) controller.abort();
+    else callerAbort.signal.addEventListener("abort", onCallerAbort, { once: true });
   }
+
+  let capReason: RunnerError | undefined;
+  const fireCap = (reason: RunnerError) => {
+    if (capReason !== undefined) return;
+    capReason = reason;
+    controller.abort();
+  };
+
+  const subagents = toChildSubagents(config.subagents);
+  const spec: ChildSpec = {
+    model: config.model,
+    systemPrompt: config.systemPrompt,
+    messages: [...(overrides.continuation ?? []), { role: "user", content: message }],
+    root: overrides.cwd ?? process.cwd(),
+    ...(subagents !== undefined ? { subagents } : {}),
+    ...(config.output !== undefined ? { output: config.output } : {}),
+    allowedTools: toolNamesFor(config, overrides),
+    guards: specs,
+    maxSteps: caps.maxSteps,
+  };
+
+  /** Run one subagent as its own child, under the same guards and the same overrides. */
+  const runSubagent = async (request: ChildRequest): Promise<ParentResponse> => {
+    const definition = config.subagents?.[request.name];
+    if (definition === undefined) {
+      return { type: "response", id: request.id, ok: false, error: `Unknown subagent "${request.name}"` };
+    }
+    const result = await runAgent(
+      {
+        name: request.name,
+        systemPrompt: definition.prompt,
+        model: definition.model ?? config.model,
+        // A subagent answers in text — the contract `pr-reviewer.ts` parses the
+        // last line of — and never spawns one of its own.
+        tools: definition.tools,
+        maxTurns: caps.maxSteps,
+        maxBudgetUsd: caps.maxBudgetUsd,
+      },
+      request.prompt,
+      {
+        cwd: overrides.cwd,
+        env: overrides.env,
+        abortController: controller,
+        toolCallGuards: overrides.toolCallGuards,
+        gitTools: overrides.gitTools,
+      },
+      deps,
+    );
+    // Priced into this run, so the totals are the whole tree's rather than the
+    // orchestrator's alone.
+    if (result.usage !== undefined) addUsageInto(spend.usage, result.usage);
+    if (result.costUsd === undefined) {
+      const model = definition.model ?? config.model;
+      if (!spend.unpriced.includes(model)) spend.unpriced.push(model);
+    } else {
+      spend.costUsd = (spend.costUsd ?? 0) + result.costUsd;
+    }
+    if (result.errorSubtype !== undefined) {
+      return {
+        type: "response",
+        id: request.id,
+        ok: false,
+        error: `${result.errorSubtype}: ${result.output.slice(0, 300)}`,
+      };
+    }
+    return { type: "response", id: request.id, ok: true, output: result.output };
+  };
+
+  let steps = 0;
+  const child: ChildResult = await spawn(spec, {
+    env: overrides.env,
+    signal: controller.signal,
+    onStep: (event: ChildStepEvent) => {
+      steps += 1;
+      addStepSpend(spend, config.model, {
+        inputTokens: event.inputTokens,
+        outputTokens: event.outputTokens,
+        cacheReadTokens: event.cacheReadTokens,
+        cacheWriteTokens: event.cacheWriteTokens,
+      });
+      log(config.name, "step", {
+        step: event.stepNumber,
+        finishReason: event.finishReason,
+        ...(event.text !== "" ? { text: event.text } : {}),
+        ...(event.toolCalls.length > 0 ? { tools: event.toolCalls.map(summariseCall) } : {}),
+      });
+      for (const call of event.toolCalls) recordSubagentCall(subagentCalls, call);
+      // Checked after each step, so the abort lands before the next model call
+      // rather than after the answer.
+      if (steps >= caps.maxSteps) fireCap("error_max_steps");
+      else if (spend.costUsd !== undefined && spend.costUsd >= caps.maxBudgetUsd) {
+        fireCap("error_max_budget_usd");
+      }
+    },
+    onRequest: runSubagent,
+  });
+
+  callerAbort?.signal.removeEventListener("abort", onCallerAbort);
+
+  const durationMs = (deps.now ?? Date.now)() - start;
+  const costUsd = spend.costUsd;
+  const usage = spend.usage;
+
+  if (capReason !== undefined) {
+    const output =
+      capReason === "error_max_steps"
+        ? `Agent error: the run reached its step cap (maxTurns=${caps.maxSteps}) before answering.`
+        : `Agent error: the run reached its budget cap (maxBudgetUsd=${caps.maxBudgetUsd}) before answering.`;
+    log(config.name, "cap_fired", { reason: capReason, steps, costUsd: costUsd ?? null, usage });
+    return {
+      agent: config.name,
+      output,
+      durationMs,
+      costUsd,
+      usage,
+      turns: steps,
+      errorSubtype: capReason,
+      ...(subagentCalls.size > 0 ? { subagentCalls: [...subagentCalls.values()] } : {}),
+    };
+  }
+
+  if (!child.ok) {
+    const subtype: RunnerError = controller.signal.aborted ? "error_aborted" : "error_agent";
+    log(config.name, "error", {
+      errorName: child.errorName,
+      error: child.error,
+      steps,
+      costUsd: costUsd ?? null,
+      usage,
+      repairable: child.repairable,
+      ...(spend.unpriced.length > 0 ? { unpriced: spend.unpriced } : {}),
+    });
+    return {
+      agent: config.name,
+      output: `Agent error: ${child.error}`,
+      durationMs,
+      costUsd,
+      usage,
+      turns: steps,
+      errorSubtype: subtype,
+      // The message array is what a repair turn continues, and it is only
+      // meaningful when the failure was the answer's shape; `run.ts` keys on it
+      // the way it keyed on `sessionId`.
+      ...(child.repairable ? { messages: child.messages } : {}),
+      ...(subagentCalls.size > 0 ? { subagentCalls: [...subagentCalls.values()] } : {}),
+    };
+  }
+
+  log(config.name, "completed", {
+    steps: child.steps,
+    costUsd: costUsd ?? null,
+    durationMs,
+    usage,
+    ...(spend.unpriced.length > 0 ? { unpriced: spend.unpriced } : {}),
+  });
 
   return {
     agent: config.name,
-    output,
-    durationMs: Date.now() - start,
-    sessionId,
+    output: child.output,
+    durationMs,
     costUsd,
-    ...(usage !== undefined ? { usage } : {}),
-    turns: resultTurns,
-    structuredOutput,
-    errorSubtype,
+    usage,
+    turns: child.steps,
+    ...(child.structuredOutput !== undefined ? { structuredOutput: child.structuredOutput } : {}),
+    // Always carried, so a repair turn continues this conversation rather than
+    // starting a fresh one. There is no session to resume under this call layer.
+    messages: child.messages,
     ...(subagentCalls.size > 0 ? { subagentCalls: [...subagentCalls.values()] } : {}),
   };
 };

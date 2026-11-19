@@ -1,5 +1,7 @@
 // What `runAgent` takes and returns, written without a harness.
 //
+import type { ModelMessage } from "ai";
+
 // Nothing here names the Claude Agent SDK: a second implementation can satisfy
 // this contract, and the two things it used to borrow from that SDK — the
 // subagent definitions and the MCP server config — are described locally. The
@@ -149,11 +151,27 @@ export type AgentConfig = {
   name: string;
   systemPrompt: string;
   model: string;
-  mcpServers?: Record<string, McpServerConfig>;
-  /** The tools the agent may call, and nothing else. */
+  /**
+   * The tools the agent may call, and nothing else. Under the AI SDK these are real
+   * `tool()` values the run's child executes; the earlier harness took the same set
+   * as names and implemented every one itself, which is why this is a set of
+   * loosely described entries rather than the SDK's own type.
+   */
   tools?: ToolSet;
+  /**
+   * The narrower bound, when an agent sets one: the names it is pre-approved to
+   * call. Under the Claude harness `tools` said which existed and `allowedTools`
+   * said which were pre-approved; here the two are one list, and it is the
+   * intersection, so an agent that sets both keeps the authority it had.
+   */
   allowedTools?: string[];
+  /**
+   * The step cap. The name is the Claude harness's and is kept because it is what
+   * the agents set; under the AI SDK it bounds delegate's own step counter, which
+   * `agent.ts` enforces and which is a different definition from `num_turns`.
+   */
   maxTurns?: number;
+  /** The spend cap, priced against `delegate/pricing/models.json`. */
   maxBudgetUsd?: number;
   subagents?: Record<string, SubagentDefinition>;
   /** Present when the agent's answer must be a structured object. */
@@ -163,30 +181,42 @@ export type AgentConfig = {
 export type RunOverrides = {
   cwd?: string;
   abortController?: AbortController;
-  mcpServers?: Record<string, McpServerConfig>;
+  /**
+   * The git tools this run may call, by name, with the implementation the child
+   * runs them with.
+   *
+   * Replaces `mcpServers`: under the AI SDK there is no MCP transport to register,
+   * and the git tools are this repo's own `tool()` entries
+   * (`review/git-tools.ts`), keyed by the names the reviewer's prompt and the
+   * replay guard already use. The child builds them from this, so a run that passes
+   * none has none.
+   */
+  gitTools?: ToolSet;
+  /** The environment the child gets, and nothing else. Never `process.env`. */
   env?: Record<string, string | undefined>;
   /**
-   * Guards run over every tool call before the tool executes. A call runs only
-   * if every guard allows it, so a guard that throws fails closed (see
-   * `ToolCallHandler`: the harness, not the contract, is what enforces it).
+   * Guards run over every tool call before the tool executes. A call runs only if
+   * every guard allows it, so a guard that throws fails closed — and *this repo*
+   * makes that true, in `applyGuards`, rather than trusting a harness to.
    *
-   * The element type is the contract's own, and no harness's is accepted here.
-   * S2 carried a type parameter so that running Claude `PreToolUse` hooks under
-   * this contract was visible instead of a cast; S3 moved both guards onto
-   * `ToolCallHandler` and the parameter went with them. A harness that has
-   * hooks of its own adapts this shape at its own boundary, in one place
-   * (`toPreToolUseHook` in `agent.ts`), which is what keeps a guard from
-   * knowing which harness is underneath it.
+   * The element type is the neutral handler. Each guard also carries a `spec`
+   * (`GuardSpec` in `guards.ts`) describing it as data, because the model call
+   * happens in a spawned child and a closure cannot cross the pipe: the spec is what
+   * travels, and `applyGuard` is the only implementation either side runs. A guard
+   * with no spec fails the run rather than being skipped, because a run with fewer
+   * guards than the caller asked for is the failure the allowlist exists to prevent.
    */
   toolCallGuards?: readonly ToolCallHandler[];
   /**
-   * Continue the conversation whose handle the last run returned as
-   * `AgentResult.sessionId`, instead of starting a fresh one: the prompt is
-   * then the follow-up user message. Named for what it is rather than for the
-   * harness's own field, and it disappears in S5, where the repair call is
-   * handed the message array instead of resuming a session at a cwd.
+   * The conversation so far, instead of a fresh one.
+   *
+   * Under the AI SDK this is the message array a previous run returned, not a
+   * session id: the bounded repair turn appends its validation error to this and
+   * makes one more call. That is what replaced "resume the session at a fixed cwd",
+   * and the class of problem it removes rather than ports: no session to resume, so
+   * a "resumed" run and a fresh one cannot be confused.
    */
-  continuation?: string;
+  continuation?: ModelMessage[];
 };
 
 export type AgentJob = {
@@ -206,9 +236,12 @@ export type AgentResult = {
   agent: string;
   output: string;
   durationMs: number;
-  // The handle `RunOverrides.continuation` takes. Named for the harness in S2
-  // and replaced by the message array in S5.
-  sessionId?: string;
+  /**
+   * What `RunOverrides.continuation` takes: the conversation as the call left it,
+   * so a repair turn continues it rather than starting over. Replaced the
+   * `sessionId` handle in S5 — there is no session to resume under the AI SDK.
+   */
+  messages?: ModelMessage[];
   costUsd?: number;
   /** Tokens the run spent, main loop and subagents alike. */
   usage?: TokenUsage;
