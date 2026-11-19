@@ -107,6 +107,43 @@ test("Glob finds files by pattern and refuses a start path outside", async () =>
   assert.match(await run(root, "Glob", { pattern: "*", path: "/etc" }), /outside the review checkout/);
 });
 
+test("Grep and Glob do not walk through a symlink committed in the checkout", async () => {
+  // The PR author owns the checkout, so a symlink is a file they can commit. The
+  // walk used to check containment only on the path the model named, then recurse
+  // with `statSync`/`readdirSync`/`readFileSync`, all of which follow links — so a
+  // search from `.` reached `/proc/self/environ` and could quote it into a posted
+  // review. Every entry is re-checked now. Both directions are asserted, so a
+  // future "optimisation" that skips the per-entry check fails here.
+  const root = checkout();
+  symlinkSync("/", join(root, "l"));
+  symlinkSync("/etc", join(root, "etc-link"));
+
+  // A pattern that matches any line: if the walk follows the link, `/etc/passwd`
+  // and the rest of the filesystem come back as matches.
+  const grep = await run(root, "Grep", { pattern: "." });
+  assert.doesNotMatch(grep, /root:/, "a symlinked / must not be searched");
+  assert.doesNotMatch(grep, /etc-link\//, "a symlinked /etc must not be listed");
+  // The checkout's own files are still found, so the check is not simply refusing
+  // everything.
+  assert.match(grep, /src\/a\.ts/);
+
+  const glob = await run(root, "Glob", { pattern: "**/*" });
+  assert.doesNotMatch(glob, /^l\//m, "a symlinked / must not be walked");
+  assert.doesNotMatch(glob, /^etc-link\//m, "a symlinked /etc must not be walked");
+  assert.match(glob, /src\/a\.ts/);
+});
+
+test("a symlink loop inside the checkout does not recurse forever", async () => {
+  // `a -> .` used to make both walks descend until the path was too long, which
+  // is a cheap way to hang a review rather than a way to read anything.
+  const root = checkout();
+  symlinkSync(".", join(root, "loop"));
+  const grep = await run(root, "Grep", { pattern: "alpha" });
+  assert.match(grep, /src\/a\.ts/);
+  const glob = await run(root, "Glob", { pattern: "**/*" });
+  assert.match(glob, /src\/a\.ts/);
+});
+
 test("globToRegExp handles the two forms a model actually writes", () => {
   // `*.ts` matches at any depth (a model that has used any other glob expects
   // that), and `src/**/*.ts` matches under `src/` at any depth including none.

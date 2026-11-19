@@ -710,6 +710,26 @@ test("no callsite after the repair pass reads result.costUsd", () => {
   assert.equal(after.includes("result.costUsd"), false);
 });
 
+// The repair turn is only reachable if a schema mismatch gets past the
+// `errorSubtype` bail. A schema failure arrives as `error_agent` with `messages`
+// attached (`isRepairable` decided the answer's shape was the failure), so
+// treating every `errorSubtype` as terminal made the repair turn dead code for
+// the one failure it exists for — while the comment above it still promised the
+// turn. The bail has to key on the conversation, not on the subtype alone.
+test("a repairable failure does not take the terminal error path", () => {
+  const source = readFileSync(join(__dirname, "run.ts"), "utf-8");
+  const bail = /if \(result\.errorSubtype !== undefined && result\.messages === undefined\)/;
+  assert.match(source, bail, "the error bail must exclude a run carrying a repair conversation");
+  // A cap or an abort carries no `messages`, so it still fails here: the repair
+  // turn must not be reachable for a failure asking again cannot fix.
+  const agent = readFileSync(join(__dirname, "..", "framework", "agent.ts"), "utf-8");
+  assert.match(
+    agent,
+    /\.\.\.\(child\.repairable \? \{ messages: child\.messages \} : \{\}\)/,
+    "only a repairable failure carries the conversation, so nothing else can reach the repair turn",
+  );
+});
+
 
 // Case 11 of `docs/plan-gated-merges.md`'s corpus, "a commit pushed after
 // approval". It cannot be an eval replay: `replay.ts` scores one bundle at one

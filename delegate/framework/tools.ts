@@ -103,12 +103,22 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
       let matches = 0;
 
       const visit = (abs: string) => {
+        // **Every entry is re-checked, not just the one the model named.** A
+        // checkout is controlled by the PR author, so a committed symlink
+        // (`etc-link -> /etc`) is a path into the worker; `confineTo` resolves
+        // through `realpath`, so the child fails this the moment the walk
+        // reaches it. Checking only the start path, as this did, let a search
+        // from `.` read `/proc/self/environ` through such a link.
+        if (!confine.check(abs).inside) return;
         let stat;
         try {
           stat = statSync(abs);
         } catch {
           return;
         }
+        // A fifo or a device would block or never end; only these two kinds are
+        // searchable.
+        if (!stat.isDirectory() && !stat.isFile()) return;
         if (stat.isDirectory()) {
           let entries: string[];
           try {
@@ -168,6 +178,7 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
       const re = globToRegExp(pattern);
       const found: { rel: string; mtime: number }[] = [];
       const visit = (abs: string) => {
+        if (!confine.check(abs).inside) return;
         let entries: string[];
         try {
           entries = readdirSync(abs);
@@ -177,6 +188,9 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
         for (const entry of entries) {
           if (SKIP_DIRS.has(entry)) continue;
           const child = join(abs, entry);
+          // Same re-check as `Grep`: a symlink in the checkout is a path out of
+          // it, and this walk is what a model uses to find one.
+          if (!confine.check(child).inside) continue;
           let stat;
           try {
             stat = statSync(child);
@@ -184,7 +198,7 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
             continue;
           }
           if (stat.isDirectory()) visit(child);
-          else {
+          else if (stat.isFile()) {
             const rel = relative(confine.root, child);
             if (re.test(rel)) found.push({ rel, mtime: stat.mtimeMs });
           }

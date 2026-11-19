@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyGuard, applyGuards, defineGuard, guardSpecs } from "./guards";
 import type { GuardSpec } from "./guards";
+import { GIT_TOOL_NAMES } from "../review/tool-names";
 
 // The guard layer, which S5 turned from a closure into a closure **plus a spec**.
 //
@@ -66,11 +67,27 @@ test("the git tools are guarded too, which the old hook did not do", () => {
   // Read/Grep/Glob because those were the tools the SDK owned; the git tools were
   // validated by `isSafePath` alone, which cannot see a symlink. They are in the
   // guarded set now.
+  //
+  // **Under the names the tools are actually keyed by.** The set is built from
+  // `GIT_TOOL_NAMES` (`mcp__git__git_log` and the rest); a literal `git_log` here
+  // matched nothing in production while this test passed against the short
+  // spelling, so every git call went unguarded. Both spellings are asserted: the
+  // real one must deny, and the bare one must not be silently treated as a git
+  // tool it is not.
   const root = checkout();
-  for (const toolName of ["git_log", "git_show", "git_diff", "git_blame"]) {
+  for (const toolName of GIT_TOOL_NAMES) {
     assert.equal(applyGuard({ toolName, input: { path: "/etc/passwd" } }, paths(root)).decision, "deny", toolName);
     assert.equal(applyGuard({ toolName, input: { path: "src/a.ts" } }, paths(root)).decision, "allow", toolName);
   }
+  for (const bare of ["git_log", "git_show", "git_diff", "git_blame"]) {
+    assert.equal(
+      applyGuard({ toolName: bare, input: { path: "/etc/passwd" } }, paths(root)).decision,
+      "allow",
+      `${bare} is not a tool the model can call; the namespaced name is`,
+    );
+  }
+  // A `Task` call still carries no path, so it stays out of this guard's way.
+  assert.equal(applyGuard({ toolName: "Task", input: { prompt: "x" } }, paths(root)).decision, "allow");
 });
 
 test("a tools guard is an allowlist, and its reason says which list refused", () => {

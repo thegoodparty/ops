@@ -666,10 +666,19 @@ export const runReview = async (args: {
     return fail(`agent crashed: ${err instanceof Error ? err.message : String(err)}`, {});
   }
 
-  if (result.errorSubtype) {
+  // A failed run is terminal **unless it carried a repair conversation**. A schema
+  // mismatch arrives as `error_agent` with `messages` attached, because
+  // `isRepairable` decided the answer's shape was the failure; everything else
+  // (a cap, an abort, a truncated response, a network error) carries no
+  // `messages` and ends the run here. Reading `errorSubtype` alone, as this did,
+  // made the repair turn unreachable for the one failure it was written for.
+  if (result.errorSubtype !== undefined && result.messages === undefined) {
     return fail(`agent error (${result.errorSubtype}): ${result.output.slice(0, 300)}`, {
       costUsd: result.costUsd,
     });
+  }
+  if (result.errorSubtype !== undefined) {
+    console.error(`agent error (${result.errorSubtype}), attempting the repair turn: ${result.output.slice(0, 300)}`);
   }
 
   let parsed = parseReviewOutput(result);

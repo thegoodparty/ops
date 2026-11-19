@@ -165,9 +165,13 @@ describe("the price table", () => {
 describe("the step cap fires", () => {
   it("sets error_max_steps rather than approving, and reports the spend", async () => {
     // The mechanism: the parent counts steps from the child's `step` events and
-    // aborts when the count reaches `maxTurns`. The child here is a fixture that
+    // aborts once the count passes `maxTurns`. The child here is a fixture that
     // emits steps without a model, so what is exercised is the counter and the
     // abort rather than a provider. **This is the test the plan asks for.**
+    //
+    // It fires *past* the cap rather than at it: the child's own `stopWhen` ends
+    // the loop on step N, and `prepareStep` reserves that step for the answer, so
+    // a run that reaches N has not run away. The next test pins that case.
     const seen: number[] = [];
     const result = await runAgent(baseConfig({ maxTurns: 3 }), "hi", {}, {
       spawn: async (_spec, options) => {
@@ -200,13 +204,52 @@ describe("the step cap fires", () => {
 
     assert.equal(result.errorSubtype, "error_max_steps");
     assert.match(result.output, /step cap \(maxTurns=3\)/);
-    assert.equal(result.turns, 3);
-    // Stopped at the cap rather than at the fixture's own limit.
-    assert.equal(seen.length, 3);
+    assert.equal(result.turns, 4);
+    // Stopped one step past the cap rather than at it, and before the fixture's
+    // own limit.
+    assert.equal(seen.length, 4);
     // A capped run spent real money, and the record says so rather than leaving a
     // zero that reads as free.
     assert.ok((result.costUsd ?? 0) > 0, "a capped run still reports its spend");
-    assert.equal(result.usage?.inputTokens, 3_000);
+    assert.equal(result.usage?.inputTokens, 4_000);
+  });
+
+  it("does not fire on a run that answers in its last allowed step", async () => {
+    // The regression this pins: `prepareStep` strips the tools on the last
+    // allowed step so the structured object is the only answer, so a good run
+    // finishes with exactly `maxTurns` steps. Counting `>=` failed that run — and
+    // with it every subagent, each of which comes through the same counter.
+    const result = await runAgent(baseConfig({ maxTurns: 3 }), "hi", {}, {
+      spawn: async (_spec, options) => {
+        for (let step = 0; step < 3; step++) {
+          options.onStep?.({
+            type: "step",
+            stepNumber: step,
+            inputTokens: 100,
+            outputTokens: 10,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            finishReason: step === 2 ? "stop" : "tool-calls",
+            text: "",
+            toolCalls: [],
+          });
+          if (options.signal?.aborted === true) break;
+        }
+        return {
+          ok: true,
+          output: '{"status":"complete","findings":[],"summary":"clean"}',
+          structuredOutput: { status: "complete", findings: [], summary: "clean" },
+          usage: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          steps: 3,
+          toolCalls: [],
+          messages: [],
+        };
+      },
+    });
+
+    assert.equal(result.errorSubtype, undefined, "an answered run is not a capped run");
+    assert.equal(result.turns, 3);
+    assert.deepEqual(result.structuredOutput, { status: "complete", findings: [], summary: "clean" });
   });
 });
 

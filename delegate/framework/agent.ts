@@ -302,9 +302,16 @@ export const runAgent = async (
         ...(event.toolCalls.length > 0 ? { tools: event.toolCalls.map(summariseCall) } : {}),
       });
       for (const call of event.toolCalls) recordSubagentCall(subagentCalls, call);
-      // Checked after each step, so the abort lands before the next model call
-      // rather than after the answer.
-      if (steps >= caps.maxSteps) fireCap("error_max_steps");
+      // **Exceeded, not reached.** The child's last allowed step is the one
+      // `prepareStep` reserves for the answer: with `stopWhen: stepCountIs(N)` the
+      // loop ends on step `N`, and grid on that step the tools are stripped so the
+      // object is the only possible answer. Firing at `>=` therefore fired on the
+      // answering step of a run that had done exactly what it was told to do, so a
+      // run that used its full step budget failed even though the answer arrived —
+      // every subagent included, since each one comes through here. The counter
+      // now fires only past the cap, which is what makes it a backstop for a child
+      // that keeps sending steps rather than a tax on the one that behaves.
+      if (steps > caps.maxSteps) fireCap("error_max_steps");
       else if (spend.costUsd !== undefined && spend.costUsd >= caps.maxBudgetUsd) {
         fireCap("error_max_budget_usd");
       }

@@ -1,5 +1,6 @@
 import type { ToolCall, ToolCallDecision, ToolCallHandler } from "./types";
 import { confineTo } from "./tool-paths";
+import { GIT_TOOL_NAMES } from "../review/tool-names";
 
 // The guards, in one implementation, described in a form that can cross a
 // process boundary.
@@ -53,6 +54,19 @@ const pathCandidates = (input: Record<string, unknown>): string[] =>
     .filter((value): value is string => typeof value === "string" && value.length > 0);
 
 /**
+ * The tools whose call can name a path.
+ *
+ * **`GIT_TOOL_NAMES` rather than bare `git_log`.** The git tools are keyed by
+ * their MCP-namespaced names (`mcp__git__git_log`) because that is the string
+ * the reviewer's prompt uses and `replayToolGuard` compares against — see
+ * `review/git-tools.ts`. Written as a literal `git_log` here, this list matched
+ * nothing in production and let every git call through unguarded while the test
+ * below passed against the short spelling. Taking the names from the constant
+ * the tools are keyed by is what stops the two from drifting again.
+ */
+const PATH_TOOLS: readonly string[] = ["Read", "Grep", "Glob", ...GIT_TOOL_NAMES];
+
+/**
  * Decide one call against one spec.
  *
  * A spec this module does not know is a **deny**, not an allow: the closed set
@@ -66,7 +80,7 @@ export const applyGuard = (call: ToolCall, spec: GuardSpec): ToolCallDecision =>
       // Only the tools that take a path are policed. A `Task` call carries a
       // prompt, not a path, and its subagent's own reads are guarded where they
       // happen.
-      if (!["Read", "Grep", "Glob", "git_log", "git_show", "git_diff", "git_blame"].includes(call.toolName)) {
+      if (!PATH_TOOLS.includes(call.toolName)) {
         return { decision: "allow" };
       }
       const confine = confineTo(spec.root);

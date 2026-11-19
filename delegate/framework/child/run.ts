@@ -43,6 +43,17 @@ export const isRepairable = (err: unknown): boolean =>
   (err as { cause?: { name?: string } }).cause?.name === "AI_TypeValidationError";
 
 /**
+ * A tool's output, as the text the parent records beside the call.
+ *
+ * A tool's `execute` returns a string here (every tool we write does), but the
+ * SDK's type is `unknown` and a future tool could return an object. Stringifying
+ * is what keeps one such tool from dropping the subagent's whole answer, which is
+ * the thing this field exists to carry.
+ */
+const asText = (output: unknown): string =>
+  typeof output === "string" ? output : JSON.stringify(output) ?? String(output);
+
+/**
  * The AI SDK's usage in the contract's shape.
  *
  * The AI SDK's `inputTokens` is the prompt total, cache reads and writes
@@ -67,8 +78,7 @@ export const toTokenUsage = (usage: {
   };
 };
 
-export type ChildDeps = {
-  /** Cancel the run: the parent's abort, its spend cap and its deadline, one signal. */
+export type ChildDeps = {  /** Cancel the run: the parent's abort, its spend cap and its deadline, one signal. */
   signal?: AbortSignal;
   /** Injected by a test; production asks the parent over the pipe. */
   askSubagent?: (request: ChildRequest) => Promise<ParentResponse>;
@@ -146,16 +156,28 @@ export const runChild = async (spec: ChildSpec, deps: ChildDeps = {}): Promise<C
         usage.cacheReadTokens += stepUsage.cacheReadTokens;
         usage.cacheWriteTokens += stepUsage.cacheWriteTokens;
         steps += 1;
+        // **Pair each call with what its tool answered.** `step.toolCalls` carries
+        // input only, so a `Task` call reached the parent with no `result` and
+        // `recordSubagentCall` stored a subagent that never reported — which left
+        // `traceLeads` reading an empty scout result on every eval run. The
+        // results are on the same step, keyed by `toolCallId`.
+        const outputs = new Map(
+          step.toolResults.map((toolResult) => [toolResult.toolCallId, toolResult.output]),
+        );
         deps.onStep?.({
           type: "step",
           stepNumber: step.stepNumber,
           ...stepUsage,
           finishReason: step.finishReason,
           text: (step.text ?? "").slice(0, 400),
-          toolCalls: step.toolCalls.map((call) => ({
-            toolName: call.toolName,
-            input: (call.input ?? {}) as Record<string, unknown>,
-          })),
+          toolCalls: step.toolCalls.map((call) => {
+            const output = outputs.get(call.toolCallId);
+            return {
+              toolName: call.toolName,
+              input: (call.input ?? {}) as Record<string, unknown>,
+              ...(output !== undefined ? { result: asText(output) } : {}),
+            };
+          }),
         });
       },
     });
