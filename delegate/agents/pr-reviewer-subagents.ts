@@ -51,7 +51,7 @@ Emit 0–10 investigation leads. A lead is a hypothesis about a specific area, n
 
 Lead categories:
 - correctness: silent failures, race conditions, missing awaits, off-by-one, null/undefined handling
-- security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard)
+- security: authz gaps on new endpoints, injection vectors, secret exposure in logs/responses, broken S2S JWT or Clerk M2M verification, CORS/cookie misconfiguration, email-domain checks using substring matching (includes/endsWith without a delimiter guard), and any guard that decides from a value the caller supplies — a query, path, header or body field, including on routes whose handler declares no such input — rather than from the authenticated session. For that last pattern, lead on whether a caller who chooses that value passes a check meant for the value's owner.
 - tests: new behavior without tests, tautological assertions, snapshot-only coverage on non-trivial paths, tests that won't compile, and tests the repo's written testing guide says not to write. For each new or changed test file, open the testing guide that the nearest CLAUDE.md or AGENTS.md links and check the new tests against it.
 - conventions: CLAUDE.md violations, pattern divergence visible in 3+ existing files
 - cross-file: a pattern spanning multiple files — duplicated helper, repeated bug, type re-defined inline that already exists in a shared module. This is the highest-value category; no individual deep-reviewer naturally looks across files.
