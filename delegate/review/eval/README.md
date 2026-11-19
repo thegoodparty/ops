@@ -33,7 +33,7 @@ Improve the reviewer one idea at a time, against whichever version is best so fa
 5. **Promote it.** The winning arm becomes `best` for the next idea, and its runs carry over. Try several ideas side by side as separate arms against the same base.
 6. **Open a PR** from the winning branch, with the final table in the body. Comment `delegate eval` on it to run the full suite in CI, holdout included. That is the only place holdout runs, and it gates against main. A human code owner approves and merges.
 
-The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of this loop.
+The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of this loop. To have the Delegate swarm run it from Slack, see [`docs/hill-climbing.md`](../../../docs/hill-climbing.md).
 
 ## Other ways to run it
 
