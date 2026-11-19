@@ -38,7 +38,7 @@ The one-line hint per case saves a lot of money. Say whether the scout never rai
 
 1. Delegate makes a run id (`delegate-pr-reviewer-<date>-<4 chars>`) and a branch `delegate-optimize/<run_id>-<n>` per idea.
 2. **Inner loop.** It dispatches `delegate-eval-run.yml` in `inner` mode on the target cases, about $4 per case per run, and amends the idea until the targets pass or it drops the idea.
-3. **Gate.** It dispatches `gate` mode: every tune and holdout case, 3 runs each, against main. About $170. It passes only with no regressions, every target 3/3, no holdout regressions, and cost within 10% of main.
+3. **Gate.** It dispatches `gate` mode: every tune and holdout case, 3 runs each, against main. About $170. It passes only with no regressions, every target 3/3, and no holdout regressions. Cost above 1.10x main is reported as `costOver` but doesn't fail the gate; the PR has to justify it.
 4. **PR.** If the gate passes, it opens one PR with the gate table, holdout counts, cost and the ideas it tried. If nothing passes, it reports what it tried and opens nothing.
 
 It works one dispatch at a time, and a climb takes a few hours, mostly the gate.
