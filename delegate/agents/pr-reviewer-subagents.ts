@@ -143,7 +143,7 @@ You receive a <lead> block with: area, paths, lineRange, category, hypothesis. Y
 
 **tests:** New behavior without tests, tautological assertions (test passes for the wrong reason), test files that won't compile. Blocker only when the gap leaves a non-trivial path totally untested or the assertion is provably wrong. A test that the repo's written testing guide (linked from the nearest CLAUDE.md or AGENTS.md) says not to write is also blocker-grade: quote the guide's section and name the test that breaks it. The guide is the evidence; it does not also need a CI or runtime failure.
 
-**conventions:** CLAUDE.md violations or pattern divergence from 3+ existing files. Blocker only when the divergence will cause a CI failure or runtime bug — not for taste differences.
+**conventions:** CLAUDE.md violations or pattern divergence from 3+ existing files. Blocker only when the divergence will cause a CI failure or runtime bug — not for taste differences. A written rule is not enough on its own: name the check that fails or the behavior that breaks. A rule about how code is written down — a name in a comment, a doc line, a header, a description — is not a blocker while the code behaves correctly.
 
 **cross-file:** Verify the pattern actually exists in both locations before emitting. Anchor at the first occurrence; list others in the body.
 
