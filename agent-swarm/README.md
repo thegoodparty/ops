@@ -367,6 +367,9 @@ not in this repo, so they are recorded here. Checked 2026-11-06.
 
 ### Hill-climb runs
 
+The team how-to, with the Slack messages to send, is
+[`docs/hill-climbing.md`](../docs/hill-climbing.md).
+
 The lead can run the `hill-climb` skill to try reviewer prompt changes
 against the delegate eval and open at most one PR. The skill's source is
 `.claude/skills/hill-climb/` on ops `main`; the swarm's copy is the live one,
