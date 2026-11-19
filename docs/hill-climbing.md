@@ -2,7 +2,7 @@
 
 How to make the delegate PR reviewer better, one measured prompt change at a time, by asking the Delegate swarm in Slack. A person always reviews and merges the result.
 
-The mechanics live elsewhere: the eval and gate in [`delegate/review/eval/README.md`](../delegate/review/eval/README.md), the loop the swarm follows in [`.claude/skills/hill-climb/SKILL.md`](../.claude/skills/hill-climb/SKILL.md), and the swarm's permissions in [`agent-swarm/README.md`](../agent-swarm/README.md#hill-climb-permissions). This page is the how-to.
+The mechanics live elsewhere: the eval and gate in [`delegate/review/eval/README.md`](../delegate/review/eval/README.md), the loop the swarm follows in [`.claude/skills/hill-climb/SKILL.md`](../.claude/skills/hill-climb/SKILL.md), and the swarm's permissions in [`agent-swarm/README.md`](../agent-swarm/README.md#hill-climb-permissions). A copy for non-GitHub readers is in ClickUp under [Eng Docs, Agent Eval Strategy](https://app.clickup.com/90132012119/docs/2ky4jq2q-20493/2ky4jq2q-206513); edit here first. This page is the how-to.
 
 ## When to climb
 
@@ -64,13 +64,12 @@ Comment `delegate eval` on the PR to run the full suite in CI if it hasn't run.
 ## After a merge
 
 - Tell Delegate in the thread that it merged. It doesn't notice merges on its own.
-- If the merge changed `.claude/skills/hill-climb/`, ask Delegate to update its copy:
+- If the merge changed `.claude/skills/hill-climb/`, ask Delegate to update its copy, then check its md5 against `git show origin/main:.claude/skills/hill-climb/SKILL.md | md5`. The Coder picks up a new version at its next start.
 
 ```
 @delegate please update the hill-climb skill (id 928c53b3-b565-4ab2-9d9b-270623fc8f63) from the latest thegoodparty/ops main: .claude/skills/hill-climb/SKILL.md and .claude/skills/hill-climb/targets/delegate-pr-reviewer.json. Pull your ops checkout to current main first. Then confirm it's installed on both the lead and the Coder, and reply with the SKILL.md size and md5.
 ```
 
-  Check its md5 against `git show origin/main:.claude/skills/hill-climb/SKILL.md | md5`. The Coder picks up a new version at its next start.
 - A merge that changes the eval code (`delegate/review/`) invalidates main's cached results, so the next gate replays main too and costs more.
 
 ## Run it yourself instead
