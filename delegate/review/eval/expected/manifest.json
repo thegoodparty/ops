@@ -509,5 +509,17 @@
     "split": "tune",
     "source": "simulated",
     "kind": "architecture"
+  },
+  {
+    "id": "omni-3891-drop-column-rollout",
+    "bundle": "omni-3891-drop-column-rollout.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "The migration drops chat_message, chat_message_segment and chat_message_feedback.chat_message_id in the same deploy that stops using them, but migrations run at container start while old tasks keep serving through the rollout, and their Prisma client still selects the dropped column and tables, so chat loads, ratings and the Chief of Staff first-run check fail until the rollout ends; the drop has to ship in a later deploy."
+    },
+    "tests": "omni #3891 at its first commit 55395d3, with the title and body as they stood when production reviewed it. The PR stops using the old chat tables and drops them in the same startup migration. ECS keeps prod at 100% minimum healthy with a 120s deregistration delay, so tasks from the previous deploy serve after the migration has run, and Prisma names every mapped column in its SELECT and RETURNING even on an empty table. Production's 23:11 review flagged only the RAISE EXCEPTION data guard in the same migration file; Cursor Bugbot caught the rollout break a minute later, and Delegate only raised it on the next push. Scored on the rollout break only, so a block on the data guard fails.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "architecture"
   }
 ]
