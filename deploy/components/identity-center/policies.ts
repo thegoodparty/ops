@@ -172,6 +172,32 @@ export const engineerAccess: PolicyDocument = {
       Resource: "*",
     },
     {
+      // gp-api's agent web tools drive one AgentCore Browser session per run
+      // over its automation stream, under the `gp-engineer` profile, which is
+      // how an engineer runs and tests those tools locally. Preview task roles
+      // get the same grant through `GpApiPreviewRoleBoundary`, and the two
+      // hold the same actions on the same resource so a preview and a laptop
+      // exercise the same browser path.
+      //
+      // Only the AWS-managed browser: a custom browser is account-owned and
+      // could carry its own execution role and network settings. No
+      // `CreateBrowser` or `DeleteBrowser` either; nothing needs to create a
+      // browser resource to start a session on the managed one. The browser
+      // actions are excluded from the tag-conditioned blanket grants above by
+      // `BEDROCK_SERVICE_PREFIXES`, so this statement and `ReadBedrockCatalog`
+      // are the only paths here.
+      Sid: "AgentCoreManagedBrowser",
+      Effect: "Allow",
+      Action: [
+        "bedrock-agentcore:StartBrowserSession",
+        "bedrock-agentcore:GetBrowserSession",
+        "bedrock-agentcore:ListBrowserSessions",
+        "bedrock-agentcore:StopBrowserSession",
+        "bedrock-agentcore:ConnectBrowserAutomationStream",
+      ],
+      Resource: "arn:aws:bedrock-agentcore:us-west-2:aws:browser/aws.browser.v1",
+    },
+    {
       Sid: "TranscribeJobs",
       Effect: "Allow",
       Action: ["transcribe:*"],

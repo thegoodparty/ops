@@ -104,6 +104,25 @@ describe("gpApiPreviewRoleBoundary", () => {
     }
   });
 
+  // A custom browser is account-owned and carries its own role and network
+  // settings, and the session actions alone are what the agent tools call.
+  it("reaches AgentCore only through browser sessions on the managed browser", () => {
+    const agentCoreStatements = gpApiPreviewRoleBoundary.Statement.filter((s) =>
+      "Action" in s && asList(s.Action).some((a) => a.startsWith("bedrock-agentcore:"))
+    );
+    assert.equal(agentCoreStatements.length, 1);
+    assert.deepEqual(asList(agentCoreStatements[0].Action), [
+      "bedrock-agentcore:StartBrowserSession",
+      "bedrock-agentcore:GetBrowserSession",
+      "bedrock-agentcore:ListBrowserSessions",
+      "bedrock-agentcore:StopBrowserSession",
+      "bedrock-agentcore:ConnectBrowserAutomationStream",
+    ]);
+    assert.deepEqual(asList(agentCoreStatements[0].Resource), [
+      "arn:aws:bedrock-agentcore:us-west-2:aws:browser/aws.browser.v1",
+    ]);
+  });
+
   it("reaches only the preview's own queues", () => {
     const queues = resources().filter((r) => r.startsWith("arn:aws:sqs:"));
     assert.deepEqual(queues, [
