@@ -393,26 +393,44 @@ export const replayCase = async (
     leads?: LeadTrace[],
     gating?: ResultGating,
     usage?: TokenUsage | null,
-  ): Result => ({
-    caseId,
-    repo: bundle.repo,
-    prNumber: bundle.prNumber,
-    headSha: bundle.headSha,
-    variant,
-    output,
-    ...(error !== undefined ? { error } : {}),
-    costUsd,
-    // Always written, even as `null`, so a result file records what the run
-    // answered about its own spend instead of leaving the question open. That
-    // is the whole point of the field: a baseline side with `usage` populated
-    // and `costUsd` beside it is what S5's token gate compares.
-    usage: usage ?? null,
-    wallTimeMs: Date.now() - startMs,
-    ...(leads ? { leads } : {}),
-    ...(gating !== undefined ? { gating } : {}),
-    ...(subagentCalls ? { subagentCalls } : {}),
-    ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
-  });
+  ): Result => {
+    // **A run that reported tokens and priced at zero is a failure.** The plan
+    // makes this assertion automatic in every eval round, and `agent.ts` claims
+    // `run.ts` asserts it downstream; this is that assertion, at the point the
+    // `Result` is written, which is the only place both fields exist together.
+    // The distinction it protects is between "free" and "we have no rate for this
+    // model": an unpriced run would otherwise land as `costUsd: 0` beside real
+    // token counts, read as a free win, and leave the spend cap unable to fire.
+    // A run with no tokens at all is not a claim about price and is left alone.
+    const tokensReported =
+      usage !== undefined &&
+      usage !== null &&
+      usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens > 0;
+    const zeroCostWithTokens = tokensReported && costUsd === 0 && error === undefined;
+    const finalError = zeroCostWithTokens
+      ? `reported tokens but priced at $0: delegate/pricing/models.json has no rate for the model this run called`
+      : error;
+    return {
+      caseId,
+      repo: bundle.repo,
+      prNumber: bundle.prNumber,
+      headSha: bundle.headSha,
+      variant,
+      output: zeroCostWithTokens ? null : output,
+      ...(finalError !== undefined ? { error: finalError } : {}),
+      costUsd,
+      // Always written, even as `null`, so a result file records what the run
+      // answered about its own spend instead of leaving the question open. That
+      // is the whole point of the field: a baseline side with `usage` populated
+      // and `costUsd` beside it is what S5's token gate compares.
+      usage: usage ?? null,
+      wallTimeMs: Date.now() - startMs,
+      ...(leads ? { leads } : {}),
+      ...(gating !== undefined ? { gating } : {}),
+      ...(subagentCalls ? { subagentCalls } : {}),
+      ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
+    };
+  };
 
   try {
     await checkoutFn(bundle, repoDir);

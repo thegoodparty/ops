@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tool } from "ai";
 import { z } from "zod";
@@ -101,6 +101,15 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
       const mode = output_mode ?? "content";
       const out: string[] = [];
       let matches = 0;
+      // **Visited, by real path.** A link `a -> .` resolves to the root, so it
+      // passes `confine.check`; following it walks `root/a/a/a/…`. The kernel's
+      // 40-symlink limit bounds that depth, which is why one loop looks
+      // survivable — but two such links branch at every level, so the walk visits
+      // on the order of 2^40 paths and the review hangs until the deadline kills
+      // it. A set of real paths makes each directory reachable once, which is what
+      // a tree walk wants anyway: a symlink to a directory already walked has no
+      // content this walk has not already seen.
+      const seen = new Set<string>();
 
       const visit = (abs: string) => {
         // **Every entry is re-checked, not just the one the model named.** A
@@ -109,7 +118,8 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
         // through `realpath`, so the child fails this the moment the walk
         // reaches it. Checking only the start path, as this did, let a search
         // from `.` read `/proc/self/environ` through such a link.
-        if (!confine.check(abs).inside) return;
+        const inside = confine.check(abs);
+        if (!inside.inside) return;
         let stat;
         try {
           stat = statSync(abs);
@@ -120,6 +130,11 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
         // searchable.
         if (!stat.isDirectory() && !stat.isFile()) return;
         if (stat.isDirectory()) {
+          // Keyed on the resolved path, so a loop or a second link to a directory
+          // already walked stops here rather than under a new name.
+          const real = realpathSync(abs);
+          if (seen.has(real)) return;
+          seen.add(real);
           let entries: string[];
           try {
             entries = readdirSync(abs);
@@ -177,6 +192,9 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
       if (!inside) return denyText(start);
       const re = globToRegExp(pattern);
       const found: { rel: string; mtime: number }[] = [];
+      // The same visited set as `Grep`, for the same reason: a pair of loop links
+      // branches the walk exponentially rather than linearly.
+      const seen = new Set<string>();
       const visit = (abs: string) => {
         if (!confine.check(abs).inside) return;
         let entries: string[];
@@ -185,6 +203,14 @@ export const createReadTools = (options: ReadToolOptions): ToolSet => {
         } catch {
           return;
         }
+        let real: string;
+        try {
+          real = realpathSync(abs);
+        } catch {
+          return;
+        }
+        if (seen.has(real)) return;
+        seen.add(real);
         for (const entry of entries) {
           if (SKIP_DIRS.has(entry)) continue;
           const child = join(abs, entry);

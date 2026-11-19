@@ -133,15 +133,28 @@ test("Grep and Glob do not walk through a symlink committed in the checkout", as
   assert.match(glob, /src\/a\.ts/);
 });
 
-test("a symlink loop inside the checkout does not recurse forever", async () => {
-  // `a -> .` used to make both walks descend until the path was too long, which
-  // is a cheap way to hang a review rather than a way to read anything.
+test("a pair of symlink loops inside the checkout does not blow the walk up", async () => {
+  // `a -> .` alone is survivable by accident: the kernel allows 40 symlinks per
+  // path resolution, so the walk descends 40 levels and stops. Two of them branch
+  // at every level — on the order of 2^40 paths — and the review hangs until the
+  // task deadline kills it, which fails the run for a PR that committed two
+  // innocent-looking links. Both walks keep a set of visited real paths now, so
+  // each directory is entered once. The assertion is the timing, because that is
+  // the property: completing at all is what the exponential walk cannot do.
   const root = checkout();
-  symlinkSync(".", join(root, "loop"));
+  symlinkSync(".", join(root, "loop-a"));
+  symlinkSync(".", join(root, "loop-b"));
+
+  const started = Date.now();
   const grep = await run(root, "Grep", { pattern: "alpha" });
-  assert.match(grep, /src\/a\.ts/);
   const glob = await run(root, "Glob", { pattern: "**/*" });
+  const elapsed = Date.now() - started;
+
+  assert.match(grep, /src\/a\.ts/, "the checkout is still searched");
   assert.match(glob, /src\/a\.ts/);
+  // A generous bound: the honest walk is milliseconds, the exponential one does
+  // not finish at all. Anything above a few seconds means the set stopped working.
+  assert.ok(elapsed < 5_000, `the walks finished in ${elapsed}ms`);
 });
 
 test("globToRegExp handles the two forms a model actually writes", () => {
