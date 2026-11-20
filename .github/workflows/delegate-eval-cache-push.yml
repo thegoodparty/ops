@@ -37,11 +37,11 @@ jobs:
       id-token: write
     steps:
       - name: Checkout main
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.1.0
         with:
           ref: ${{ inputs.main-sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -50,14 +50,14 @@ jobs:
         run: npm ci
 
       - name: Download main's results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           artifact-ids: ${{ inputs.artifact-id }}
           path: ./results
           merge-multiple: true
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-delegate-eval-cache-push
           aws-region: us-west-2

@@ -48,21 +48,21 @@ jobs:
     # runtime and well below that.
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.1.0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6.5.0
         with:
           node-version-file: .nvmrc
           cache: npm
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v5.1.1
         with:
           role-to-assume: arn:aws:iam::333022194791:role/github-actions-org-deploy
           aws-region: us-west-2
 
       - name: Install Pulumi
-        uses: pulumi/actions@v6
+        uses: pulumi/actions@v6.6.1
         with:
           pulumi-version: "^3"
 
