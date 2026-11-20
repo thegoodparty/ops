@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { isAbsolute, resolve, sep } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { getAgent, runAgent } from "../framework";
-import type { ToolCallHandler } from "../framework/types";
+import { pathGuardHook } from "./guards";
 import { buildRepairPrompt, buildReviewPrompt } from "../agents/pr-reviewer";
 import { POSTMORTEM_SELECTOR, selectPostmortems } from "./postmortems";
 import { promptDiff } from "./prompt-diff";
@@ -18,7 +18,7 @@ import {
   type GatingMode,
   type GatingResult,
 } from "./gating";
-import { createGitTool } from "./git-tool";
+import { createGitTools } from "./git-tools";
 import { createGitHub } from "./github";
 import {
   dismissablePriorFindings,
@@ -40,11 +40,37 @@ import { emit } from "./telemetry";
 
 export type ReviewTrigger = ReviewRecord["trigger"];
 
-// Everything the Claude Code subprocess (and therefore the model) can see in
-// its environment. Allowlist, not denylist: the worker's env is the whole
-// DELEGATES secret bundle, and a Read on /proc/self/environ would leak any
-// key we forgot to name. Only what the CLI needs to run and reach the model.
+// Everything the agent subprocess (and therefore the model) can see in its
+// environment.
+//
+// Allowlist, not denylist: the worker's env is the whole DELEGATES secret bundle,
+// and a read of /proc/self/environ would leak any key we forgot to name.
+// `agentEnv()` is what crosses into the spawned child — `framework/agent.ts`
+// passes it as `spawn`'s env, so this list is the whole of what the model can
+// see: the child holds these names and nothing else. It replaces the Claude CLI's
+// allowlist, and the shape is deliberately the same, because the property is the
+// same: a short list a reviewer can read in one screen.
+//
+// **Shaped for a non-role credential.** Stage 2 of
+// `docs/delegate-harness-migration.md` moves the provider without putting a
+// model-invoke grant on the task role, which means the credential that arrives is
+// a bearer token in the environment rather than something found through the
+// instance metadata service. So the list is provider keys **by name** —
+// `ANTHROPIC_API_KEY` today, `AWS_BEARER_TOKEN_BEDROCK` and `FIREWORKS_API_KEY`
+// later, each declared additively — plus the process and region names a spawned
+// Node child needs, and **no credential-provider path at all**: no
+// `AWS_CONTAINER_CREDENTIALS_*`, no `AWS_PROFILE`, no `AWS_ACCESS_KEY_ID`. Any of
+// those would let the child fetch role credentials, which is the thing S7's
+// separate principal exists to prevent. Adding a key later is one line here; the
+// shape does not move.
+//
+// **Dropped in S5: the `CLAUDE_` and `DISABLE_` prefixes.** They were the Claude
+// CLI's own knobs (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`, the twenty
+// `CLAUDE_CODE_DISABLE_*` lines in the eval workflows) and nothing in the AI SDK
+// reads one. Keeping the prefixes would carry two namespaces of dead configuration
+// into a process whose environment is meant to be a short, reviewable list.
 const ENV_ALLOW_EXACT = new Set([
+  // The child is a Node process: enough to start and to print.
   "PATH",
   "HOME",
   "USER",
@@ -54,108 +80,26 @@ const ENV_ALLOW_EXACT = new Set([
   "LC_ALL",
   "TERM",
   "NODE_OPTIONS",
+  // Region, for anything that resolves an AWS endpoint by name. Not credentials.
   "AWS_DEFAULT_REGION",
   "AWS_REGION",
+  // The provider key, by name. One today; S7 and S9 add theirs beside it.
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
   "ANTHROPIC_MODEL",
 ]);
-const ENV_ALLOW_PREFIX = ["CLAUDE_", "DISABLE_"];
 
 export const agentEnv = (
   source: NodeJS.ProcessEnv = process.env,
 ): Record<string, string | undefined> =>
-  Object.fromEntries(
-    Object.entries(source).filter(
-      ([key]) =>
-        ENV_ALLOW_EXACT.has(key) || ENV_ALLOW_PREFIX.some((p) => key.startsWith(p)),
-    ),
-  );
+  Object.fromEntries(Object.entries(source).filter(([key]) => ENV_ALLOW_EXACT.has(key)));
 
-// The agent's file tools may only touch the review checkout. The worker
-// process next door still holds every token, and /proc/<ppid>/environ is a
-// regular file to the Read tool, so a cwd alone is not a boundary.
-//
-// The guard is a `ToolCallHandler`, not a harness hook: it decides over a tool
-// name and an input object, and whichever harness is underneath adapts it
-// (`toPreToolUseHook` in `framework/agent.ts`).
-//
-// **The normalisation is the guard.** A path the model sends is not a path the
-// file tool will open: a resolver that strips a leading `@` and folds unicode
-// spaces before resolving (pi's `resolveToCwd` does, which is where the bypasses
-// were found) reads `@/etc/hostname` and `\u00a0/etc/hostname` as `/etc/hostname`,
-// while a naive prefix test reads them as relative strings inside the checkout.
-// So every candidate is normalised first — unicode spaces out, then one leading
-// `@` off, then `resolve` against the review directory, then `realpath` (a
-// symlink inside the checkout pointing at `/etc` is not inside) — and only then
-// tested against the prefix. Dropping any one of those steps is a bypass, which
-// is what the adversarial table in `run.test.ts` pins.
-//
-// The normalised path is checked **alongside** the literal one, never instead of
-// it: until S5 the tool opening the file is the Claude SDK's, which resolves the
-// string it was given, so the guard cannot assume the two agree. See `inside()`.
-//
-// The unicode space characters a filesystem and a person can disagree about:
-// no-break, en quad through hair space, narrow no-break, medium mathematical,
-// ideographic. The same set pi normalises (`UNICODE_SPACES` in
-// `utils/paths.ts`), and the class is kept here rather than taken from there:
-// this module must not depend on the harness whose bug it is closing.
-//
-// Removing them is deliberate, and matches what pi does before it resolves
-// (`normalizePath`, same class). Folding to a plain space instead would leave
-// the space in the path, so `\u00a0/etc/hostname` would resolve as
-// `<checkout>/ /etc/hostname` — a different path that is inside the prefix and
-// therefore passes. Either way the guard would be disagreeing with the tool it
-// is protecting, which is the bug.
-const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+// The reviewer's path confinement is `pathGuardHook` in `./guards`, which is the
+// same `confineTo` the read tools call themselves (`framework/tools.ts`). It is
+// imported here rather than defined here because a spawned child needs to apply
+// it too, and a guard defined in a module the child does not import cannot cross
+// the pipe: see `framework/guards.ts`.
 
-export const normalizeGuardPath = (p: string): string => {
-  const spaced = p.replace(UNICODE_SPACES, "");
-  return spaced.startsWith("@") ? spaced.slice(1) : spaced;
-};
-
-export const pathGuardHook = (reviewDir: string): ToolCallHandler => {
-  const root = realpathSync(reviewDir);
-  const resolvesInside = (p: string) => {
-    const abs = isAbsolute(p) ? p : resolve(root, p);
-    let real: string;
-    try {
-      real = realpathSync(abs);
-    } catch {
-      real = resolve(abs);
-    }
-    // `root` or `root + sep`, never a bare `startsWith(root)`: otherwise
-    // `/checkout-evil` reads as inside `/checkout`.
-    return real === root || real.startsWith(root + sep);
-  };
-  // **Both spellings, and a candidate has to pass both.** The normalised path
-  // is what a resolver that strips `@` and unicode spaces would open; the
-  // literal path is what one that does not would open. Under S3 that second
-  // tool is the real one — the Claude Agent SDK's Read/Grep/Glob resolve the
-  // string they are given — so testing only the normalised path lets a PR
-  // author commit a symlink *named* `@l` or `<nbsp>l` pointing at `/`, have the
-  // model ask for `@l/proc/1/environ`, and have this guard realpath
-  // `<root>/l/proc/1/environ` (nonexistent, so inside) while the tool opens
-  // `<root>/@l/…` through the link and reads the worker's environ. Checking the
-  // literal path too is what makes the normalisation safe to apply before the
-  // tool underneath agrees with it. A path `realpath` cannot resolve is neither
-  // spelling's escape, so it keeps its old `resolve` fallback.
-  const inside = (raw: string) =>
-    resolvesInside(normalizeGuardPath(raw)) && resolvesInside(raw);
-  return (call) => {
-    if (!["Read", "Grep", "Glob"].includes(call.toolName)) return { decision: "allow" };
-    const ti = call.input;
-    const candidates = [ti.file_path, ti.path].filter(
-      (v): v is string => typeof v === "string" && v.length > 0,
-    );
-    const outside = candidates.find((p) => !inside(p));
-    if (outside === undefined) return { decision: "allow" };
-    return {
-      decision: "deny",
-      reason: `Path is outside the review checkout: ${outside}`,
-    };
-  };
-};
 
 // Longer than the worker's wall-clock deadline (45 min) plus teardown.
 const STALE_LOCK_MS = 60 * 60 * 1000;
@@ -714,7 +658,7 @@ export const runReview = async (args: {
     result = await runAgent(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: reviewDir,
       abortController: args.abortController,
-      mcpServers: { git: createGitTool(reviewDir) },
+      gitTools: createGitTools({ root: reviewDir }),
       env: agentEnv(),
       toolCallGuards: [pathGuardHook(reviewDir)],
     });
@@ -722,20 +666,36 @@ export const runReview = async (args: {
     return fail(`agent crashed: ${err instanceof Error ? err.message : String(err)}`, {});
   }
 
-  if (result.errorSubtype) {
+  // A failed run is terminal **unless it carried a repair conversation**. A schema
+  // mismatch arrives as `error_agent` with `messages` attached, because
+  // `isRepairable` decided the answer's shape was the failure; everything else
+  // (a cap, an abort, a truncated response, a network error) carries no
+  // `messages` and ends the run here. Reading `errorSubtype` alone, as this did,
+  // made the repair turn unreachable for the one failure it was written for.
+  if (result.errorSubtype !== undefined && result.messages === undefined) {
     return fail(`agent error (${result.errorSubtype}): ${result.output.slice(0, 300)}`, {
       costUsd: result.costUsd,
     });
+  }
+  if (result.errorSubtype !== undefined) {
+    console.error(`agent error (${result.errorSubtype}), attempting the repair turn: ${result.output.slice(0, 300)}`);
   }
 
   let parsed = parseReviewOutput(result);
   let costUsd = result.costUsd;
 
-  // One bounded repair turn. A schema failure must not throw away a review
-  // that was otherwise complete: resume the session with the specific
-  // validation error and ask for the corrected object. Attempted once, never
+  // One bounded repair turn. A schema failure must not throw away a review that
+  // was otherwise complete: hand the model the specific validation error, in the
+  // same conversation, and ask for the corrected object. Attempted once, never
   // looped, and never allowed to fail the review on its own.
-  if ("error" in parsed && result.sessionId) {
+  //
+  // The conversation is the `messages` array `runAgent` returned, not a session
+  // id: there is no session to resume under the AI SDK, which is the class of
+  // problem this step removes rather than ports. Whether the run is worth
+  // repairing at all was decided by the call layer's error taxonomy — a schema
+  // mismatch is repairable, a truncated response is not — and `messages` is
+  // carried back only when that was the failure.
+  if ("error" in parsed && result.messages !== undefined) {
     const previous =
       result.structuredOutput !== undefined
         ? JSON.stringify(result.structuredOutput)
@@ -747,10 +707,10 @@ export const runReview = async (args: {
         {
           cwd: reviewDir,
           abortController: args.abortController,
-          mcpServers: { git: createGitTool(reviewDir) },
+          gitTools: createGitTools({ root: reviewDir }),
           env: agentEnv(),
           toolCallGuards: [pathGuardHook(reviewDir)],
-          continuation: result.sessionId,
+          continuation: result.messages,
         },
       );
       costUsd = (costUsd ?? 0) + (repair.costUsd ?? 0);
@@ -771,7 +731,7 @@ export const runReview = async (args: {
       console.error("repair pass crashed:", err);
     }
   } else if ("error" in parsed) {
-    console.error("repair pass skipped: no session id to resume");
+    console.error("repair pass skipped: the run carried no repair conversation");
   }
 
   if ("error" in parsed) {

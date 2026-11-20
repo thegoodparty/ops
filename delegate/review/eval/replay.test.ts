@@ -428,6 +428,44 @@ test("a written result file carries usage beside costUsd", async () => {
   });
 });
 
+test("a run that reported tokens and priced at $0 is a failure, not a free win", async () => {
+  // The plan makes this assertion automatic in all three eval rounds, and
+  // `agent.ts` says `run.ts` asserts it downstream. This is the assertion, at the
+  // one place both fields exist together. Without it an unpriced model lands as
+  // `costUsd: 0` beside real token counts, which reads as a free run and leaves
+  // the spend cap unable to fire -- the exact failure the price table exists to
+  // prevent, and one a row missing from `models.json` produces silently.
+  const unpriced: RunAgentImpl = async (config) => ({
+    agent: config.name,
+    output: config.name === "postmortem-selector" ? '{"ids":[]}' : JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+    durationMs: 1,
+    costUsd: 0,
+    usage: { inputTokens: 1_000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    ...(config.name === "postmortem-selector"
+      ? {}
+      : { structuredOutput: { status: "complete", findings: [], summary: "s" } }),
+  });
+
+  const result = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, unpriced, fakeCheckout);
+  assert.match(result.error ?? "", /priced at \$0/);
+  assert.equal(result.output, null, "a zero-priced run must not stand as a scored answer");
+
+  // And a run that reported nothing is not a claim about price: no tokens means
+  // no evidence either way, so it is left alone rather than turned into a finding.
+  const silent: RunAgentImpl = async (config) => ({
+    agent: config.name,
+    output: config.name === "postmortem-selector" ? '{"ids":[]}' : JSON.stringify({ status: "complete", findings: [], summary: "s" }),
+    durationMs: 1,
+    costUsd: 0,
+    ...(config.name === "postmortem-selector"
+      ? {}
+      : { structuredOutput: { status: "complete", findings: [], summary: "s" } }),
+  });
+  const unmeasured = await replayCase(makeRecord(), { workDir: tmpDir(), variant: "v1" }, silent, fakeCheckout);
+  assert.equal(unmeasured.error, undefined);
+  assert.notEqual(unmeasured.output, null);
+});
+
 test("a result's usage and costUsd describe the same call", async () => {
   // The invariant the previous test's shape depends on. A case whose review
   // call answered no usage but whose selector did would otherwise carry a token
@@ -776,12 +814,20 @@ test("loadRunResults still parses a result file written without leads", () => {
 const isDenied = (out: ToolCallDecision) => out.decision === "deny";
 
 test("replayToolGuard allows only the reviewer's read-only tools", async () => {
-  for (const tool of ["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", "mcp__git__git_show"]) {
+  for (const tool of ["Read", "Grep", "Glob", "Task", "Agent", "mcp__git__git_show"]) {
     assert.equal(isDenied(await replayToolGuard({ toolName: tool, input: {} })), false, tool);
   }
   for (const tool of ["Bash", "Write", "Edit", "WebFetch", "mcp__other__x"]) {
     assert.equal(isDenied(await replayToolGuard({ toolName: tool, input: {} })), true, tool);
   }
+});
+
+test("replayToolGuard no longer allows StructuredOutput, because nothing implements it", async () => {
+  // Under the Claude harness the answer arrived through a tool the harness
+  // provided, so a candidate branch that asked for it was asking for something
+  // real. The object call replaced it, and a tool name nothing implements is a
+  // name the guard should refuse rather than wave through.
+  assert.equal(isDenied(await replayToolGuard({ toolName: "StructuredOutput", input: {} })), true);
 });
 
 test("replayCase denies Bash even when the reviewer config allows it", async () => {

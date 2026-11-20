@@ -4,7 +4,9 @@ import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, realpathSync, readF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ToolCallDecision, ToolCallHandler } from "../framework/types";
-import { agentEnv, gatingFor, latestCompletedRecord, normalizeGuardPath, parseReviewOutput, pathGuardHook, statusForRecord } from "./run";
+import { agentEnv, gatingFor, latestCompletedRecord, parseReviewOutput, statusForRecord } from "./run";
+import { pathGuardHook } from "./guards";
+import { normalizeGuardPath } from "../framework/tool-paths";
 import { decide } from "./gates";
 import { priorFindingsFrom } from "./bundle";
 import { ReviewOutputSchema, ReviewRecordSchema, StoredReviewOutputSchema, lockKey, recordKey } from "./schema";
@@ -206,8 +208,35 @@ test("agentEnv drops anything it was not told about", () => {
     AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.23/v1/credentials",
     SOME_NEW_SECRET: "x",
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000",
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    DISABLE_TELEMETRY: "1",
+    AWS_PROFILE: "admin",
+    AWS_ACCESS_KEY_ID: "AKIA...",
   });
-  assert.deepEqual(Object.keys(env), ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]);
+  // **Nothing at all crosses.** The first four were the old list's refusals; the
+  // last five are the ones S5 added. The `CLAUDE_` / `DISABLE_` prefixes are gone
+  // with the Claude CLI whose knobs they were, and the two credential-provider
+  // names are refused on purpose: a child that could read role credentials would
+  // undo the separate principal S7 creates. Not an empty object by accident —
+  // every one of these is a name the old list kept or a name that would widen
+  // what the child can reach.
+  assert.deepEqual(Object.keys(env), []);
+});
+
+test("agentEnv keeps the provider key and the process names, and no credential path", () => {
+  // The other half: what does cross, and the shape it is shaped for. A bearer
+  // token for a non-role principal is added here by name (S7), not by prefix, so
+  // there is no path by which a credential the worker holds arrives without
+  // someone adding it to this list in a reviewed diff.
+  const env = agentEnv({
+    PATH: "/usr/bin",
+    HOME: "/home/agent",
+    ANTHROPIC_API_KEY: "sk-ant",
+    AWS_REGION: "us-west-2",
+    AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials/x",
+    GH_TOKEN: "ghs_1",
+  });
+  assert.deepEqual(Object.keys(env).sort(), ["ANTHROPIC_API_KEY", "AWS_REGION", "HOME", "PATH"]);
 });
 
 // A guard is asked about one tool call now, not handed a Claude hook event, so
@@ -679,6 +708,26 @@ test("no callsite after the repair pass reads result.costUsd", () => {
   assert.ok(start !== -1, "expected the repair cost accumulator");
   const after = source.slice(start + marker.length);
   assert.equal(after.includes("result.costUsd"), false);
+});
+
+// The repair turn is only reachable if a schema mismatch gets past the
+// `errorSubtype` bail. A schema failure arrives as `error_agent` with `messages`
+// attached (`isRepairable` decided the answer's shape was the failure), so
+// treating every `errorSubtype` as terminal made the repair turn dead code for
+// the one failure it exists for — while the comment above it still promised the
+// turn. The bail has to key on the conversation, not on the subtype alone.
+test("a repairable failure does not take the terminal error path", () => {
+  const source = readFileSync(join(__dirname, "run.ts"), "utf-8");
+  const bail = /if \(result\.errorSubtype !== undefined && result\.messages === undefined\)/;
+  assert.match(source, bail, "the error bail must exclude a run carrying a repair conversation");
+  // A cap or an abort carries no `messages`, so it still fails here: the repair
+  // turn must not be reachable for a failure asking again cannot fix.
+  const agent = readFileSync(join(__dirname, "..", "framework", "agent.ts"), "utf-8");
+  assert.match(
+    agent,
+    /\.\.\.\(child\.repairable \? \{ messages: child\.messages \} : \{\}\)/,
+    "only a repairable failure carries the conversation, so nothing else can reach the repair turn",
+  );
 });
 
 

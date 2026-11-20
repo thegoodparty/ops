@@ -3,17 +3,20 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
-import type { AgentConfig, AgentResult, McpServerConfig, ToolCallHandler } from "../../framework";
+import type { AgentConfig, AgentResult, ToolCallHandler, ToolSet } from "../../framework";
+import type { GuardHandler } from "../../framework/guards";
+import { replayToolGuard as replayGuard } from "../guards";
 import type { SubagentCall, TokenUsage } from "../../framework/types";
 import { buildReviewPrompt } from "../../agents/pr-reviewer";
 import { parseDiffAnchors, placeFindings } from "../anchors";
 import { decide } from "../gates";
 import { evaluateGating, isGatedRepo, type GatingMode } from "../gating";
-import { createGitTool } from "../git-tool";
+import { createGitTools } from "../git-tools";
 import { GIT_TOOL_NAMES } from "../tool-names";
 import { promptDiff } from "../prompt-diff";
 import { POSTMORTEM_SELECTOR, selectPostmortems, type SelectedPostmortem } from "../postmortems";
-import { agentEnv, extractJsonObjects, parseReviewOutput, pathGuardHook } from "../run";
+import { agentEnv, extractJsonObjects, parseReviewOutput } from "../run";
+import { pathGuardHook } from "../guards";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
 
@@ -310,7 +313,7 @@ export type RunAgentImpl = (
   prompt: string,
   overrides: {
     cwd: string;
-    mcpServers: Record<string, McpServerConfig>;
+    gitTools?: ToolSet;
     env: Record<string, string | undefined>;
     toolCallGuards?: readonly ToolCallHandler[];
   },
@@ -360,12 +363,14 @@ const getVariant = (): string => {
 // The tool lists in pr-reviewer.ts are string literals a candidate branch may
 // change, so replay holds its own list. A candidate that names Bash or Write
 // would otherwise reach the run's result files and the holdout manifest.
-const REPLAY_TOOLS = new Set<string>(["Read", "Grep", "Glob", "Task", "Agent", "StructuredOutput", ...GIT_TOOL_NAMES]);
+//
+// `StructuredOutput` left this list with the tool it named: the answer is an
+// object call now, and a candidate that still asked for the old terminator would
+// be asking for a tool nothing implements. It is *not* replaced by anything — the
+// guard is a ceiling over the tools that exist, and the object call is not one.
+const REPLAY_TOOLS = ["Read", "Grep", "Glob", "Task", "Agent", ...GIT_TOOL_NAMES] as const;
 
-export const replayToolGuard: ToolCallHandler = (call) =>
-  REPLAY_TOOLS.has(call.toolName)
-    ? { decision: "allow" }
-    : { decision: "deny", reason: `Tool not allowed in replay: ${call.toolName}` };
+export const replayToolGuard: GuardHandler = replayGuard(REPLAY_TOOLS);
 
 export const replayCase = async (
   record: ReviewRecord,
@@ -388,26 +393,44 @@ export const replayCase = async (
     leads?: LeadTrace[],
     gating?: ResultGating,
     usage?: TokenUsage | null,
-  ): Result => ({
-    caseId,
-    repo: bundle.repo,
-    prNumber: bundle.prNumber,
-    headSha: bundle.headSha,
-    variant,
-    output,
-    ...(error !== undefined ? { error } : {}),
-    costUsd,
-    // Always written, even as `null`, so a result file records what the run
-    // answered about its own spend instead of leaving the question open. That
-    // is the whole point of the field: a baseline side with `usage` populated
-    // and `costUsd` beside it is what S5's token gate compares.
-    usage: usage ?? null,
-    wallTimeMs: Date.now() - startMs,
-    ...(leads ? { leads } : {}),
-    ...(gating !== undefined ? { gating } : {}),
-    ...(subagentCalls ? { subagentCalls } : {}),
-    ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
-  });
+  ): Result => {
+    // **A run that reported tokens and priced at zero is a failure.** The plan
+    // makes this assertion automatic in every eval round, and `agent.ts` claims
+    // `run.ts` asserts it downstream; this is that assertion, at the point the
+    // `Result` is written, which is the only place both fields exist together.
+    // The distinction it protects is between "free" and "we have no rate for this
+    // model": an unpriced run would otherwise land as `costUsd: 0` beside real
+    // token counts, read as a free win, and leave the spend cap unable to fire.
+    // A run with no tokens at all is not a claim about price and is left alone.
+    const tokensReported =
+      usage !== undefined &&
+      usage !== null &&
+      usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheWriteTokens > 0;
+    const zeroCostWithTokens = tokensReported && costUsd === 0 && error === undefined;
+    const finalError = zeroCostWithTokens
+      ? `reported tokens but priced at $0: delegate/pricing/models.json has no rate for the model this run called`
+      : error;
+    return {
+      caseId,
+      repo: bundle.repo,
+      prNumber: bundle.prNumber,
+      headSha: bundle.headSha,
+      variant,
+      output: zeroCostWithTokens ? null : output,
+      ...(finalError !== undefined ? { error: finalError } : {}),
+      costUsd,
+      // Always written, even as `null`, so a result file records what the run
+      // answered about its own spend instead of leaving the question open. That
+      // is the whole point of the field: a baseline side with `usage` populated
+      // and `costUsd` beside it is what S5's token gate compares.
+      usage: usage ?? null,
+      wallTimeMs: Date.now() - startMs,
+      ...(leads ? { leads } : {}),
+      ...(gating !== undefined ? { gating } : {}),
+      ...(subagentCalls ? { subagentCalls } : {}),
+      ...(postmortems.length > 0 ? { postmortems: postmortems.map((p) => ({ file: p.file, lessons: p.lessons })) } : {}),
+    };
+  };
 
   try {
     await checkoutFn(bundle, repoDir);
@@ -435,7 +458,6 @@ export const replayCase = async (
     ask: async (prompt) => {
       const selection = await runAgentImpl(POSTMORTEM_SELECTOR, prompt, {
         cwd: repoDir,
-        mcpServers: {},
         env: agentEnv(),
         toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
       });
@@ -448,7 +470,7 @@ export const replayCase = async (
   try {
     agentResult = await runAgentImpl(config, buildReviewPrompt(bundle, { diffPath, postmortems }), {
       cwd: repoDir,
-      mcpServers: { git: createGitTool(repoDir) },
+      gitTools: createGitTools({ root: repoDir }),
       env: agentEnv(),
       toolCallGuards: [replayToolGuard, pathGuardHook(repoDir)],
     });

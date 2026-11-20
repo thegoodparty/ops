@@ -4,6 +4,7 @@ import {
   buildRepairPrompt,
   buildReviewPrompt,
   REVIEW_OUTPUT_JSON_SCHEMA,
+  REVIEW_OUTPUT_SCHEMA,
 } from "./pr-reviewer";
 import prReviewer from "./pr-reviewer";
 import { prReviewerSubagents } from "./pr-reviewer-subagents";
@@ -301,80 +302,69 @@ describe("buildReviewPrompt with a plan", () => {
   });
 });
 
-describe("REVIEW_OUTPUT_JSON_SCHEMA", () => {
-  it("declares draft-07, not 2020-12, which the bundled CLI cannot resolve", () => {
-    const meta = (REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>)[
-      "$schema"
-    ];
+describe("the structured-output ask", () => {
+  // **What replaced the four tests that stood here.** They pinned the shape the
+  // Claude harness needed from a *tool* input schema: draft-07, a flat object with
+  // no top-level union, `anyOf` in place of `oneOf`, and `required: ["status"]`.
+  // Every one of those was a constraint of routing the answer through the built-in
+  // `StructuredOutput` tool, and none of them survives the object call:
+  //
+  // - draft-07 was for a dialect an MCP tool schema had to be resolvable in.
+  //   `@ai-sdk/anthropic` normalises what it sends (its `sanitizeDefinition` maps
+  //   `oneOf` to `anyOf` itself), so a draft-07 marker on our side is decoration.
+  // - the flat object existed because a tool's `input_schema` cannot carry a
+  //   top-level `oneOf`. `Output.object` takes the schema itself.
+  // - `anyOf`-for-`oneOf` was that same workaround by another name.
+  // - `required: ["status"]` was the flat object's concession: one object had to
+  //   describe both branches, so only the discriminator could be required. The
+  //   union requires each branch's own fields.
+  //
+  // What is true now, and is what these assert: the ask is `ReviewOutputSchema`
+  // itself, and it validates a real review.
+
+  it("is ReviewOutputSchema, not a rewritten copy of it", () => {
+    // Identity, not equality: a second schema built to look the same would drift
+    // the first time someone edited one of them.
+    assert.equal(REVIEW_OUTPUT_SCHEMA, ReviewOutputSchema);
+    assert.deepEqual(prReviewer.output?.schema, REVIEW_OUTPUT_JSON_SCHEMA);
+  });
+
+  it("keeps the union as a union, because the object call can carry one", () => {
+    // The branches a top-level `oneOf` used to be smuggled through `anyOf` are a
+    // union in the schema the API is handed. This is the construct that used to
+    // need flattening and no longer does.
+    const json = REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>;
+    assert.ok(json.oneOf !== undefined || json.anyOf !== undefined);
+    const branches = (json.oneOf ?? json.anyOf) as Array<Record<string, any>>;
+    assert.equal(branches.length, 2);
+    const requiredOf = (status: string) =>
+      (branches.find((b) => b.properties?.status?.const === status)?.required ?? []) as string[];
+    // Each branch owes its own fields, which the flat schema could not require.
+    assert.deepEqual(requiredOf("complete").sort(), ["findings", "status", "summary"]);
+    assert.deepEqual(requiredOf("failed").sort(), ["reason", "status"]);
+  });
+
+  it("validates a real result, which is the only thing the ask has to do", () => {
+    // The plan's replacement for the old `required: ["status"]` assertion: the
+    // schema is worth having if a genuine answer passes and a wrong shape does not.
     assert.ok(
-      meta === undefined || /draft-07/.test(String(meta)),
-      `unresolvable $schema: ${String(meta)}`,
+      ReviewOutputSchema.safeParse({ status: "complete", findings: [], summary: "ok" }).success,
     );
+    assert.ok(ReviewOutputSchema.safeParse({ status: "failed", reason: "no diff" }).success);
+    assert.equal(ReviewOutputSchema.safeParse({ status: "complete" }).success, false);
+    assert.equal(ReviewOutputSchema.safeParse({ status: "bogus" }).success, false);
   });
 
-  it("is a plain object (JSON Schema)", () => {
-    assert.equal(typeof REVIEW_OUTPUT_JSON_SCHEMA, "object");
-    assert.notEqual(REVIEW_OUTPUT_JSON_SCHEMA, null);
-  });
-
-  it("is a flat object the Anthropic API accepts as a tool input_schema", () => {
-    const schema = REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>;
-    assert.equal(schema["type"], "object", "top-level type is required");
-    for (const key of ["oneOf", "anyOf", "allOf", "not", "enum"]) {
-      assert.equal(
-        schema[key],
-        undefined,
-        `top-level ${key} is rejected by the API`,
-      );
+  it("still carries the consistency union's three branches and their fields", () => {
+    // The plan-consistency question is unchanged by this step, so its schema's
+    // three-answer shape has to survive the move to `Output.object` intact.
+    const json = JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA);
+    for (const verdict of ["consistent", "inconsistent", "unclear"]) {
+      assert.ok(json.includes(verdict), `missing ${verdict}`);
     }
-  });
-
-  it("uses anyOf, not oneOf, for the consistency union", () => {
-    // Zod emits `oneOf` for a discriminated union, and Anthropic's
-    // structured-output dialect lists `anyOf` but not `oneOf`. The branches are
-    // mutually exclusive by their verdict literal, so the constraint is the
-    // same and the keyword is one the API compiles.
-    assert.ok(
-      !JSON.stringify(REVIEW_OUTPUT_JSON_SCHEMA).includes('"oneOf"'),
-      "no oneOf anywhere in the model schema",
-    );
-    const props = (REVIEW_OUTPUT_JSON_SCHEMA as Record<string, any>).properties;
-    const branches = props.planConsistency.anyOf as Array<Record<string, any>>;
-    assert.equal(branches.length, 3);
-    const requiredOf = (verdict: string) =>
-      branches.find((b) => b.properties.verdict.const === verdict)?.required ?? [];
-    assert.deepEqual(requiredOf("consistent"), ["verdict", "reasoning"]);
-    assert.ok(requiredOf("inconsistent").includes("departure"));
-    assert.ok(requiredOf("unclear").includes("uncertainty"));
-  });
-
-  it("offers every ReviewOutputSchema field and requires only status", () => {
-    const schema = REVIEW_OUTPUT_JSON_SCHEMA as Record<string, unknown>;
-    const props = schema["properties"] as Record<string, unknown>;
-    for (const key of [
-      "status",
-      "findings",
-      "summary",
-      "planConsistency",
-      "reason",
-    ]) {
-      assert.ok(props[key], `missing ${key}`);
+    for (const field of ["departure", "uncertainty", "additions", "planDefects"]) {
+      assert.ok(json.includes(field), `missing ${field}`);
     }
-    assert.deepEqual(schema["required"], ["status"]);
-  });
-
-  it("describes output that ReviewOutputSchema accepts", () => {
-    assert.ok(
-      ReviewOutputSchema.safeParse({
-        status: "complete",
-        findings: [],
-        summary: "ok",
-      }).success,
-    );
-    assert.ok(
-      ReviewOutputSchema.safeParse({ status: "failed", reason: "no diff" })
-        .success,
-    );
   });
 });
 
