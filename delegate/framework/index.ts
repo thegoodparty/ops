@@ -5,7 +5,6 @@ export type {
   AgentConfig,
   AgentJob,
   AgentResult,
-  McpServerConfig,
   RunOverrides,
   StructuredOutputAsk,
   SubagentDefinition,

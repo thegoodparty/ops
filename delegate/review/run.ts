@@ -69,6 +69,14 @@ export type ReviewTrigger = ReviewRecord["trigger"];
 // `CLAUDE_CODE_DISABLE_*` lines in the eval workflows) and nothing in the AI SDK
 // reads one. Keeping the prefixes would carry two namespaces of dead configuration
 // into a process whose environment is meant to be a short, reviewable list.
+//
+// **`ANTHROPIC_MODEL` went in S6, with the Claude Agent SDK dependency.** The CLI
+// read it to override the model; the AI SDK does not. Of the `ANTHROPIC_*` names,
+// `@ai-sdk/anthropic` reads exactly two — `ANTHROPIC_API_KEY` and
+// `ANTHROPIC_BASE_URL` — and both stay. Asserting that from the installed package
+// rather than from the old list is also the check the plan's "no `ANTHROPIC_*`
+// variable reaches an agent" is about: a name in this set is a name the child can
+// read, so a dead one is leftover surface.
 const ENV_ALLOW_EXACT = new Set([
   // The child is a Node process: enough to start and to print.
   "PATH",
@@ -83,10 +91,11 @@ const ENV_ALLOW_EXACT = new Set([
   // Region, for anything that resolves an AWS endpoint by name. Not credentials.
   "AWS_DEFAULT_REGION",
   "AWS_REGION",
-  // The provider key, by name. One today; S7 and S9 add theirs beside it.
+  // The provider key and base URL, by name. One key today; S7 and S9 add theirs
+  // beside it. `ANTHROPIC_MODEL` used to sit here and went in S6: the CLI read it,
+  // the AI SDK does not, and `createAnthropic()` takes the model as an argument.
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
-  "ANTHROPIC_MODEL",
 ]);
 
 export const agentEnv = (
