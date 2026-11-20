@@ -20,19 +20,23 @@ export const PULLED_MARKER = ".cache-pulled";
 // are <suite>/<caseId>/run-<n>.json, with the single pairwise result as run-1.
 export type CacheLayout = "flat" | "runs";
 
-// The agent, the framework and review code it runs through, and the pinned
-// SDK. The whole review tree is hashed, so an eval-code edit costs a replay
+// The agent, the framework and the review code it runs through, and **the price
+// table**. The whole review tree is hashed, so an eval-code edit costs a replay
 // but a stale baseline is never served.
-// The agent, the framework and the review code it runs through, the pinned SDK,
-// and **the price table**. The whole review tree is hashed, so an eval-code edit
-// costs a replay but a stale baseline is never served.
 //
-// `delegate/pricing` joins the inputs in S5, when the table first carries a rate
+// `delegate/pricing` joined the inputs in S5, when the table first carried a rate
 // the shipped code spends. A rate change re-keys the cache for the same reason a
 // prompt change does: a cached `costUsd` computed under an older table is not
 // comparable to a new one, and the spend gate reads those numbers. The directory
 // is hashed rather than the one file so a row added beside `models.json` (an
 // override, a per-provider file) is covered without an edit here.
+//
+// `package-lock.json` stays even though S6 removed the Agent SDK, and the reason
+// is the dependency count rather than the harness: the lockfile is what pins the
+// provider package and the `ai` version whose answers a cached result came from,
+// so a bump there is a different reviewer and has to re-key. "The pinned SDK" —
+// the phrase this comment used to carry — named the Agent SDK, which is gone; the
+// input it described was never only that SDK.
 const REPLAY_INPUTS = [
   "delegate/agents",
   "delegate/framework",

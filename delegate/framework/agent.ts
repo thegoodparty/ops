@@ -19,8 +19,8 @@ import type {
 // provider package, in a child process), the tool list (the `tool()` set this repo
 // writes, in `tools.ts`), and the caps (delegate's own step and spend counters,
 // with one abort). Does not move: this function's signature and `AgentResult`,
-// because S2 made the contract neutral on purpose and S6 is where the old
-// implementation's dependency goes.
+// because S2 made the contract neutral on purpose and S6 removed the SDK
+// implementation that was its second caller.
 //
 // **The credential boundary is `spawn`.** The worker holds the whole `DELEGATES`
 // bundle; in-process, `/proc/self/environ` is the worker's own environ and no path
@@ -36,13 +36,14 @@ const log = (agent: string, event: string, data?: Record<string, unknown>) =>
 /**
  * The failure vocabulary.
  *
- * The Claude SDK's `subtype` strings have no AI SDK equivalent, so a run that hits
+ * The Claude SDK's `subtype` strings had no AI SDK equivalent, so a run that hits
  * a bound needs a closed set of its own or every cap becomes a generic `error`
  * status. `run.ts` puts `errorSubtype` in the failure reason, so these names are
  * what a reader sees. A step is not a turn — `num_turns` and an AI SDK step count
  * different things — which is why these are new names rather than the old
  * spellings, and why the caps are re-tuned from measurement rather than assumed
- * equivalent.
+ * equivalent. They keep their shape now that the SDK is gone, because stored
+ * `ReviewRecord`s carry these strings and a replay has to read them.
  */
 export type RunnerError = "error_max_steps" | "error_max_budget_usd" | "error_aborted" | "error_agent";
 
@@ -131,7 +132,7 @@ export const toChildSubagents = (
  * so the starting point is `Object.keys`. The git tools and the subagent tool are
  * named here because the run was given an implementation for them, and
  * `allowedTools` is the outer bound when an agent sets one — the same intersection
- * the Claude harness saw, where `tools` said which existed and `allowedTools` said
+ * the earlier harness saw, where `tools` said which existed and `allowedTools` said
  * which were pre-approved. One list here, and it is the narrower of the two.
  */
 export const toolNamesFor = (config: AgentConfig, overrides: RunOverrides): string[] => {
