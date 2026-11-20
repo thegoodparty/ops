@@ -13,5 +13,21 @@
       "source": "production-missed",
       "kind": "bug"
     }
+  },
+  {
+    "reason": "Passing needs bin/gp-pi to be run: most of its defects show only with Docker and a shell under set -e, and the reviewer only reads code, so main passes it 0 to 1 times in 3 and no prompt change makes that reliable. Parked 2026-11-20 by Tomer; move it back to manifest.json if the reviewer gets a way to run code.",
+    "case": {
+      "id": "gp-pi-57-multi-instance",
+      "bundle": "gp-pi-57-multi-instance.bundle.json",
+      "expect": {
+        "verdict": "block",
+        "reason": "bin/gp-pi has real launcher defects, any one of which is the reason: `recreate omni` destroys the container and then dies on the overlap check, `rm --all` exits silently under set -e, a fixed host port collides across instances, the credential guard can be bypassed with --workspace ~/.config, `up` mounts the current directory by default, or the docs promise an rm confirmation the code does not ask for."
+      },
+      "tests": "Simulated from gp-pi #57 at 854028d (tree rebuilt on the pre-PR base; the real head is the same tree). Production approved. Sanjay's agent then reproduced bugs in bin/gp-pi that Jeff fixed in 7f76519: `recreate omni` destroys the container then dies on the overlap check, `rm --all` exits silently under set -e, a fixed host port collides across instances. Path match is loose: any bugs or security finding in bin/gp-pi passes, because the credential-guard bypass is one of the real defects and the reviewer tags it security. The reviewer has no Docker and only reads code. Sanjay's agent found most of these by running the launcher with Docker faked or a real daemon, and a few (the credential-guard bypass via --workspace ~/.config, up default mounting the cwd, docs that promise an rm confirmation) by comparing docs to code, so a pass means reading alone was enough.",
+      "split": "tune",
+      "source": "simulated",
+      "kind": "bug",
+      "flakyOnMain": "Main drops the credential-guard bypass on some runs: 2/3 in one tune run and 3/3 in the next, and it failed a main-vs-main comparison. The failing runs all raise the lead and the deep-reviewer drops it, so a candidate's 3/6 here is not evidence of a regression."
+    }
   }
 ]
