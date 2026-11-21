@@ -142,6 +142,112 @@ WRAP
   git config --system user.email "${GITHUB_EMAIL:-268660869+delegate-gp[bot]@users.noreply.github.com}"
 fi
 
+# agent-browser stack health, baked at container start: the /api/sessions probe must send 127.0.0.1 Host/Origin/Referer, or a live browser reads as dead (403).
+if command -v agent-browser >/dev/null 2>&1; then
+  cat >/usr/local/bin/agent-browser-stack-health <<'HEALTH'
+#!/usr/bin/env bash
+# agent-browser-stack-health — one-call, read-only snapshot of a worker's agent-browser stack.
+#
+# Prints exactly one JSON line. Never starts, restarts or kills a browser.
+# Exit codes (the point of the tool):
+#   0  chrome is alive AND the dashboard /api/sessions answers 200
+#   2  no chrome process for the given profile (browser really is down)
+#   3  chrome is alive but /api/sessions did not answer 200 — a dashboard Origin/auth
+#      problem, NOT a dead browser. This is the case that cost four revive tasks.
+#   4  bad usage
+#
+# Env: AGENT_BROWSER_PORT (14848), AGENT_BROWSER_PROFILE (s2w-login)
+#
+# Why whitelisted Origin/Host/Referer: the dashboard's /api/sessions returns 403 for
+# every Origin except http://127.0.0.1:<port> / http://localhost:<port>, and
+# AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS is not honored. Session data is fetched
+# client-side, so a remote viewer through an SSM tunnel sees "No sessions" while
+# chrome is perfectly alive. Always probe as 127.0.0.1 with a matching Origin.
+set -u
+umask 077
+
+PORT=${AGENT_BROWSER_PORT:-14848}
+PROFILE=${AGENT_BROWSER_PROFILE:-s2w-login}
+BASE="http://127.0.0.1:${PORT}"
+ORIGIN="http://127.0.0.1:${PORT}"
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,20p' "$0"; exit 4
+fi
+
+# ---- chrome process -------------------------------------------------------
+pids=$(pgrep -f -- "chrome.*${PROFILE}" 2>/dev/null | paste -sd, -)
+if [ -z "${pids:-}" ]; then
+  # Fall back to any agent-browser chrome (profile name may sit elsewhere in argv).
+  pids=$(pgrep -f -- 'chrome.*user-data-dir=' 2>/dev/null | paste -sd, -)
+fi
+chrome_pid=${pids%%,*}
+chrome_ppid=-
+chrome_sid=-
+chrome_lstart=-
+if [ -n "${chrome_pid:-}" ]; then
+  line=$(ps -o ppid=,sid=,lstart= -p "$chrome_pid" 2>/dev/null | head -1)
+  if [ -n "${line:-}" ]; then
+    chrome_ppid=$(printf '%s' "$line" | awk '{print $1}')
+    chrome_sid=$(printf '%s' "$line" | awk '{print $2}')
+    chrome_lstart=$(printf '%s' "$line" | awk '{$1="";$2="";sub(/^ +/,"");print}')
+  fi
+fi
+
+# ---- dashboard pid + watchdog --------------------------------------------
+dash_pid=-
+dash_pidfile="${HOME:-/tmp}/.agent-browser/dashboard.pid"
+[ -r "$dash_pidfile" ] && dash_pid=$(tr -dc '0-9' <"$dash_pidfile" 2>/dev/null)
+[ -n "${dash_pid:-}" ] || dash_pid=-
+
+# ---- dashboard API -------------------------------------------------------
+body=$(mktemp) || exit 4
+trap 'rm -f "$body"' EXIT
+api_status=$(curl -sS -m 5 -o "$body" -w '%{http_code}' \
+  -H "Host: 127.0.0.1:${PORT}" \
+  -H "Origin: ${ORIGIN}" \
+  -H "Referer: ${ORIGIN}/" \
+  "${BASE}/api/sessions" 2>/dev/null) || api_status=000
+
+session_count=-
+if [ "$api_status" = "200" ] && command -v jq >/dev/null 2>&1; then
+  session_count=$(jq 'if type=="array" then length else (.sessions|length) end' "$body" 2>/dev/null) || session_count=-
+fi
+
+browser_list=$(agent-browser session list 2>/dev/null | head -5 | paste -sd';' - 2>/dev/null) || browser_list=
+[ -n "${browser_list:-}" ] || browser_list=
+
+# ---- verdict -------------------------------------------------------------
+rc=0
+verdict=ok
+if [ -z "${chrome_pid:-}" ]; then
+  rc=2; verdict=no-chrome
+elif [ "$api_status" != "200" ]; then
+  rc=3; verdict=api-not-200
+fi
+
+jq -cn \
+  --arg verdict "$verdict" \
+  --arg profile "$PROFILE" --arg port "$PORT" \
+  --arg chrome_pid "${chrome_pid:--}" --arg chrome_ppid "${chrome_ppid:--}" \
+  --arg chrome_sid "${chrome_sid:--}" --arg chrome_lstart "${chrome_lstart:--}" \
+  --arg dash_pid "${dash_pid:--}" \
+  --arg api_status "$api_status" --arg session_count "$session_count" \
+  --arg sessions "$browser_list" --argjson rc "$rc" \
+  '{verdict:$verdict, exitCode:$rc, profile:$profile, port:$port,
+    chrome:{pid:$chrome_pid, ppid:$chrome_ppid, sid:$chrome_sid, lstart:$chrome_lstart},
+    dashboard:{pid:$dash_pid},
+    api:{status:$api_status, sessionCount:$session_count},
+    browserSessions:$sessions,
+    hint:(if $rc==2 then "no chrome for this profile: relaunch detached (nohup ... &) and re-check"
+          elif $rc==3 then "chrome is alive; the dashboard refused a non-127.0.0.1 Origin or died: do NOT relaunch, check dashboard.pid and the Origin headers"
+          else "stack healthy" end)}'
+
+exit "$rc"
+HEALTH
+  chmod 755 /usr/local/bin/agent-browser-stack-health
+fi
+
 # --- pi harness: Fireworks, US-only, exactly one model ----------------------
 #
 # This script runs as root before the privilege drop, so writing to /root/.pi
