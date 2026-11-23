@@ -522,5 +522,29 @@
     "split": "tune",
     "source": "production-missed",
     "kind": "bug"
+  },
+  {
+    "id": "omni-3716-fanout-payload-uuid",
+    "bundle": "omni-3716-fanout-payload-uuid.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "The meetingBriefingDispatch job types its payload's electedOfficeId with z.uuid(), but elected_office.id is a plain TEXT primary key with no format constraint and prod holds ids that are not RFC uuids, so JobsService.sendMany's up-front parse of the whole batch throws on one such office and the daily meetingBriefingsDaily fan-out dead-letters on every attempt without dispatching a single briefing."
+    },
+    "tests": "omni#3716 at c31af42, the head Delegate approved before merge, with the title and body as they stood when production reviewed it. The PR moves nine agent dispatch crons onto pg-boss schedules that fan out one job per record, and meetingBriefingDispatch declares `schema: z.object({ electedOfficeId: z.uuid() })` in jobs.registry.ts while fanOutDailyBriefings sends every candidate office's id through JobsService.sendMany. elected_office.id is `TEXT NOT NULL` with no DEFAULT and no CHECK (migration 20251015161723); Prisma's uuid(7) default only applies to Prisma creates, and a 2024 bulk batch left prod with v7-shaped ids whose variant nibble is not RFC 4122 (e.g. 01932f7e-574c-7ea2-c133-4f0b0b7b6295). sendMany parses every item against that schema before it inserts any of them, so one such row aborts the whole fan-out: on 2026-11-12 07:00 UTC all three attempts dead-lettered with a ZodError reading `Invalid UUID` on the electedOfficeId path and no office got a briefing. The worker only does findUnique by id, so the uuid claim bought nothing, and #3758 fixed it by accepting the non-empty string the column actually guarantees (ENG-11627). Production approved this head, listing the per-record fan-out as one of the things that checked out, and the schedule tests seeded offices with Prisma-created ids only.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "bug"
+  },
+  {
+    "id": "omni-3748-drop-column-rollout",
+    "bundle": "omni-3748-drop-column-rollout.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "The migration drops campaign.ai_content and the ai_chat table in the same release that removes their Prisma fields, but gp-api runs `prisma migrate deploy` from each new task's entrypoint while the previous revision's tasks keep serving through the rollout and their generated client still selects the column, so every campaign read fails with P2022 until those tasks drain; the drop had to ship one release after the client stopped selecting the column."
+    },
+    "tests": "omni#3748 at fa066b6, the head Delegate approved, with the title and body as they stood when production reviewed it. The migration drops campaign.ai_content and the ai_chat table, and the same PR removes the Prisma field and model. #3747 had stopped the last code readers 20 hours earlier but deliberately kept the Prisma field, so every deployed client still selected the column. docker-entrypoint.sh runs `npx prisma migrate deploy` in each new task before it serves, and prod keeps a 100% minimum-healthy floor with a 120s deregistration delay, so the old revision's tasks read a column that no longer exists for the length of the handover. From 2026-11-12 18:04:47Z to 18:05:31Z, 18 requests failed with P2022 (`The column campaign.ai_content does not exist in the current database`) across GET /v1/campaigns/mine, /v1/campaigns/mine/status, /v1/organizations and /v1/campaigns/tracker-tasks, all through the useCampaign guard, plus the tcrStrandedKickoffSweep job (ENG-11633, ENG-11634). Delegate found no blocking issue and listed three things for the human to confirm, none of them the rollout. The shape differs from omni-3891-drop-column-rollout: that PR removed its readers and dropped its tables in one change, and its case is scored on the same-release drop; this one is the two-release sequence done half right, where release N stopped reading in code but kept the Prisma field, so release N+1's drop still ran against a client that selected the column. Scored on the rollout break only, so a block on the irreversible data drop or on the missing backup fails.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   }
 ]
