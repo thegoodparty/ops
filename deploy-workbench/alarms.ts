@@ -10,6 +10,7 @@ import {
   TASK_MEMORY,
 } from "./ecs";
 import type { BifrostIngress } from "./ingress";
+import { DATABASE_IDENTIFIER, DATABASE_INSTANCE_CLASS } from "./rds";
 
 /**
  * The Bifrost gateway's capacity and availability alarms, and the one email
@@ -23,7 +24,12 @@ import type { BifrostIngress } from "./ingress";
  * says nothing about whether the gateway is serving. `ecs.ts` recorded the gap
  * twice, as a deliberate follow-up ("the Logs Insights / metric-filter alarm
  * that would make it a page ... there is no alerting target in this account
- * yet"). This module is that alerting target and four alarms on it.
+ * yet"). This module is that alerting target and six alarms on it: four on the
+ * gateway's own compute and load balancer, and two on the Postgres instance
+ * underneath it, which is the failure the most recent outage here had and none
+ * of the earlier ones did. The database half is sections 5 and 6 below; its
+ * measurements are in those comments, and they are a different window from the
+ * one recorded here because it is a different incident.
  *
  * Measured over 2026-10-22..2026-11-06, from CloudWatch:
  *
@@ -37,8 +43,11 @@ import type { BifrostIngress } from "./ingress";
  *   task that is briefly pinned, which is why no application-side signal saw
  *   them.
  *
- * Every alarm below is tuned against that measured window rather than against a
- * round number, and the comment on each names the numbers it was chosen from.
+ * Every alarm below is tuned against a measured window rather than against a
+ * round number, and the comment on each names the numbers it was chosen from —
+ * the four gateway alarms against the fortnight above, and the two database
+ * alarms against the 32 days that ended with the 2026-11-23 outage, because it
+ * is a different incident with a different signal set.
  *
  * ## The task size is imported, never restated
  *
@@ -55,6 +64,26 @@ import type { BifrostIngress } from "./ingress";
  * 1024/2048 while this module was being written, and the only thing the resize
  * had to touch is `ecs.ts`. Nothing in this file names a task size, and
  * `alarms.test.ts` pins that.
+ *
+ * ## The database's metrics are absolute, so the threshold divides by the class
+ *
+ * The four gateway alarms read percentages: `CPUUtilization` and
+ * `MemoryUtilization` are percentages of the task, so a threshold survives a
+ * resize with no edit. `AWS/RDS` publishes `FreeableMemory` in **bytes** and
+ * has no percentage form, so the threshold below has to divide by the amount of
+ * memory the instance has for the percentage to mean anything — and the day it
+ * starts meaning the wrong thing is the day the class changes, which is exactly
+ * what happened here (the incident's instance was `db.t4g.micro`, a quarter the
+ * memory of the class the fix moved to).
+ *
+ * So the class is imported from `rds.ts` and its memory is looked up in
+ * `DATABASE_CLASS_MEMORY_MIB`, and an unknown class **throws** rather than
+ * guessing. A memory alarm measured against the wrong denominator is an alarm
+ * that is silent forever (`db.m5.large` has eight times the RAM of
+ * `db.t4g.micro`, so the old class's byte threshold would sit under a value the
+ * new one never reaches), and that is a worse failure than an apply that stops.
+ * `alarms.test.ts` pins that the imported class is in the table, so a class
+ * change without a memory figure fails `npm test` before it reaches a preview.
  *
  * ## One topic, email only
  *
@@ -76,12 +105,18 @@ import type { BifrostIngress } from "./ingress";
  *
  * ## What is deliberately absent
  *
- * - **No composite alarms.** The four signals are independent failures with
+ * - **No composite alarms.** The six signals are independent failures with
  *   independent answers: a CPU pin, a memory leak, an ALB with no healthy
- *   target, and the load balancer's own 5XX. A composite would only be
- *   justified if two of them were the same fault seen twice, and the measured
- *   data says they are not (`alarms.test.ts` records the two that look closest:
- *   5XX and CPU pinning coincide, but each also occurs without the other).
+ *   target, the load balancer's own 5XX, and the database's memory and storage
+ *   queue. A composite would only be justified if two of them were the same
+ *   fault seen twice, and the measured data says they are not (`alarms.test.ts`
+ *   records the two that look closest: 5XX and CPU pinning coincide, but each
+ *   also occurs without the other). The database pair is the one case where the
+ *   two do describe one fault, and they are still separate alarms on purpose:
+ *   the queue can go deep without memory being scarce (a slow device), and
+ *   memory can go low without the queue moving (an idle instance holding a big
+ *   page cache), so either one on its own is the answer to a different
+ *   question.
  * - **No budget or spend alarm.** `index.ts` already has those.
  * - **No `UnHealthyHostCount` alarm.** The task's availability question offers
  *   it as an alternative to `RunningTaskCount`; the measurements say it cannot
@@ -92,7 +127,7 @@ import type { BifrostIngress } from "./ingress";
 export const BIFROST_GATEWAY_HEALTH_NAME = "bifrost-gateway-health";
 
 /**
- * Five minutes, and the same period for all four alarms.
+ * Five minutes, and the same period for all six alarms.
  *
  * One period is one CloudWatch datapoint, so keeping every period at five
  * minutes keeps every evaluation window a whole number of datapoints and lets
@@ -307,6 +342,207 @@ export const AVAILABILITY_ALARM_DESCRIPTION =
   `The Bifrost gateway has had no running task for ${AVAILABILITY_WINDOW_MINUTES} minutes, or has stopped reporting a task count for that long, so the endpoint is answering 503 from the load balancer and every caller is failing. That window is deliberately more than twice the longest gap any deploy has produced, so this is not a normal merge. Answer: docs/runbooks.md, "The Bifrost gateway is saturated or not serving", step 4. Run aws ecs describe-services --cluster ${BIFROST_CLUSTER_NAME} --services ${BIFROST_SERVICE_NAME} and read the service events for why the task will not stay up; the deployment circuit breaker rolls back a revision that cannot become healthy, so a service stuck here is usually a task that starts and then dies. scripts/verify-service.ts covers the deploy-time version of this check.`;
 
 // ---------------------------------------------------------------------------
+// 5. Database memory pressure — the alarm that names the database while it is
+//    still a database problem.
+//
+// The instance took an outage on 2026-11-23: the load balancer started
+// returning 5XX at 11:05 local and the gateway was not serving until a console
+// resize at 12:42. Nothing in this module pointed at the database, and the
+// runbook's triage pointed at ECS `CPUUtilization`, which averaged 5.3% of the
+// task over that window and peaked at 69% in one bucket — not a pin, and not
+// something `bifrost-gateway-cpu-saturation` would have fired on. These two
+// alarms are what was missing.
+//
+// ## What the memory actually did
+//
+// Measured at the 5-minute grain CloudWatch publishes, 2026-10-22..2026-11-23
+// (9,151 buckets), on the `db.t4g.micro` the incident ran on — 1 GiB of RAM:
+//
+// - The 13 days before the incident (2026-11-10..2026-11-23): `Minimum`
+//   median 77.5 MiB, **lowest 52.1 MiB**, and not one bucket below 51.2 MiB.
+// - The full 32 days: lowest 32.0 MiB, a single bucket at 2026-10-27T14:30;
+//   nine buckets under 48 MiB in four separate windows, the widest twenty
+//   minutes. One window (2026-10-30T13:15..13:30) held four consecutive buckets
+//   under 51.2 MiB and is the only episode this alarm has in those 32 days.
+// - The incident: 49.9, 44.7, 49.3, 51.1, 37.3 and 40.0 MiB in the buckets
+//   from 11:15 to 12:25, a floor of 37.3 MiB at 12:10 — 3.6% of the instance.
+//
+// `DatabaseConnections` is the other half of the same story: it sat at 7-10
+// before the outage and then read 0 in the buckets from 11:35 to 11:50 and
+// again at 12:00-12:25, because the task could not hold a connection open. That
+// is what the gateway was doing while it returned 503s, and it is why "the task
+// is fine, the database is not" is the right reading. `SwapUsage` is not a
+// discriminator here — it is non-zero throughout the record, up to 230 MiB — so
+// this comment does not lean on it; the memory state is `FreeableMemory` alone.
+//
+// So the alarm is not set at the floor. 37.3 MiB is where the outage had
+// already happened; an alarm there is a post-mortem. It is set at 5% of the
+// instance's memory, which on the class that had the incident is 51.2 MiB: just
+// under the lowest routine bucket those 13 days produced, and 14 MiB above the
+// incident's own floor. That is the measured gap, and the comment is stating it
+// rather than naming a round number.
+//
+// ## The percentage, and the one thing it assumes
+//
+// `FreeableMemory` is Bytes and has no percentage form, so 5% is resolved
+// against `DATABASE_INSTANCE_CLASS` from `rds.ts` at apply time. On today's
+// `db.m5.large` (8 GiB) that is 410 MiB. **That figure is an assumption and not
+// a measurement, and the risk it carries is silence rather than noise.** The
+// incident happened on 1 GiB; the resize is hours old at the time of writing;
+// and the whole post-resize record is an hour of buckets sitting flat at
+// 4.6 GiB free. 410 MiB is defensible as "the same fraction of the instance",
+// which is the state Postgres is in either way (a page cache with nowhere to
+// grow, so it waits on storage), but it may simply be a figure an 8 GiB
+// instance never reaches, and an alarm that never fires is the thing this
+// module exists to stop. If the next month of FreeableMemory on `db.m5.large`
+// shows a routine floor well above 410 MiB, the fix is a threshold measured on
+// that class — recorded here with the window, like every other number — and not
+// a percentage invented until it is quiet.
+//
+// A wrong denominator is worse than a low one: 410 MiB read against a 1 GiB
+// instance would be 40% of it, and the alarm would sit permanently in ALARM.
+// That is why the class is imported, why the table has an entry per class, and
+// why an unknown class throws rather than guessing.
+//
+// ## Why 3 of 6, and what it buys
+//
+// Three of the last six buckets, which is fifteen of the last thirty minutes,
+// and `Minimum` rather than `Average` so one bucket in the window cannot be
+// diluted by the four readings around it. A single bucket cannot fire it, so
+// the papercuts do not page: the 32-day record has nine buckets under 48 MiB
+// and the longest unbroken run among them is four. In the incident the buckets
+// at 11:15, 11:20 and 11:30 are 49.9, 44.7 and 49.3 MiB, so it would have been
+// in ALARM by about 11:35 — after the load balancer's first 5XX bucket at 11:05,
+// because memory was behind the symptom rather than ahead of it, and an hour
+// before the resize. Its job is to say **the database is the reason**: with it
+// in place, the 5XX page at 11:15 has one more place to look and the right one,
+// instead of a hand-read CloudWatch graph the next afternoon.
+// ---------------------------------------------------------------------------
+export const DB_MEMORY_PRESSURE_ALARM_NAME = "bifrost-db-memory-pressure";
+
+/**
+ * 5% of the instance's RAM. On the 1 GiB class that had the incident, 51.2 MiB
+ * — below every routine bucket in the 13 days measured, and above every one of
+ * the incident's own buckets but the last two.
+ */
+export const DB_MEMORY_PRESSURE_THRESHOLD_PERCENT = 5;
+export const DB_MEMORY_PRESSURE_EVALUATION_PERIODS = 6;
+export const DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM = 3;
+
+export const DB_MEMORY_PRESSURE_BREACH_MINUTES =
+  (DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM * ALARM_PERIOD_SECONDS) / 60;
+export const DB_MEMORY_PRESSURE_WINDOW_MINUTES =
+  (DB_MEMORY_PRESSURE_EVALUATION_PERIODS * ALARM_PERIOD_SECONDS) / 60;
+
+/**
+ * The classes this database has run, and the RAM each one has (AWS's published
+ * figure for the class, not a choice this repo makes).
+ *
+ * `db.t4g.micro` is what item 7 shipped and what the 2026-11-23 incident ran
+ * on; `db.m5.large` is what #575 raised it to afterwards. A third entry is a
+ * class change, and the lookup below refuses one whose memory it does not know
+ * rather than measuring the threshold against the wrong denominator.
+ */
+export const DATABASE_CLASS_MEMORY_MIB: Record<string, number> = {
+  "db.t4g.micro": 1024,
+  "db.m5.large": 8192,
+};
+
+/** The memory of the instance `rds.ts` creates, in MiB. */
+export const databaseMemoryMiB = (): number => {
+  const memory = DATABASE_CLASS_MEMORY_MIB[DATABASE_INSTANCE_CLASS];
+  if (memory === undefined) {
+    throw new Error(
+      `alarms.ts has no RAM figure for ${DATABASE_INSTANCE_CLASS}. Add it to DATABASE_CLASS_MEMORY_MIB: the FreeableMemory alarm states its threshold as a percentage of the instance's memory, and a percentage of the wrong instance is an alarm that never fires.`,
+    );
+  }
+  return memory;
+};
+
+export const BYTES_PER_MIB = 1024 * 1024;
+
+/** "5% of the instance" as something a human can hold: "51 MiB". */
+export const percentOfDatabaseMemory = (percent: number): string =>
+  `${Math.round((databaseMemoryMiB() * percent) / 100)} MiB`;
+
+/**
+ * The threshold in the unit CloudWatch publishes the metric in. `FreeableMemory`
+ * is Bytes, so a percentage of the class has to become bytes before it can be
+ * compared with a datapoint.
+ */
+export const DB_MEMORY_PRESSURE_THRESHOLD_BYTES = Math.round(
+  ((databaseMemoryMiB() * DB_MEMORY_PRESSURE_THRESHOLD_PERCENT) / 100) *
+    BYTES_PER_MIB,
+);
+
+export const DB_MEMORY_PRESSURE_ALARM_DESCRIPTION =
+  `The Bifrost database has been down to its last ${DB_MEMORY_PRESSURE_THRESHOLD_PERCENT}% of free memory (${percentOfDatabaseMemory(DB_MEMORY_PRESSURE_THRESHOLD_PERCENT)} of ${databaseMemoryMiB()} MiB) for ${DB_MEMORY_PRESSURE_BREACH_MINUTES} of the last ${DB_MEMORY_PRESSURE_WINDOW_MINUTES} minutes. A Postgres instance in that state has nothing left to give a query, so it starts waiting on storage instead, which is how the last outage here reached its users as 503s rather than as a database error. This alarm is an ask to look at the database while it is still a database problem, not a capacity alarm on its own. Answer: docs/runbooks.md, "The Bifrost gateway is saturated or not serving", step 5. Read AWS/RDS FreeableMemory for DBInstanceIdentifier=${DATABASE_IDENTIFIER} over a day to see whether it is climbing or stepped, then find what is holding it (a long transaction, a migration, connections) before raising the class.`;
+
+// ---------------------------------------------------------------------------
+// 6. Database storage queue — the pair that actually identified the incident.
+//
+// `DiskQueueDepth` is the number of I/O requests waiting on the volume. Over
+// 2026-10-21..2026-11-23 (9,410 buckets before the incident) it has a routine
+// `Maximum` of 0.198, a 99th percentile of 0.060 and a 99.9th of 0.159: this
+// database queues essentially nothing. The incident's 5-minute buckets from
+// 11:15 to 12:25 ran 1.64, 0.22, 1.69, **8.37**, 2.08, 0.23, 0.20, 1.65, 2.57,
+// 7.88, 0.48, 2.19, 5.81, 1.67 and 1.73 — bursty, not a ramp — and
+// `WriteLatency` went with it to 441 ms from a routine maximum of 291 ms and a
+// 99th percentile of 3.7 ms.
+//
+// ## Why this alarm and not an IOPS or a latency alarm
+//
+// - **Not IOPS.** `ReadIOPS` peaks at 224 over the routine record and
+//   `WriteIOPS` at 61, against a 3,000-IOPS gp3 baseline: the volume was 2-7%
+//   utilised. An alarm on either would have been quiet through the whole
+//   outage, which is why describing it as "IO saturation" was wrong and why
+//   `rds.ts` says the class change was a stopgap rather than a fix.
+// - **Not `WriteLatency` on its own.** Its routine spikes are the same size as
+//   its incident ones: 291 ms at 2026-10-25T05:30 and 239 ms at 2026-10-23T07:10
+//   are backup-window buckets, and the incident's own peak is 441 ms. A
+//   threshold that clears the routine maximum (300 ms) is crossed by two of the
+//   incident's twenty-one buckets; there is no gap to put a threshold in, only
+//   a factor of 1.5 where `DiskQueueDepth` offers 40. It is the metric to read
+//   beside the queue, not one to page on.
+// - **Queue depth is the state users feel.** A request waiting on the device is
+//   a query waiting on the device, whatever the provisioned IOPS say.
+//
+// ## The threshold, and why it is a count and not a percentage
+//
+// There is no "capacity" for queue depth to be a percentage of: a queue of one
+// outstanding request is the definition of "the device is behind", and one is
+// five times the highest value this database reached in 32 days of normal
+// operation. Two of the last six buckets rather than one, so a single bucket
+// cannot page, and two rather than three because the incident's queue was
+// bursty — 1.64, 1.69, 2.08, 1.65 — so a three-bucket requirement is still
+// waiting at 11:25 and fires at 11:30. Over the 9,410 buckets measured before
+// the incident, at 2 of 6, this alarm has **zero** episodes; at 3 of 6 it also
+// has zero, so the choice between them is latency and not noise.
+//
+// ## The part that is evidence and the part that is not
+//
+// 1.0 is the lowest round number above the routine maximum (0.198), and the
+// margin there is a factor of five, not a hair. What is *not* measured is where
+// the queue would sit on a volume with provisioned IOPS, or on a class with
+// more EBS bandwidth: this is one instance's history, and `rds.ts` records that
+// the volume's provisioned IOPS and throughput are still open decisions. If
+// that decision lands and the routine queue moves, this threshold moves with
+// it, measured the same way.
+// ---------------------------------------------------------------------------
+export const DB_STORAGE_QUEUE_ALARM_NAME = "bifrost-db-storage-queue";
+export const DB_STORAGE_QUEUE_THRESHOLD = 1;
+export const DB_STORAGE_QUEUE_EVALUATION_PERIODS = 6;
+export const DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM = 2;
+
+export const DB_STORAGE_QUEUE_BREACH_MINUTES =
+  (DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM * ALARM_PERIOD_SECONDS) / 60;
+export const DB_STORAGE_QUEUE_WINDOW_MINUTES =
+  (DB_STORAGE_QUEUE_EVALUATION_PERIODS * ALARM_PERIOD_SECONDS) / 60;
+
+export const DB_STORAGE_QUEUE_ALARM_DESCRIPTION =
+  `The Bifrost database's storage has had ${DB_STORAGE_QUEUE_THRESHOLD} or more I/O requests queued on the device for ${DB_STORAGE_QUEUE_BREACH_MINUTES} minutes out of the last ${DB_STORAGE_QUEUE_WINDOW_MINUTES}, where its normal queue is a fraction of one. A queue that long while the volume's own IOPS are still in single digits is not a throughput ceiling: the device is slow, and every query that touches the config or log store is waiting on it, so callers see slow responses or 503s while the application logs nothing. Answer: docs/runbooks.md, "The Bifrost gateway is saturated or not serving", step 5. Read AWS/RDS DiskQueueDepth, WriteLatency, WriteIOPS and EBSByteBalance% for DBInstanceIdentifier=${DATABASE_IDENTIFIER} together: a high queue with low IOPS and a drained byte balance is the storage stalling rather than the query volume outgrowing it.`;
+
+// ---------------------------------------------------------------------------
 // The topic and its policy.
 // ---------------------------------------------------------------------------
 
@@ -339,7 +575,7 @@ export const alertTopicPolicy = (topicArn: string): string =>
   });
 
 /**
- * The four alarms, as data.
+ * The six alarms, as data.
  *
  * Declared once here and consumed by the loop below, so the test can assert
  * every alarm's full shape without a Pulumi runtime, and so "does every alarm
@@ -378,6 +614,15 @@ export const bifrostServiceDimensions = (): Record<string, string> => ({
 });
 
 /**
+ * The database's one dimension. `AWS/RDS` publishes per-instance metrics under
+ * `DBInstanceIdentifier` and nothing else for these two, so the value is the
+ * identifier `rds.ts` creates the instance with rather than a copied literal.
+ */
+export const bifrostDatabaseDimensions = (): Record<string, string> => ({
+  DBInstanceIdentifier: DATABASE_IDENTIFIER,
+});
+
+/**
  * The dimension map one alarm is created with, resolved from the spec plus the
  * load balancer the ingress actually made. A pure function so
  * `alarms.test.ts` can check what the apply sends without a Pulumi runtime —
@@ -393,7 +638,7 @@ export const alarmDimensions = (
     : spec.dimensions;
 
 /**
- * The four specs. Pure and synchronous so `alarms.test.ts` can read them. The
+ * The six specs. Pure and synchronous so `alarms.test.ts` can read them. The
  * ALB alarm's `dimensions` is empty here on purpose: its one key's value is the
  * load balancer's `arnSuffix`, a resource the spec cannot see, so
  * `alarmDimensions` fills it in at creation time.
@@ -462,6 +707,36 @@ export const alarmSpecs = (): AlarmSpec[] => [
     // reporting, which is exactly the 34-bucket hole in the 2026-10-26 outage.
     treatMissingData: "breaching",
   },
+  {
+    logicalName: "bifrostDatabaseMemoryPressureAlarm",
+    name: DB_MEMORY_PRESSURE_ALARM_NAME,
+    description: DB_MEMORY_PRESSURE_ALARM_DESCRIPTION,
+    namespace: "AWS/RDS",
+    metricName: "FreeableMemory",
+    statistic: "Minimum",
+    dimensions: bifrostDatabaseDimensions(),
+    comparisonOperator: "LessThanThreshold",
+    // Bytes, because that is how AWS publishes it: the percentage of the class
+    // is resolved into a byte figure by the constant above.
+    threshold: DB_MEMORY_PRESSURE_THRESHOLD_BYTES,
+    evaluationPeriods: DB_MEMORY_PRESSURE_EVALUATION_PERIODS,
+    datapointsToAlarm: DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM,
+    treatMissingData: "notBreaching",
+  },
+  {
+    logicalName: "bifrostDatabaseStorageQueueAlarm",
+    name: DB_STORAGE_QUEUE_ALARM_NAME,
+    description: DB_STORAGE_QUEUE_ALARM_DESCRIPTION,
+    namespace: "AWS/RDS",
+    metricName: "DiskQueueDepth",
+    statistic: "Maximum",
+    dimensions: bifrostDatabaseDimensions(),
+    comparisonOperator: "GreaterThanOrEqualToThreshold",
+    threshold: DB_STORAGE_QUEUE_THRESHOLD,
+    evaluationPeriods: DB_STORAGE_QUEUE_EVALUATION_PERIODS,
+    datapointsToAlarm: DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM,
+    treatMissingData: "notBreaching",
+  },
 ];
 
 export const createBifrostGatewayAlarms = (args: {
@@ -472,8 +747,9 @@ export const createBifrostGatewayAlarms = (args: {
   const tags = { Name: BIFROST_GATEWAY_HEALTH_NAME, Project: BIFROST_GATEWAY_HEALTH_NAME };
 
   // One topic for gateway health, not one per alarm: they answer the same
-  // operator question ("is the gateway serving?"), and four topics would be
-  // four subscriptions to confirm on four separate AWS emails.
+  // operator question ("is the gateway serving?"), the database is one of the
+  // ways that stops being true, and a topic per alarm would be six
+  // subscriptions to confirm on six separate AWS emails.
   const alertTopic = new aws.sns.Topic(
     "bifrostGatewayHealthTopic",
     {
@@ -526,7 +802,7 @@ export const createBifrostGatewayAlarms = (args: {
         treatMissingData: spec.treatMissingData,
         // Every alarm publishes to the one topic. This line is the wiring the
         // whole module exists for, and a mistake in it fails silently, which is
-        // why `alarms.test.ts` asserts it for all four.
+        // why `alarms.test.ts` asserts it for all six.
         alarmActions: [alertTopic.arn],
         tags: { Name: spec.name },
       },
@@ -546,5 +822,7 @@ export const createBifrostGatewayAlarms = (args: {
     memoryPressureAlarm: alarms[1],
     alb5xxAlarm: alarms[2],
     availabilityAlarm: alarms[3],
+    databaseMemoryAlarm: alarms[4],
+    databaseStorageQueueAlarm: alarms[5],
   };
 };

@@ -23,6 +23,22 @@ import {
   CPU_SATURATION_EVALUATION_PERIODS,
   CPU_SATURATION_THRESHOLD_PERCENT,
   CPU_SATURATION_WINDOW_MINUTES,
+  DATABASE_CLASS_MEMORY_MIB,
+  DB_MEMORY_PRESSURE_ALARM_DESCRIPTION,
+  DB_MEMORY_PRESSURE_ALARM_NAME,
+  DB_MEMORY_PRESSURE_BREACH_MINUTES,
+  DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM,
+  DB_MEMORY_PRESSURE_EVALUATION_PERIODS,
+  DB_MEMORY_PRESSURE_THRESHOLD_BYTES,
+  DB_MEMORY_PRESSURE_THRESHOLD_PERCENT,
+  DB_MEMORY_PRESSURE_WINDOW_MINUTES,
+  DB_STORAGE_QUEUE_ALARM_DESCRIPTION,
+  DB_STORAGE_QUEUE_ALARM_NAME,
+  DB_STORAGE_QUEUE_BREACH_MINUTES,
+  DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM,
+  DB_STORAGE_QUEUE_EVALUATION_PERIODS,
+  DB_STORAGE_QUEUE_THRESHOLD,
+  DB_STORAGE_QUEUE_WINDOW_MINUTES,
   MEMORY_PRESSURE_ALARM_DESCRIPTION,
   MEMORY_PRESSURE_ALARM_NAME,
   MEMORY_PRESSURE_EVALUATION_PERIODS,
@@ -31,7 +47,10 @@ import {
   alarmDimensions,
   alarmSpecs,
   alertTopicPolicy,
+  bifrostDatabaseDimensions,
   bifrostServiceDimensions,
+  databaseMemoryMiB,
+  percentOfDatabaseMemory,
   percentOfTaskCpu,
   percentOfTaskMemory,
   taskMemoryMiB,
@@ -44,6 +63,7 @@ import {
   TASK_CPU,
   TASK_MEMORY,
 } from "./ecs";
+import { DATABASE_IDENTIFIER, DATABASE_INSTANCE_CLASS } from "./rds";
 import { VK_JANITOR_ALERT_EMAIL } from "./bifrost-vk-janitor";
 
 /**
@@ -174,11 +194,11 @@ describe("the topic and its policy", () => {
   });
 });
 
-describe("all four alarms are wired to the topic", () => {
-  it("declares exactly four, and every one publishes to alertTopic", () => {
+describe("all six alarms are wired to the topic", () => {
+  it("declares exactly six, and every one publishes to alertTopic", () => {
     const specs = alarmSpecs();
-    assert.equal(specs.length, 4);
-    // One `alarmActions` in the source, inside the loop, so a fourth alarm
+    assert.equal(specs.length, 6);
+    // One `alarmActions` in the source, inside the loop, so a seventh alarm
     // cannot be added without it.
     const actions = SOURCE.match(/alarmActions:\s*\[([^\]]*)\]/g) ?? [];
     assert.equal(actions.length, 1, "expected exactly one alarmActions line");
@@ -187,13 +207,15 @@ describe("all four alarms are wired to the topic", () => {
     assert.match(SOURCE, /alarmSpecs\(\)\.map\(/);
   });
 
-  it("names the four alarms so a runbook can name them back", () => {
+  it("names the six alarms so a runbook can name them back", () => {
     const names = alarmSpecs().map((spec) => spec.name);
     assert.deepEqual(names, [
       "bifrost-gateway-cpu-saturation",
       "bifrost-gateway-memory-pressure",
       "bifrost-gateway-alb-5xx",
       "bifrost-gateway-no-running-task",
+      "bifrost-db-memory-pressure",
+      "bifrost-db-storage-queue",
     ]);
     // The service-level ticket names the topic; the runbook names each alarm.
     for (const name of names) {
@@ -206,8 +228,8 @@ describe("all four alarms are wired to the topic", () => {
 
   it("gives every alarm a distinct logical name and a real description", () => {
     const specs = alarmSpecs();
-    assert.equal(new Set(specs.map((s) => s.logicalName)).size, 4);
-    assert.equal(new Set(specs.map((s) => s.name)).size, 4);
+    assert.equal(new Set(specs.map((s) => s.logicalName)).size, 6);
+    assert.equal(new Set(specs.map((s) => s.name)).size, 6);
     for (const spec of specs) {
       assert.ok(
         spec.description.length > 200,
@@ -232,6 +254,10 @@ describe("all four alarms are wired to the topic", () => {
     assert.match(MEMORY_PRESSURE_ALARM_DESCRIPTION, /leak/);
     assert.match(ALB_5XX_ALARM_DESCRIPTION, /5XX/);
     assert.match(AVAILABILITY_ALARM_DESCRIPTION, /no running task/);
+    // The database pair has to say what state the instance is in, because
+    // "FreeableMemory is low" is not something a woken human can act on.
+    assert.match(DB_MEMORY_PRESSURE_ALARM_DESCRIPTION, /free memory/);
+    assert.match(DB_STORAGE_QUEUE_ALARM_DESCRIPTION, /queued on the device/);
   });
 
   it("does not restate a number in prose that it also interpolates", () => {
@@ -249,6 +275,12 @@ describe("all four alarms are wired to the topic", () => {
       String(CPU_SATURATION_WINDOW_MINUTES),
       String(MEMORY_PRESSURE_WINDOW_MINUTES),
       String(AVAILABILITY_WINDOW_MINUTES),
+      String(DB_MEMORY_PRESSURE_THRESHOLD_PERCENT),
+      String(DB_MEMORY_PRESSURE_BREACH_MINUTES),
+      String(DB_MEMORY_PRESSURE_WINDOW_MINUTES),
+      String(DB_STORAGE_QUEUE_THRESHOLD),
+      String(DB_STORAGE_QUEUE_BREACH_MINUTES),
+      String(DB_STORAGE_QUEUE_WINDOW_MINUTES),
     ]);
     for (const spec of alarmSpecs()) {
       // Strip what is allowed to be there: the interpolated constants, the
@@ -428,7 +460,7 @@ describe("the availability alarm", () => {
     assert.equal(spec.datapointsToAlarm, spec.evaluationPeriods);
   });
 
-  it("treats an absent datapoint as breaching, unlike the other three", () => {
+  it("treats an absent datapoint as breaching, unlike every other alarm", () => {
     // The one place the opposite treatment is correct: Container Insights stops
     // publishing RunningTaskCount when the service stops reporting, which is a
     // 34-bucket hole in the 2026-10-26 outage. Silence is the signal.
@@ -442,6 +474,172 @@ describe("the availability alarm", () => {
     );
     // The cluster has insights enabled, or RunningTaskCount is never published.
     assert.match(ECS_SOURCE, /containerInsights"?,?\s*value: "enabled"|name: "containerInsights", value: "enabled"/);
+  });
+});
+
+describe("the database memory alarm", () => {
+  it("reads AWS/RDS FreeableMemory for the instance rds.ts creates", () => {
+    // `FreeableMemory` is published per instance under `DBInstanceIdentifier`
+    // and nothing else, so the identifier is imported rather than copied: a
+    // literal that drifts from `rds.ts` is an alarm on a metric that does not
+    // exist, which `notBreaching` would then make silent forever.
+    assert.equal(DATABASE_IDENTIFIER, "bifrost-db");
+    assert.deepEqual(bifrostDatabaseDimensions(), {
+      DBInstanceIdentifier: "bifrost-db",
+    });
+    const spec = alarmSpecs().find((s) => s.name === DB_MEMORY_PRESSURE_ALARM_NAME);
+    assert.ok(spec);
+    assert.equal(spec.namespace, "AWS/RDS");
+    assert.equal(spec.metricName, "FreeableMemory");
+    // `Minimum` of the period, not `Average`: the question is whether the
+    // instance had nothing left at any point in the bucket, and four quiet
+    // minutes should not dilute the one that was starved.
+    assert.equal(spec.statistic, "Minimum");
+    assert.equal(spec.comparisonOperator, "LessThanThreshold");
+    assert.deepEqual(spec.dimensions, { DBInstanceIdentifier: DATABASE_IDENTIFIER });
+    assert.equal(spec.treatMissingData, "notBreaching");
+  });
+
+  it("is 5% of the instance, resolved from the class rather than from a literal", () => {
+    // Measured on the 1 GiB class the incident ran on: the 13 days before it
+    // never went below 52.1 MiB, so 5% (51.2 MiB) sits in the gap between the
+    // routine floor and the incident's own 37.3 MiB floor.
+    assert.equal(DB_MEMORY_PRESSURE_THRESHOLD_PERCENT, 5);
+    assert.equal(DATABASE_CLASS_MEMORY_MIB["db.t4g.micro"], 1024);
+    assert.equal(DATABASE_CLASS_MEMORY_MIB["db.m5.large"], 8192);
+    // The class the stack actually creates has to be in the table, or the byte
+    // threshold is a percentage of nothing.
+    assert.ok(
+      DATABASE_CLASS_MEMORY_MIB[DATABASE_INSTANCE_CLASS] !== undefined,
+      `alarms.ts has no RAM figure for ${DATABASE_INSTANCE_CLASS}`,
+    );
+    assert.equal(databaseMemoryMiB(), DATABASE_CLASS_MEMORY_MIB[DATABASE_INSTANCE_CLASS]);
+    // The metric is published in Bytes, so the threshold has to be too.
+    assert.equal(
+      DB_MEMORY_PRESSURE_THRESHOLD_BYTES,
+      Math.round((databaseMemoryMiB() * 5 * 1024 * 1024) / 100),
+    );
+    // 5% of the class that had the incident, which is the measured figure.
+    assert.equal(Math.round((1024 * 5) / 100), 51);
+    assert.ok(DB_MEMORY_PRESSURE_ALARM_DESCRIPTION.includes(percentOfDatabaseMemory(5)));
+  });
+
+  it("holds the low reading for fifteen of thirty minutes, so one bucket cannot fire it", () => {
+    // Measured: nine buckets under 48 MiB in 32 days, in four windows whose
+    // longest unbroken run is four buckets. A single-bucket threshold would
+    // page on a backup window; three of six does not.
+    assert.equal(DB_MEMORY_PRESSURE_EVALUATION_PERIODS, 6);
+    assert.equal(DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM, 3);
+    assert.ok(
+      DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM > 1,
+      "a single bucket is the backup-window alarm this window exists to avoid",
+    );
+    assert.ok(DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM <= DB_MEMORY_PRESSURE_EVALUATION_PERIODS);
+    assert.equal(DB_MEMORY_PRESSURE_BREACH_MINUTES, 15);
+    assert.equal(DB_MEMORY_PRESSURE_WINDOW_MINUTES, 30);
+    const spec = alarmSpecs().find((s) => s.name === DB_MEMORY_PRESSURE_ALARM_NAME);
+    assert.ok(spec);
+    assert.equal(spec.datapointsToAlarm, DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM);
+  });
+
+  it("would have fired during the 2026-11-23 outage, and only then", () => {
+    // The incident's own `Minimum` buckets, in MiB, from 11:10 to 12:25. The
+    // three low ones at 11:15, 11:20 and 11:30 (49.9, 44.7, 49.3) are three of
+    // six, so the alarm evaluates to ALARM at 11:30 and is paging by about
+    // 11:35 — after the load balancer's first 5XX at 11:05, and an hour before
+    // the console resize. It is a "the database is the reason" alarm, not an
+    // early-warning one.
+    const incidentMinimumMiB = [
+      65.8, 49.9, 44.7, 52.9, 49.3, 66.2, 61.1, 74.7, 51.1, 56.5, 56.3, 60.9,
+      37.3, 62.4, 71.1, 40.0,
+    ];
+    const thresholdMiB = (1024 * DB_MEMORY_PRESSURE_THRESHOLD_PERCENT) / 100;
+    const breaches = incidentMinimumMiB.map((mib) => mib < thresholdMiB);
+    const firesAt = breaches.findIndex((_, i) => {
+      const window = breaches.slice(Math.max(0, i - 5), i + 1);
+      return window.filter(Boolean).length >= DB_MEMORY_PRESSURE_DATAPOINTS_TO_ALARM;
+    });
+    assert.equal(firesAt, 4, "the alarm must trip inside the incident, not after it");
+    // And the floor the incident reached is well inside the threshold, so this
+    // is not an alarm that fires on the first bucket that happens to be low.
+    assert.ok(Math.min(...incidentMinimumMiB) < thresholdMiB);
+  });
+
+  it("points a responder at the runbook step that reads the database", () => {
+    assert.match(DB_MEMORY_PRESSURE_ALARM_DESCRIPTION, /step 5/);
+    assert.ok(DB_MEMORY_PRESSURE_ALARM_DESCRIPTION.includes(DATABASE_IDENTIFIER));
+    // It asks for the cause, not for a bigger instance: the class was already
+    // raised once for a different reason (#575).
+    assert.match(DB_MEMORY_PRESSURE_ALARM_DESCRIPTION, /before raising the class/);
+  });
+});
+
+describe("the database storage queue alarm", () => {
+  it("reads AWS/RDS DiskQueueDepth, which is what separated this incident", () => {
+    // Measured over 9,410 buckets before the incident: routine `Maximum` 0.198,
+    // p99 0.060. The incident's buckets ran 1.64 to 8.37. `ReadIOPS` peaked at
+    // 224 and `WriteIOPS` at 61 against a 3,000-IOPS gp3 baseline, so an IOPS
+    // alarm would have been quiet through all of it.
+    const spec = alarmSpecs().find((s) => s.name === DB_STORAGE_QUEUE_ALARM_NAME);
+    assert.ok(spec);
+    assert.equal(spec.namespace, "AWS/RDS");
+    assert.equal(spec.metricName, "DiskQueueDepth");
+    assert.equal(spec.statistic, "Maximum");
+    assert.equal(spec.comparisonOperator, "GreaterThanOrEqualToThreshold");
+    assert.equal(spec.threshold, DB_STORAGE_QUEUE_THRESHOLD);
+    assert.deepEqual(spec.dimensions, { DBInstanceIdentifier: DATABASE_IDENTIFIER });
+    assert.equal(spec.treatMissingData, "notBreaching");
+    // The metrics this alarm deliberately is not.
+    for (const notThis of ["ReadIOPS", "WriteIOPS", "WriteLatency", "ReadLatency"]) {
+      assert.ok(
+        !alarmSpecs().some((s) => s.metricName === notThis),
+        `${notThis} cannot separate this incident from routine load, so it cannot be the alarm`,
+      );
+    }
+  });
+
+  it("is set five times above the routine maximum and below the incident", () => {
+    assert.equal(DB_STORAGE_QUEUE_THRESHOLD, 1);
+    assert.ok(
+      DB_STORAGE_QUEUE_THRESHOLD > 0.198 * 4,
+      "the threshold must clear the 32-day routine maximum of 0.198 by a factor, not a hair",
+    );
+    assert.ok(
+      DB_STORAGE_QUEUE_THRESHOLD <= 1.64,
+      "the threshold must be reached by the incident's first queued bucket",
+    );
+  });
+
+  it("needs two of six buckets, and had zero episodes in the measured record", () => {
+    // The incident's queue was bursty (1.64, 1.69, 2.08, 1.65), so one bucket
+    // is too little and three waits for the 8.37 spike; two fires at 11:25.
+    assert.equal(DB_STORAGE_QUEUE_EVALUATION_PERIODS, 6);
+    assert.equal(DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM, 2);
+    assert.ok(DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM > 1);
+    assert.equal(DB_STORAGE_QUEUE_BREACH_MINUTES, 10);
+    assert.equal(DB_STORAGE_QUEUE_WINDOW_MINUTES, 30);
+
+    // Replayed over the 9,410 buckets measured before the incident: every one
+    // of them is below 1, so the alarm has no episodes at all.
+    const routineMaximum = 0.198;
+    assert.ok(routineMaximum < DB_STORAGE_QUEUE_THRESHOLD);
+    // And the two-bucket rule is satisfiable inside the incident's burst.
+    const incidentBuckets = [0.07, 0.04, 0.17, 1.64, 0.22, 1.69, 8.37, 2.08];
+    const breaches = incidentBuckets.map((d) => d >= DB_STORAGE_QUEUE_THRESHOLD);
+    const firesAt = breaches.findIndex((_, i) => {
+      const window = breaches.slice(Math.max(0, i - 5), i + 1);
+      return window.filter(Boolean).length >= DB_STORAGE_QUEUE_DATAPOINTS_TO_ALARM;
+    });
+    assert.equal(firesAt, 5, "the alarm must trip on the burst, not only on its peak");
+  });
+
+  it("tells the reader how to tell a stalled device from a throughput ceiling", () => {
+    // The runbook step makes the same distinction; the description has to send
+    // the reader there already knowing which question they are answering.
+    assert.match(DB_STORAGE_QUEUE_ALARM_DESCRIPTION, /not a throughput ceiling/);
+    assert.match(DB_STORAGE_QUEUE_ALARM_DESCRIPTION, /WriteLatency/);
+    assert.match(DB_STORAGE_QUEUE_ALARM_DESCRIPTION, /WriteIOPS/);
+    assert.match(DB_STORAGE_QUEUE_ALARM_DESCRIPTION, /step 5/);
   });
 });
 

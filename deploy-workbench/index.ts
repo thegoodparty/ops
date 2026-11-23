@@ -695,11 +695,14 @@ export const vkBifrostJanitorAlertTopicArn = vkJanitor.alertTopic.arn;
 //
 // The gap `ecs.ts` recorded twice ("the Logs Insights / metric-filter alarm
 // that would make it a page ... there is no alerting target in this account
-// yet"), closed. Four alarms on the one signal set that describes whether the
+// yet"), closed. Six alarms on the one signal set that describes whether the
 // gateway is serving: the task's CPU and memory, the load balancer's own 5XX
-// count, and whether a task is running at all. Each is tuned against a
-// fortnight of measured CloudWatch data rather than a round number, and the
-// measuring is in `alarms.ts` beside the constant it justifies.
+// count, whether a task is running at all, and — since the 2026-11-23 outage,
+// which was none of those — the database's free memory and its storage queue.
+// Each is tuned against measured CloudWatch data rather than a round number,
+// and the measuring is in `alarms.ts` beside the constant it justifies. The
+// database half was measured over a different window from the gateway half
+// because it is a different incident; each comment names its own.
 //
 // It consumes the ingress object rather than the load balancer's name, because
 // `HTTPCode_ELB_5XX_Count`'s `LoadBalancer` dimension is the ARN suffix
@@ -709,20 +712,26 @@ export const vkBifrostJanitorAlertTopicArn = vkJanitor.alertTopic.arn;
 // for this account, and this is not the change that reverses it.
 //
 // The alarms import `TASK_CPU` and `TASK_MEMORY` from `ecs.ts` so their
-// descriptions state the task size they are actually measuring. The thresholds
-// are percentages and survive a resize on their own; the prose would not, and
-// #484's move to 1024/2048 is the case that proves it.
+// descriptions state the task size they are actually measuring, and
+// `DATABASE_INSTANCE_CLASS` from `rds.ts` for the database's memory: the
+// thresholds are percentages and survive a resize on their own, while the prose
+// would not. #484's move to 1024/2048 is the case for the task, and #575's move
+// to `db.m5.large` is the case for the database — the memory alarm's byte
+// threshold follows that class rather than staying on the one that had the
+// incident.
 const alarms = createBifrostGatewayAlarms({ provider, ingress });
 
 /** The one topic every gateway alarm publishes to, for the console and a human. */
 export const bifrostGatewayAlertTopicArn = alarms.alertTopic.arn;
 
-/** The four alarm names, so a reader of `pulumi stack output` can find them. */
+/** The six alarm names, so a reader of `pulumi stack output` can find them. */
 export const bifrostGatewayAlarmNames = [
   alarms.cpuSaturationAlarm.name,
   alarms.memoryPressureAlarm.name,
   alarms.alb5xxAlarm.name,
   alarms.availabilityAlarm.name,
+  alarms.databaseMemoryAlarm.name,
+  alarms.databaseStorageQueueAlarm.name,
 ];
 
 // ---------------------------------------------------------------------------
