@@ -37,8 +37,8 @@ import { exportWindow, parquetSchema, toColumnData, usageExportObjectKey } from 
  * - **A failed run throws.** A silent success leaves a gap in the bucket that
  *   nothing notices until the loader's freshness check — which, as it turns out,
  *   nothing runs. Throwing is what feeds both alarms.
- * - **`end()` always runs**, or a failed run leaves a connection open on a
- *   `t4g.micro` until the execution environment is reaped.
+ * - **`end()` always runs**, or a failed run leaves a connection open on the
+ *   gateway's database instance until the execution environment is reaped.
  * - **`IfNoneMatch: "*"`.** S3 conditional write: with a timestamp in the key a
  *   collision means two runs in the same second, so this is a guard against a bug
  *   rather than an expected event, and it makes "never rewrites a file" a

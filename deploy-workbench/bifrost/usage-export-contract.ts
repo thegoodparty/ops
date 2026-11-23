@@ -114,8 +114,8 @@ export const USAGE_EXPORT_MONTHLY_SCHEDULE = "cron(30 9 1 * ? *)";
  * How long one statement may run, in milliseconds, and why it is not the
  * function's timeout.
  *
- * The export is a guest on a `t4g.micro` shared with the one gateway every
- * engineer codes through. A predicate on `timestamp` should use
+ * The export is a guest on the gateway's database instance, shared with the one
+ * gateway every engineer codes through. A predicate on `timestamp` should use
  * `idx_logs_timestamp`, and a read of one window should take seconds; 300s is
  * orders of magnitude above that and still far inside the 900s ceiling, so a plan
  * that went wrong costs the instance five minutes and one alarm rather than

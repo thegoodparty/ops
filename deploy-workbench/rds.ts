@@ -86,17 +86,32 @@ export const DATABASE_ENGINE = "postgres";
 export const DATABASE_ENGINE_VERSION = "16";
 
 /**
- * `db.t4g.micro` — the smallest ARM instance RDS offers, and the plan's "start
- * as small as reasonable".
+ * `db.m5.large`, x86 — the class a console change ended an outage on. This is
+ * not the smallest reasonable class, and the reason is an incident rather than
+ * a preference.
  *
- * The workload is one engineer's gateway configuration and its request
- * metadata; the plan's own sizing argument for the task ("Bifrost adds
- * microseconds of overhead and the load is per-engineer") applies twice over
- * here. Burstable is the right family for a database that is idle most of the
- * working day, and the class is a one-line change when the logs store outgrows
- * it — that change is a reboot, not a migration.
+ * This started at `db.t4g.micro`, the smallest ARM (Graviton) instance RDS
+ * offers, on the argument that the workload was one engineer's gateway
+ * configuration and its request metadata. That argument was contradicted in
+ * practice: the gateway took an outage because the instance's storage was IO
+ * saturated. The class was raised in the console to `db.m5.large` in November
+ * 2026 to end it, and this constant is what makes the code agree with the
+ * console. Without it, a refresh of this stack records the console's class in
+ * state and the next apply modifies the instance back to `db.t4g.micro` — the
+ * class that saturated — because the program still asks for it.
+ *
+ * `m5` is x86 where `t4g` was ARM/Graviton. Do not "correct" this back to a
+ * `t4g` class without going through the same incident: the family change is
+ * deliberate, not a typo.
+ *
+ * This is a stopgap sized on that one incident, not a measured steady state.
+ * The levers for sizing the database properly are still open decisions this
+ * change does not settle: the volume's provisioned IOPS and throughput, log
+ * retention, and Multi-AZ. Storage, storage autoscaling and `applyImmediately`
+ * (left at the provider default, false) are unchanged on purpose: the only
+ * thing this change does is agree with the class the console already has.
  */
-export const DATABASE_INSTANCE_CLASS = aws.rds.InstanceType.T4G_Micro;
+export const DATABASE_INSTANCE_CLASS = aws.rds.InstanceType.M5_Large;
 
 /**
  * 20 GiB gp3, and storage autoscaling deliberately off.

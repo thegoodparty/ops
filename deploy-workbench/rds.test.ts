@@ -88,8 +88,16 @@ describe("bifrost database", () => {
     );
   });
 
-  it("starts at the smallest reasonable class and volume", () => {
-    assert.equal(DATABASE_INSTANCE_CLASS, "db.t4g.micro");
+  it("holds the class the console was raised to, on the original volume", () => {
+    // Not the smallest reasonable class any more, and deliberately so: the
+    // instance started on `db.t4g.micro` (the smallest ARM class) and took an
+    // IO saturation outage. The class was raised in the console to
+    // `db.m5.large` — x86 where the t4g class was ARM/Graviton — and it is
+    // pinned here so a refresh and apply cannot reconcile the instance back
+    // onto the class that saturated. The size is a stopgap from one incident,
+    // not a measurement; the volume levers are a separate, still-open
+    // decision, which is why the storage assertions below are unchanged.
+    assert.equal(DATABASE_INSTANCE_CLASS, "db.m5.large");
     assert.equal(DATABASE_ALLOCATED_STORAGE_GB, 20);
     assert.equal(DATABASE_STORAGE_TYPE, "gp3");
 
