@@ -510,5 +510,20 @@
     "split": "tune",
     "source": "production-missed",
     "kind": "architecture"
+  },
+  {
+    "id": "omni-3876-created-arm-checkout-session",
+    "bundle": "omni-3876-created-arm-checkout-session.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "paths": [
+        "packages/gp-api/src/payments/services/paymentEventsService.ts",
+        "packages/gp-api/src/payments/purchase.controller.ts"
+      ]
+    },
+    "tests": "omni#3876 at 07ad14f. customer.subscription.created now fulfils Pro on its own, but only checkout.session.completed clears user.metaData.checkoutSessionId. When completion is the lost event (the case the PR exists for), the stored session stays paid, so a cancel and rebuy hits CHECKOUT_ALREADY_COMPLETED in createProCheckoutSession with no self-serve way out. Cursor Bugbot flagged it; delegate approved. Opponent-collection finding on the previous commit was caught by both.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   }
 ]
