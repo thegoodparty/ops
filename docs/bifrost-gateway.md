@@ -1379,7 +1379,7 @@ What genuinely remains open:
   from `Admins` (which needs an Identity Store reader oauth2-proxy does not
   have, so a small job would have to write the file), or move to Verified
   Access, which reads `Admins` natively at roughly $200/month.
-- **RDS size and Multi-AZ: answered by item 7.** Single-AZ, `db.t4g.micro`,
+- **RDS size and Multi-AZ: answered by item 7.** Single-AZ, `db.m5.large`,
   20 GiB gp3 (RDS's minimum), no storage autoscaling, 7-day automated backup
   retention, and a master password RDS manages and rotates in Secrets Manager
   rather than one a human types. PostgreSQL 16, which is the version
@@ -1387,6 +1387,17 @@ What genuinely remains open:
   guides run (`postgres:16-alpine`); 17 is documented as supported but never
   exercised upstream. What remains is not a decision but a test: item 23
   rehearses the restore.
+
+  **Amended 2026-11-23:** the class is `db.m5.large`, not the `db.t4g.micro`
+  item 7 shipped, and item 7's "start as small as reasonable" no longer
+  describes it. The gateway took a database IO saturation outage — the
+  instance's storage could not serve the gateway's reads and writes — and the
+  class was raised in the console to `db.m5.large`, x86 where `t4g` was
+  ARM/Graviton, to end it. `deploy-workbench/rds.ts` now declares that class so
+  an apply cannot read the console value as drift and revert it. This is a
+  stopgap sized on one incident, not a measured steady state: the volume's
+  provisioned IOPS and throughput, retention and Multi-AZ are still open
+  decisions, and 20 GiB gp3 with autoscaling off is unchanged.
 - **Model allowlist: answered under "Inference residency" in "Provider
   configuration".** The Bedrock list is eight `global.` profiles and the
   Fireworks list is one US-only router on the US-only host, and the Bedrock
@@ -1468,12 +1479,17 @@ network or a permission can land before the item that creates it.
 7. Add the RDS Postgres instance, private and encrypted, with automated
    backups and deletion protection, and its credentials in Secrets Manager, in
    `deploy-workbench/rds.ts`. PostgreSQL 16, single-AZ
-   `db.t4g.micro`, 20 GiB gp3 with autoscaling off, 7-day automated backups,
+   `db.m5.large`, 20 GiB gp3 with autoscaling off, 7-day automated backups,
    deletion protection, no public access, and the RDS-managed master password
    whose secret ARN is exported as `bifrostDatabaseSecretArn`. It consumes the
    DB subnet group and the task-only security group from item 5, which is not
    touched; the ECS task definition and the read grant on that secret arrive in
    item 8, so the database is created and consumed by nothing until then.
+
+   **Amended 2026-11-23:** item 7 shipped `db.t4g.micro`; it is `db.m5.large`
+   now, x86 rather than ARM/Graviton, after an IO saturation outage. The
+   reasoning and the still-open sizing levers are in the open-questions entry
+   "RDS size and Multi-AZ" above.
 8. Add the ECS cluster, task definition and service, copying the
    task-definition idiom in `deploy/components/worker.ts` (execution role with
    the managed ECS policy plus secrets read, a separate task role scoped to the
