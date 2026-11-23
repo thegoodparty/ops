@@ -153,10 +153,12 @@ on every boot and only carries the keys that are in the secret. `/share` and
 The lead and both workers do not run the upstream worker image directly.
 `up.sh` builds `delegate-swarm-worker:<version>-<patch hash>` from
 `host/worker-patch/Dockerfile`, which starts from
-`ghcr.io/desplega-ai/agent-swarm-worker:<version>` and upgrades Node to
+`ghcr.io/desplega-ai/agent-swarm-worker:<version>`, upgrades Node to
 22.23.4 (the [October 2026 security
 release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases));
-upstream images up to v2.4.5 still ship 22.23.3. The build fails if Node is
+upstream images up to v2.4.5 still ship 22.23.3, and installs the Google
+Workspace CLI (`gws`), which every agent container needs and which no volume
+would keep across a recreate. The build fails if Node is
 still older than v22.23.4. `render-env.sh` writes the patch hash to `.env`
 as `WORKER_PATCH_HASH`, so the tag changes, and the agents are rebuilt and
 recreated, only when the version or the Dockerfile changes. A deploy that
@@ -167,10 +169,12 @@ Node and is used as is.
    the version lives.
 2. Check the new worker's Node:
    `docker run --rm --entrypoint node ghcr.io/desplega-ai/agent-swarm-worker:<version> -v`.
-   If it is v22.23.4 or later, delete `host/worker-patch/`, point
-   `x-worker-base` in `host/docker-compose.yml` back at that image, and
-   drop the build from `up.sh` and `WORKER_PATCH_HASH` from
-   `render-env.sh`.
+   If it is v22.23.4 or later, drop the Node upgrade from
+   `host/worker-patch/Dockerfile` and the Node assertion with it, but keep the
+   directory, the `gws` install and the build in `up.sh`: `gws` has no other
+   home. Pointing `x-worker-base` back at the upstream image and deleting the
+   patch is only possible once upstream ships `gws` or a host setup script
+   installs it.
 3. Merge. `up.sh` sees the dashboard marker
    (`ui-dist/.agent-swarm-version`) is stale and rebuilds the UI from the new
    tag, builds the worker image, then recreates every agent-swarm container.
