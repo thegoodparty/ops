@@ -111,8 +111,10 @@ failure.
 `aws-workbench@goodparty.org`.
 
 Six alarms, one topic, because they are six ways of answering the same
-question — is the gateway serving? — and the triage below is the same until step
-3. Which one fired tells you where to start, so start there.
+question — is the gateway serving? — and the triage below is one sequence rather
+than six. Which one fired tells you where to start, so start there; the steps
+cross-reference each other, and step 3 is the one that decides whether you are
+looking at the task, the load balancer, or the database.
 
 | Alarm | What it counted | Where to look first |
 |---|---|---|

@@ -497,9 +497,11 @@ export const DB_MEMORY_PRESSURE_ALARM_DESCRIPTION =
 //   The incident's own peaks (198 and 61) were no higher than the routine ones,
 //   and its medians (29 and 12) are barely above the routine medians (11 and
 //   10): the volume was not being asked for more, it was delivering less. An
-//   alarm on either metric would have been quiet throughout, which is why
-//   describing the incident as "IO saturation" was wrong and why `rds.ts` says
-//   the class change was a stopgap rather than a fix.
+//   alarm on either metric would have been quiet throughout. The class change
+//   in `rds.ts` describes itself as the end of an "IO saturation" incident,
+//   and that description is the one this comment is correcting: the class was
+//   raised to buy headroom, but the volume was never saturated. `rds.ts` also
+//   calls it a stopgap sized on one incident, which is the part it gets right.
 // - **Not `WriteLatency` on its own.** Its routine spikes are the same size as
 //   its incident ones: 291 ms at 2026-10-25T05:30 and 239 ms at 2026-10-23T07:10
 //   are backup-window buckets, and the incident's own peak is 441 ms. A
