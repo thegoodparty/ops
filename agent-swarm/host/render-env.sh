@@ -100,7 +100,7 @@ fi
   echo
   echo "# --- static ---"
   cat <<'EOF'
-AGENT_SWARM_VERSION=2.13.0
+AGENT_SWARM_VERSION=2.14.4
 NODE_ENV=production
 HARNESS_PROVIDER=pi
 # One model, Fireworks US-only. The provider id is `fireworks-us`, not the
