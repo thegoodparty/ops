@@ -1275,6 +1275,30 @@ Virtual keys are Bifrost's primary governance entity
   Late repricing past 30 days is therefore the one thing this change gives up,
   and it is deliberate: that is a corrected number in a file already landed, and
   a table that purges on time is worth more than it.
+
+  **The one way this change could lose history, and how to avoid it.** The export
+  is younger than the table. Both stores moved to Postgres on 2026-10-26
+  (`3be6c8b`), which is when durable rows begin, while the export only landed on
+  2026-11-16 (`a342366`) and its first run was 2026-11-17 over a 7-day window —
+  so no run has ever read a row older than 2026-11-10, and the first 90-day read
+  is the 2026-12-01 monthly run. A 30-day cutoff therefore deletes a window no
+  export has covered:
+
+  - rows of **2026-10-26 .. 2026-11-01** are purged before the 12-01 monthly run
+    and would never be exported at all;
+  - rows of **2026-11-01 .. 2026-11-10** are not covered by any daily run but
+    *are* inside the 12-01 monthly run's 30-day reach, so that run rescues them.
+
+  That is six days of per-request cost, not the sixty the review guessed — the
+  gateway is only 29 days old, so 90-day retention was never holding a quarter.
+  It is still real history, so the mitigation is a manual invoke of the export
+  with `{"window_days": 90}` **before the first 30-day purge, which is 2026-11-25**
+  (the oldest row, 2026-10-26, plus 30 days). One invoke writes the whole
+  existing table as one Parquet object and closes the gap permanently; it is a
+  backfill, so it is a human step rather than something this PR automates, and
+  it is why this change should be applied after that run rather than before.
+  Sequencing note for a reviewer: the client setting is live, so the first
+  cleaner pass after the apply is what starts deleting.
 - **Backup.** RDS automated backups plus manual snapshots before an upgrade,
   with a documented restore. The encryption key and provider keys are in
   Secrets Manager and are not part of a database snapshot; a restore is
