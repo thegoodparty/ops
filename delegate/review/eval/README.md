@@ -165,7 +165,7 @@ Every `delegate eval` comment also runs this suite as a parallel job and posts t
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
 ```
 
-Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY` (score, gate and `main-short` use it for the block judge too) and `gh` auth for the target repos; the cases themselves are in the repo. Forty-six cases at three runs costs about $195 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
+Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has a non-errored file there is skipped) and the report to `<out>/report.md` and `<out>/report.json`. Needs `ANTHROPIC_API_KEY` (score, gate and `main-short` use it for the block judge too) and `gh` auth for the target repos; the cases themselves are in the repo. Forty-six cases at three runs costs about $205 (the gp-pi case is a 2,400-line diff, roughly $4 a run; the plan cases and the prompt-text case are small diffs, the prompt-text case about $2.80 a run).
 
 ### Gate
 
