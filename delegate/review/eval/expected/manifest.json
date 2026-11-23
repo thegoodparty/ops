@@ -546,5 +546,17 @@
     "split": "tune",
     "source": "production-missed",
     "kind": "bug"
+  },
+  {
+    "id": "omni-3739-silenced-alert-hides-failures",
+    "bundle": "omni-3739-silenced-alert-hides-failures.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "The front-end error alerts now count only exceptions with a stack frame in the shipped bundle, so a real user-facing failure that surfaces without one, such as a dropped chat stream or an exception the browser reports with no stack, stops alerting instead of being fixed or still reported as a log or a metric, which hides the product problem rather than solving it."
+    },
+    "tests": "omni#3739 at 1d909f2, the head Delegate approved before merge, with the title and body as they stood when production reviewed it. The PR replaces the alert rules' browser-extension denylist with SHIPPED_CODE_FRAMES, a positive LogQL line filter (`|~ \"turbopack:///|/_next/static/\"`) applied to both frontend-error-new and frontend-error-spreading, so an exception is counted only when one of its frames is in the chunk we built. The stated goal is to stop an in-page injected script paging a human, and on the measured week it drops 76 of 85 exception lines. The cost is that anything else without a bundle frame goes silent too: an exception Faro recorded with no stack at all, a browser refusing the service worker or a chunk, a third-party runtime the page depends on (a chat stream, the WebGL map) failing in its own bundle, and an error thrown by inline script in our own HTML, which the PR's own doc comment and docs/observability.md name as the trade-off. Those are user-facing failures, and the alert is the only channel that reported them; the PR's answer is to stop counting them rather than to fix the experience or keep reporting them somewhere else. Production approved this head.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "architecture"
   }
 ]
