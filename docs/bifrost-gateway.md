@@ -1288,6 +1288,16 @@ Virtual keys are Bifrost's primary governance entity
     and would never be exported at all;
   - rows of **2026-11-01 .. 2026-11-10** are not covered by any daily run but
     *are* inside the 12-01 monthly run's 30-day reach, so that run rescues them.
+  - the boundary is not exact to the day, because the two halves filter on
+    different clocks. The cleaner deletes by `created_at`
+    (`RDBLogStore.DeleteLogsBatch`, `framework/logstore/rdb.go:5235`) while the
+    export reads by `"timestamp"` (`usage-export-contract.ts`, `EXPORT_QUERY`),
+    and `created_at` is when the row was written, a moment before the request's
+    `timestamp` is stamped. A row written just before midnight on 2026-11-01 can
+    therefore be purged while the monthly run's window still nominally reaches
+    it, so treat 11-01 as a few hours either side rather than a clean edge. It
+    does not change the mitigation: the 90-day backfill covers every row in
+    existence, boundary included.
 
   That is six days of per-request cost, not the sixty the review guessed — the
   gateway is only 29 days old, so 90-day retention was never holding a quarter.

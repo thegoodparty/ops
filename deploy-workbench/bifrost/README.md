@@ -92,7 +92,8 @@ a later tag. It holds:
   deploy takes it with it. The connection fields are `env.` references to the
   task definition's `PG_*` values rather than a connection string spelled in
   this file, and `logs_store.retention_days` is explicit (30, lowered from 90 on
-  2026-11-23) because the upstream default prunes nothing. The password is the
+  2026-11-23) rather than left to the store's default, which is 0 and means no
+  retention-based cleanup at all. The password is the
   one field that is not a
   plain `env.` reference: both stores declare a `password_command`
   (`/usr/local/bin/bifrost-pg-password`, from the derived gateway image) that
