@@ -124,8 +124,10 @@ export const DATABASE_INSTANCE_CLASS = aws.rds.InstanceType.M5_Large;
  * `maxAllocatedStorage: 0` is the provider's spelling for "no autoscaling". It
  * stays off because autoscaling raises the storage bill on its own schedule
  * without telling anyone, and a logs store that outgrows 20 GiB is a signal to
- * shorten `logs_store.retention_days` or move logs to ClickHouse (both are
- * configuration) rather than to buy disk.
+ * shorten the log retention or move logs to ClickHouse (both are configuration,
+ * and the first is `config.json`'s `client.log_retention_days` — that is the
+ * setting that prunes a Postgres store; `logs_store.retention_days` is only read
+ * by the ClickHouse store at the pinned tag) rather than to buy disk.
  */
 export const DATABASE_ALLOCATED_STORAGE_GB = 20;
 export const DATABASE_STORAGE_TYPE = aws.rds.StorageType.GP3;
