@@ -258,17 +258,18 @@ DBInstanceIdentifier=bifrost-db
 
 **A high `DiskQueueDepth` with low `WriteIOPS` is not an IOPS ceiling; it is a
 stalled device.** That is the distinction this step exists to make, and the one
-the incident was first described without. On 2026-11-23 the queue reached 8.37
-while `WriteIOPS` peaked at 61 and `ReadIOPS` at 224 against a 3,000-IOPS gp3
-baseline — 2-7% of what the volume was provisioned for. A volume at its IOPS
-ceiling shows the IOPS *at* the baseline with the queue growing behind it;
-twenty writes a second with eight queued behind them means the device is taking
-hundreds of milliseconds per request, not that there are too many requests. If
-you see a deep queue **and** IOPS near 3,000, that is a real ceiling and the
-answer is provisioned IOPS, which is an open decision
-(`docs/bifrost-gateway.md`, the "RDS size and Multi-AZ" question). A deep queue
-with low IOPS is this instance's storage not keeping up, which is what the
-class change was a stopgap for.
+the incident was first described without. On 2026-11-23 the queue reached
+8.37 while `WriteIOPS` peaked at 61 and `ReadIOPS` at 224 against a 3,000-IOPS
+gp3 baseline — 2% and 7% of what the volume was provisioned for, and no higher
+than their own routine peaks, with the volume delivering less per request than it
+normally does. A volume at its IOPS ceiling shows the IOPS *at* the baseline with
+the queue growing behind it; a couple of dozen writes a second with eight queued
+behind them means the device is taking hundreds of milliseconds per request, not
+that there are too many requests. If you see a deep queue **and** IOPS near
+3,000, that is a real ceiling and the answer is provisioned IOPS, which is an
+open decision (`docs/bifrost-gateway.md`, the "RDS size and Multi-AZ" question).
+A deep queue with IOPS far below the baseline is this instance's storage not
+keeping up, which is what the class change was a stopgap for.
 
 Read the seven together, over an hour, and the shape tells you which:
 

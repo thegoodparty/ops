@@ -492,17 +492,20 @@ export const DB_MEMORY_PRESSURE_ALARM_DESCRIPTION =
 //
 // ## Why this alarm and not an IOPS or a latency alarm
 //
-// - **Not IOPS.** `ReadIOPS` peaks at 224 over the routine record and
-//   `WriteIOPS` at 61, against a 3,000-IOPS gp3 baseline: the volume was 2-7%
-//   utilised. An alarm on either would have been quiet through the whole
-//   outage, which is why describing it as "IO saturation" was wrong and why
-//   `rds.ts` says the class change was a stopgap rather than a fix.
+// - **Not IOPS.** `ReadIOPS` peaks at 224 and `WriteIOPS` at 61 against a
+//   3,000-IOPS gp3 baseline — 7% and 2% of what the volume is provisioned for.
+//   The incident's own peaks (198 and 61) were no higher than the routine ones,
+//   and its medians (29 and 12) are barely above the routine medians (11 and
+//   10): the volume was not being asked for more, it was delivering less. An
+//   alarm on either metric would have been quiet throughout, which is why
+//   describing the incident as "IO saturation" was wrong and why `rds.ts` says
+//   the class change was a stopgap rather than a fix.
 // - **Not `WriteLatency` on its own.** Its routine spikes are the same size as
 //   its incident ones: 291 ms at 2026-10-25T05:30 and 239 ms at 2026-10-23T07:10
 //   are backup-window buckets, and the incident's own peak is 441 ms. A
 //   threshold that clears the routine maximum (300 ms) is crossed by two of the
-//   incident's twenty-one buckets; there is no gap to put a threshold in, only
-//   a factor of 1.5 where `DiskQueueDepth` offers 40. It is the metric to read
+//   incident's fifteen buckets; there is no gap to put a threshold in, only a
+//   factor of 1.5 where `DiskQueueDepth` offers 40. It is the metric to read
 //   beside the queue, not one to page on.
 // - **Queue depth is the state users feel.** A request waiting on the device is
 //   a query waiting on the device, whatever the provisioned IOPS say.
@@ -540,7 +543,7 @@ export const DB_STORAGE_QUEUE_WINDOW_MINUTES =
   (DB_STORAGE_QUEUE_EVALUATION_PERIODS * ALARM_PERIOD_SECONDS) / 60;
 
 export const DB_STORAGE_QUEUE_ALARM_DESCRIPTION =
-  `The Bifrost database's storage has had ${DB_STORAGE_QUEUE_THRESHOLD} or more I/O requests queued on the device for ${DB_STORAGE_QUEUE_BREACH_MINUTES} minutes out of the last ${DB_STORAGE_QUEUE_WINDOW_MINUTES}, where its normal queue is a fraction of one. A queue that long while the volume's own IOPS are still in single digits is not a throughput ceiling: the device is slow, and every query that touches the config or log store is waiting on it, so callers see slow responses or 503s while the application logs nothing. Answer: docs/runbooks.md, "The Bifrost gateway is saturated or not serving", step 5. Read AWS/RDS DiskQueueDepth, WriteLatency, WriteIOPS and EBSByteBalance% for DBInstanceIdentifier=${DATABASE_IDENTIFIER} together: a high queue with low IOPS and a drained byte balance is the storage stalling rather than the query volume outgrowing it.`;
+  `The Bifrost database's storage has had ${DB_STORAGE_QUEUE_THRESHOLD} or more I/O requests queued on the device for ${DB_STORAGE_QUEUE_BREACH_MINUTES} minutes out of the last ${DB_STORAGE_QUEUE_WINDOW_MINUTES}, where its normal queue is a fraction of one. A queue that long while the volume's own IOPS are a small fraction of what it is provisioned for is not a throughput ceiling: the device is slow, and every query that touches the config or log store is waiting on it, so callers see slow responses or 503s while the application logs nothing. Answer: docs/runbooks.md, "The Bifrost gateway is saturated or not serving", step 5. Read AWS/RDS DiskQueueDepth, WriteLatency, WriteIOPS and EBSByteBalance% for DBInstanceIdentifier=${DATABASE_IDENTIFIER} together: a high queue with IOPS well under the volume's baseline and a drained byte balance is the storage stalling rather than the query volume outgrowing it.`;
 
 // ---------------------------------------------------------------------------
 // The topic and its policy.
