@@ -1394,7 +1394,8 @@ What genuinely remains open:
   instance's storage could not serve the gateway's reads and writes — and the
   class was raised in the console to `db.m5.large`, x86 where `t4g` was
   ARM/Graviton, to end it. `deploy-workbench/rds.ts` now declares that class so
-  an apply cannot read the console value as drift and revert it. This is a
+  a refresh and apply cannot reconcile the instance back onto the class that
+  saturated. This is a
   stopgap sized on one incident, not a measured steady state: the volume's
   provisioned IOPS and throughput, retention and Multi-AZ are still open
   decisions, and 20 GiB gp3 with autoscaling off is unchanged.

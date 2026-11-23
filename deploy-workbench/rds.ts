@@ -96,8 +96,9 @@ export const DATABASE_ENGINE_VERSION = "16";
  * practice: the gateway took an outage because the instance's storage was IO
  * saturated. The class was raised in the console to `db.m5.large` in November
  * 2026 to end it, and this constant is what makes the code agree with the
- * console — otherwise the next apply of this stack reads the console value as
- * drift and puts the instance back on the class that saturated.
+ * console. Without it, a refresh of this stack records the console's class in
+ * state and the next apply modifies the instance back to `db.t4g.micro` — the
+ * class that saturated — because the program still asks for it.
  *
  * `m5` is x86 where `t4g` was ARM/Graviton. Do not "correct" this back to a
  * `t4g` class without going through the same incident: the family change is
