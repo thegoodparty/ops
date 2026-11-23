@@ -1647,7 +1647,10 @@ describe("bifrost ecs", () => {
       [
         "client config",
         (doc) => {
-          doc.client.log_retention_days = 30;
+          // Not the committed 30, for the same reason as the logs_store case
+          // below: a live edit that equals the file's own value moves nothing
+          // and would pass without proving the leaf is live.
+          doc.client.log_retention_days = 45;
         },
       ],
       [
@@ -1682,7 +1685,10 @@ describe("bifrost ecs", () => {
       [
         "a logs_store leaf outside the connection block",
         (doc) => {
-          doc.logs_store.retention_days = 30;
+          // Any value but the committed one: this case is about the leaf being
+          // boot-only, and an edit that happened to equal the file's own value
+          // would leave the digest unmoved and fail for the wrong reason.
+          doc.logs_store.retention_days = 45;
         },
       ],
       [

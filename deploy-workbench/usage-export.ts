@@ -285,8 +285,9 @@ export const createBifrostUsageExport = (args: {
    * delete the recovery copy that versioning exists to keep, so there is not one.
    *
    * There is no expiry rule on current objects either: these files are the copy
-   * that outlives the database's 90-day retention and the record that makes any
-   * day reproducible as of any run. A day's file is well under a megabyte.
+   * that outlives the database's log retention — 30 days since 2026-11-23 — and
+   * the record that makes any day reproducible as of any run. A day's file is
+   * well under a megabyte.
    *
    * No abort-multipart rule: the export makes one `PutObject`, so a multipart rule
    * would guard a code path this design does not have. `l2_voter_files_storage.tf`

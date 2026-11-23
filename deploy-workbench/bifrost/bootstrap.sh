@@ -35,7 +35,7 @@ SETUP_TOKEN_HEADER="X-Bifrost-Setup-Token"
 # deployed gateway stayed unclaimed after phase 2 item 11 landed.
 #
 # The smallest value the write path accepts, not the repo's real retention:
-# `config.json` declares 90 days and is authoritative for it once item 10's
+# `config.json` declares 30 days and is authoritative for it once item 10's
 # `BIFROST_CONFIG` injection lands, so this script must not encode a policy of
 # its own. It only has to stop a server-supplied default from failing the
 # server's own validation.

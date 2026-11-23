@@ -385,10 +385,14 @@ Rules, each of which is a decision:
   delete path. **The timer is set once, on the transition**, and the janitor
   leaves a key that is already inactive with an expiry set alone — otherwise an
   hourly run pushes the window forward every hour and nothing is ever
-  deleted. **The retention window is 90 days**, matching the gateway's own log
-  retention: past that point the request records that make the history worth
-  keeping have rolled off anyway, and a returning person is a reactivation
-  rather than a resurrection.
+  deleted. **The retention window is 90 days.** It was chosen to match the
+  gateway's own log retention, on the argument that past that point the request
+  records that make the history worth keeping had rolled off anyway. The log
+  retention is 30 days since 2026-11-23, so the two no longer match and that
+  argument no longer holds. What holds is the grace period itself: ninety days
+  is long enough that a returning person's key, budgets and model policy are
+  reactivated rather than rebuilt. A returning person is a reactivation rather
+  than a resurrection.
 - **The janitor only ever takes access away; the mint gives it back.** It never
   reactivates a key, including when the owner is a member again. Getting a key
   back is a mint, which is the path that also clears the deletion timer

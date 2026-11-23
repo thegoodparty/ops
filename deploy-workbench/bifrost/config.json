@@ -38,13 +38,13 @@
       "max_idle_conns": 10,
       "max_open_conns": 100
     },
-    "retention_days": 90
+    "retention_days": 30
   },
   "client": {
     "enable_logging": true,
     "disable_content_logging": true,
     "allow_per_request_content_storage_override": false,
-    "log_retention_days": 90,
+    "log_retention_days": 30,
     "enforce_auth_on_inference": true,
     "allow_direct_keys": false,
     "allowed_origins": ["https://bifrost.workbench.goodparty.org"]

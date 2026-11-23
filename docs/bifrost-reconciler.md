@@ -518,10 +518,12 @@ that the `PUT` semantics do not have.
 that per-key budgets and rate limits were dropped for the first pass, on the
 argument that a number chosen before there is usage data can starve a person
 mid-task as easily as it catches a runaway. That argument has expired: the log
-store has been collecting per-request cost keyed by virtual key at 90-day
-retention (`deploy-workbench/bifrost/config.json`, `client.log_retention_days:
-90`), so the number can now be chosen from evidence rather than guessed. The
-reversal is deliberate and this paragraph is the record of it.
+store has been collecting per-request cost keyed by virtual key at a retention
+that was 90 days when this argument was made (`deploy-workbench/bifrost/config.json`,
+`client.log_retention_days: 90`; it is 30 since 2026-11-23, and the evidence it
+produced is no less evidence for having aged out of the table — the daily usage
+export carries it forward), so the number can now be chosen from evidence rather
+than guessed. The reversal is deliberate and this paragraph is the record of it.
 
 **Per-provider budgets are reconciled too** (decision 18), and they are where
 the fleet's actual cap lives: the committed template gives the `bedrock` entry
@@ -826,7 +828,7 @@ discovered by whoever needed it.
 Recorded in full under "Budgets and rate limits". Rejected alternative: the
 status quo, per-key budgets deferred, with the account budget as the only cap.
 That was right when there was no usage data and is wrong now that the log store
-has a quarter of it at 90-day retention.
+has a quarter of it at the 90-day retention it then used.
 
 ### 14. Rollback is a revert plus a tick
 
@@ -882,8 +884,10 @@ This is decision 13's argument applied one level down, and the reason it is a
 decision rather than a field: the same objection `#404` raised — that a number
 chosen without usage data is a guess that can starve somebody mid-task — applied
 here too, and it has expired in the same way. The log store has been collecting
-per-request cost keyed by virtual key at 90-day retention
-(`deploy-workbench/bifrost/config.json`, `client.log_retention_days: 90`), so
+per-request cost keyed by virtual key at the 90-day retention it then had
+(`deploy-workbench/bifrost/config.json`, `client.log_retention_days: 90`; 30
+since 2026-11-23, with the history the evidence was read from carried forward by
+the daily usage export), so
 $1500 is read off a quarter of evidence rather than invented. It is also a
 per-provider number and not a fleet-wide one for a reason the evidence supports:
 Bedrock is where the expensive models are, and a person who has exhausted
