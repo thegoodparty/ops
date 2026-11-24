@@ -244,4 +244,32 @@ describe("bifrost usage export", () => {
     assert.ok(SOURCE.includes('const EXPORT_PREFIX = "bifrost/logs"'));
     assert.ok(SOURCE.includes('const USAGE_EXPORT_READER_ROLE_NAME = "bifrost-usage-export-reader"'));
   });
+
+  it("admits the swarm host's write as a cross-account statement, on the two prefixes only", () => {
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const write = policy.slice(policy.indexOf("SwarmHostWriteExportObjects"));
+    assert.ok(write.length > 0, "the bucket policy must carry the swarm host's write");
+    assert.ok(
+      write.includes("INFRASTRUCTURE_ACCOUNT_ID"),
+      "the swarm host is in the infrastructure account, so the principal has to name it",
+    );
+    assert.ok(write.includes('"aws:PrincipalArn": swarmHostRoleArn'));
+    assert.ok(
+      !/\bGet|List|Delete/.test(write.slice(0, write.indexOf("}") + 400)),
+      "the grant is write only: no read, no list, no delete",
+    );
+  });
+
+  it("reads the swarm's two prefixes with the same Databricks role", () => {
+    // One statement per action over one list, so a prefix cannot be granted the
+    // objects half and miss the list half: that fails as an empty day rather than
+    // an error.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    assert.ok(policy.includes("READ_PREFIXES"));
+    assert.ok(SOURCE.includes('const SWARM_EXPORT_PREFIXES = ["delegate-swarm/session-cost", "delegate-swarm/task-edge"]'));
+    assert.ok(SOURCE.includes("const READ_PREFIXES = [EXPORT_PREFIX, ...SWARM_EXPORT_PREFIXES]"));
+    // And the terraform external location must be a sibling of bifrost/logs, not
+    // inside it.
+    assert.ok(!SOURCE.includes("bifrost/logs/delegate-swarm"));
+  });
 });

@@ -39,6 +39,10 @@ systemctl enable agent-swarm.service
 # up.sh opens it as ec2-user; a copy root created first would lock it out.
 [[ -e "$DEST/.deploy.lock" ]] || install -o ec2-user -g ec2-user -m 644 /dev/null "$DEST/.deploy.lock"
 systemctl enable --now agent-swarm-disk-cleanup.timer
+# Idempotent, so this reruns on every host deploy. Without it the exporter is
+# installed and never scheduled: every unit is copied above, and a copy alone
+# does not make systemd run it.
+systemctl enable --now agent-swarm-usage-export.timer
 
 # A new host is installed before anyone has filled the secret. Leave the
 # stack down until they have, but still fail on any other error.

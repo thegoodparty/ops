@@ -114,6 +114,55 @@ sudo df -h /var/lib/docker; sudo df -i /var/lib/docker
 sudo systemctl start agent-swarm-disk-cleanup; journalctl -u agent-swarm-disk-cleanup -n 5
 ```
 
+## Usage export
+
+The swarm's model spend is read out of `session_costs` once a day and landed in
+S3 for the finance dashboard, because the swarm calls Fireworks directly and never
+reaches the Bifrost gateway, so its spend cannot be reconstructed from the
+gateway's logs. `export-usage.ts` runs as root from
+`agent-swarm-usage-export.timer` at 09:15 UTC, an hour and a quarter before the
+data volume's 10:00 snapshot. `install.sh` enables the timer, so a host deploy
+schedules it; a copy of the files alone would not.
+
+It writes two files per run, one per table, into the bucket the Bifrost usage
+export already owns:
+
+- `s3://goodparty-workbench-bifrost-usage/delegate-swarm/session-cost/session-cost-<stamp>.ndjson`
+- `s3://goodparty-workbench-bifrost-usage/delegate-swarm/task-edge/task-edge-<stamp>.ndjson`
+
+JSON Lines, one object per row, keys equal to the landing column names. The
+stamp is the run's UTC start, and every row carries it as `exported_at`, so a
+file's name and its rows agree. A daily run re-reads 7 days and a run on the
+first of the month re-reads 90, because a cost row can be written after a run has
+read the ledger and a task deletion can null a row's `task_id`. Each run writes
+new keys with a conditional PUT, so a file is never replaced.
+
+The database is opened read-only, where it lives in
+`/var/lib/docker/volumes/agent-swarm_swarm_api_data/_data/`, found through
+`docker volume inspect` rather than a hardcoded path. Both statements run inside
+one read transaction, so the cost and edge files come from one snapshot. The
+database is never copied: a copy of a live WAL database is a torn read.
+
+A failed run is a failed systemd unit and nothing else. It is not alarmed and the
+page is the only place a gap shows, so:
+
+```sh
+systemctl status agent-swarm-usage-export.timer
+sudo systemctl start agent-swarm-usage-export; journalctl -u agent-swarm-usage-export -n 50
+```
+
+The exit is non-zero on a database that is missing or lacks a column, and on a
+prefix it cannot write to. A run that finds its own key already there exits zero
+with `already exists` in the log: that is a rerun inside the same second, or a
+rerun of a run that already succeeded.
+
+The files carry no task text, no prompt, no output and no credential. What they do
+carry is agent names and cost. The write grant is on the host's own instance
+profile, so a process on this host that can reach IMDS can write a plausible file
+into those two prefixes, and a fabricated one cannot be told from a real one.
+That is an accepted v1 exposure rather than an oversight; the conditional PUT is
+what stays behind it.
+
 ## Connect
 
 The instance id is the stack output `delegateSwarmInstanceId`

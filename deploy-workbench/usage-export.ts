@@ -3,7 +3,7 @@ import * as aws from "@pulumi/aws";
 import * as esbuild from "esbuild";
 import * as path from "node:path";
 
-import { MANAGEMENT_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
+import { INFRASTRUCTURE_ACCOUNT_ID, MANAGEMENT_ACCOUNT_ID, WORKBENCH_ACCOUNT_ID } from "../utils/accounts";
 import { LAMBDA_VPC_ACCESS_MANAGED_POLICY_ARN } from "./bifrost-vk-mint";
 import {
   USAGE_EXPORT_ALERT_TOPIC_NAME,
@@ -115,6 +115,42 @@ const EXPORT_PREFIX = "bifrost/logs";
  * and a `COPY INTO` that cannot read.
  */
 const USAGE_EXPORT_READER_ROLE_NAME = "bifrost-usage-export-reader";
+
+/**
+ * The swarm host's role, in the infrastructure account. The same string
+ * `deploy-infrastructure/agent-swarm.ts` gives its role, and pinned equal by
+ * `usage-export.test.ts`.
+ */
+const SWARM_HOST_ROLE_NAME = "delegate-swarm-host";
+
+/**
+ * The two prefixes the swarm's exporter writes, one per table.
+ *
+ * One prefix per table and not one shared prefix, because `COPY INTO` reads a
+ * whole prefix: a shared one would make each table's load read the other table's
+ * file and fail on the columns it does not have. Both sit under
+ * `delegate-swarm/`, a sibling of `bifrost/logs` rather than a child of it,
+ * because Unity Catalog refuses an external location nested in another.
+ *
+ * Pinned equal to `SWARM_USAGE_EXPORT_PREFIXES` in
+ * `deploy-infrastructure/agent-swarm.ts` by `usage-export.test.ts` and by a test
+ * on that side: the exporter's own test pins the paths it writes, so a rename has
+ * to travel through all three.
+ */
+const SWARM_EXPORT_PREFIXES = ["delegate-swarm/session-cost", "delegate-swarm/task-edge"];
+
+/**
+ * Everything the Databricks reader role may read here, which is the gateway's
+ * prefix and the swarm's two.
+ *
+ * The read grant is widened rather than duplicated so there is one statement per
+ * action: the loader reads each prefix through one Unity Catalog external
+ * location per table, and both halves of a prefix-scoped read (the objects and
+ * the `ListBucket` on the prefix) then cover the same list. A prefix added to one
+ * statement and not the other fails as a listing that returns nothing, which
+ * looks like an empty day rather than a permission error.
+ */
+const READ_PREFIXES = [EXPORT_PREFIX, ...SWARM_EXPORT_PREFIXES];
 
 /** Bundle the export handler the way the two existing functions bundle theirs. */
 export const buildUsageExportCode = (): pulumi.asset.AssetArchive => {
@@ -302,25 +338,52 @@ export const createBifrostUsageExport = (args: {
   );
 
   /**
-   * The bucket policy: read-only, for one role in the management account.
+   * The bucket policy: read-only for one role in the management account, and a
+   * write-only statement for the swarm host in the infrastructure account.
    *
-   * Two statements because S3 needs both halves of a prefix-scoped read: an object
-   * action on the objects and `ListBucket` on the bucket itself. The list is
-   * `s3:prefix`-conditioned, so the credential cannot enumerate the bucket, only
-   * the one prefix it is given.
+   * Two statements for the read because S3 needs both halves of a prefix-scoped
+   * read: an object action on the objects and `ListBucket` on the bucket itself.
+   * The list is `s3:prefix`-conditioned, so the credential cannot enumerate the
+   * bucket, only the one prefix it is given.
    *
    * The principal is the account root with an `ArnEquals aws:PrincipalArn`
    * condition rather than the role ARN as `Principal`. See the module header: S3
    * validates named principals, so the role cannot be named before it exists, and
    * the condition is exactly as narrow.
+   *
+   * ## The swarm host's write, and why it is a bucket-policy statement too
+   *
+   * The delegate swarm exporter writes two of its own prefixes here
+   * (`delegate-swarm/session-cost/` and `delegate-swarm/task-edge/`; see
+   * `agent-swarm/host/export-usage-core.ts`). Its role lives in the
+   * infrastructure account, so this is a cross-account write: both sides of the
+   * request are evaluated, and the identity grant in
+   * `deploy-infrastructure/agent-swarm.ts` alone would be refused by this bucket.
+   *
+   * `s3:PutObject` only. No read, no list, no delete, and no version permission:
+   * the exporter writes a new key per run and never reads one back. The
+   * conditional PUT it uses (`IfNoneMatch: "*"`) is what stops a key being
+   * replaced, and versioning behind that is the recovery copy.
+   *
+   * Object ownership is the default `BucketOwnerEnforced` for a bucket created
+   * today, which is what makes this writable without an ACL: the object belongs
+   * to this account whatever the writer's. It also means the Databricks role
+   * reads the swarm's objects under the same statement as the gateway's, so the
+   * two new prefixes need no second grant on the read side.
    */
   new aws.s3.BucketPolicy(
     "bifrostUsageExportBucketPolicy",
     {
       bucket: bucket.id,
       policy: pulumi
-        .all([bucket.arn, pulumi.output(`arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/${USAGE_EXPORT_READER_ROLE_NAME}`)])
-        .apply(([bucketArn, roleArn]) =>
+        .all([
+          bucket.arn,
+          pulumi.output(`arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:role/${USAGE_EXPORT_READER_ROLE_NAME}`),
+          pulumi.output(
+            `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:role/${SWARM_HOST_ROLE_NAME}`,
+          ),
+        ])
+        .apply(([bucketArn, roleArn, swarmHostRoleArn]) =>
           JSON.stringify({
             Version: "2012-10-17",
             Statement: [
@@ -329,7 +392,7 @@ export const createBifrostUsageExport = (args: {
                 Effect: "Allow",
                 Principal: { AWS: `arn:aws:iam::${MANAGEMENT_ACCOUNT_ID}:root` },
                 Action: ["s3:GetObject", "s3:GetObjectVersion"],
-                Resource: `${bucketArn}/${EXPORT_PREFIX}/*`,
+                Resource: READ_PREFIXES.map((prefix) => `${bucketArn}/${prefix}/*`),
                 Condition: { ArnEquals: { "aws:PrincipalArn": roleArn } },
               },
               {
@@ -340,7 +403,9 @@ export const createBifrostUsageExport = (args: {
                 Resource: bucketArn,
                 Condition: {
                   ArnEquals: { "aws:PrincipalArn": roleArn },
-                  StringLike: { "s3:prefix": [`${EXPORT_PREFIX}/*`, EXPORT_PREFIX] },
+                  StringLike: {
+                    "s3:prefix": READ_PREFIXES.flatMap((prefix) => [prefix, `${prefix}/*`]),
+                  },
                 },
               },
               {
@@ -355,6 +420,18 @@ export const createBifrostUsageExport = (args: {
                 Action: "s3:GetBucketLocation",
                 Resource: bucketArn,
                 Condition: { ArnEquals: { "aws:PrincipalArn": roleArn } },
+              },
+              {
+                // The swarm host's exporter. Cross-account, so this bucket has to
+                // allow it as well as the host role; see the comment above. Write
+                // only, on the two prefixes and never the bucket itself, so the
+                // host cannot enumerate what is there.
+                Sid: "SwarmHostWriteExportObjects",
+                Effect: "Allow",
+                Principal: { AWS: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:root` },
+                Action: "s3:PutObject",
+                Resource: SWARM_EXPORT_PREFIXES.map((prefix) => `${bucketArn}/${prefix}/*`),
+                Condition: { ArnEquals: { "aws:PrincipalArn": swarmHostRoleArn } },
               },
             ],
           }),

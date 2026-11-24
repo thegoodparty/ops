@@ -53,6 +53,48 @@ export const panelRepliesPutStatement = {
   ],
 };
 
+// The delegate swarm usage export writes here, one prefix per table, into the
+// bucket the Bifrost usage export already owns in the workbench account. The
+// bucket lives there and this role lives in the infrastructure account, so the
+// write is cross-account: this grant alone is not enough, and the other half is
+// `SwarmHostWriteExportObjects` in `deploy-workbench/usage-export.ts`.
+//
+// Both halves have to name the same strings, and a drift between them is not an
+// apply failure: it is a PUT the host is allowed to make by its own policy and
+// refused by the bucket's, which reads as an exporter that cannot write. The
+// bucket name here is pinned equal to `BUCKET_NAME` there by
+// `agent-swarm.test.ts`, which reads that file's source.
+export const SWARM_USAGE_EXPORT_BUCKET = "goodparty-workbench-bifrost-usage";
+export const SWARM_USAGE_EXPORT_PREFIXES = [
+  "delegate-swarm/session-cost",
+  "delegate-swarm/task-edge",
+];
+
+/**
+ * The exporter's write grant, on the host role the swarm's own containers
+ * already reach through IMDS.
+ *
+ * No separate publisher identity, deliberately, and this is what the grant means
+ * in one sentence: **the prefix trusts its writer, so a fabricated object in
+ * these two prefixes cannot be told from a real one.** Any process on that host
+ * that can fetch the instance role's credentials can write a plausible spend
+ * file, and the loader would accept it. That is accepted for v1 rather than
+ * designed away because the same principal already holds the production-read
+ * role, the ClickUp and Grafana tokens and the GitHub App key, so forging spend
+ * rows is not the largest thing reachable from that box; it is only the quietest.
+ * The mitigations that stay are the conditional PUT, so an existing key can never
+ * be replaced, and versioning behind it. Adding a publisher identity later is
+ * additive and needs no change to the export.
+ */
+export const swarmUsageExportPutStatement = {
+  Sid: "PutSwarmUsageExport",
+  Effect: "Allow",
+  Action: "s3:PutObject",
+  Resource: SWARM_USAGE_EXPORT_PREFIXES.map(
+    (prefix) => `arn:aws:s3:::${SWARM_USAGE_EXPORT_BUCKET}/${prefix}/*`,
+  ),
+};
+
 // Read-only access to CloudWatch Logs across this account, plus alarms and
 // metrics, so the swarm can triage infrastructure-account incidents the way it
 // does in the main account. Same-account grant on the host role, so no
@@ -155,6 +197,7 @@ export const swarmHostPolicy = (secretArn: string, bucketArn: string) => ({
       Resource: `${bucketArn}/ssm-output/*`,
     },
     panelRepliesPutStatement,
+    swarmUsageExportPutStatement,
     ...infraLogsReadStatements,
     diskMetricsPutStatement,
     {
