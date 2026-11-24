@@ -20,7 +20,9 @@ KV key `handoff:<outreachId>` holds `state` (`new`, `building`, `built`, `schedu
 `replies_uploaded`, `needs_human`), `campaignName`, `sendAt`, `repliesDueAt`
 (`sendAt` + 48h), `slackTs`, `attempts` (with `attemptsFor`, the action the tick
 counted them for; leave both alone). `tevyn-handoffs-new` wrote the claim: `{state:'new',
-slackTs, channel, sendAt, timeZone, mode, message, recipientCount}`. Always read the record, change fields,
+slackTs, channel, sendAt, timeZone, mode, message, recipientCount}`, or for a wave
+gp-api builds through the Scale to Win API `{state:'built', handler:'api', ...}` with
+the same fields. Always read the record, change fields,
 and write it back whole. Never drop `slackTs` or any other field.
 
 Write the record after every step, and before every irreversible click, so a rerun
