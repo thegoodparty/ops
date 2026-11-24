@@ -260,6 +260,22 @@ describe("bifrost usage export", () => {
     );
   });
 
+  it("requires the conditional PUT in the grant, not only in the script", () => {
+    // The store refuses an overwrite for every caller holding the host role, not
+    // only for the exporter that remembers the header. `s3:if-none-match` is a
+    // condition key on PutObject.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const write = policy.slice(policy.indexOf("SwarmHostWriteExportObjects"));
+    assert.ok(
+      write.includes('StringEquals: { "s3:if-none-match": "*" }'),
+      "the swarm writer must be required to send If-None-Match: *",
+    );
+    // And the exporter does send it, so the condition cannot refuse its own run.
+    const aws = fs.readFileSync(path.resolve(__dirname, "../agent-swarm/host/export-usage-aws.ts"), "utf8");
+    assert.ok(aws.includes('"--if-none-match"'));
+    assert.match(aws, /"--if-none-match",\s*"\*"/);
+  });
+
   it("reads the swarm's two prefixes with the same Databricks role", () => {
     // One statement per action over one list, so a prefix cannot be granted the
     // objects half and miss the list half: that fails as an empty day rather than

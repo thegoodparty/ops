@@ -277,11 +277,26 @@ describe("export usage: the landed files", () => {
 });
 
 describe("export usage: the window", () => {
-  it("reads seven days daily and ninety on the first of the month", () => {
+  it("reads seven days daily and ninety on any of the month's first three days", () => {
     assert.equal(windowDaysFor(new Date("2026-11-23T09:15:00Z")), DAILY_WINDOW_DAYS);
+    assert.equal(windowDaysFor(new Date("2026-11-30T09:15:00Z")), DAILY_WINDOW_DAYS);
+    // The timer is `Persistent=true`, so a run missed while the host was down
+    // catches up on the next boot. Keying only on the 1st would make that catch-up
+    // a 7 day read and push the month's repair out another month.
     assert.equal(windowDaysFor(new Date("2026-12-01T09:15:00Z")), MONTHLY_WINDOW_DAYS);
+    assert.equal(windowDaysFor(new Date("2026-12-02T14:02:00Z")), MONTHLY_WINDOW_DAYS);
+    assert.equal(windowDaysFor(new Date("2026-12-03T23:59:00Z")), MONTHLY_WINDOW_DAYS);
+    assert.equal(windowDaysFor(new Date("2026-12-04T00:00:00Z")), DAILY_WINDOW_DAYS);
     assert.equal(DAILY_WINDOW_DAYS, 7);
     assert.equal(MONTHLY_WINDOW_DAYS, 90);
+  });
+
+  it("binds the window's lower bound once per arm, from one instant", () => {
+    // The edge statement's second arm has to use the same instant as the cost
+    // statement: a second clock read could put a task outside its own edge query.
+    const since = "2026-11-16T09:15:00.000Z";
+    assert.deepEqual(EXPORTS[0].params(since), [since]);
+    assert.deepEqual(EXPORTS[1].params(since), [since, since]);
   });
 
   it("bounds the window from the run's own start", () => {
@@ -289,6 +304,47 @@ describe("export usage: the window", () => {
       windowStart(new Date("2026-11-23T09:15:00.000Z"), 7),
       "2026-11-16T09:15:00.000Z",
     );
+  });
+
+  it("exports a referenced task whose own creation predates the window", () => {
+    // The dangling-edge case: a task created before the window that is still
+    // costing money inside it. Filtering on the task's own createdAt alone would
+    // export the cost row and not its edge, and on the first run there is no
+    // earlier file to fill the gap.
+    const databasePath = withFixture((db) => {
+      db.exec(`
+        INSERT INTO agents (id, name, createdAt) VALUES ('agent-1', 'coder', '2026-10-01T00:00:00.000Z');
+        INSERT INTO agent_tasks (id, agentId, task, status, parentTaskId, dispatchedByTaskId, createdAt) VALUES
+          ('task-ancient', 'agent-1', 'ancestor text', 'completed', NULL, NULL, '2026-10-01T00:00:00.000Z'),
+          ('task-long', 'agent-1', 'a long running task', 'running', 'task-ancient', NULL, '2026-11-10T00:00:00.000Z'),
+          ('task-fresh', 'agent-1', 'a new task', 'pending', NULL, NULL, '2026-11-22T11:00:00.000Z');
+        INSERT INTO session_costs (
+          id, sessionId, taskId, agentId, totalCostUsd, durationMs, numTurns, model,
+          isError, costSource, createdAt
+        ) VALUES ('cost-long', 'session-long', 'task-long', 'agent-1', 0.75, 10, 1, 'm', 0, 'priced', '2026-11-22T12:00:00.000Z');
+      `);
+    });
+    const { deps, puts } = harness({ databasePath });
+    runExport(deps);
+
+    const costs = parse(puts[0].body);
+    assert.deepEqual(costs.map((row) => row.id), ["cost-long"]);
+    const edges = parse(puts[1].body);
+    // The referenced task is exported even though it was created 13 days before
+    // the run. So is the task created inside the window. The referenced task's
+    // own parent is not: an ancestor outside the window is the residue the deltas
+    // accept, and earlier runs' files fill it.
+    assert.deepEqual(edges.map((row) => row.task_id), ["task-long", "task-fresh"]);
+    assert.equal(edges[0].parent_task_id, "task-ancient");
+    // Ordering is unchanged, so two runs still agree byte for byte.
+    assert.deepEqual(
+      edges.map((row) => row.created_at),
+      [...edges.map((row) => row.created_at)].sort(),
+    );
+    // Every cost row's task now has an edge in the same file, which is the point.
+    for (const cost of costs) {
+      assert.ok(edges.some((edge) => edge.task_id === cost.task_id), String(cost.task_id));
+    }
   });
 
   it("leaves a row older than the window out of the file, and one inside it in", () => {

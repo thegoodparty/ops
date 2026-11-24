@@ -132,10 +132,17 @@ export already owns:
 
 JSON Lines, one object per row, keys equal to the landing column names. The
 stamp is the run's UTC start, and every row carries it as `exported_at`, so a
-file's name and its rows agree. A daily run re-reads 7 days and a run on the
-first of the month re-reads 90, because a cost row can be written after a run has
-read the ledger and a task deletion can null a row's `task_id`. Each run writes
-new keys with a conditional PUT, so a file is never replaced.
+file's name and its rows agree. A daily run re-reads 7 days and a run on any of
+the month's first three days re-reads 90, because a cost row can be written after
+a run has read the ledger and a task deletion can null a row's `task_id`. The
+wider window covers three days rather than one because the timer is persistent: a
+run missed while the host was down catches up on the next boot, and a catch-up on
+the 2nd still does the month's repair. Each run writes new keys with a
+conditional PUT, so a file is never replaced.
+
+The edge file carries every task created in the window plus every task that
+window's cost rows reference, which is why a long-running task created before the
+window still gets an edge row.
 
 The database is opened read-only, where it lives in
 `/var/lib/docker/volumes/agent-swarm_swarm_api_data/_data/`, found through

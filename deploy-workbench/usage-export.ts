@@ -361,9 +361,10 @@ export const createBifrostUsageExport = (args: {
    * `deploy-infrastructure/agent-swarm.ts` alone would be refused by this bucket.
    *
    * `s3:PutObject` only. No read, no list, no delete, and no version permission:
-   * the exporter writes a new key per run and never reads one back. The
-   * conditional PUT it uses (`IfNoneMatch: "*"`) is what stops a key being
-   * replaced, and versioning behind that is the recovery copy.
+   * the exporter writes a new key per run and never reads one back. The statement
+   * carries `StringEquals s3:if-none-match: "*"`, so the conditional write is
+   * required by the grant and not only chosen by the script. Versioning behind
+   * that is the recovery copy.
    *
    * Object ownership is the default `BucketOwnerEnforced` for a bucket created
    * today, which is what makes this writable without an ACL: the object belongs
@@ -426,12 +427,26 @@ export const createBifrostUsageExport = (args: {
                 // allow it as well as the host role; see the comment above. Write
                 // only, on the two prefixes and never the bucket itself, so the
                 // host cannot enumerate what is there.
+                //
+                // The `s3:if-none-match` condition is deliberate, and it is what
+                // makes "a run never replaces a file" true of the grant rather
+                // than of one script. It requires every PUT under these prefixes
+                // to carry `If-None-Match: *`, so the store refuses an overwrite
+                // for any caller holding the host role, not only for the exporter
+                // that remembers the header. The cost of that is a future writer
+                // with a different code path being refused with a 412 it does not
+                // expect; a 412 here therefore means "that key already exists",
+                // never "permission denied", and the reader of a 412 should check
+                // the key before the policy.
                 Sid: "SwarmHostWriteExportObjects",
                 Effect: "Allow",
                 Principal: { AWS: `arn:aws:iam::${INFRASTRUCTURE_ACCOUNT_ID}:root` },
                 Action: "s3:PutObject",
                 Resource: SWARM_EXPORT_PREFIXES.map((prefix) => `${bucketArn}/${prefix}/*`),
-                Condition: { ArnEquals: { "aws:PrincipalArn": swarmHostRoleArn } },
+                Condition: {
+                  ArnEquals: { "aws:PrincipalArn": swarmHostRoleArn },
+                  StringEquals: { "s3:if-none-match": "*" },
+                },
               },
             ],
           }),

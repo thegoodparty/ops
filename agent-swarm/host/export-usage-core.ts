@@ -159,7 +159,24 @@ LEFT JOIN agents ag ON ag.id = sc.agentId
 WHERE sc.createdAt >= ?
 ORDER BY sc.createdAt, sc.id`;
 
-/** The edge statement. Six columns, and `ORDER BY` so two runs of the same ledger agree byte for byte. */
+/**
+ * The edge statement. Six columns, and `ORDER BY` so two runs of the same ledger
+ * agree byte for byte.
+ *
+ * Two predicates rather than one, and the second is not decoration. Filtering on
+ * the task's own `createdAt` alone exports an edge for every task created in the
+ * window and none for a task that was created before it but is still costing
+ * money: a long-running task, or a child dispatched more than a week after its
+ * parent. On the very first run, whose file is the only one that exists, such a
+ * cost row would land with no edge at all and the file would not describe
+ * itself, which is the dangling edge the single read transaction exists to
+ * prevent. So the second arm takes every task the window's cost rows reference,
+ * whatever its own creation date.
+ *
+ * The parent chain beyond that is deliberately not walked: an ancestor outside
+ * the window is the residue `03-phase2-deltas.md` item 13 accepts in writing, and
+ * the append-only landing fills it from earlier runs.
+ */
 export const TASK_EDGE_SQL = `SELECT
   t.id                  AS task_id,
   t.parentTaskId        AS parent_task_id,
@@ -168,6 +185,7 @@ export const TASK_EDGE_SQL = `SELECT
   t.createdAt           AS created_at
 FROM agent_tasks t
 WHERE t.createdAt >= ?
+   OR t.id IN (SELECT taskId FROM session_costs WHERE taskId IS NOT NULL AND createdAt >= ?)
 ORDER BY t.createdAt, t.id`;
 
 export type ExportTable = {
@@ -178,6 +196,8 @@ export type ExportTable = {
   readonly prefix: string;
   readonly columns: readonly string[];
   readonly sql: string;
+  /** The statement's bound parameters, given the window's lower bound. */
+  readonly params: (since: string) => string[];
 };
 
 export const EXPORTS: readonly ExportTable[] = [
@@ -187,6 +207,7 @@ export const EXPORTS: readonly ExportTable[] = [
     prefix: SESSION_COST_PREFIX,
     columns: SESSION_COST_COLUMNS,
     sql: SESSION_COST_SQL,
+    params: (since) => [since],
   },
   {
     table: "task_edge",
@@ -194,6 +215,10 @@ export const EXPORTS: readonly ExportTable[] = [
     prefix: TASK_EDGE_PREFIX,
     columns: TASK_EDGE_COLUMNS,
     sql: TASK_EDGE_SQL,
+    // Bound twice, once per arm. The second arm has to use the same instant as
+    // the cost statement, not a second clock read, or a row written between them
+    // could be referenced by the file and outside its edge query.
+    params: (since) => [since, since],
   },
 ];
 
@@ -219,12 +244,23 @@ export const objectKey = (table: ExportTable, startedAt: Date): string =>
   `${table.prefix}/${table.stem}-${compactStamp(startedAt)}.ndjson`;
 
 /**
- * The window this run reads: ninety days on the first of the month, seven on
- * every other day. Decided from the run's UTC start, so the object key and the
- * window always come from the same instant.
+ * The first day of the month on which the wide read runs. Days 1 to 3 rather than
+ * the 1st alone: the timer is `Persistent=true`, so a run missed while the host
+ * was down catches up on the next boot. Keying only on the 1st would make that
+ * catch-up a 7 day read, and the month's 90 day repair would then wait another
+ * month, so a cost row corrected in the meantime would age out unhealed.
+ */
+const MONTHLY_WINDOW_FIRST_DAYS = 3;
+
+/**
+ * The window this run reads: ninety days on any of the month's first three days,
+ * seven on every other day. Decided from the run's UTC start, so the object key
+ * and the window always come from the same instant.
  */
 export const windowDaysFor = (startedAt: Date): number =>
-  startedAt.getUTCDate() === 1 ? MONTHLY_WINDOW_DAYS : DAILY_WINDOW_DAYS;
+  startedAt.getUTCDate() <= MONTHLY_WINDOW_FIRST_DAYS
+    ? MONTHLY_WINDOW_DAYS
+    : DAILY_WINDOW_DAYS;
 
 /**
  * The lower bound of the window, in the `strftime('%Y-%m-%dT%H:%M:%fZ')` shape
@@ -328,7 +364,9 @@ export const runExport = (deps: ExporterDeps): ExportOutcome => {
   let rowsByTable: Record<string, Record<string, unknown>[]>;
   try {
     rowsByTable = deps.readSnapshot((reader) =>
-      Object.fromEntries(EXPORTS.map((table) => [table.table, reader.query(table.sql, [since])])),
+      Object.fromEntries(
+        EXPORTS.map((table) => [table.table, reader.query(table.sql, table.params(since))]),
+      ),
     );
   } catch (error) {
     // No object is written for either table: a half-read ledger is not a file.
