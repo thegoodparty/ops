@@ -96,6 +96,14 @@ const SERVED_BEDROCK_PREFIX = "global.";
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
 
+/**
+ * The System One Decisions model, as Fireworks documents it. It is a `models/`
+ * id with no `-us` router suffix: Fireworks' US-only *routers* are a separate
+ * family, and Rune is documented as running on US capacity with no such id
+ * (https://docs.fireworks.ai/api-reference/post-systemone).
+ */
+const RUNE_MODEL_ID = "accounts/fireworks/models/rune";
+
 const providerConfigs = (template: Template): ProviderConfigEntry[] => {
   const entries = template.provider_configs;
   assert.ok(
@@ -169,6 +177,17 @@ describe("bifrost virtual-key template", () => {
             US_FIREWORKS_ROUTER,
             `${model} is not a US-only Fireworks router id, or an alias of one; use accounts/fireworks/routers/<model>-us`,
           );
+        } else if (entry.provider === "fireworks-rune") {
+          // The Decisions model is not a chat model and has no `-us` router id:
+          // Fireworks documents it as `accounts/fireworks/models/rune` and says
+          // it runs on US capacity, with no US-only premium. Residency here is
+          // the provider's endpoint instead, which the loop below pins to the
+          // same US-only host as `fireworks`.
+          assert.deepEqual(
+            entry.allowed_models,
+            [RUNE_MODEL_ID],
+            `${entry.provider} must allow exactly the System One Decisions model`, 
+          );
         }
       }
     }
@@ -179,12 +198,21 @@ describe("bifrost virtual-key template", () => {
     // and quietly point a key elsewhere.
     const config = loadConfig();
     for (const [provider, configured] of Object.entries(config.providers ?? {})) {
-      if (provider === "fireworks") continue;
+      if (provider === "fireworks" || provider === "fireworks-rune") continue;
       assert.ok(
         configured.network_config?.base_url === undefined,
-        `${provider} carries a base_url in config.json; only the Fireworks endpoint is a reviewed decision`,
+        `${provider} carries a base_url in config.json; only the Fireworks endpoints are a reviewed decision`,
       );
     }
+
+    // The second Fireworks provider is on the same US-only endpoint. That is
+    // the whole of its residency rule, since its model id has no `-us` router
+    // suffix to check: the endpoint is what keeps the traffic in the US.
+    assert.equal(
+      config.providers?.["fireworks-rune"]?.network_config?.base_url,
+      "https://us.api.fireworks.ai/inference",
+      "fireworks-rune must serve the Decisions model from the US-only endpoint",
+    );
   });
 
   it("allows exactly the models config.json allows, provider for provider", () => {

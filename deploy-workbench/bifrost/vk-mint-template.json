@@ -25,6 +25,11 @@
         "coordinator-default"
       ],
       "key_ids": ["*"]
+    },
+    {
+      "provider": "fireworks-rune",
+      "allowed_models": ["accounts/fireworks/models/rune"],
+      "key_ids": ["*"]
     }
   ]
 }

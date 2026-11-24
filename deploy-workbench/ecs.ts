@@ -733,18 +733,22 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * is in git. Nothing secret is lost, and `describe-parameter` stays a way to
  * see what the gateway is actually running with.
  *
- * Standard tier, which holds 4 KiB. The file is 3,604 bytes today, so there are
- * **492 bytes** of headroom, not the couple of kilobytes an earlier version of
- * this comment claimed. Most of that room was recovered rather than always
- * there: the file was 4,085 bytes, 11 bytes under the ceiling, until the three
- * Fireworks alias descriptions moved into
- * `docs/bifrost-fireworks-model-metadata.md` on 2026-11-10. Every addition is
- * still a deliberate byte budget. Past 4 KiB this needs `tier: "Advanced"`
- * explicitly (8 KiB, and AWS charges for it), because the provider would
- * otherwise fail the apply rather than truncate.
- * `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES` below pins the ceiling and
- * `ecs.test.ts` fails the suite before the file crosses it, so the next person
- * to add a provider finds out here rather than in a failed apply.
+ * **Advanced tier, since the Decisions provider.** The file was 3,604 bytes
+ * against the standard tier's 4 KiB until `fireworks-rune` and its pricing
+ * override landed; it is 4,474 bytes now, so the standard tier would reject
+ * `PutParameter`. The tier is therefore set explicitly to `Advanced` (8 KiB,
+ * charged) rather than left to the provider's default, which is what the
+ * previous version of this comment named as the escape. That leaves
+ * **3,718 bytes** of headroom under 8 KiB; `BIFROST_CONFIG_PARAMETER_TIER` below
+ * is the value the parameter is created with and
+ * `BIFROST_CONFIG_PARAMETER_BYTES` is the ceiling `ecs.test.ts` now pins, so the
+ * next person to add a provider finds out here rather than in a failed apply.
+ *
+ * Neither half fits the old headroom on its own, which is why the tier moved
+ * rather than the content: the provider block is 471 bytes and the override 399,
+ * against 492 bytes of standard-tier headroom. Making them fit would have meant
+ * reformatting entries this change does not touch, which is churn a reviewer
+ * cannot check against anything.
  *
  * The leading slash is not decoration: SSM rejects a hierarchical name that is
  * not fully qualified, so `PutParameter` fails with "Parameter name must be a
@@ -757,16 +761,35 @@ export const BIFROST_CONFIG_ENV_NAME = "BIFROST_CONFIG";
 export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
 
 /**
+ * The parameter's tier. `Advanced` holds 8 KiB and is charged; `Standard` holds
+ * 4 KiB and is free.
+ *
+ * `Advanced`, because `bifrost/config.json` is 4,474 bytes: the standard tier
+ * would reject the `PutParameter`, and it is set explicitly rather than left to
+ * the provider's default so a smaller file later is a deliberate downgrade
+ * rather than a silent one. Named here so the test and the resource read the
+ * same value, the way `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES` used to.
+ */
+export const BIFROST_CONFIG_PARAMETER_TIER = "Advanced";
+
+/**
  * The standard tier's content limit for an SSM `String` parameter, in bytes.
  *
- * Named rather than written into a comment because `bifrost/config.json` is
- * 3,604 bytes today, which leaves 492 bytes of headroom: the margin is
- * measured, so the suite fails when it is crossed rather than a reviewer. An
- * over-limit value is rejected by `PutParameter` rather than truncated, so the
- * apply fails loudly, but only after a merge. Past this the parameter needs
- * `tier: "Advanced"` (8 KiB, charged).
+ * Kept as a constant because the decision above is stated against it: the file
+ * outgrew 4 KiB, and this is the number that says by how much. Nothing pins the
+ * file to it any more; `BIFROST_CONFIG_PARAMETER_BYTES` is the ceiling the suite
+ * checks.
  */
 export const BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES = 4096;
+
+/**
+ * The Advanced tier's content limit, in bytes, which the parameter now uses.
+ *
+ * `bifrost/config.json` is 4,474 bytes, so this is the ceiling that actually
+ * applies. Pinned by `ecs.test.ts`, which fails the suite before an apply would
+ * fail, rather than in a `PutParameter` that has already merged.
+ */
+export const BIFROST_CONFIG_PARAMETER_BYTES = 8192;
 
 /**
  * One committed classification of a `config.json` path: either a boot-only path
@@ -816,6 +839,17 @@ export interface BifrostConfigPathRule {
  * - `$schema` is **live**, i.e. excluded. It is an editor pointer with no
  *   runtime effect at any point, so a change to it can never require a boot.
  *   Excluding it is also the cheap direction of the asymmetry below.
+ * - `providers.*.custom_provider_config` is **boot-only**. Its two leaves are a
+ *   custom provider's `base_provider_type` and its `allowed_requests`. The
+ *   first is immutable once the provider exists (`ValidateCustomProviderUpdate`,
+ *   "base_provider_type cannot be changed ... after creation"), so no live
+ *   convergence could ever apply a change to it; the second round-trips as the
+ *   full ~60-field `AllowedRequests` struct, so diffing a file that names only
+ *   `decisions` would differ every tick and rewrite the provider forever. A
+ *   custom provider is also the one thing convergence never creates
+ *   (`ConfigGateway.getProvider` answers `null` for one the file has and the
+ *   gateway does not), so a file that gains one needs the boot path anyway.
+ *   Boot-only is the visible, cheap direction of the asymmetry below.
  */
 export const BIFROST_BOOT_ONLY_PATHS = [
   { path: "config_store", subtree: true },
@@ -824,6 +858,7 @@ export const BIFROST_BOOT_ONLY_PATHS = [
   { path: "setup_token", subtree: false },
   { path: "providers.*.keys[].value", subtree: false },
   { path: "source_of_truth", subtree: false },
+  { path: "providers.*.custom_provider_config", subtree: true },
 ] as const satisfies readonly BifrostConfigPathRule[];
 
 /**
@@ -842,6 +877,11 @@ export const BIFROST_BOOT_ONLY_PATHS = [
  * the key update route for `name`/`models`/`aliases`/`weight`/
  * `bedrock_key_config`, `PUT /api/models/catalog` for the catalog, and the
  * governance routes for `governance`.
+ *
+ * `providers.*.custom_provider_config` is deliberately **not** live: see the
+ * boot-only list's note on it. Its `base_provider_type` is immutable after
+ * creation and its `allowed_requests` round-trips as the full ~60-field struct,
+ * so a live diff could neither apply a change nor stop rewriting one.
  */
 export const BIFROST_LIVE_PATHS = [
   { path: "$schema", subtree: false },
@@ -1607,6 +1647,7 @@ export const createBifrostEcs = (args: {
     {
       name: BIFROST_CONFIG_PARAMETER_NAME,
       type: "String",
+      tier: BIFROST_CONFIG_PARAMETER_TIER,
       value: bifrostConfig,
       description:
         "Bifrost gateway config.json (docs/bifrost-gateway.md phase 2 item 10); injected as BIFROST_CONFIG.",

@@ -81,6 +81,23 @@
         }
       ]
     },
+    "fireworks-rune": {
+      "network_config": {
+        "base_url": "https://us.api.fireworks.ai/inference"
+      },
+      "keys": [
+        {
+          "name": "fireworks-rune-primary",
+          "value": "env.FIREWORKS_API_KEY",
+          "models": ["accounts/fireworks/models/rune"],
+          "weight": 1
+        }
+      ],
+      "custom_provider_config": {
+        "base_provider_type": "typesafe",
+        "allowed_requests": { "decisions": true }
+      }
+    },
     "bedrock": {
       "keys": [
         {
@@ -112,6 +129,17 @@
     }
   },
   "governance": {
+    "pricing_overrides": [
+      {
+        "id": "rune-decisions-us",
+        "name": "Rune decisions (US endpoint)",
+        "scope_kind": "global",
+        "match_type": "exact",
+        "pattern": "accounts/fireworks/models/rune",
+        "request_types": ["decisions"],
+        "pricing_patch": "{\"input_cost_per_token_decisions\":4.2e-8,\"cache_read_input_token_cost\":8.4e-9}"
+      }
+    ],
     "auth_config": {
       "is_enabled": false,
       "admin_username": "env.BIFROST_ADMIN_USERNAME",

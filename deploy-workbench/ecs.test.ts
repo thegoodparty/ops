@@ -12,6 +12,8 @@ import {
   BIFROST_CONFIG_ENV_NAME,
   BIFROST_CONFIG_FILE_PATH,
   BIFROST_CONFIG_PARAMETER_NAME,
+  BIFROST_CONFIG_PARAMETER_TIER,
+  BIFROST_CONFIG_PARAMETER_BYTES,
   BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
   BIFROST_CONFIG_SOURCE_PATH,
   BIFROST_CONFIG_VERSION_ENV_NAME,
@@ -1857,27 +1859,29 @@ describe("bifrost ecs", () => {
     );
   });
 
-  it("keeps config.json inside the SSM standard tier, with the headroom the comments now claim", () => {
-    // 3,604 bytes against the standard tier's 4 KiB, measured on 2026-11-10
-    // after the three Fireworks alias descriptions moved into
-    // `docs/bifrost-fireworks-model-metadata.md`: 492 bytes of headroom, not the
-    // 11 the file had while those descriptions were in it and not the couple of
-    // kilobytes a comment in `ecs.ts` and one in `bifrost/README.md` used to
-    // claim. The number is asserted rather than left to a comment, because the
-    // failure mode of getting it wrong is a rejected `PutParameter` in an apply
-    // that has already merged.
+  it("keeps config.json inside the SSM Advanced tier, which now holds it", () => {
+    // The file outgrew the standard tier's 4 KiB when the Decisions provider
+    // and its pricing override landed: 4,474 bytes, so `PutParameter` on a
+    // standard-tier parameter would be rejected. The parameter is created with
+    // `tier: BIFROST_CONFIG_PARAMETER_TIER` ("Advanced", 8 KiB) for that reason,
+    // and this test pins the ceiling that actually applies rather than the one
+    // the comment used to claim. The number is asserted rather than left to a
+    // comment, because the failure mode of getting it wrong is a rejected
+    // `PutParameter` in an apply that has already merged.
+    assert.equal(BIFROST_CONFIG_PARAMETER_TIER, "Advanced");
     assert.equal(BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES, 4096);
+    assert.equal(BIFROST_CONFIG_PARAMETER_BYTES, 8192);
     const bytes = Buffer.byteLength(BIFROST_CONFIG_SOURCE, "utf8");
     assert.ok(
-      bytes < BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
-      `bifrost/config.json is ${bytes} bytes and the standard tier holds ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; past that the parameter needs tier: "Advanced"`,
+      bytes < BIFROST_CONFIG_PARAMETER_BYTES,
+      `bifrost/config.json is ${bytes} bytes and the Advanced tier holds ${BIFROST_CONFIG_PARAMETER_BYTES}; past that the parameter needs a larger tier`,
     );
-    // The headroom is worth naming exactly, which is what the comment block
-    // does. If this fails the comment is the stale part.
-    assert.equal(
-      BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES - bytes,
-      492,
-      "the 492-byte headroom in the ecs.ts comment block must be the measured one",
+    // The file is past the standard tier, which is why the tier moved. If this
+    // ever stops being true the tier can go back, and the assertion says so
+    // rather than leaving a charged tier nobody can explain.
+    assert.ok(
+      bytes > BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
+      `bifrost/config.json is ${bytes} bytes, inside the standard tier's ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; the Advanced tier is no longer needed`,
     );
   });
 

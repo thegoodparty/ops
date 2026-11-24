@@ -64,6 +64,7 @@ type ProviderKey = {
   value?: string;
   models: string[];
   aliases?: Record<string, KeyAlias>;
+  alias?: string;
   weight: number;
   bedrock_key_config?: Record<string, unknown>;
 };
@@ -71,6 +72,11 @@ type ProviderKey = {
 type ProviderConfig = {
   keys: ProviderKey[];
   network_config?: { base_url?: string };
+  custom_provider_config?: {
+    base_provider_type?: string;
+    allowed_requests?: Record<string, boolean>;
+    is_key_less?: boolean;
+  };
   prompt_cache?: {
     auto_inject?: boolean;
     ttl?: string;
@@ -100,6 +106,16 @@ type Config = {
   providers?: Record<string, ProviderConfig>;
   governance?: {
     auth_config?: Record<string, unknown>;
+    pricing_overrides?: Array<{
+      id?: string;
+      name?: string;
+      scope_kind?: string;
+      provider_id?: string;
+      match_type?: string;
+      pattern?: string;
+      request_types?: string[];
+      pricing_patch?: string;
+    }>;
     virtual_keys?: unknown;
     budgets?: unknown;
     teams?: unknown;
@@ -198,6 +214,16 @@ const SERVED_MODEL_CLASSES: Record<string, string[]> = {
     // trade this list makes on purpose.
     "accounts/fireworks/routers/deepseek-v4p1-flash-1017-us",
   ],
+  // A second Fireworks provider, on the same US-only endpoint, serving the
+  // System One Decisions model. It is not a chat class: `accounts/fireworks/models/rune`
+  // answers `/v1/systemone` only, and chat completions against it return 400
+  // (https://docs.fireworks.ai/api-reference/post-systemone). The provider is a
+  // custom `typesafe` one because Bifrost's own Fireworks provider implements
+  // `Decision` as `unsupported_operation`, so the built-in provider cannot
+  // serve it. The US-only rule is the same one, and the id is the model name
+  // Fireworks documents for the serverless Decision model, which has no `-us`
+  // router suffix ("Rune runs on US capacity", pricing page).
+  "fireworks-rune": ["accounts/fireworks/models/rune"],
 };
 
 /** The profile prefix every Bedrock entry must carry: `global.`, not `us.`. */
@@ -205,6 +231,14 @@ const SERVED_BEDROCK_PREFIX = "global.";
 
 /** A US-only Fireworks router id, and nothing else: not a global model id. */
 const US_FIREWORKS_ROUTER = /^accounts\/fireworks\/routers\/[a-z0-9.-]+-us$/;
+
+/**
+ * The System One Decisions model, as Fireworks documents it: a `models/` id
+ * with no `-us` router suffix. Fireworks' US-only *routers* are a separate
+ * family, and Rune is documented as running on US capacity without one
+ * (<https://docs.fireworks.ai/api-reference/post-systemone>).
+ */
+const RUNE_MODEL = "accounts/fireworks/models/rune";
 
 /**
  * The wire id a served model name is sent to the provider as: the alias's
@@ -518,12 +552,29 @@ describe("bifrost config.json", () => {
     // No other provider may carry an endpoint override: one that did would be
     // an endpoint no decision in this repo covers. Bedrock's endpoint is the
     // region in `bedrock_key_config`, and a global profile is still invoked
-    // from that source region.
+    // from that source region. The one exception is `fireworks-rune`, a second
+    // Fireworks endpoint that must be the same US-only host: it serves the
+    // Decisions API rather than an OpenAI-shaped chat endpoint, and the
+    // residency rule is the endpoint plus the model, not the provider's name.
     for (const [name, configured] of Object.entries(config.providers ?? {})) {
       if (name === "fireworks") continue;
+      if (name === "fireworks-rune") {
+        const runeUrl = configured.network_config?.base_url;
+        assert.equal(
+          runeUrl,
+          "https://us.api.fireworks.ai/inference",
+          "fireworks-rune must point at the same US-only Fireworks endpoint",
+        );
+        assert.equal(
+          new URL(runeUrl as string).host,
+          "us.api.fireworks.ai",
+          "fireworks-rune must be the US-only host, not the global api.fireworks.ai",
+        );
+        continue;
+      }
       assert.ok(
         configured.network_config?.base_url === undefined,
-        `${name} carries a base_url override; only the Fireworks endpoint is a reviewed decision`,
+        `${name} carries a base_url override; only the Fireworks endpoints are a reviewed decision`,
       );
     }
   });
@@ -1028,6 +1079,108 @@ describe("bifrost config.json", () => {
         `${name} is a router id served under its own name; it would list bare`,
       );
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Fireworks Rune Decisions. docs/bifrost-fireworks-rune.md
+  // ---------------------------------------------------------------------------
+
+  it("serves Fireworks Rune as a Decisions-only provider, and refuses every chat shape", () => {
+    // The whole reason this is a second provider rather than another model on
+    // the first: Bifrost's own Fireworks provider implements `Decision` as
+    // `unsupported_operation` (`core/providers/fireworks/fireworks.go` at
+    // v2.4.0), so the only way to reach `/v1/systemone` is a custom provider on
+    // the `typesafe` base. `allowed_requests` is a whitelist once present: every
+    // field it omits becomes false, so naming only `decisions` is what keeps
+    // chat, completions, embeddings and the rest refused before any upstream
+    // call. Verified against the pinned image locally: `/v1/decisions`
+    // succeeds, `/v1/chat/completions` answers 400 `unsupported_operation`.
+    const rune = provider(loadConfig(), "fireworks-rune");
+    assert.equal(
+      rune.custom_provider_config?.base_provider_type,
+      "typesafe",
+      "fireworks-rune must use the typesafe base; the fireworks base refuses decisions",
+    );
+    assert.deepEqual(
+      rune.custom_provider_config?.allowed_requests,
+      { decisions: true },
+      "allowed_requests is a whitelist: this must name decisions and nothing else, so no chat shape is exposed",
+    );
+    for (const chatShape of [
+      "chat_completion",
+      "chat_completion_stream",
+      "text_completion",
+      "responses",
+      "embedding",
+      "speech",
+      "transcription",
+      "image_generation",
+      "list_models",
+    ]) {
+      assert.ok(
+        !rune.custom_provider_config?.allowed_requests?.[chatShape],
+        `${chatShape} must not be allowed on fireworks-rune; that is a chat surface on a Decisions model`,
+      );
+    }
+
+    // One model, named exactly as Fireworks documents it, with no alias: a
+    // Decisions model is not a chat model, and an alias here would invent a
+    // second name for a model that has no other.
+    assert.deepEqual(rune.keys.map((key) => key.models), [[RUNE_MODEL]]);
+    assert.equal(rune.keys.length, 1);
+    assert.equal(
+      rune.keys[0].alias,
+      undefined,
+      "fireworks-rune serves one model under its documented name; an alias would be a second name for it",
+    );
+    // The key reuses the deployment's existing Fireworks credential rather than
+    // adding a second secret: same account, same host, different path.
+    assert.equal(rune.keys[0].value, "env.FIREWORKS_API_KEY");
+  });
+
+  it("prices Rune's Decisions calls, which the catalog cannot do for a custom provider", () => {
+    // A custom provider has no row in Bifrost's datasheet, so without an
+    // override its requests log at $0 (measured on the pinned image: cost null
+    // with no override, 1234 tokens x 4.2e-8 = 5.1828e-05 with this one). The
+    // override is also why cost is visible per key at all, which is one of the
+    // gateway's success criteria.
+    //
+    // Fireworks publishes Rune at $0.042 / $0.0084 / $0.00 per 1M
+    // input/cached-input/output, and says Rune runs on US capacity with no US
+    // premium (https://docs.fireworks.ai/serverless/pricing). So $0.042/M is
+    // 4.2e-8 per token, and cached input is 20% of it, 8.4e-9.
+    const overrides = loadConfig().governance?.pricing_overrides ?? [];
+    const rune = overrides.find((entry) => entry.pattern === RUNE_MODEL);
+    assert.ok(rune, "no pricing override for the Rune model; its calls would log at $0");
+    assert.equal(rune.match_type, "exact");
+    assert.deepEqual(
+      rune.request_types,
+      ["decisions"],
+      "the override must be scoped to decisions; Rune serves nothing else",
+    );
+    // Global scope, not `provider`: a custom provider's name is not a catalog
+    // provider, and the global-scope form was the one measured to price the
+    // request (both were tried against the pinned image).
+    assert.equal(
+      rune.scope_kind,
+      "global",
+      "the override is global-scope; a provider-scoped one is not resolved for a custom provider's name",
+    );
+    const patch = JSON.parse(rune.pricing_patch ?? "{}") as Record<string, number>;
+    assert.equal(
+      patch.input_cost_per_token_decisions,
+      4.2e-8,
+      "Rune is $0.042 per 1M input tokens",
+    );
+    assert.equal(
+      patch.cache_read_input_token_cost,
+      8.4e-9,
+      "Rune's cached input is 20% of its input rate",
+    );
+    assert.ok(
+      !("output_cost_per_token_decisions" in patch),
+      "Rune emits no output tokens, so an output rate would be a number nothing bills",
+    );
   });
 
 });
