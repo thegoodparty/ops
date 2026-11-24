@@ -8,11 +8,11 @@ source: https://goodparty.clickup.com/90132012119/v/dc/2ky4jq2q-20493/2ky4jq2q-1
 
 ## Lessons
 
-- Running a CPU-heavy computation synchronously on the single Node.js request thread, so one slow call stops the whole server from answering any request or health check (statistical opinion model run inline in the gp-api priority read).
-- Adding an algorithm whose cost grows much faster than its input, without capping the input or measuring it at the largest size the data allows (MRP model with one parameter per census tract in omni #2977).
-- Recomputing an expensive result on every read when it only changes when its inputs change, instead of computing it once when those inputs update (priority read on every Home load in omni #3023).
-- Caching an expensive result in each server process's memory when a load balancer spreads requests across many instances, so the cache rarely hits (per-task 15-minute priority read cache in gp-api).
-- Making a page wait on a slow backend call in its server render, so the whole page fails with that call and each retry starts more backend work (priority page server render in omni #2852).
+- Running a CPU-heavy computation synchronously on the single Node.js request thread stops the whole server answering any request or health check, until that computation finishes (statistical opinion model run inline in the gp-api priority read).
+- Adding an algorithm whose cost grows much faster than its input, without capping the input or measuring it at the largest size the data allows, blows the request past its budget on the biggest districts (MRP model with one parameter per census tract in omni #2977).
+- Recomputing an expensive result on every read when it only changes when its inputs change spends every page view's request budget on the same unchanged answer (priority read on every Home load in omni #3023).
+- Caching an expensive result in each server process's memory when a load balancer spreads requests across many instances misses on nearly every request, which sends each instance to recompute the same answer (per-task 15-minute priority read cache in gp-api).
+- Making a page wait on a slow backend call in its server render fails the whole page with that call, and every retry starts more backend work (priority page server render in omni #2852).
 
 ## Post-mortem
 
