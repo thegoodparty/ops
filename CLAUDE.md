@@ -193,6 +193,7 @@ Infrastructure is managed with Pulumi (TypeScript) and deployed via GitHub Actio
 - CloudWatch log group for agent execution logs
 - IAM roles for ECS execution, task, and Lambda
 - IAM Identity Center permission sets and account assignments
+- `ama.goodparty.org` HTTPS redirect for all-hands. Change the Mentimeter destination in `deploy/components/ama-redirect.ts`; the Ops deploy manages the CloudFront distribution, certificate, and DNS records.
 
 ### CI/CD
 

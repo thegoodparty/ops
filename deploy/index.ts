@@ -10,6 +10,7 @@ import { createSheriffGrant } from "./components/sheriff-grant";
 import { createIdentityGroupSyncGrant } from "./components/identity-group-sync-grant";
 import { createBifrostVkReader } from "./components/bifrost-vk-reader";
 import { createInfraZoneDelegation } from "./components/infra-zone-delegation";
+import { createAmaRedirect } from "./components/ama-redirect";
 import { createWorkbenchZoneDelegation } from "./components/workbench-zone-delegation";
 import { createGrafanaCloudwatchRead } from "./components/grafana-cloudwatch-read";
 import { DELEGATE_SECRET_KEYS } from "./delegate-secret";
@@ -57,6 +58,7 @@ export = async () => {
   createIdentityGroupSyncGrant();
   createBifrostVkReader();
   createInfraZoneDelegation();
+  createAmaRedirect();
   createWorkbenchZoneDelegation();
   createGrafanaCloudwatchRead();
 
