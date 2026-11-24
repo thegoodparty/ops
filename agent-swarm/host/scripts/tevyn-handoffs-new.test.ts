@@ -261,7 +261,20 @@ describe('run', () => {
     const out = await run(h.deps)
     assert.deepEqual(out.handoffs, [])
     assert.equal(out.unreadable[0]?.reason, 'handler mismatch')
+    assert.equal(out.unreadable[0]?.api, true)
     assert.equal(h.kv.data.has('handoff:12345'), false)
+    assert.equal(h.replies.length, 1)
+    assert.match(h.replies[0].text, /do not build it by hand/)
+    assert.doesNotMatch(h.replies[0].text, /handle the wave by hand/)
+  })
+
+  it('warns an agent post that names handler api not to build it', async () => {
+    const h = harness([
+      post('1762560000.000100', { block: machine({ handler: 'api' }) }),
+    ])
+    const out = await run(h.deps)
+    assert.equal(out.unreadable[0]?.api, true)
+    assert.match(h.replies[0].text, /do not build it by hand/)
   })
 
   it('asks Slack only for messages after the stored cursor', async () => {

@@ -26,6 +26,13 @@ const UNREADABLE_REPLY =
   'Automated panel-wave dispatcher could not read this hand-off post, so ' +
   'nothing was scheduled from it. A person needs to check this post and ' +
   'handle the wave by hand.'
+// gp-api is building an api wave itself, so the warning must never send a
+// person to build it: only the replies export is lost.
+const UNREADABLE_API_REPLY =
+  'Automated panel-wave dispatcher could not read this hand-off post. gp-api ' +
+  'is still building this wave, so do not build it by hand. Its replies will ' +
+  'not be exported automatically: a person needs to export them 48 hours ' +
+  'after the send.'
 
 export const argsSchema = z.object({})
 
@@ -168,7 +175,7 @@ export type UnreadableReason =
 type Classification =
   | { kind: 'handoff'; handoff: Handoff }
   | { kind: 'not-handoff' }
-  | { kind: 'unreadable'; reason: UnreadableReason }
+  | { kind: 'unreadable'; reason: UnreadableReason; api: boolean }
 
 // Detection is separate from parsing. The handling note is what makes a post
 // ours to act on, so once it is there a post that does not parse has to reach a
@@ -181,19 +188,24 @@ const classify = (message: Message, channel: string): Classification => {
   const apiNote = texts.some((t) => t.includes(API_NOTE_MARKER))
   if (!agentNote && !apiNote) return { kind: 'not-handoff' }
   const fields = parseMachineBlock(texts)
-  if (!fields) return { kind: 'unreadable', reason: 'no machine block' }
+  // Any api sign at all gets the api warning: telling a person to build a
+  // wave gp-api is building is the double send this guards against.
+  const api = apiNote || fields?.handler === 'api'
+  if (!fields) return { kind: 'unreadable', reason: 'no machine block', api }
   const block = handoffBlockSchema.safeParse(fields)
-  if (!block.success) return { kind: 'unreadable', reason: 'invalid fields' }
+  if (!block.success) {
+    return { kind: 'unreadable', reason: 'invalid fields', api }
+  }
   // The note and the block must agree: an api wave read as an agent one
   // would be built a second time by hand.
   if (apiNote !== (block.data.handler === 'api') || (agentNote && apiNote)) {
-    return { kind: 'unreadable', reason: 'handler mismatch' }
+    return { kind: 'unreadable', reason: 'handler mismatch', api }
   }
   if (
     block.data.handler === 'agent' &&
     block.data.repliesKey !== `agent-replies/${block.data.outreachId}.csv`
   ) {
-    return { kind: 'unreadable', reason: 'replies key mismatch' }
+    return { kind: 'unreadable', reason: 'replies key mismatch', api }
   }
   const recipients = texts
     .map((t) => /^\*Recipients:\*\s*(\d+)\s*$/.exec(t.trim())?.[1])
@@ -279,6 +291,8 @@ const unparsedOf = (record: unknown): UnparsedRecord | null => {
 export type Unreadable = {
   ts: string
   reason: UnreadableReason
+  // Set when the post looks like an api wave; its warning differs.
+  api?: true
   // True when the warning reply is in the thread, whether this run posted it or
   // an earlier one did.
   posted: boolean
@@ -313,6 +327,7 @@ export const run = async (deps: Deps): Promise<RunResult> => {
       unreadable.push({
         ts: message.ts,
         reason: classified.reason,
+        ...(classified.api ? { api: true as const } : {}),
         posted: false,
       })
       continue
@@ -365,7 +380,7 @@ export const run = async (deps: Deps): Promise<RunResult> => {
       await deps.reply({
         channel: deps.channel,
         ts: entry.ts,
-        text: UNREADABLE_REPLY,
+        text: entry.api ? UNREADABLE_API_REPLY : UNREADABLE_REPLY,
       })
     } catch {
       // A warning that cannot be posted must not fail the run: the post stays

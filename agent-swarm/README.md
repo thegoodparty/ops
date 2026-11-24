@@ -492,7 +492,9 @@ policy grants the other half.
   disagree is unreadable (`handler mismatch`). A post that carries the
   note but cannot be read (no machine block, invalid fields, replies key
   mismatch, handler mismatch) is never claimed: it is reported in `unreadable` with its reason and
-  gets one warning reply in its own thread, deduped by `unparsed:<ts>`, and the
+  gets one warning reply in its own thread, deduped by `unparsed:<ts>` (for a
+  post with any api sign, flagged `api: true`, the warning says not to build
+  it by hand and asks for a manual replies export instead), and the
   cursor stops just before the oldest unreleased one so history still covers it
   next run. After 48h from first sight it stops holding the cursor and is
   reported with `released: true`.
