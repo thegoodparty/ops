@@ -1,0 +1,30 @@
+[Unit]
+Description=Export the delegate swarm's cost ledger and task edges to S3
+Documentation=https://github.com/thegoodparty/ops/blob/main/agent-swarm/README.md
+# The database lives in a Docker volume, so Docker has to be up to resolve the
+# mountpoint, and the upload needs routes rather than just a link. Deliberately no
+# `ConditionPathIsMountPoint` guard: if the data volume did not mount, this should
+# fail as a failed unit rather than be skipped into a green no-op, because a
+# skipped export is invisible and a failed one is not.
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root, not ec2-user: `docker volume inspect` needs the docker socket and the
+# database's -shm file has to be writable to open the write-ahead log, which
+# ec2-user cannot do on the container's files.
+User=root
+Environment=AWS_REGION=us-west-2
+# A daily run reads its file in seconds; the monthly read is the long one. 30
+# minutes is enough for both and keeps an on-time 09:15 start finished by 09:45, so
+# the read is done before the data volume's 10:00 snapshot. A catch-up run after
+# downtime starts when the host comes back and is only bounded by this same value.
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/bun /opt/agent-swarm/export-usage.ts
+# The object body is written to a temp file before the PUT. A private tmp keeps
+# that copy of the ledger out of a shared /tmp and removes it when the unit stops.
+PrivateTmp=true

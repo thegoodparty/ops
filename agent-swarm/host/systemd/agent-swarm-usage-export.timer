@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the delegate swarm usage export daily at 09:15 UTC
+
+[Timer]
+# 09:15 UTC: 45 minutes before the data volume's 10:00 snapshot, and ahead of the
+# loader, so a day's file exists before the warehouse build that reads it. Not
+# 09:00, which is the gateway's own export.
+OnCalendar=*-*-* 09:15:00 UTC
+# Any of the month's first three days reads ninety days instead of seven, and the
+# exporter decides that from the date, so one timer covers both. Three days rather
+# than one because `Persistent` is what runs a missed activation: a catch-up on
+# the 2nd still does the month's repair instead of waiting another month.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

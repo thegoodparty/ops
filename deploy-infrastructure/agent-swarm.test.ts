@@ -10,7 +10,9 @@ import {
   infraLogsReadStatements,
   panelRepliesPutStatement,
   SWARM_HOSTNAME,
+  SWARM_USAGE_EXPORT_PREFIXES,
   swarmHostPolicy,
+  swarmUsageExportPutStatement,
   syncCommand,
   userData,
 } from "./agent-swarm";
@@ -211,5 +213,105 @@ describe("infrastructure account log read access", () => {
     for (const arn of [reads?.Resource].flat()) {
       assert.match(String(arn), /^arn:aws:logs:[a-z0-9-]+:\d{12}:log-group:\*/);
     }
+  });
+});
+
+describe("usage export install and schedule", () => {
+  // Every unit is copied by install.sh and a copy alone does not schedule
+  // anything: the disk cleanup timer's `systemctl enable --now` is the only
+  // reason it runs, and the export timer needs its own. Without the line the
+  // exporter is deployed and never scheduled.
+  it("ships the exporter, its unit and its timer, and enables the timer", () => {
+    assert.ok(hostFiles().includes("export-usage.ts"));
+    assert.ok(hostFiles().includes("export-usage-core.ts"));
+    assert.ok(hostFiles().includes("export-usage-sqlite.ts"));
+    assert.ok(hostFiles().includes("systemd/agent-swarm-usage-export.service"));
+    assert.ok(hostFiles().includes("systemd/agent-swarm-usage-export.timer"));
+    const install = fs.readFileSync(path.join(HOST_DIR, "install.sh"), "utf8");
+    assert.match(install, /^systemctl enable --now agent-swarm-usage-export\.timer$/m);
+  });
+
+  it("runs the unit as root, after the network is up, with a bounded timeout", () => {
+    const unit = fs.readFileSync(
+      path.join(HOST_DIR, "systemd/agent-swarm-usage-export.service"),
+      "utf8",
+    );
+    // Root because `docker volume inspect` needs the docker socket and the
+    // database's -shm file has to be writable to open the WAL.
+    assert.match(unit, /^User=root$/m);
+    assert.match(unit, /^Requires=docker\.service$/m);
+    assert.match(unit, /^After=.*network-online\.target$/m);
+    assert.match(unit, /^Wants=network-online\.target$/m);
+    // The monthly read is the long one; 1800s keeps a 09:15 start clear of the
+    // data volume's 10:00 snapshot even if it goes slow.
+    assert.match(unit, /^TimeoutStartSec=1800$/m);
+    assert.match(unit, /^ExecStart=\/usr\/local\/bin\/bun \/opt\/agent-swarm\/export-usage\.ts$/m);
+  });
+
+  it("schedules 09:15 UTC daily, persistent, ahead of the loader", () => {
+    const timer = fs.readFileSync(
+      path.join(HOST_DIR, "systemd/agent-swarm-usage-export.timer"),
+      "utf8",
+    );
+    assert.match(timer, /^OnCalendar=\*-\*-\* 09:15:00 UTC$/m);
+    // A host that was down at 09:15 catches up rather than skipping the day.
+    assert.match(timer, /^Persistent=true$/m);
+    assert.match(timer, /^WantedBy=timers\.target$/m);
+  });
+});
+
+describe("usage export write grant", () => {
+  const { Statement } = swarmHostPolicy("arn:aws:secretsmanager:secret", "arn:aws:s3:::bucket");
+
+  it("grants PutObject on the two export prefixes and nothing else", () => {
+    assert.ok(Statement.includes(swarmUsageExportPutStatement));
+    assert.equal(swarmUsageExportPutStatement.Action, "s3:PutObject");
+    assert.deepEqual(swarmUsageExportPutStatement.Resource, [
+      "arn:aws:s3:::goodparty-workbench-bifrost-usage/delegate-swarm/session-cost/*",
+      "arn:aws:s3:::goodparty-workbench-bifrost-usage/delegate-swarm/task-edge/*",
+    ]);
+  });
+
+  // The bucket is in the workbench account and its policy's other half is
+  // written in `deploy-workbench/usage-export.ts`. Two literals in two files, so
+  // both sides read them from one place here.
+  it("matches the bucket policy's prefixes in deploy-workbench", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, "../deploy-workbench/usage-export.ts"),
+      "utf8",
+    );
+    assert.ok(
+      source.includes('const BUCKET_NAME = "goodparty-workbench-bifrost-usage"'),
+      "the bucket name must still be the one this grant writes to",
+    );
+    for (const prefix of SWARM_USAGE_EXPORT_PREFIXES) {
+      assert.ok(
+        source.includes(`"${prefix}"`),
+        `deploy-workbench/usage-export.ts must name the ${prefix} prefix the export writes`,
+      );
+    }
+    assert.ok(
+      source.includes('const SWARM_HOST_ROLE_NAME = "delegate-swarm-host"'),
+      "the bucket policy must pin the role this host actually has",
+    );
+  });
+
+  it("is named by the role the instance profile carries", () => {
+    const source = fs.readFileSync(path.join(__dirname, "agent-swarm.ts"), "utf8");
+    assert.ok(source.includes('name: "delegate-swarm-host"'));
+  });
+
+  // The prefix trusts its writer, and the code says so where the grant is. This
+  // is finding M1's accepted exposure: a worker that can reach IMDS can forge a
+  // spend file, and nothing downstream can tell it from a real one.
+  it("states the exposure the shared identity carries", () => {
+    const source = fs.readFileSync(path.join(__dirname, "agent-swarm.ts"), "utf8");
+    assert.match(
+      source,
+      /a fabricated object in\s+\*\s+these two prefixes cannot be told from a real one/,
+    );
+    assert.ok(source.includes("conditional PUT"));
+    // No publisher identity: one grant on the host role, not a second role.
+    assert.ok(!/SwarmPublisher|usageExportPublisher/.test(source));
   });
 });

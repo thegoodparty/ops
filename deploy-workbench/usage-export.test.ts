@@ -244,4 +244,91 @@ describe("bifrost usage export", () => {
     assert.ok(SOURCE.includes('const EXPORT_PREFIX = "bifrost/logs"'));
     assert.ok(SOURCE.includes('const USAGE_EXPORT_READER_ROLE_NAME = "bifrost-usage-export-reader"'));
   });
+
+  it("admits the swarm host's write as a cross-account statement, on the two prefixes only", () => {
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const write = policy.slice(policy.indexOf("SwarmHostWriteExportObjects"));
+    assert.ok(write.length > 0, "the bucket policy must carry the swarm host's write");
+    assert.ok(
+      write.includes("INFRASTRUCTURE_ACCOUNT_ID"),
+      "the swarm host is in the infrastructure account, so the principal has to name it",
+    );
+    assert.ok(write.includes('"aws:PrincipalArn": swarmHostRoleArn'));
+    assert.ok(
+      !/\bGet|List|Delete/.test(write.slice(0, write.indexOf("}") + 400)),
+      "the grant is write only: no read, no list, no delete",
+    );
+  });
+
+  it("requires the conditional PUT in the grant, not only in the script", () => {
+    // The store refuses an overwrite for every caller holding the host role, not
+    // only for the exporter that remembers the header. `s3:if-none-match` is a
+    // condition key on PutObject.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const write = policy.slice(policy.indexOf("SwarmHostWriteExportObjects"));
+    assert.ok(
+      write.includes('StringEquals: { "s3:if-none-match": "*" }'),
+      "the swarm writer must be required to send If-None-Match: *",
+    );
+    // And the exporter does send it, so the condition cannot refuse its own run.
+    const aws = fs.readFileSync(path.resolve(__dirname, "../agent-swarm/host/export-usage-aws.ts"), "utf8");
+    assert.ok(aws.includes('"--if-none-match"'));
+    assert.match(aws, /"--if-none-match",\s*"\*"/);
+  });
+
+  it("reads the swarm's two prefixes with the same Databricks role", () => {
+    // One statement per action over one list, so a prefix cannot be granted the
+    // objects half and miss the list half: that fails as an empty day rather than
+    // an error.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    assert.ok(policy.includes("READ_PREFIXES"));
+    assert.ok(SOURCE.includes('const SWARM_EXPORT_PREFIXES = ["delegate-swarm/session-cost", "delegate-swarm/task-edge"]'));
+    assert.ok(SOURCE.includes("const READ_PREFIXES = [EXPORT_PREFIX, ...SWARM_EXPORT_PREFIXES]"));
+    // And the terraform external location must be a sibling of bifrost/logs, not
+    // inside it.
+    assert.ok(!SOURCE.includes("bifrost/logs/delegate-swarm"));
+  });
+
+  it("admits each external location's own root in the list condition", () => {
+    // The test that a plan cannot stand in for. Databricks lists an external
+    // location's root when it validates the location, and a root is not always a
+    // prefix a load reads: the gateway's location is `s3://<bucket>/bifrost/logs`
+    // so its root and its load prefix coincide, while the swarm's is
+    // `s3://<bucket>/delegate-swarm`, one level above both table prefixes. A
+    // `ListBucket` scoped only to the load prefixes denies the bare root, the
+    // location fails to validate, and no `pulumi preview` and no CI check reads a
+    // bucket policy, so it surfaces only when someone runs Deploy.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const list = policy.slice(policy.indexOf("DatabricksListExportPrefix"));
+    assert.ok(list.includes("LIST_PREFIXES"), "the list condition must use the list-only list");
+    assert.ok(
+      SOURCE.includes('const SWARM_EXPORT_ROOT = "delegate-swarm"'),
+      "the swarm location's root must be named",
+    );
+    assert.ok(
+      SOURCE.includes("const LIST_PREFIXES = [...READ_PREFIXES, SWARM_EXPORT_ROOT]"),
+      "the root joins the list statement and not the object grant",
+    );
+    // Expanded, the admitted prefixes are the two roots and the two table
+    // prefixes, each with its `/*` form.
+    assert.ok(SOURCE.includes('"s3:prefix": LIST_PREFIXES.flatMap((prefix) => [prefix, `${prefix}/*`])'));
+    const expanded = ["bifrost/logs", "delegate-swarm", "delegate-swarm/session-cost", "delegate-swarm/task-edge"];
+    for (const root of expanded) {
+      // Each of these has to reach the condition, either as a literal or through
+      // the list it is built from.
+      assert.ok(
+        SOURCE.includes(`"${root}"`) || SOURCE.includes(`"${root}/`),
+        `the list condition must admit ${root}`,
+      );
+    }
+    // The object grant must NOT be widened to the root: a directory holding no
+    // object is not something a load reads.
+    const objects = policy.slice(
+      policy.indexOf("DatabricksReadExportObjects"),
+      policy.indexOf("DatabricksListExportPrefix"),
+    );
+    assert.ok(objects.includes("READ_PREFIXES"));
+    assert.ok(!objects.includes("LIST_PREFIXES"));
+    assert.ok(!objects.includes("SWARM_EXPORT_ROOT"));
+  });
 });
