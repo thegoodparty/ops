@@ -288,4 +288,47 @@ describe("bifrost usage export", () => {
     // inside it.
     assert.ok(!SOURCE.includes("bifrost/logs/delegate-swarm"));
   });
+
+  it("admits each external location's own root in the list condition", () => {
+    // The test that a plan cannot stand in for. Databricks lists an external
+    // location's root when it validates the location, and a root is not always a
+    // prefix a load reads: the gateway's location is `s3://<bucket>/bifrost/logs`
+    // so its root and its load prefix coincide, while the swarm's is
+    // `s3://<bucket>/delegate-swarm`, one level above both table prefixes. A
+    // `ListBucket` scoped only to the load prefixes denies the bare root, the
+    // location fails to validate, and no `pulumi preview` and no CI check reads a
+    // bucket policy, so it surfaces only when someone runs Deploy.
+    const policy = resourceBlock("bifrostUsageExportBucketPolicy");
+    const list = policy.slice(policy.indexOf("DatabricksListExportPrefix"));
+    assert.ok(list.includes("LIST_PREFIXES"), "the list condition must use the list-only list");
+    assert.ok(
+      SOURCE.includes('const SWARM_EXPORT_ROOT = "delegate-swarm"'),
+      "the swarm location's root must be named",
+    );
+    assert.ok(
+      SOURCE.includes("const LIST_PREFIXES = [...READ_PREFIXES, SWARM_EXPORT_ROOT]"),
+      "the root joins the list statement and not the object grant",
+    );
+    // Expanded, the admitted prefixes are the two roots and the two table
+    // prefixes, each with its `/*` form.
+    assert.ok(SOURCE.includes('"s3:prefix": LIST_PREFIXES.flatMap((prefix) => [prefix, `${prefix}/*`])'));
+    const expanded = ["bifrost/logs", "delegate-swarm", "delegate-swarm/session-cost", "delegate-swarm/task-edge"];
+    for (const root of expanded) {
+      // Each of these has to reach the condition, either as a literal or through
+      // the list it is built from.
+      assert.ok(
+        SOURCE.includes(`"${root}"`) || SOURCE.includes(`"${root}/`),
+        `the list condition must admit ${root}`,
+      );
+    }
+    // The object grant must NOT be widened to the root: a directory holding no
+    // object is not something a load reads.
+    const objects = policy.slice(
+      policy.indexOf("DatabricksReadExportObjects"),
+      policy.indexOf("DatabricksListExportPrefix"),
+    );
+    assert.ok(objects.includes("READ_PREFIXES"));
+    assert.ok(!objects.includes("LIST_PREFIXES"));
+    assert.ok(!objects.includes("SWARM_EXPORT_ROOT"));
+  });
 });

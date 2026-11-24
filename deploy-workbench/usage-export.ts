@@ -140,17 +140,49 @@ const SWARM_HOST_ROLE_NAME = "delegate-swarm-host";
 const SWARM_EXPORT_PREFIXES = ["delegate-swarm/session-cost", "delegate-swarm/task-edge"];
 
 /**
- * Everything the Databricks reader role may read here, which is the gateway's
- * prefix and the swarm's two.
+ * The parent of the two swarm prefixes, which is also the URL of the one Unity
+ * Catalog external location that covers both: `s3://<bucket>/delegate-swarm`.
  *
- * The read grant is widened rather than duplicated so there is one statement per
- * action: the loader reads each prefix through one Unity Catalog external
- * location per table, and both halves of a prefix-scoped read (the objects and
- * the `ListBucket` on the prefix) then cover the same list. A prefix added to one
- * statement and not the other fails as a listing that returns nothing, which
- * looks like an empty day rather than a permission error.
+ * One location rather than one per table, because Unity Catalog refuses a
+ * location nested inside another, and a location may be read at a subpath. So the
+ * location's root sits a level above the two prefixes a load reads, which is why
+ * it has to be named in the list condition separately from them. See
+ * `LIST_PREFIXES`.
+ */
+const SWARM_EXPORT_ROOT = "delegate-swarm";
+
+/**
+ * Everything the Databricks reader role may read here, which is the gateway's
+ * prefix and the swarm's two. This is what `COPY INTO` reads, so it is what the
+ * object grant covers.
+ *
+ * Widened rather than duplicated so there is one statement per action: a prefix
+ * added to the object half and not the list half fails as a listing that returns
+ * nothing, which looks like an empty day rather than a permission error.
  */
 const READ_PREFIXES = [EXPORT_PREFIX, ...SWARM_EXPORT_PREFIXES];
+
+/**
+ * The prefixes the list statement admits, which is **not** the same list as
+ * `READ_PREFIXES`.
+ *
+ * Databricks lists an external location's own root when it validates the
+ * location, and a root is not always a prefix a load reads. The gateway's
+ * location is `s3://<bucket>/bifrost/logs`, so its root and its load prefix are
+ * the same string, and the read list happened to cover it. The swarm's location
+ * is `s3://<bucket>/delegate-swarm`, one level above both table prefixes, so a
+ * `ListBucket` scoped to the read list alone denies the bare root, the location
+ * fails to validate, and **that happens at apply, not in a plan**: nothing in
+ * `pulumi preview` or any CI check reads a bucket policy, so it surfaces only
+ * when someone runs Deploy.
+ *
+ * So the root joins this list and only this list. The object grant stays on the
+ * two table prefixes, because a directory that holds no object is not something a
+ * load reads, and collapsing the two lists would either widen the object grant to
+ * a parent that contains nothing or narrow the listing below the root the
+ * location validates at.
+ */
+const LIST_PREFIXES = [...READ_PREFIXES, SWARM_EXPORT_ROOT];
 
 /** Bundle the export handler the way the two existing functions bundle theirs. */
 export const buildUsageExportCode = (): pulumi.asset.AssetArchive => {
@@ -344,7 +376,12 @@ export const createBifrostUsageExport = (args: {
    * Two statements for the read because S3 needs both halves of a prefix-scoped
    * read: an object action on the objects and `ListBucket` on the bucket itself.
    * The list is `s3:prefix`-conditioned, so the credential cannot enumerate the
-   * bucket, only the one prefix it is given.
+   * bucket, only the prefixes it is given.
+   *
+   * The two statements do not cover quite the same list, and that is deliberate:
+   * the objects are the prefixes a load reads, and the listing also admits each
+   * external location's own root because Databricks lists that when it validates
+   * one. See `LIST_PREFIXES`.
    *
    * The principal is the account root with an `ArnEquals aws:PrincipalArn`
    * condition rather than the role ARN as `Principal`. See the module header: S3
@@ -405,7 +442,7 @@ export const createBifrostUsageExport = (args: {
                 Condition: {
                   ArnEquals: { "aws:PrincipalArn": roleArn },
                   StringLike: {
-                    "s3:prefix": READ_PREFIXES.flatMap((prefix) => [prefix, `${prefix}/*`]),
+                    "s3:prefix": LIST_PREFIXES.flatMap((prefix) => [prefix, `${prefix}/*`]),
                   },
                 },
               },
