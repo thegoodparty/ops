@@ -7,8 +7,11 @@ const TOKEN = 'xoxb-secret-token'
 const NOTE =
   '*Delegate is handling this wave.* Do not schedule it by hand unless it posts that it needs help.'
 
-const machine = (over: Record<string, string> = {}) => {
-  const f = {
+const API_NOTE =
+  "gp-api is building this wave through the Scale to Win API. Don't build it by hand."
+
+const machine = (over: Record<string, string | undefined> = {}) => {
+  const f: Record<string, string | undefined> = {
     outreachId: '12345',
     sendAt: '2026-11-08T16:00:00.000Z',
     timeZone: 'US/Eastern',
@@ -17,21 +20,32 @@ const machine = (over: Record<string, string> = {}) => {
     repliesKey: 'agent-replies/12345.csv',
     ...over,
   }
-  return ['```', ...Object.entries(f).map(([k, v]) => `${k}: ${v}`), '```'].join(
+  const lines = Object.entries(f).flatMap(([k, v]) =>
+    v === undefined ? [] : [`${k}: ${v}`],
+  )
+  return ['```', ...lines, '```'].join(
     '\n',
   )
 }
 
 const post = (
   ts: string,
-  opts: { note?: boolean; block?: string; text?: string } = {},
+  opts: { note?: boolean | string; block?: string; text?: string } = {},
 ) => ({
   ts,
   blocks: [
     { type: 'header', text: { type: 'plain_text', text: 'Text Send Recipients' } },
     ...(opts.note === false
       ? []
-      : [{ type: 'section', text: { type: 'mrkdwn', text: NOTE } }]),
+      : [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: typeof opts.note === 'string' ? opts.note : NOTE,
+            },
+          },
+        ]),
     { type: 'section', text: { type: 'mrkdwn', text: opts.block ?? machine() } },
     { type: 'section', text: { type: 'mrkdwn', text: '*Outreach ID:* `12345`' } },
     {
@@ -95,6 +109,7 @@ describe('parseHandoff', () => {
       timeZone: 'US/Eastern',
       mode: 'shadow',
       env: 'dev',
+      handler: 'agent',
       repliesKey: 'agent-replies/12345.csv',
       message: 'Town hall Saturday',
       recipientCount: 42,
@@ -126,6 +141,54 @@ describe('parseHandoff', () => {
     const parsed = parseHandoff(withButton('1762560000.000100'), CHANNEL)
     assert.equal(parsed?.outreachId, '12345')
     assert.equal(parsed?.recipientCount, 42)
+  })
+
+  it('reads an api post, which has no replies key', () => {
+    const parsed = parseHandoff(
+      post('1.1', {
+        note: API_NOTE,
+        block: machine({ handler: 'api', repliesKey: undefined }),
+      }),
+      CHANNEL,
+    )
+    assert.equal(parsed?.handler, 'api')
+    assert.equal(parsed?.repliesKey, undefined)
+  })
+
+  it('reads an agent post that names its handler', () => {
+    const parsed = parseHandoff(
+      post('1.1', { block: machine({ handler: 'agent' }) }),
+      CHANNEL,
+    )
+    assert.equal(parsed?.handler, 'agent')
+  })
+
+  it('skips a post whose note and handler disagree', () => {
+    assert.equal(
+      parseHandoff(post('1.1', { block: machine({ handler: 'api' }) }), CHANNEL),
+      null,
+    )
+    assert.equal(
+      parseHandoff(
+        post('1.1', { note: API_NOTE, block: machine({ handler: 'agent' }) }),
+        CHANNEL,
+      ),
+      null,
+    )
+    assert.equal(
+      parseHandoff(
+        post('1.1', { note: API_NOTE, block: machine({ repliesKey: undefined }) }),
+        CHANNEL,
+      ),
+      null,
+    )
+  })
+
+  it('skips an agent post without a replies key', () => {
+    assert.equal(
+      parseHandoff(post('1.1', { block: machine({ repliesKey: undefined }) }), CHANNEL),
+      null,
+    )
   })
 
   it('skips a post without the handling note', () => {
@@ -166,6 +229,39 @@ describe('run', () => {
 
     const second = await run(h.deps)
     assert.deepEqual(second, { handoffs: [], unreadable: [] })
+  })
+
+  it('claims an api post as built so it is never scheduled', async () => {
+    const h = harness([
+      post('1762560000.000100', {
+        note: API_NOTE,
+        block: machine({ handler: 'api', repliesKey: undefined }),
+      }),
+    ])
+    const out = await run(h.deps)
+    assert.equal(out.handoffs.length, 1)
+    assert.deepEqual(out.unreadable, [])
+    assert.deepEqual(h.kv.data.get('handoff:12345'), {
+      state: 'built',
+      handler: 'api',
+      slackTs: '1762560000.000100',
+      channel: CHANNEL,
+      sendAt: '2026-11-08T16:00:00.000Z',
+      timeZone: 'US/Eastern',
+      mode: 'shadow',
+      message: 'Town hall Saturday',
+      recipientCount: 42,
+    })
+  })
+
+  it('reports an api note with an agent block as unreadable', async () => {
+    const h = harness([
+      post('1762560000.000100', { note: API_NOTE, block: machine() }),
+    ])
+    const out = await run(h.deps)
+    assert.deepEqual(out.handoffs, [])
+    assert.equal(out.unreadable[0]?.reason, 'handler mismatch')
+    assert.equal(h.kv.data.has('handoff:12345'), false)
   })
 
   it('asks Slack only for messages after the stored cursor', async () => {

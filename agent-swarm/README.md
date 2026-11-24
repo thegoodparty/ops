@@ -479,14 +479,19 @@ policy grants the other half.
 
 - `tevyn-handoffs-new` returns `{handoffs, unreadable}`: the hand-off posts it
   has not returned before, as compact JSON (outreachId, sendAt, timeZone, mode,
-  repliesKey, message, recipientCount, channel, ts), and the posts it could not
+  handler, repliesKey, message, recipientCount, channel, ts), and the posts it could not
   read. It keeps a cursor in KV (`tevyn:cursor`) and claims each outreach id as
   `handoff:<outreachId>` = `{ state: 'new', slackTs, channel, sendAt, timeZone,
   mode, message, recipientCount }`, so an id is returned once and can still be
-  handled from KV if nobody got its output. A post without the "Delegate is
-  handling this wave" note is not ours and is skipped. A post that carries the
+  handled from KV if nobody got its output. A post with neither the "Delegate is
+  handling this wave" note nor the "gp-api is building this wave" note is not
+  ours and is skipped. The second note marks an api wave (`handler: api` in the
+  block, no `repliesKey`), which gp-api builds through the Scale to Win API: it is
+  claimed as `{ state: 'built', handler: 'api', ... }`, so the tick never
+  schedules it and only exports its replies. A post whose note and `handler`
+  disagree is unreadable (`handler mismatch`). A post that carries the
   note but cannot be read (no machine block, invalid fields, replies key
-  mismatch) is never claimed: it is reported in `unreadable` with its reason and
+  mismatch, handler mismatch) is never claimed: it is reported in `unreadable` with its reason and
   gets one warning reply in its own thread, deduped by `unparsed:<ts>`, and the
   cursor stops just before the oldest unreleased one so history still covers it
   next run. After 48h from first sight it stops holding the cursor and is
@@ -538,7 +543,7 @@ policy grants the other half.
 | --- | --- |
 | `new` | claimed by `tevyn-handoffs-new`, waiting for a schedule task |
 | `building` | a schedule task is working in S2W; a rerun resumes it |
-| `built` | `mode: shadow`, campaign built, a person schedules it; replies due at `sendAt` + 48h |
+| `built` | `mode: shadow`, campaign built, a person schedules it; or `handler: api`, built and sent by gp-api. Replies due at `sendAt` + 48h |
 | `scheduled` | `mode: auto`, scheduled and read back; replies due at `repliesDueAt` |
 | `replies_uploaded` | replies export is in S3 |
 | `needs_human` | the skill escalated in the post's thread; nothing touches it until a person clears the record |

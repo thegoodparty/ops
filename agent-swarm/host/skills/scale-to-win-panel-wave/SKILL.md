@@ -103,9 +103,12 @@ Delete local screenshots, recipient CSVs and exports when you are done.
 ## Action: export_replies
 
 Run only at or after `repliesDueAt`. The record is `scheduled` (auto) or `built`
-(shadow, scheduled by a person). For both, `repliesDueAt` counts from the hand-off's
+(shadow, scheduled by a person). A record with `handler: 'api'` is a wave gp-api
+built and sent through the Scale to Win API: it is `built` from the claim, has no
+`campaignName`, and you never build or schedule it. For both, `repliesDueAt` counts from the hand-off's
 `sendAt`, not from the time a person actually picked.
-1. Open the campaign (search `#<outreachId>`; use the saved `campaignName`). If it was
+1. Open the campaign (search `#<outreachId>`; use the saved `campaignName` when
+   there is one). If it was
    never sent, or is still scheduled or sending, do not export; escalate (step `export`,
    cause "campaign not sent").
 2. Export Campaign Data. On the "Campaign Replies Export" row click Refresh Export.

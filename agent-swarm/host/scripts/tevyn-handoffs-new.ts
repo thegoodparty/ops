@@ -1,8 +1,10 @@
 import type { ScriptContext } from 'swarm-sdk'
 import * as z from 'zod'
 
-// Finds gp-api agent hand-off posts in #tevyn-api that this swarm has not
-// returned before. The Slack token stays in this script; errors are built from
+// Finds gp-api hand-off posts in #tevyn-api that this swarm has not returned
+// before. An agent post is built here; an api post (gp-api builds it through
+// the Scale to Win API) is claimed as already built, so only its replies
+// export runs here. The Slack token stays in this script; errors are built from
 // status codes and Slack's error code, never from a URL or response body.
 //
 // A post that carries the handling note but cannot be read is not dropped: it
@@ -16,6 +18,7 @@ const MAX_PAGES = 5
 const FIRST_RUN_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
 const CURSOR_KEY = 'tevyn:cursor'
 const HANDLING_NOTE_MARKER = 'Delegate is handling this wave'
+const API_NOTE_MARKER = 'gp-api is building this wave'
 const UNPARSED_PREFIX = 'unparsed:'
 const RELEASE_MS = 48 * 60 * 60 * 1000
 const REPLY_SCRIPT = 'tevyn-thread-reply'
@@ -72,7 +75,10 @@ export const handoffBlockSchema = z.object({
   timeZone: z.string().min(1),
   mode: z.enum(['shadow', 'auto']),
   env: z.string().min(1),
-  repliesKey: z.string().min(1),
+  // Posts from before gp-api named the handler are agent posts.
+  handler: z.enum(['agent', 'api']).default('agent'),
+  // gp-api leaves it off an api post; an agent post must carry it.
+  repliesKey: z.string().min(1).optional(),
 })
 
 export type Handoff = z.infer<typeof handoffBlockSchema> & {
@@ -157,6 +163,7 @@ export type UnreadableReason =
   | 'no machine block'
   | 'invalid fields'
   | 'replies key mismatch'
+  | 'handler mismatch'
 
 type Classification =
   | { kind: 'handoff'; handoff: Handoff }
@@ -170,14 +177,22 @@ const classify = (message: Message, channel: string): Classification => {
   const blocks = message.blocks
   if (!blocks) return { kind: 'not-handoff' }
   const texts = sectionTexts(blocks)
-  if (!texts.some((t) => t.includes(HANDLING_NOTE_MARKER))) {
-    return { kind: 'not-handoff' }
-  }
+  const agentNote = texts.some((t) => t.includes(HANDLING_NOTE_MARKER))
+  const apiNote = texts.some((t) => t.includes(API_NOTE_MARKER))
+  if (!agentNote && !apiNote) return { kind: 'not-handoff' }
   const fields = parseMachineBlock(texts)
   if (!fields) return { kind: 'unreadable', reason: 'no machine block' }
   const block = handoffBlockSchema.safeParse(fields)
   if (!block.success) return { kind: 'unreadable', reason: 'invalid fields' }
-  if (block.data.repliesKey !== `agent-replies/${block.data.outreachId}.csv`) {
+  // The note and the block must agree: an api wave read as an agent one
+  // would be built a second time by hand.
+  if (apiNote !== (block.data.handler === 'api') || (agentNote && apiNote)) {
+    return { kind: 'unreadable', reason: 'handler mismatch' }
+  }
+  if (
+    block.data.handler === 'agent' &&
+    block.data.repliesKey !== `agent-replies/${block.data.outreachId}.csv`
+  ) {
     return { kind: 'unreadable', reason: 'replies key mismatch' }
   }
   const recipients = texts
@@ -316,9 +331,12 @@ export const run = async (deps: Deps): Promise<RunResult> => {
   // consume ids it never returned. The claim holds everything a later task
   // needs, so an id that is never returned again can still be handled from KV.
   // The cursor moves last.
+  // An api wave is built by gp-api, so it is claimed as built: the tick
+  // never schedules it and exports its replies at sendAt + 48h.
   for (const handoff of fresh) {
     await deps.kv.set(`handoff:${handoff.outreachId}`, {
-      state: 'new',
+      state: handoff.handler === 'api' ? 'built' : 'new',
+      ...(handoff.handler === 'api' ? { handler: 'api' } : {}),
       slackTs: handoff.ts,
       channel: handoff.channel,
       sendAt: handoff.sendAt,
