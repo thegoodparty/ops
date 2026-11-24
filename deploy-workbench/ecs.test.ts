@@ -1914,11 +1914,12 @@ describe("bifrost ecs", () => {
       `bifrost/config.json is ${bytes} bytes and the Advanced tier holds ${BIFROST_CONFIG_PARAMETER_BYTES}; past that the parameter needs a larger tier`,
     );
     // The file is past the standard tier, which is why the tier moved. If this
-    // ever stops being true the tier can go back, and the assertion says so
-    // rather than leaving a charged tier nobody can explain.
+    // ever stops being true the decision has to be revisited deliberately: AWS
+    // does not allow an `Advanced` parameter to go back to `Standard`, so the
+    // parameter would have to be deleted and recreated, not merely re-tagged.
     assert.ok(
       bytes > BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES,
-      `bifrost/config.json is ${bytes} bytes, inside the standard tier's ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; the Advanced tier is no longer needed`,
+      `bifrost/config.json is ${bytes} bytes, inside the standard tier's ${BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES}; revisit the Advanced tier, which cannot be downgraded in place`,
     );
   });
 

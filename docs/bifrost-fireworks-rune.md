@@ -130,14 +130,17 @@ make it fit were to minify ~400 bytes of the file (reformatting entries this
 change does not touch, which is churn a reviewer cannot check) or to move the
 tier, which `ecs.ts` already named as the escape. The tier moved:
 `BIFROST_CONFIG_PARAMETER_TIER` is `"Advanced"` (8 KiB, and AWS charges for it),
-set explicitly on the parameter so a later smaller file is a deliberate
-downgrade rather than a silent one.
+set explicitly on the parameter so the tier that holds the file is stated rather
+than inferred from a provider default.
 
 The cost is real and worth naming: a charged parameter, and a ceiling far enough
-away that the next addition will not feel it. `ecs.test.ts` now pins both — the
-file is under 8 KiB, and it is still *over* 4 KiB, so the day it fits the
-standard tier again the test says so instead of leaving a charged tier nobody can
-explain.
+away that the next addition will not feel it. `ecs.test.ts` pins both — the file
+is under 8 KiB, and it is still *over* 4 KiB, so the day it fits the standard
+tier again the suite says so. That assertion does not license moving the
+parameter back: AWS upgrades a `Standard` parameter to `Advanced` and **refuses
+the reverse**, because the move would truncate an 8 KiB value to 4 KiB and drop
+any policies on it. Returning to `Standard` means deleting the parameter and
+recreating it, which is a deliberate change rather than a default.
 
 ## Classification: two boot-only additions, not one
 

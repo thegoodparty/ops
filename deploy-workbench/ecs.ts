@@ -765,10 +765,14 @@ export const BIFROST_CONFIG_PARAMETER_NAME = "/bifrost/config";
  * 4 KiB and is free.
  *
  * `Advanced`, because `bifrost/config.json` is 4,474 bytes: the standard tier
- * would reject the `PutParameter`, and it is set explicitly rather than left to
- * the provider's default so a smaller file later is a deliberate downgrade
- * rather than a silent one. Named here so the test and the resource read the
- * same value, the way `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES` used to.
+ * would reject the `PutParameter`. It is set explicitly rather than left to the
+ * provider's default, so the tier that holds the file is stated rather than
+ * inferred. The move is one-way — AWS upgrades a `Standard` parameter to
+ * `Advanced` and refuses the reverse — so a smaller file later does not return
+ * the parameter to `Standard`; that takes deleting it and recreating it, which
+ * is a deliberate act rather than something a default does. Named here so the
+ * test and the resource read the same value, the way
+ * `BIFROST_CONFIG_PARAMETER_STANDARD_TIER_BYTES` used to.
  */
 export const BIFROST_CONFIG_PARAMETER_TIER = "Advanced";
 

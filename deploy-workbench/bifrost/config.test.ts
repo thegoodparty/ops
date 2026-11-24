@@ -64,7 +64,6 @@ type ProviderKey = {
   value?: string;
   models: string[];
   aliases?: Record<string, KeyAlias>;
-  alias?: string;
   weight: number;
   bedrock_key_config?: Record<string, unknown>;
 };
@@ -1112,9 +1111,9 @@ describe("bifrost config.json", () => {
     // second name for a model that has no other.
     assert.deepEqual(rune.keys.map((key) => key.models), [[RUNE_MODEL]]);
     assert.equal(rune.keys.length, 1);
-    assert.equal(
-      rune.keys[0].alias,
-      undefined,
+    assert.deepEqual(
+      Object.keys(rune.keys[0].aliases ?? {}),
+      [],
       "fireworks-rune serves one model under its documented name; an alias would be a second name for it",
     );
     // The key reuses the deployment's existing Fireworks credential rather than
