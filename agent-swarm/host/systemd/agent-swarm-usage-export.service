@@ -17,9 +17,10 @@ Type=oneshot
 # ec2-user cannot do on the container's files.
 User=root
 Environment=AWS_REGION=us-west-2
-# A daily run reads its file in seconds; the monthly read is the long one. This
-# bound keeps a 09:15 start well clear of the data volume's 10:00 snapshot, so the
-# two can never overlap even if an upload goes slow.
+# A daily run reads its file in seconds; the monthly read is the long one. 30
+# minutes is enough for both and keeps an on-time 09:15 start finished by 09:45, so
+# the read is done before the data volume's 10:00 snapshot. A catch-up run after
+# downtime starts when the host comes back and is only bounded by this same value.
 TimeoutStartSec=1800
 Nice=10
 IOSchedulingClass=idle

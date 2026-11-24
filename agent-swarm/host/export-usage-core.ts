@@ -59,8 +59,9 @@ export const TASK_EDGE_PREFIX = "delegate-swarm/task-edge";
  * the ledger; ninety days on the first of the month heals a row whose `task_id`
  * was nulled by a task deletion upstream. Both files carry the same window.
  *
- * The ninety day read runs at 09:15, an hour and a quarter before the data
- * volume's 10:00 snapshot, so it is bounded and cannot overlap it.
+ * The read starts at 09:15, 45 minutes before the data volume's 10:00 snapshot,
+ * and the unit's timeout bounds an on-time run to 30 minutes, so it finishes by
+ * 09:45.
  */
 export const DAILY_WINDOW_DAYS = 7;
 export const MONTHLY_WINDOW_DAYS = 90;
@@ -234,15 +235,6 @@ export const windowDaysFor = (startedAt: Date): number =>
 export const windowStart = (startedAt: Date, days: number): string =>
   new Date(startedAt.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
 
-/**
- * The database file, from the volume's mountpoint.
- *
- * Resolved at run time through `docker volume inspect` rather than hardcoded
- * under `/var/lib/docker`, because Docker's root can move and the compose
- * project name (which makes the volume `agent-swarm_swarm_api_data`) is the only
- * stable half.
- */
-export { databasePathFrom } from "./export-usage-sqlite";
 
 /** One row as the landing object, keys in landing-column order. */
 export const toLandingRow = (
@@ -258,12 +250,12 @@ export const toLandingRow = (
   );
 
 /**
- * The file body: one JSON object per line, no indentation, no trailing newline
- * on the last row, and no nesting.
+ * The file body: one JSON object per line, no indentation, no nesting, and a
+ * newline after every row **including the last**.
  *
- * The newline after every row including the last is kept deliberately. A trailing
- * newline is what makes appended files behave, and `COPY INTO` with
- * `fileformat = json` reads a final empty line as nothing.
+ * The final newline is deliberate rather than tidy. It is the conventional
+ * JSON Lines terminator, and `COPY INTO` with `fileformat = json` reads the empty
+ * string after it as no row at all, so a file ends on a boundary.
  */
 export const toJsonLines = (
   rows: readonly Record<string, unknown>[],

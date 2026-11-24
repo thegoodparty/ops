@@ -2,9 +2,9 @@
 Description=Run the delegate swarm usage export daily at 09:15 UTC
 
 [Timer]
-# 09:15 UTC: an hour and a quarter before the data volume's 10:00 snapshot, and
-# ahead of the loader, so a day's file exists before the warehouse build that
-# reads it. Not 09:00, which is the gateway's own export.
+# 09:15 UTC: 45 minutes before the data volume's 10:00 snapshot, and ahead of the
+# loader, so a day's file exists before the warehouse build that reads it. Not
+# 09:00, which is the gateway's own export.
 OnCalendar=*-*-* 09:15:00 UTC
 # The first of the month reads ninety days instead of seven; the exporter decides
 # that from the date, so one timer covers both.

@@ -79,7 +79,12 @@ export const putObjectWithCli = (
     const stdout = String((error as { stdout?: string }).stdout ?? "");
     const message =
       `${stderr}${stdout}`.trim() || String((error as { message?: string }).message ?? error);
-    if (/(^|\D)412(\D|$)|PreconditionFailed/.test(message)) {
+    // `PreconditionFailed` is the code the CLI prints for a 412 on this call.
+    // The bare status is matched only in the "An error occurred (412)" shape the
+    // CLI uses when it has no modelled error for the case, never as a loose
+    // three-digit number: a request id can contain "412" and a rerun is not worth
+    // silently swallowing a real failure over.
+    if (/PreconditionFailed|An error occurred \(412\)/.test(message)) {
       return { ok: false, alreadyExists: true };
     }
     return { ok: false, error: message };

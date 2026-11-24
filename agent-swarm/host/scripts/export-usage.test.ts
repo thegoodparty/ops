@@ -21,7 +21,6 @@ import {
   UNKNOWN_AGENT_NAME,
   compactStamp,
   exportedAtStamp,
-  databasePathFrom,
   objectKey,
   runExport,
   toJsonLines,
@@ -31,7 +30,7 @@ import {
   type ExporterDeps,
   type PutResult,
 } from "../export-usage-core";
-import { readSnapshotWith, type SqliteHandle } from "../export-usage-sqlite";
+import { databasePathFrom, readSnapshotWith, type SqliteHandle } from "../export-usage-sqlite";
 import { putObjectWithCli, volumeMountpoint } from "../export-usage-aws";
 
 /**
@@ -544,9 +543,11 @@ describe("export usage: the checked-in column pin", () => {
     ]) {
       assert.ok(!SESSION_COST_SQL.includes(forbidden), `session_costs: ${forbidden} must not be exported`);
     }
-    for (const forbidden of ["t.task", "output", "progress", "failureReason", "rejectionReason"]) {
-      assert.ok(!TASK_EDGE_SQL.includes(forbidden), `agent_tasks: ${forbidden} must not be exported`);
-    }
+    // The edge SELECT names only `agent_tasks` columns, and none of them is a free
+    // text one. Checked on the column references rather than as a substring
+    // search, which "output" would pass on a rename and fail on a comment.
+    const selected = [...TASK_EDGE_SQL.matchAll(/t\.([A-Za-z]+)\s+AS/g)].map((match) => match[1]);
+    assert.deepEqual(selected, ["id", "parentTaskId", "dispatchedByTaskId", "status", "createdAt"]);
   });
 });
 
@@ -666,7 +667,7 @@ describe("export usage: the aws cli half", () => {
     const databasePath = withFixture(LEDGER);
     const { deps, puts, lines } = harness({
       databasePath,
-      put: putObjectWithCli,
+      put: (args) => putObjectWithCli({ ...args, region: "us-west-2" }),
     });
     withStubs(
       {
