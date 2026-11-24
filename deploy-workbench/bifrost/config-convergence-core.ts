@@ -47,9 +47,9 @@
  * - `$schema` is live and has no runtime effect, so it is named as skipped
  *   rather than pretended to be converged.
  *
- * `governance` is the refusal, and it is worth stating because the plan's split
- * table calls it live. It is live in the sense that `PUT /api/config` accepts
- * `auth_config`. What the file actually holds there is
+ * `governance.auth_config` is the refusal, and it is worth stating because the
+ * plan's split table calls `governance` live. `auth_config` is live in the sense
+ * that `PUT /api/config` accepts it. What the file actually holds there is
  * `admin_username: "env.BIFROST_ADMIN_USERNAME"` and
  * `admin_password: "env.BIFROST_ADMIN_PASSWORD"` — `env.` references only the
  * task can resolve, exactly like a provider key's value. A reconciler that
@@ -58,6 +58,12 @@
  * same reason. The section is provisioned at boot from the file and by the
  * claim container, so it is applied today; this loop names it in `skipped` with
  * `env-reference` rather than silently dropping it.
+ *
+ * `governance.pricing_overrides` is the other leaf in that block, and it is not
+ * this loop's either: it is boot-only (`ecs.ts`, `BIFROST_BOOT_ONLY_PATHS`), so
+ * an edit rolls the task and the next boot loads it from the file. Naming the
+ * block whole would have swallowed the override into this refusal, which is the
+ * silent direction: a corrected rate would then neither roll nor converge.
  *
  * And that refusal has to reach the client-config write, not only the skip list.
  * `GET /api/config` includes `auth_config` whenever the admin row exists, so the
@@ -206,7 +212,7 @@ export const UNCONVERGED_LIVE_SECTIONS: ReadonlyArray<{
     reason: "no-runtime-effect",
   },
   {
-    path: "governance",
+    path: "governance.auth_config",
     reason: "env-reference",
   },
 ];
@@ -490,7 +496,8 @@ export const differingKeyFields = (
  * would carry it. `PUT /api/config` decodes `auth_config` whenever the body
  * carries it, which would make every deploy a write to the admin-account block —
  * the exact thing this module's header says the loop refuses to do, and the
- * reason `governance` is skipped as `env-reference` rather than converged.
+ * reason `governance.auth_config` is skipped as `env-reference` rather than
+ * converged.
  *
  * What that write would do is not pinned by anything in this repo: if the read
  * path masks `admin_password`, the echo stores the mask as the credential; if the

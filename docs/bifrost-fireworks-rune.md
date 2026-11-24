@@ -17,8 +17,9 @@ Fireworks documents that chat completions and completions against it return
 way to reach it through the gateway, so the gateway cannot see, attribute or cap
 that spend, which is the whole point of the gateway existing.
 
-This document records what was measured, what the change is, and the one thing it
-could not prove.
+This document records what was measured, what the change is, and the two
+verifications it did not perform: the pre-merge authorized upstream call, and the
+post-deploy call through the gateway's virtual key.
 
 ## Why a second provider, and not another model on the first
 
@@ -138,13 +139,15 @@ file is under 8 KiB, and it is still *over* 4 KiB, so the day it fits the
 standard tier again the test says so instead of leaving a charged tier nobody can
 explain.
 
-## Classification: `custom_provider_config` is boot-only
+## Classification: two boot-only additions, not one
 
 `ecs.ts` splits `config.json` into boot-only leaves, which `BIFROST_CONFIG_VERSION`
 digests so a change rolls the task, and live leaves, which the reconciler
 converges into the running process. The two lists must partition every leaf, and
-`ecs.test.ts` fails on an unclassified one. `providers.*.custom_provider_config`
-is new with this change, so it had to be classified.
+`ecs.test.ts` fails on an unclassified one. This change adds leaves to both
+lists' neighbourhoods, so each had to be classified.
+
+### `providers.*.custom_provider_config`
 
 It is **boot-only**, for three reasons rather than a preference:
 
@@ -164,28 +167,64 @@ It is **boot-only**, for three reasons rather than a preference:
 Boot-only is the visible, cheap direction of the asymmetry the module documents.
 `ecs.test.ts`'s drift test is clean with it.
 
-## Convergence, and the one thing this could not prove
+### `governance.pricing_overrides`
 
-**A live US smoke test.** The gateway is an ECS deployment in the workbench
-account. Nothing here could reach it, and an unauthenticated probe of
-`https://us.api.fireworks.ai/inference/v1/systemone` returning `401` proves only
-that the route exists, not that this account's key is entitled to Rune. That
-needs an authorized call with a real key against the real endpoint, which is
-**a pre-merge requirement**, not something this PR can assert:
+The other new leaf is the override, and it lands in `governance` — a block the
+lists previously classified whole: live in `BIFROST_LIVE_PATHS`, refused as
+`env-reference` by the convergence loop, because its only content was the admin
+account. That premise was what the refusal rested on, and the override breaks it,
+so leaving `governance` as one rule would have made the override an edit that
+neither rolls the task nor converges: the parameter updates, the running process
+keeps the old rate, and Rune spend keeps logging at it.
 
-1. After merge and the `deploy-workbench` deploy, mint a **new** virtual key
-   (`gp-pi bifrost-key --refresh`), because the template change reaches existing
-   keys only through the reconciler's next tick.
-2. `POST /v1/decisions` with `model: "fireworks-rune/accounts/fireworks/models/rune"`
-   and one `predicate` question. Expect `200` and an `answers` array.
+It is therefore **boot-only**, and the live rule narrows to
+`governance.auth_config`. `config.json` is authoritative for the block, so the
+boot path loads the override; a corrected price is a number nobody sees until
+the task rolls, so it rolls. `ecs.test.ts` pins both directions — a rate change
+registers a new revision, and a leaf added under `governance` outside
+`auth_config` and `pricing_overrides` is unclassified and fails rather than
+inheriting a blanket live rule.
+
+## What has not been verified, and the two steps that would
+
+Nothing here has made a live call, and no deploy has run. There are two distinct
+verifications left, and they are not interchangeable: one is a pre-merge
+requirement against the upstream endpoint, and the other only becomes possible
+after this merges and `deploy-workbench` deploys.
+
+### Before merge: an authorized upstream call
+
+An unauthenticated probe of `https://us.api.fireworks.ai/inference/v1/systemone`
+returning `401` proves only that the route exists, not that this account's key is
+entitled to Rune. That needs an authorized call with a real key **directly
+against the Fireworks US endpoint**, ahead of merge:
+
+- `POST https://us.api.fireworks.ai/inference/v1/systemone` with
+  `Authorization: Bearer $FIREWORKS_API_KEY`, `model:
+  "accounts/fireworks/models/rune"`, and one `predicate` question.
+- Expect `200` with an `answers` array. A `400`/`403` here means the account is
+  not entitled to Rune, and the provider block would be dead on arrival.
+- This is the check `fireworks-rune` rests on, and it says nothing about the
+  gateway: it exercises Fireworks, not Bifrost.
+
+### After merge and deploy: through the deployed virtual key
+
+Only reachable once the workbench stack has deployed the new config, and it must
+not be reported as done before then:
+
+1. Mint a **new** virtual key (`gp-pi bifrost-key --refresh`), because the
+   template change reaches existing keys only through the reconciler's next tick.
+2. Through the deployed gateway, `POST /v1/decisions` with
+   `model: "fireworks-rune/accounts/fireworks/models/rune"` and one `predicate`
+   question. Expect `200` and an `answers` array.
 3. Re-send the same body to `/v1/chat/completions`. Expect `400` with
    `unsupported_operation`, which is the no-chat-exposure claim made concrete.
 4. Read the request's cost in the gateway's log for that key. Expect a non-zero
    cost at about $0.000042 per 1k input tokens.
 
-**What was proved locally instead**, on the pinned `maximhq/bifrost:v2.4.0`
-image with this exact provider block and override, against a stub that mimics
-Fireworks' `systemone` reply:
+**What was proved locally, which stands in for neither step**, on the pinned
+`maximhq/bifrost:v2.4.0` image with this exact provider block and override,
+against a stub that mimics Fireworks' `systemone` reply:
 
 - `/v1/decisions` answered `200` with the normalized answers, on the custom
   provider, with `Authorization: Bearer <key>` and a body at
@@ -200,7 +239,9 @@ Fireworks' `systemone` reply:
 `bifrost/config.test.ts`:
 
 - `fireworks-rune` serves one model, has no alias, reuses `env.FIREWORKS_API_KEY`,
-  and allows **only** `decisions` — every chat shape asserted absent.
+  and pins `allowed_requests` to exactly `{ decisions: true }`; because that field
+  is a whitelist, the equality is the whole no-chat-shape claim, so no per-shape
+  loop is asserted on top of it.
 - the pricing override is exact-match, `decisions`-only, global-scope, and its
   rates are the published ones with no output rate.
 - the endpoint is the US-only host, on both Fireworks providers; every other
@@ -213,8 +254,15 @@ one model, and the residency rule for it is the endpoint, since its id has no
 `-us` router suffix to check.
 
 `ecs.test.ts`: the byte ceiling is the Advanced tier, and the file is still over
-the standard one; the classification drift test is clean with
-`custom_provider_config` boot-only.
+the standard one; the drift test is clean with `custom_provider_config` and
+`governance.pricing_overrides` boot-only, a rate edit registers a new
+revision, and a new leaf under `governance` outside `auth_config` fails as
+unclassified.
+
+`bifrost/config-convergence-core.test.ts`: the loop still refuses
+`governance.auth_config` as `env-reference`, and `governance.pricing_overrides`
+is asserted boot-only rather than skipped — so a rate edit rolls instead of being
+silently dropped.
 
 ## What this does not do
 

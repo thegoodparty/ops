@@ -1106,22 +1106,6 @@ describe("bifrost config.json", () => {
       { decisions: true },
       "allowed_requests is a whitelist: this must name decisions and nothing else, so no chat shape is exposed",
     );
-    for (const chatShape of [
-      "chat_completion",
-      "chat_completion_stream",
-      "text_completion",
-      "responses",
-      "embedding",
-      "speech",
-      "transcription",
-      "image_generation",
-      "list_models",
-    ]) {
-      assert.ok(
-        !rune.custom_provider_config?.allowed_requests?.[chatShape],
-        `${chatShape} must not be allowed on fireworks-rune; that is a chat surface on a Decisions model`,
-      );
-    }
 
     // One model, named exactly as Fireworks documents it, with no alias: a
     // Decisions model is not a chat model, and an alias here would invent a

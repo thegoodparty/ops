@@ -33,9 +33,9 @@ import {
  *    traps: `client_config` is sent complete from the server's own view, and a
  *    provider key's body carries only the fields that differed — so a key's
  *    `value` never appears in a request.
- * 4. A section this loop cannot converge (`governance`, which holds `env.`
- *    references only the task can resolve) is reported as skipped rather than
- *    silently dropped, and a provider the gateway does not have is skipped
+ * 4. A section this loop cannot converge (`governance.auth_config`, which holds
+ *    `env.` references only the task can resolve) is reported as skipped rather
+ *    than silently dropped, and a provider the gateway does not have is skipped
  *    rather than created.
  * 5. A refused write fails the run, so the deploy's poll cannot read a
  *    half-converged gateway as a converged one.
@@ -168,7 +168,7 @@ describe("the desired state, from the committed file", () => {
 
     assert.deepEqual(
       desired.skipped.map((entry) => `${entry.path}:${entry.reason}`),
-      ["$schema:no-runtime-effect", "governance:env-reference"],
+      ["$schema:no-runtime-effect", "governance.auth_config:env-reference"],
     );
   });
 
@@ -190,14 +190,20 @@ describe("the desired state, from the committed file", () => {
  * The live path list (step 1) and this loop's coverage, cross-checked against
  * each other and against the committed file.
  *
- * The point is to make one real gap loud rather than silent. \`BIFROST_LIVE_PATHS\`
- * classifies \`governance\` live, so editing it registers no new revision; this
- * loop refuses it, because its only content is \`env.\` references. Those two
- * facts together mean an edit to \`config.json\`'s \`governance\` block applies
- * nowhere: no restart, and no converge. It is a step 1 classification question
- * rather than a step 4 one -- moving the section to the boot-only list would roll
- * the task on such an edit, which is the cheap direction of the asymmetry -- so
- * this test pins the tension instead of quietly resolving it in one direction.
+ * The point is to make the one remaining gap loud rather than silent.
+ * \`BIFROST_LIVE_PATHS\` classifies \`governance.auth_config\` live, so editing it
+ * registers no new revision; this loop refuses it, because its only content is
+ * \`env.\` references. Those two facts together mean an edit to \`config.json\`'s
+ * admin block applies nowhere: no restart, and no converge. It is a step 1
+ * classification question rather than a step 4 one -- moving the section to the
+ * boot-only list would roll the task on such an edit, which is the cheap
+ * direction of the asymmetry -- so this test pins the tension instead of quietly
+ * resolving it in one direction.
+ *
+ * \`governance.pricing_overrides\` is the same question and no longer a gap: the
+ * first non-env leaf in that block is boot-only, so a rate edit rolls the task
+ * and the next boot loads it. Both halves are asserted here, because the failure
+ * mode of getting it wrong is a price correction that applies nowhere.
  */
 describe("the live path list and this loop agree, except where they cannot", () => {
   const claimed = (rules: typeof BIFROST_LIVE_PATHS): Set<string> =>
@@ -206,17 +212,19 @@ describe("the live path list and this loop agree, except where they cannot", () 
   it("names the one section whose classification and convergence disagree", () => {
     const desired = liveConfigDesiredState(readBifrostConfig());
     assert.deepEqual(
-      desired.skipped.find((entry) => entry.path === "governance"),
-      { path: "governance", reason: "env-reference" },
-      "config.json's governance block holds env. references only the task resolves",
+      desired.skipped.find((entry) => entry.path === "governance.auth_config"),
+      { path: "governance.auth_config", reason: "env-reference" },
+      "config.json's auth_config holds env. references only the task resolves",
     );
     // Step 1's list says live; this loop refuses. Both statements are true, and
     // the consequence is that an edit to the block applies nowhere. Pinned here
     // so the gap is a failing test if either side changes, and reported in the
     // PR body as a decision rather than quietly fixed in this one.
     assert.ok(
-      [...claimed(BIFROST_LIVE_PATHS)].some((path) => path.startsWith("governance.")),
-      "step 1 classifies governance live: an edit registers no new revision",
+      [...claimed(BIFROST_LIVE_PATHS)].some((path) =>
+        path.startsWith("governance.auth_config."),
+      ),
+      "step 1 classifies governance.auth_config live: an edit registers no new revision",
     );
     const file = JSON.parse(readBifrostConfig()) as {
       governance?: { auth_config?: Record<string, unknown> };
@@ -229,6 +237,34 @@ describe("the live path list and this loop agree, except where they cannot", () 
         "if a governance value stops being an env. reference this refusal is wrong and the section should be converged",
       );
     }
+  });
+
+  it("leaves the pricing overrides out of both lists' quiet directions", () => {
+    // `governance.pricing_overrides` is the first leaf in the block that is not
+    // an env. reference, so the "governance is only env. references" premise no
+    // longer covers the whole block. It is boot-only instead: the loop has no
+    // pricing writer, so a live classification would be a rate edit that neither
+    // rolls the task nor converges.
+    const live = claimed(BIFROST_LIVE_PATHS);
+    const boot = bifrostConfigClaimedLeaves(
+      readBifrostConfig(),
+      BIFROST_BOOT_ONLY_PATHS,
+    );
+    assert.ok(
+      boot.includes("governance.pricing_overrides[0].pricing_patch"),
+      "a pricing override's rate is read at boot, so an edit must register a new revision",
+    );
+    assert.ok(
+      ![...live].some((path) => path.startsWith("governance.pricing_overrides")),
+      "nothing converges a pricing override live, so claiming it live would let a rate edit land nowhere",
+    );
+    assert.equal(
+      liveConfigDesiredState(readBifrostConfig()).skipped.find((entry) =>
+        entry.path.startsWith("governance.pricing_overrides"),
+      ),
+      undefined,
+      "the override is boot-only, not a live section this loop refuses: naming it skipped would hide the roll that applies it",
+    );
   });
 
   it("converges or names every provider key leaf, and never the value", () => {

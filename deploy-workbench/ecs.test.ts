@@ -1567,6 +1567,7 @@ describe("bifrost ecs", () => {
       "providers.fireworks.keys[0].value=",
       "providers.bedrock.keys[0].value=",
       "source_of_truth=",
+      "governance.pricing_overrides[0].pricing_patch=",
     ]) {
       assert.ok(
         digestLines.some((line) => line.startsWith(expected)),
@@ -1578,7 +1579,7 @@ describe("bifrost ecs", () => {
     for (const excluded of [
       "$schema=",
       "client.",
-      "governance.",
+      "governance.auth_config.",
       "providers.fireworks.network_config.",
       "providers.bedrock.prompt_cache.",
       "providers.fireworks.keys[0].models",
@@ -1724,6 +1725,26 @@ describe("bifrost ecs", () => {
           doc.source_of_truth = "database";
         },
       ],
+      [
+        "a governance pricing override rate",
+        (doc) => {
+          doc.governance.pricing_overrides[0].pricing_patch =
+            '{"input_cost_per_token_decisions":5e-8}';
+        },
+      ],
+      [
+        "a whole new governance pricing override",
+        (doc) => {
+          doc.governance.pricing_overrides.push({
+            id: "another-rate",
+            scope_kind: "global",
+            match_type: "exact",
+            pattern: "accounts/fireworks/models/another",
+            request_types: ["decisions"],
+            pricing_patch: '{"input_cost_per_token_decisions":1e-7}',
+          });
+        },
+      ],
     ];
 
     for (const [what, edit] of edits) {
@@ -1768,13 +1789,29 @@ describe("bifrost ecs", () => {
     // failure is provoked here with a deliberately broken input, so the
     // assertions above are known to be load-bearing rather than vacuous.
     const unclassified = editedBifrostConfig((doc) => {
+      doc.governance.auth_config.brand_new_leaf = { enabled: true };
+    });
+    // `governance.auth_config` is a live subtree, so a new leaf under it is
+    // classified by the subtree rule and is not a problem. That is asserted,
+    // because a subtree rule that quietly stopped matching would otherwise only
+    // show up as an unclaimed leaf in production.
+    assert.deepEqual(bifrostConfigClassificationProblems(unclassified), []);
+
+    // The narrowing is load-bearing in the other direction too: a leaf added
+    // directly under `governance`, outside `auth_config` and
+    // `pricing_overrides`, belongs to neither rule, so it fails rather than
+    // inheriting a blanket live classification nobody converged.
+    const newGovernanceLeaf = editedBifrostConfig((doc) => {
       doc.governance.brand_new_leaf = { enabled: true };
     });
-    // `governance` is a live subtree, so a new leaf under it is classified by
-    // the subtree rule and is not a problem. That is asserted, because a
-    // subtree rule that quietly stopped matching would otherwise only show up
-    // as an unclaimed leaf in production.
-    assert.deepEqual(bifrostConfigClassificationProblems(unclassified), []);
+    const governanceProblems =
+      bifrostConfigClassificationProblems(newGovernanceLeaf);
+    assert.ok(
+      governanceProblems.some((problem) =>
+        problem.startsWith("governance.brand_new_leaf.enabled "),
+      ),
+      `a new governance leaf outside auth_config must be classified:\n${governanceProblems.join("\n")}`,
+    );
 
     // A top-level section nobody classified, added at the root: this is the
     // shape of an upstream schema addition, and it fails.

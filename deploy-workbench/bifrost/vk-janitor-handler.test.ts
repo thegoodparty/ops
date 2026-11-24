@@ -82,9 +82,9 @@ const harness = (options: {
 
   // The gateway's config view and the committed file agree, so a test that is
   // not about config convergence gets an empty diff and no write. `client`
-  // carries one field the file also carries; `governance` is in the file and
-  // deliberately not converged (`env-reference`), which is what the default
-  // summary's `skipped: 2` counts.
+  // carries one field the file also carries; `governance.auth_config` is in the
+  // file and deliberately not converged (`env-reference`), which is what the
+  // default summary's `skipped: 2` counts.
   const observedConfig = options.observedConfig ?? {
     client_config: { enable_logging: true },
     framework_config: {},
@@ -163,7 +163,7 @@ describe("the janitor handler", () => {
    *
    * `config.unchanged: 1` and `config.skipped: 2` are the harness's default file:
    * one client field that already matches, plus the two sections config
-   * convergence names and refuses ($schema, governance).
+   * convergence names and refuses ($schema, governance.auth_config).
    */
   const runSummary = (overrides: {
     revocation?: Record<string, unknown>;

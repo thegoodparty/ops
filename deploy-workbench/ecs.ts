@@ -715,9 +715,9 @@ export const GATEWAY_PASSWORD_ENV_NAMES = [PG_SECRET_ARN_ENV_NAME] as const;
  * `BIFROST_CONFIG`.
  *
  * Why a parameter rather than an `environment` entry with the JSON inlined in
- * the task definition: the file is 3,604 bytes today (`wc -c`, measured on
- * `deploy-workbench/bifrost/config.json`) and grows when item 14 adds teams and
- * virtual keys, and task-definition environment entries are the wrong place for
+ * the task definition: the file grows when item 14 adds teams and virtual keys
+ * (`wc -c` on `deploy-workbench/bifrost/config.json` is the number), and
+ * task-definition environment entries are the wrong place for
  * a document that changes on its own schedule. Why SSM rather
  * than Secrets Manager: the file holds no secret by construction - every
  * credential in it is an `env.NAME` reference, which `bifrost/config.test.ts`
@@ -850,6 +850,15 @@ export interface BifrostConfigPathRule {
  *   (`ConfigGateway.getProvider` answers `null` for one the file has and the
  *   gateway does not), so a file that gains one needs the boot path anyway.
  *   Boot-only is the visible, cheap direction of the asymmetry below.
+ * - `governance.pricing_overrides` is **boot-only**, and it is the one leaf in
+ *   the `governance` block that is not an `env.` reference. `config.json` is
+ *   authoritative (`source_of_truth`), so the override is loaded at boot; the
+ *   convergence loop does not touch `governance` at all (it holds the admin
+ *   credentials, `env-reference`), and no other code converges a
+ *   `pricing_overrides` edit. Classified live, a rate correction would update
+ *   the parameter and apply nowhere: no restart, no converge, and spend keeps
+ *   logging at the old rate — the silent direction this digest exists to close.
+ *   A corrected price is a number nobody sees until the task rolls, so it rolls.
  */
 export const BIFROST_BOOT_ONLY_PATHS = [
   { path: "config_store", subtree: true },
@@ -859,6 +868,7 @@ export const BIFROST_BOOT_ONLY_PATHS = [
   { path: "providers.*.keys[].value", subtree: false },
   { path: "source_of_truth", subtree: false },
   { path: "providers.*.custom_provider_config", subtree: true },
+  { path: "governance.pricing_overrides", subtree: true },
 ] as const satisfies readonly BifrostConfigPathRule[];
 
 /**
@@ -876,7 +886,13 @@ export const BIFROST_BOOT_ONLY_PATHS = [
  * `PUT /api/providers/{provider}` for `network_config` and `prompt_cache`,
  * the key update route for `name`/`models`/`aliases`/`weight`/
  * `bedrock_key_config`, `PUT /api/models/catalog` for the catalog, and the
- * governance routes for `governance`.
+ * governance routes for `governance.auth_config`.
+ *
+ * `governance` is claimed by one leaf, not the whole block: `auth_config` is the
+ * admin account the loop refuses to write (`config-convergence-core.ts`), and
+ * `pricing_overrides` is boot-only (see the boot-only list's note on it). The
+ * two rules have to partition the block, or a price edit registers no revision
+ * and no convergence reaches it either.
  *
  * `providers.*.custom_provider_config` is deliberately **not** live: see the
  * boot-only list's note on it. Its `base_provider_type` is immutable after
@@ -886,7 +902,7 @@ export const BIFROST_BOOT_ONLY_PATHS = [
 export const BIFROST_LIVE_PATHS = [
   { path: "$schema", subtree: false },
   { path: "client", subtree: true },
-  { path: "governance", subtree: true },
+  { path: "governance.auth_config", subtree: true },
   { path: "providers.*.network_config", subtree: true },
   { path: "providers.*.prompt_cache", subtree: true },
   { path: "providers.*.keys[].name", subtree: false },

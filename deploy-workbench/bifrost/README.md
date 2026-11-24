@@ -293,15 +293,17 @@ The parameter is a plain `String`, not the plan's `SecureString`. The file holds
 no secret by construction (the test above enforces it), so encryption would buy
 nothing, while a `SecureString` would make the ECS agent need `kms:Decrypt` on
 the account's `aws/ssm` key — either a wildcard key resource or a deploy-time
-`kms` lookup that a `preview` would then need permission to run. Standard tier
-holds 4 KiB and the file is **3,604 bytes**, so there are 492 bytes left rather
-than the room one earlier version of this paragraph claimed. Most of that was
+`kms` lookup that a `preview` would then need permission to run. The file has
+outgrown the standard tier's 4 KiB (it sits over 4 KiB now, which is why the
+parameter is `Advanced`), so the byte budget is the 8 KiB ceiling in `ecs.ts`
+rather than the standard one. Most of that headroom was
 recovered rather than always there: the file sat at 4,085 bytes, 11 under the
 ceiling, until the three Fireworks alias descriptions moved into
 [`docs/bifrost-fireworks-model-metadata.md`](../../docs/bifrost-fireworks-model-metadata.md)
 on 2026-11-10. Every addition is still a deliberate byte budget, and
 `deploy-workbench/ecs.test.ts` fails the suite before the file crosses the
-ceiling. Past 4 KiB it needs `tier: "Advanced"` rather than a silent truncation.
+ceiling. Past the standard tier's 4 KiB it is `tier: "Advanced"` rather than a
+silent truncation.
 
 **A change to this file reaches the gateway by rolling the task — but only a
 boot-only one.** The container's `secrets` entry names the parameter's ARN, and
@@ -311,11 +313,13 @@ file**: step 1 of [`docs/bifrost-reconciler.md`](../../docs/bifrost-reconciler.m
 narrowed it to the boot-only subset, computed from the parsed JSON against a
 committed allowlist of leaf paths (`BIFROST_BOOT_ONLY_PATHS` in `ecs.ts`). What
 is boot-only is the two store connection blocks, `encryption_key`, `setup_token`,
-`source_of_truth` and `providers.*.keys[].value`; a change to any of those still
-registers a new task-definition revision and the service's stop-before-start
-rollout picks it up. A change to the live subset — client config, provider
-metadata, a key's models/aliases/weight, the model catalog, governance — no
-longer moves the digest, so it does not roll the task. **Until the reconciler
+`source_of_truth`, `providers.*.keys[].value`, `providers.*.custom_provider_config`
+and `governance.pricing_overrides`; a change to any of those still registers a
+new task-definition revision and the service's stop-before-start rollout picks it
+up. A change to the live subset — client config, provider
+metadata, a key's models/aliases/weight, the model catalog,
+`governance.auth_config` — no longer moves the digest, so it does not roll the
+task. **Until the reconciler
 lands (steps 3 to 5 of the same plan) that also means such a change does not
 reach the running task at all**: the parameter is updated and the running task
 keeps what it booted with until something else rolls it. That is the intended
@@ -425,8 +429,9 @@ the template's" would invite a reader to think the two differ. Naming
 wire, so an override that narrows one provider states the whole list it means.
 
 The reason it is a second parameter and not more of the first is the tier
-ceiling: `config.json` is **3,604 bytes** against the standard tier's 4 KiB,
-and the two governance documents have separate lifetimes anyway. Both are
+ceiling: `config.json` has outgrown the standard tier's 4 KiB (it is over 4 KiB
+now, which is why its parameter is `Advanced`), and the two governance documents
+have separate lifetimes anyway. Both are
 checked against the ceiling by `governance-parameters.test.ts`, which fails the
 build rather than the apply.
 
