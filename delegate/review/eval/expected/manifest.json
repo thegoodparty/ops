@@ -558,5 +558,17 @@
     "split": "tune",
     "source": "production-missed",
     "kind": "architecture"
+  },
+  {
+    "id": "omni-2702-paid-work-in-the-request",
+    "bundle": "omni-2702-paid-work-in-the-request.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "`POST /community-issues/onboarding` awaits the paid AI search, its extraction and both full dispatches inside the HTTP request instead of queueing them and answering at once, and the in-memory `inFlight` map meant to stop paying twice only dedupes within one gp-api process, so a retry handled by another task runs its own search."
+    },
+    "tests": "omni#2702 at d12ed29, the head Delegate approved, with the title and body as they stood when production reviewed it. startForOnboarding awaits starter.seed, which runs a Gemini Flash search plus a structured extraction, then awaits dispatch.onElectedOfficeCreated for both experiment types, and only then returns `{ starterIssueCount }`. The client posts this from ServeOnboardingFlow as soon as the office is known, races the promise against a 30s timer on the priorities step and then reads GET /v1/priorities/onboarding, so nothing in the response is used and the wait buys nothing. The dedupe meant to make an abandoned request's retry cheap is seed()'s in-memory `inFlight` Map keyed by organization slug; the comment beside the field admits it is per process and points at the transaction for the rest, but seedOnce calls generate() before the transaction opens, so the transaction only refuses duplicate rows while a call another task handles spends again and then throws its own result away. In production the request took 25 to 55 seconds end to end, a mobile Safari fetch did not survive it, and the retry that followed landed on four tasks, each of which generated the list once. #3949 fixed both with a single pg-boss job keyed by org slug and `{ queued: true }` from the route; docs/adr/2026-11-20-serve-onboarding-issues-behind-a-queue.md records the decision. One approval missed both mistakes, so this case scores either: a block naming the in-request paid work or naming the per-process guard passes.",
+    "split": "holdout",
+    "source": "production-missed",
+    "kind": "architecture"
   }
 ]
