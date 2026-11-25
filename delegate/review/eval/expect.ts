@@ -9,6 +9,7 @@ import type { Bundle, Finding, ReviewRecord } from "../schema";
 import { BlockJudgmentSchema, defaultBlockJudge } from "./block-judge";
 import type { BlockJudge, BlockJudgment } from "./block-judge";
 import { isCacheable } from "./cache";
+import { planReplays } from "./replay-plan";
 import { replayCase } from "./replay";
 import type { CheckoutFn, Result } from "./replay";
 
@@ -172,7 +173,7 @@ export const ensureInMirror = (mirrorDir: string, repo: string, shas: string[]):
   return mirror;
 };
 
-const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
+export const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
   const git = (args: string[], timeout = 120_000) =>
     execFileSync("git", args, { cwd: repoDir, stdio: "pipe", timeout });
   rmSync(repoDir, { recursive: true, force: true });
@@ -201,8 +202,9 @@ const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => 
 };
 
 // replayCase only reads runId and bundle, so a case needs no more than that.
-// runId is set to the case id so results are named after the case.
-const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
+// runId is set to the case id so results are named after the case. The vitest
+// suite builds the same record from the same manifest.
+export const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
   const bundle = readBundleFile(manifestPath, c.bundle);
   return { runId: c.id, bundle } as ReviewRecord;
 };
@@ -782,15 +784,14 @@ const main = async () => {
     );
     const checkout = checkoutFor(synthetic, flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined);
 
-    const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: fromRun + i })));
+    // A result already on disk (pulled from the cache, or from an earlier run)
+    // stands; an errored or failed one is retried. The same plan decides which
+    // pairs those are for the vitest suite the workflow runs.
+    const plan = planReplays(cases, { out, replays: runs, fromRun, id: (c) => c.id });
     let next = 0;
     const worker = async () => {
-      while (next < tasks.length) {
-        const { c, run } = tasks[next++];
-        // A result already on disk (pulled from the cache, or from an earlier
-        // run) stands; an errored or failed one is retried.
-        const existing = join(out, c.id, `run-${run}.json`);
-        if (existsSync(existing) && isCacheable(JSON.parse(readFileSync(existing, "utf-8")) as Result)) continue;
+      while (next < plan.pending.length) {
+        const { item: c, run } = plan.pending[next++];
         const result = await replayCase(
           records.get(c.id)!,
           { workDir: join(workDir, `run-${run}`), variant },
@@ -803,7 +804,7 @@ const main = async () => {
         console.error(`  ${c.id} run ${run}: ${scoreRun(c.expect, result).outcome}`);
       }
     };
-    await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(concurrency, plan.pending.length) }, worker));
   }
 
   if (mode === "score" || mode === "all") {

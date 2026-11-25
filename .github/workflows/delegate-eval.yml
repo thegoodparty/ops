@@ -259,17 +259,18 @@ jobs:
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVAL_CASES_DIR: ./eval/cases
+          EVAL_OUT: ./eval/results-main
+          EVAL_VARIANT: main-${{ needs.prepare.outputs.main_sha7 }}
+          EVAL_REPLAYS: "2"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-main
         run: |
           # gh clones with the app token, but the follow-up git fetch of the
           # recorded sha needs it too, or private repos fail to check out.
           gh auth setup-git
-          npm run -s review:eval -- replay \
-            --cases ./eval/cases \
-            --out ./eval/results-main \
-            --variant main-${{ needs.prepare.outputs.main_sha7 }} \
-            --replays 2 \
-            --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work-main
+          # vitest owns the pool: --maxConcurrency is the same 4 replays that
+          # --concurrency ran, and each (case, run) is one concurrent test.
+          npx vitest run delegate/review/eval/suites/pairwise.test.ts --maxConcurrency 4
 
       # Uploaded even when the replay failed, so the good results still reach
       # the cache. Hidden files are included for the pulled-results marker.
@@ -353,15 +354,21 @@ jobs:
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVAL_CASES_DIR: ../eval/cases
+          EVAL_OUT: ../eval/results-pr
+          EVAL_VARIANT: pr-${{ needs.prepare.outputs.sha7 }}
+          EVAL_REPLAYS: "2"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-pr
         run: |
           gh auth setup-git
-          cd pr && npm run -s review:eval -- replay \
-            --cases ../eval/cases \
-            --out ../eval/results-pr \
-            --variant pr-${{ needs.prepare.outputs.sha7 }} \
-            --replays 2 \
-            --concurrency 4 \
-            --work-dir ${{ runner.temp }}/work-pr
+          # A branch cut before these suites existed has no test file and no
+          # vitest in its lockfile, and `npx vitest` would fetch an unpinned
+          # one. Name the fix instead of failing on "No test files found".
+          if [ ! -f pr/delegate/review/eval/suites/pairwise.test.ts ]; then
+            echo "::error::This PR predates the vitest eval suites. Rebase onto main, then comment 'delegate eval' again."
+            exit 1
+          fi
+          cd pr && npx vitest run delegate/review/eval/suites/pairwise.test.ts --maxConcurrency 4
 
       - name: Upload PR results
         if: always()
@@ -549,15 +556,14 @@ jobs:
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVAL_MANIFEST: delegate/review/eval/expected/manifest.json
+          EVAL_OUT: ./eval-expected-main
+          EVAL_VARIANT: main-${{ needs.prepare.outputs.main_sha7 }}
+          EVAL_REPLAYS: "3"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-expected-main
         run: |
           gh auth setup-git
-          npm run -s review:expect -- \
-            --mode replay \
-            --runs 3 \
-            --concurrency 5 \
-            --variant main-${{ needs.prepare.outputs.main_sha7 }} \
-            --out ./eval-expected-main \
-            --work-dir ${{ runner.temp }}/work-expected-main
+          npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
 
       # Uploaded even when the replay failed, so the good runs still reach the
       # cache. Hidden files are included for the pulled-results marker.
@@ -634,16 +640,23 @@ jobs:
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Main's manifest, the PR's suite and replay code: the PR replays
+          # main's cases, exactly as the --manifest flag did.
+          EVAL_MANIFEST: ../delegate/review/eval/expected/manifest.json
+          EVAL_OUT: ../eval-expected
+          EVAL_VARIANT: pr-${{ needs.prepare.outputs.sha7 }}
+          EVAL_REPLAYS: "3"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-expected
         run: |
           gh auth setup-git
-          cd pr && npm run -s review:expect -- \
-            --mode replay \
-            --manifest ../delegate/review/eval/expected/manifest.json \
-            --runs 3 \
-            --concurrency 5 \
-            --variant pr-${{ needs.prepare.outputs.sha7 }} \
-            --out ../eval-expected \
-            --work-dir ${{ runner.temp }}/work-expected
+          # A branch cut before these suites existed has no test file and no
+          # vitest in its lockfile, and `npx vitest` would fetch an unpinned
+          # one. Name the fix instead of failing on "No test files found".
+          if [ ! -f pr/delegate/review/eval/suites/expected.test.ts ]; then
+            echo "::error::This PR predates the vitest eval suites. Rebase onto main, then comment 'delegate eval' again."
+            exit 1
+          fi
+          cd pr && npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
 
       - name: Upload PR results
         if: always()
@@ -753,19 +766,25 @@ jobs:
           CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          RERUN_IDS: ${{ needs.expected-gate.outputs.rerun }}
+          EVAL_CASE: ${{ needs.expected-gate.outputs.rerun }}
+          EVAL_MANIFEST: ../delegate/review/eval/expected/manifest.json
+          EVAL_OUT: ../eval-expected-rerun
+          EVAL_FROM_RUN: "4"
+          EVAL_VARIANT: pr-${{ needs.prepare.outputs.sha7 }}
+          EVAL_REPLAYS: "3"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-expected-rerun
         run: |
           gh auth setup-git
-          cd pr && npm run -s review:expect -- \
-            --mode replay \
-            --manifest ../delegate/review/eval/expected/manifest.json \
-            --case "$RERUN_IDS" \
-            --runs 3 \
-            --from-run 4 \
-            --concurrency 5 \
-            --variant pr-${{ needs.prepare.outputs.sha7 }} \
-            --out ../eval-expected-rerun \
-            --work-dir ${{ runner.temp }}/work-expected-rerun
+          # Runs 4 to 6 of the cases the first gate pass flagged, so the rerun
+          # adds runs instead of replacing the ones already scored.
+          # A branch cut before these suites existed has no test file and no
+          # vitest in its lockfile, and `npx vitest` would fetch an unpinned
+          # one. Name the fix instead of failing on "No test files found".
+          if [ ! -f pr/delegate/review/eval/suites/expected.test.ts ]; then
+            echo "::error::This PR predates the vitest eval suites. Rebase onto main, then comment 'delegate eval' again."
+            exit 1
+          fi
+          cd pr && npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
 
       - name: Upload PR rerun results
         if: always()

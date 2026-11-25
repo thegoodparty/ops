@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
@@ -19,6 +19,7 @@ import { agentEnv, extractJsonObjects, parseReviewOutput } from "../run";
 import { pathGuardHook } from "../guards";
 import { FindingSchema } from "../schema";
 import type { Bundle, Finding, ReviewOutput, ReviewRecord, StoredReviewOutput } from "../schema";
+import { planReplays } from "./replay-plan";
 
 // not-investigated: no deep-reviewer was given the lead. dropped: it returned
 // no findings. raised: it returned findings, none of which reached the final
@@ -550,31 +551,18 @@ export const replayAll = async (
   mkdirSync(out, { recursive: true });
   mkdirSync(workDir, { recursive: true });
 
-  const results: Result[] = [];
-  const toRun: { record: ReviewRecord; run: number }[] = [];
+  // The same plan the vitest suites use, so `review:eval replay` and a
+  // workflow suite cannot disagree about which runs are still missing.
+  const plan = planReplays(records, { out, replays, force, id: (record) => record.runId });
+  const results: Result[] = plan.reused.map(({ result }) => result);
 
-  for (const record of records) {
-    for (let run = 1; run <= replays; run++) {
-      const resultPath = join(out, record.runId, `run-${run}.json`);
-      if (!force && existsSync(resultPath)) {
-        try {
-          results.push(JSON.parse(readFileSync(resultPath, "utf-8")) as Result);
-          continue;
-        } catch {
-          // file unreadable — fall through to replay
-        }
-      }
-      toRun.push({ record, run });
-    }
-  }
-
-  console.error(`Replaying ${toRun.length} run(s); ${results.length} already had results`);
-  if (toRun.length === 0) return results;
+  console.error(`Replaying ${plan.pending.length} run(s); ${results.length} already had results`);
+  if (plan.pending.length === 0) return results;
 
   let index = 0;
   const worker = async () => {
-    while (index < toRun.length) {
-      const { record, run } = toRun[index++];
+    while (index < plan.pending.length) {
+      const { item: record, run, resultPath } = plan.pending[index++];
       // A case's replays run side by side, so each needs its own checkout dir.
       const result = await replayCase(
         record,
@@ -584,14 +572,11 @@ export const replayAll = async (
       );
       results.push(result);
       mkdirSync(join(out, result.caseId), { recursive: true });
-      writeFileSync(
-        join(out, result.caseId, `run-${run}.json`),
-        JSON.stringify(result, null, 2),
-      );
+      writeFileSync(resultPath, JSON.stringify(result, null, 2));
     }
   };
 
-  const workerCount = Math.min(concurrency, toRun.length);
+  const workerCount = Math.min(concurrency, plan.pending.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   return results;

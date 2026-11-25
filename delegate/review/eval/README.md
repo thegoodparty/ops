@@ -41,13 +41,58 @@ The `hill-climb` skill (`.claude/skills/hill-climb/`) is the agent version of th
 - **Dispatched run** (`delegate-eval-run.yml`, below): the same gate in CI on a branch without a PR, for prompt-text changes only, with a per-run budget. It is how the Delegate swarm hill-climbs, always, and how any agent without local credentials does.
 - **`review:expect`**: the replay and scoring engine under all of the above, for one checkout at a time.
 - **`review:eval replay` and `judge`**: pairwise comparison of two result sets by a model judge, on recorded production reviews.
+- **The vitest suites** (next section): the same two replays CI runs, one test per (case, run), for running one case or one suite by hand.
+
+## The vitest suites
+
+Replay is orchestrated by vitest. `delegate/review/eval/suites/expected.test.ts` replays the expected-result cases and `suites/pairwise.test.ts` replays the pairwise ones, each as one `test.concurrent` per (case, run). They call the same `replayCase` and write the same `<out>/<case>/run-<n>.json`, so scoring, the gate and the cache read exactly what they read before: a completed result on disk is reused, an errored or `failed` one is retried.
+
+The runner owns the orchestration because a replay *is* a test: vitest pools the replays and selects them by name, and the job's own timeout is still the only ceiling on a single one, as it was for the CLI loops. CI launches one of these files per job with `--maxConcurrency` at the job's former `--concurrency`, so a job costs what it did before.
+
+Configuration is the environment (`EVAL_*`), not argv: a test file has no argv. `EVAL_OUT` is required, and so is `EVAL_CASES_DIR` for the pairwise suite; the suite file supplies the rest from its own defaults.
+
+| Variable | Meaning |
+| --- | --- |
+| `EVAL_OUT` | Results directory; replays write `<EVAL_OUT>/<case>/run-<n>.json`. |
+| `EVAL_CASES_DIR` | Pairwise only: the case records `review:eval cases scenarios` wrote. |
+| `EVAL_MANIFEST` | Expected only: the case manifest (default `expected/manifest.json`); pairwise only when `EVAL_SPLIT` is set. |
+| `EVAL_REPLAYS` | Runs per case (default 3 expected, 2 pairwise). |
+| `EVAL_FROM_RUN` | First run number (default 1); a rerun uses 4 so it adds runs instead of replacing scored ones. |
+| `EVAL_VARIANT` | The variant label stored on each result (default: the checkout's `HEAD`). |
+| `EVAL_WORK_DIR` | Scratch directory for checkouts (per-suite default under `/tmp`). |
+| `EVAL_FORCE` | `true` replays even where a completed result is on disk. |
+| `EVAL_CASE` | Comma-separated case ids, the same selection `--case` makes. |
+| `EVAL_SPLIT` | `tune` or `holdout`. |
+| `EVAL_DRY_RUN` | `true` parses, plans and prints the (case, run) pairs without calling the model. |
+
+```sh
+# A whole expected suite: three runs each, five replays at a time
+EVAL_OUT=./eval-expected EVAL_REPLAYS=3 EVAL_VARIANT=main \
+  npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
+
+# One case: a test is named `<caseId> run <n>`, so -t takes every run of it
+EVAL_OUT=./eval-expected EVAL_REPLAYS=3 EVAL_CASE=omni-2977 \
+  npx vitest run delegate/review/eval/suites/expected.test.ts -t omni-2977 --maxConcurrency 5
+
+# The pairwise suite, from a materialized case directory
+npm run review:eval -- cases scenarios \
+  --manifest delegate/review/eval/scenarios.json --out ./eval-cases --suite re-review
+EVAL_CASES_DIR=./eval-cases EVAL_OUT=./results EVAL_REPLAYS=2 \
+  npx vitest run delegate/review/eval/suites/pairwise.test.ts --maxConcurrency 4
+
+# Plan only: prints the pairs that would replay, and spends nothing
+EVAL_OUT=./eval-expected EVAL_DRY_RUN=true \
+  npx vitest run delegate/review/eval/suites/expected.test.ts
+```
+
+`npm test` does not run these files (`node --test` globs the eval directory non-recursively, and vitest's `include` is the `suites/` directory alone), so neither runner picks up the other's work.
 
 ## From a PR
 
 Comment `delegate eval` on any ops PR to run the `core` suite, or `delegate eval <suite>` (for example `delegate eval re-review`) to run another suite from `scenarios.json`. The workflow:
 
 1. Loads the suite's scenarios from `scenarios.json`, where each entry names a record file under `scenarios/`, so every eval runs the same cases and none of them needs the bucket. If your PR changes `scenarios.json`, its copy and its record files are used.
-2. Replays every scenario twice per side in parallel (`--replays 2`): two replays with main's agent code and two with your PR head's.
+2. Replays every scenario twice per side in parallel (`EVAL_REPLAYS=2`): two replays with main's agent code and two with your PR head's.
 3. Judges the two sides pairwise and posts a single comment to the PR with three verdicts: **Quality (tune)** and **Quality (holdout)** (each Better / Worse / Can't tell, from the sign test over that split's judged cases) and **Cost** (Better / Worse / Same, average cost per review before and after; under 10% change is Same). The holdout line shows only the verdict and counts. The drop-down lists tune cases only; every raw result and the full report, holdout cases included, are on the workflow run as artifacts.
 4. Uploads the full eval directory as a workflow artifact (`delegate-eval-<sha7>`).
 
@@ -159,7 +204,7 @@ Replay runs the gate in `enforce` for a repo on `gating.ts`'s adoption list, whi
 
 An outcome case may also carry `consistency` as a diagnostic. When it does, the model's answer has to be right as well, and the result line reports both (`approved; planConsistency: consistent`), which is how a wrong outcome is attributed to the model rather than to the gate.
 
-Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`--mode replay`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $65 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` as `cases[].main = { runs, completed, runsPassed, unfinished }` for the merge gate to read. `runs` is how many runs each case should have; a run that errored or never happened counts toward `unfinished`, not toward `runsPassed` or a failure, and the markdown reads `2/2 (1 of 3 runs unfinished)`. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
+Every `delegate eval` comment also runs this suite as a parallel job and posts the result as its own PR comment. The PR head's agent replays main's cases (`suites/expected.test.ts`), then main's code scores them (`--mode score`), so a PR can't change what it is graded on. It adds about $65 and no wall time. The job also replays main's agent on the same cases, from the cache when main's replay inputs are unchanged, and the report has a "Main runs passed" column per case. The same baseline is written to `report.json` as `cases[].main = { runs, completed, runsPassed, unfinished }` for the merge gate to read. `runs` is how many runs each case should have; a run that errored or never happened counts toward `unfinished`, not toward `runsPassed` or a failure, and the markdown reads `2/2 (1 of 3 runs unfinished)`. Its cache suite is `expected-<tree of expected/>`, so editing a case never reuses an answer to the old one.
 
 ```sh
 npm run review:expect -- [--runs 3] [--concurrency 5] [--case <id>] [--split tune|holdout] [--out ./eval-expected] [--work-dir /tmp/review-expect] [--baseline <main-results-dir> --baseline-variant <label>]
@@ -171,7 +216,7 @@ Writes each run's result to `<out>/<case>/run-<n>.json` (a run that already has 
 
 `--mode gate --base <main-results-dir> [--history <dir>] [--targets id,id] [--final true] [--runs 3] [--min-main-runs 6]` turns the baseline into a verdict and writes `<out>/gate.json` and the gate report to `<out>/report.md`. It refuses to run without `--base`, or when main has no completed runs at all.
 
-- A case main passed on every run (`runsPassed == completed == runs`) must not regress. If the candidate passes fewer than `runs`, the case is returned in `rerun`; after `runs` more runs (`--mode replay --case a,b --from-run 4`) it needs `2*runs-1` of `2*runs` (5 of 6), or it is a `regression`. With `--final true` a case still short of `runs` passes counts as a regression, so a rerun that never happened cannot pass.
+- A case main passed on every run (`runsPassed == completed == runs`) must not regress. If the candidate passes fewer than `runs`, the case is returned in `rerun`; after `runs` more runs (`EVAL_CASE=a,b EVAL_FROM_RUN=4` on the suite) it needs `2*runs-1` of `2*runs` (5 of 6), or it is a `regression`. With `--final true` a case still short of `runs` passes counts as a regression, so a rerun that never happened cannot pass.
 - A case main did not pass 3/3 (including one with unfinished main runs) cannot regress.
 - `--min-main-runs` (default `runs`) is how many completed main runs, this baseline's and `--history`'s together, a case needs before it can regress: a case main passes 9 times in 10 still passes three in a row about 73% of the time. `delegate-eval-run.yml` passes 6, and before gating replays main's runs 4 to 6 on every case main passed so far with fewer (`--mode main-short --base <dir> [--history <dir>] --min-main-runs 6 --ids-out <file>` writes those ids to a file and prints only a count). Those runs are cached like the first three, and like them are not charged to the run id.
 - `--history` holds main's earlier runs of the same reviewer, pulled by `review:eval cache history` from other replay keys: a run counts when its `main-<sha>` variant has this checkout's `delegate/agents`, `delegate/review/postmortems/` and `delegate/review/postmortems.ts`, and its case head matches the baseline's. Replay shows every case the latest post-mortems, so a new post-mortem starts history over. A key changes with any edit under `delegate/review`, so without history the gate sees only this check's three main runs and treats a lucky streak as a bar. A case main failed on any earlier run cannot regress either, and `flaky` counts both. `delegate-eval-run.yml` passes it; `delegate eval` on a PR does not yet.

@@ -59,6 +59,7 @@
   "devDependencies": {
     "@pulumi/aws": "^7.21.0",
     "@pulumi/pulumi": "^3.225.1",
-    "esbuild": "^0.27.3"
+    "esbuild": "^0.27.3",
+    "vitest": "^5.1.2"
   }
 }
