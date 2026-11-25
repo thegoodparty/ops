@@ -134,6 +134,9 @@ const freshConfig = () => ({
     enforce_auth_on_inference: true,
     allowed_origins: ["https://bifrost.workbench.goodparty.org"],
     drop_excess_requests: false,
+    // A stored value, not `config.json`'s: these cases are about the claim
+    // script's behaviour, and nothing here should have to move when the file's
+    // retention does.
     log_retention_days: 90,
   },
   framework_config: {
@@ -289,10 +292,15 @@ describe("bifrost bootstrap claim", () => {
   });
 
   it("leaves a retention the store already holds alone", async () => {
-    // config.json's 90 days, once item 10 injects it, is authoritative; the
-    // claim must not overwrite it with its own minimum.
+    // Whatever the store already holds is authoritative; the claim must not
+    // overwrite it with its own minimum. The stub's number is not `config.json`'s
+    // on purpose, so this case is about the script's behaviour and does not have
+    // to move when the file's retention does.
+    const held = 90;
+    const serverConfig = freshConfig();
+    (serverConfig.client_config as Record<string, unknown>).log_retention_days = held;
     await withStubBifrost(
-      { config: freshConfig(), authActive: false },
+      { config: serverConfig, authActive: false },
       async (baseUrl, requests) => {
         const result = await runBootstrap(baseUrl);
         assert.equal(result.status, 0, result.output);
@@ -303,7 +311,7 @@ describe("bifrost bootstrap claim", () => {
         const sent = JSON.parse(put.body) as {
           client_config: Record<string, unknown>;
         };
-        assert.equal(sent.client_config.log_retention_days, 90);
+        assert.equal(sent.client_config.log_retention_days, held);
       },
     );
   });

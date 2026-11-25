@@ -87,11 +87,21 @@ export { isEmailShaped };
 /**
  * The retention window before Bifrost deletes a deactivated key, in days.
  *
- * Decision 6: ninety days, matching the gateway's own request-log retention
- * (`client.log_retention_days` is 90 in `bifrost/config.json`), because past
- * that point the request records that make the spend history worth keeping
- * have rolled off anyway. A returning person is a reactivation — a mint, which
- * clears this timer — rather than a resurrection.
+ * Decision 6: ninety days. It *was* chosen to match the gateway's own
+ * request-log retention (`client.log_retention_days`), on the argument that past
+ * that point the request records that make the spend history worth keeping had
+ * rolled off anyway. That argument no longer binds: the log retention is 30 days
+ * since 2026-11-23, and the per-request cost history is durable outside the
+ * table — `bifrost-usage-export` lands every request's cost per key and team in
+ * the warehouse daily, and nothing there expires. So the two numbers answer
+ * separate questions now. This one is a grace period for a person, not a pointer
+ * at log rows: ninety days is long enough that a returning engineer's key, its
+ * per-provider budgets and its model policy are still there to reactivate rather
+ * than to rebuild. Lowering it to 30 to keep the pair equal would delete a
+ * departed person's key two months earlier and save nothing, so it stays.
+ *
+ * A returning person is a reactivation — a mint, which clears this timer —
+ * rather than a resurrection.
  */
 export const VK_RETENTION_DAYS = 90;
 

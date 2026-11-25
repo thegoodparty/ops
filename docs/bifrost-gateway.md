@@ -1197,6 +1197,118 @@ Virtual keys are Bifrost's primary governance entity
   cost-attribution record; the gateway log is an operational and budget
   record, and 90 days covers a budget cycle. Raise it, or offload to object
   storage, if the cost history needs to outlive the budget window.
+
+  **Amended 2026-11-23:** both settings are now **30 days**, lowered from 90 in
+  the same change and still equal to each other, so the one-story property
+  above is unchanged. The reason is the outage the 90-day window caused rather
+  than its length: the gateway's Postgres instance (`bifrost-db`) exhausted its
+  memory on a 1 GiB `db.t4g.micro`, and ninety days of request metadata in a
+  20 GiB volume meant the purge and autovacuum were working against a table that
+  only ever got bigger. The class was raised separately (`db.m5.large`, 8 GiB,
+  PR #575) and that removed the immediate pressure; shortening the window
+  removes the accumulation. Thirty rather than lower because the number is a
+  debugging and operations window with a floor of one plausible working month,
+  not because the cost history needs it — see the next paragraph.
+
+  **Which of the two actually prunes, at this tag.** On a Postgres logs store,
+  `logs_store.retention_days` is read into `logstore.Config.RetentionDays`
+  (`framework/logstore/config.go:15`) and consumed by exactly one caller: the
+  ClickHouse store, as its table TTL (`framework/logstore/store.go:287`,
+  `newClickHouseLogStore(…, config.RetentionDays, …)`). `newPostgresLogStore`
+  never reads it. What prunes this deployment is `client.log_retention_days`:
+  server startup passes it to `logstore.NewLogsCleaner`
+  (`transports/bifrost-http/server/server.go:3455-3482`), and
+  `ReloadClientConfigFromConfigStore` refreshes the running cleaner on a live
+  config change (`:1696`). So the value that had to move is the client one; the
+  store one is lowered with it only to keep the one-story property, which is
+  why the earlier sentence that called it "the store's own purge window" is
+  true of the ClickHouse store and not of this one.
+
+  **This change rolls the task once, and it is the one restart in the file.**
+  The two halves of the change are in opposite halves of the reconciler's
+  split, which is why the deploy behaviour is not uniform
+  ([`bifrost-reconciler.md`](./bifrost-reconciler.md), "The split"):
+  `client.log_retention_days` is live, converged by the deploy's
+  `PUT /api/config` and applied to the running cleaner without a restart, while
+  `logs_store` is boot-only in its entirety, so lowering
+  `logs_store.retention_days` moves `BIFROST_CONFIG_VERSION` and registers a new
+  task-definition revision that the stop-before-start rollout replaces. That is
+  a brief gateway outage and is the correct outcome rather than a regression:
+  under `source_of_truth: "config.json"` a boot-only leaf that did not roll the
+  task would be a change that never applies (the `75d30ae` failure the digest
+  exists to prevent). The alternative — changing only the client value, to avoid
+  the restart — would break the one-story property this entry's first paragraph
+  records. Since the effective window is the client one, the restart buys no
+  earlier purge; it buys the file telling the truth.
+
+  **What outlives the table.** The cost history does, and that is why 30 is the
+  right value rather than a guess. `bifrost-usage-export`
+  (`deploy-workbench/usage-export.ts`) reads the gateway's `logs` table every
+  day at 09:00 UTC over a 7-day window, and again on the 1st at 09:30 UTC over
+  90 days, and writes one Parquet object per run to the workbench bucket. Every
+  row carries the 29 columns it reads out of `logs`, plus an `exported_at`
+  stamp: `cost`, `input_cost`, `output_cost` and `additional_cost` as
+  `DECIMAL(20,6)`, the token counts, `virtual_key_name`, `team_name`,
+  `user_name`, `provider` and `model`. dbt lands
+  it as `bifrost_request_log` and models `bifrost_daily_usage` from it, one row
+  per day, provider, model and person. Nothing in that file expires: the bucket
+  has no lifecycle rule on current objects, versioning is on, and a later run
+  cannot rewrite an earlier file (`IfNoneMatch: "*"` on the PUT). So the n-day
+  window in the database is the window for *debugging a specific request* and
+  for the gateway's own dashboard, not the system of record for spend.
+
+  **What the export does not replace, and the one caveat.** It is not real-time:
+  a day's numbers become durable at the next 09:00 UTC run, and the newest day
+  in the mart is partial by design. It also only carries rows that are still in
+  the table when a run reads them, so a row deleted between two daily runs would
+  be missed. Nothing in this deployment does that automatically: the only
+  scheduled deleter is the gateway's own retention pass
+  (`framework/logstore/cleaner.go`, once a day with 15-30 minutes of jitter, in
+  5000-row batches by `created_at`), and its 30-day cutoff sits 23 days older
+  than the oldest row the export's 7-day window reads. (A human can delete a row
+  from the dashboard's `DELETE /api/logs` by id; that has to stay rare enough
+  not to matter, and it is already outside any export guarantee.) The monthly
+  run requests a 90-day window and is now larger than
+  the table; it is kept because a row can be repriced after it leaves the 7-day
+  window (`plugins/logging/costrecalc.go` recalcs a caller-supplied window), and
+  with a 30-day table it still re-observes anything the cutoff has not removed.
+  Late repricing past 30 days is therefore the one thing this change gives up,
+  and it is deliberate: that is a corrected number in a file already landed, and
+  a table that purges on time is worth more than it.
+
+  **The one way this change could lose history, and how to avoid it.** The export
+  is younger than the table. Both stores moved to Postgres on 2026-10-26
+  (`3be6c8b`), which is when durable rows begin, while the export only landed on
+  2026-11-16 (`a342366`) and its first run was 2026-11-17 over a 7-day window —
+  so no run has ever read a row older than 2026-11-10, and the first 90-day read
+  is the 2026-12-01 monthly run. A 30-day cutoff therefore deletes a window no
+  export has covered:
+
+  - rows of **2026-10-26 .. 2026-11-01** are purged before the 12-01 monthly run
+    and would never be exported at all;
+  - rows of **2026-11-01 .. 2026-11-10** are not covered by any daily run but
+    *are* inside the 12-01 monthly run's 30-day reach, so that run rescues them.
+  - the boundary is not exact to the day, because the two halves filter on
+    different clocks. The cleaner deletes by `created_at`
+    (`RDBLogStore.DeleteLogsBatch`, `framework/logstore/rdb.go:5235`) while the
+    export reads by `"timestamp"` (`usage-export-contract.ts`, `EXPORT_QUERY`),
+    and `created_at` is when the row was written, a moment before the request's
+    `timestamp` is stamped. A row written just before midnight on 2026-11-01 can
+    therefore be purged while the monthly run's window still nominally reaches
+    it, so treat 11-01 as a few hours either side rather than a clean edge. It
+    does not change the mitigation: the 90-day backfill covers every row in
+    existence, boundary included.
+
+  That is six days of per-request cost, not the sixty the review guessed — the
+  gateway is only 29 days old, so 90-day retention was never holding a quarter.
+  It is still real history, so the mitigation is a manual invoke of the export
+  with `{"window_days": 90}` **before the first 30-day purge, which is 2026-11-25**
+  (the oldest row, 2026-10-26, plus 30 days). One invoke writes the whole
+  existing table as one Parquet object and closes the gap permanently; it is a
+  backfill, so it is a human step rather than something this PR automates, and
+  it is why this change should be applied after that run rather than before.
+  Sequencing note for a reviewer: the client setting is live, so the first
+  cleaner pass after the apply is what starts deleting.
 - **Backup.** RDS automated backups plus manual snapshots before an upgrade,
   with a documented restore. The encryption key and provider keys are in
   Secrets Manager and are not part of a database snapshot; a restore is
@@ -1367,6 +1479,73 @@ OSS over Enterprise clustering.
   `aws-marketplace` broke the pipeline on its first apply — is the precedent:
   check a new action against `deploy-workbench.yml`, not only against a
   person.
+- **The database holds ~4 connections around the clock, and none of it is a
+  pool minimum.** Investigated 2026-11-23 while sizing the instance; recorded
+  here so the next person to read `DatabaseConnections` does not have to
+  re-derive it. Measured on `AWS/RDS DatabaseConnections`, hourly minima over
+  2026-11-10..24: 265 of 336 hours had a minimum of exactly 4, the rest 5-9,
+  maxima 8-15, while traffic is working-hours-only. The important findings, in
+  the order they matter:
+
+  - **Bifrost does expose pool sizing, and this deployment already sets it.**
+    `max_idle_conns` / `max_open_conns` / `conn_max_lifetime` /
+    `conn_max_idle_time` are per-store fields at the pinned tag
+    (`transports/config.schema.json:2655-2677` for `config_store`,
+    `:3361-3403` for `logs_store`) and are passed to `database/sql` by
+    `postgresconn.ApplyPoolTuning` (`framework/postgresconn/postgresconn.go:472`).
+    `config.json` sets `config_store` 5/50 and `logs_store` 10/100 (lines 20-21
+    and 38-39), and the running task confirms both took effect
+    (`/aws/ecs/bifrost`, 2026-11-23T17:31:37Z and `:39Z`: `max_open_conns=50
+    max_idle_conns=5` then `max_open_conns=100 max_idle_conns=10`, each logged
+    with “this is one pool; logstore and configstore each open their own”).
+  - **There is no minimum in that code, so grep cannot find the 4.**
+    `max_idle_conns` is a *ceiling* on idle connections, not a floor: the pool
+    starts at zero, opens one per concurrent query, and
+    `SetConnMaxIdleTime(5m)` (`postgresconn.go:456`) closes what nothing has used
+    for five minutes. A pool cannot hold four connections on its own.
+  - **So the 4 is steady background work, and the reboot proves it is the
+    client.** Over the 23 Nov replacement the metric reads 0 while the task is
+    down, 13 while the new task's stores migrate, then settles back to 5. RDS's
+    own backends do not vanish when a Fargate task is replaced, so a floor that
+    disappeared with the task belongs to the task. What keeps it up is the set
+    of loops at the pinned tag whose period is shorter than the five-minute idle
+    reaper, each taking a pooled connection briefly and handing it back:
+    `/health` **pings both stores** with one `SELECT 1` each
+    (`handlers/health.go:31-67`, `configstore/rdb.go:404`,
+    `logstore/rdb.go:880`) every 10s from the target group and every 15s from the
+    container check (`ingress.ts:342`, `BIFROST_HEALTH_CHECK` in
+    `ecs.ts:486-501`); the governance tracker dumps budgets and rate limits every
+    10s (`plugins/governance/tracker.go:97`, `:258`); the sidekiq dispatcher
+    scans for claimable jobs every 30s (`framework/sidekiq/sidekiq.go:59`); the
+    async-job cleaner runs every 1m (`framework/logstore/asyncjob.go:24`); the
+    webhook dispatcher polls its delivery queue every 5s
+    (`framework/webhooks/dispatcher.go:75`); and — the one that is not brief — the
+    materialized-view refresher holds a **dedicated** connection for the whole of
+    each pass (`framework/logstore/matviews.go:1005`, `sqlDB.Conn(ctx)`), on a 1m
+    interval (`framework/logstore/postgres.go:67`) while passes are measured in
+    minutes, so it is effectively always holding one.
+
+  **What I could not verify:** the exact per-pool split needs
+  `pg_stat_activity` on the instance, and this sandbox has no route to it —
+  `rds:DescribeDBInstances` is denied to `WorkbenchAccess` and nothing here can
+  open 5432. The mechanism above is read from the pinned tag's source and the
+  task's own logs; the four-way attribution is inference, not a measurement.
+
+  **Recommendation: change nothing about pool sizing, here or as a follow-up.**
+  The brief's premise that each connection “costs `work_mem`” is not right: an
+  idle backend holds a few hundred KiB of private memory, and `work_mem` is only
+  allocated while it sorts or hashes. Four warm backends is not what exhausted a
+  1 GiB instance, and a `max_idle_conns` of 0 would churn TCP/TLS handshakes and
+  `aws secretsmanager` password resolutions (`password_command`) for no gain. Two
+  things this investigation did surface are real, and both are separate follow-ups
+  with their own review rather than anything a retention PR should carry:
+  `matview_refresh_interval` is unset and therefore the pinned default `1m`,
+  which is refreshing 11 filter views plus `mv_logs_hourly` against a table big
+  enough that a pass takes minutes — the 2026-11-23 logs show `matview refresh
+  failed after 5m0.12s … consider raising matview_refresh_interval` and an
+  initial refresh timing out on `mv_filter_models` — and
+  `logs_store.config.max_open_conns: 100` is more headroom than this traffic
+  needs, which is worth lowering only alongside that change.
 
 ### Open questions a human has to answer
 

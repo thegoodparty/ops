@@ -91,8 +91,10 @@ a later tag. It holds:
   `config_store` Bifrost creates a SQLite file inside the container, and every
   deploy takes it with it. The connection fields are `env.` references to the
   task definition's `PG_*` values rather than a connection string spelled in
-  this file, and `logs_store.retention_days` is explicit (90) because the
-  upstream default prunes nothing. The password is the one field that is not a
+  this file, and `logs_store.retention_days` is explicit (30, lowered from 90 on
+  2026-11-23) rather than left to the store's default, which is 0 and means no
+  retention-based cleanup at all. The password is the
+  one field that is not a
   plain `env.` reference: both stores declare a `password_command`
   (`/usr/local/bin/bifrost-pg-password`, from the derived gateway image) that
   prints the RDS-managed password for every new physical connection, because a
@@ -146,8 +148,9 @@ a later tag. It holds:
 - **Client settings.** Inference auth is enforced
   (`enforce_auth_on_inference: true`), direct provider keys are refused
   (`allow_direct_keys: false`), content logging is off with no per-request
-  override, metadata logging is on with an explicit 90-day retention, and the
-  gateway's public origin is the only allowed CORS origin.
+  override, metadata logging is on with an explicit 30-day retention (lowered
+  from 90 on 2026-11-23; the cost history lives in the usage export, not in this
+  table), and the gateway's public origin is the only allowed CORS origin.
 - **Governance.** `auth_config` is present with `is_enabled: false`: Bifrost's
   own dashboard login is off, and oauth2-proxy plus the allowlist is the only
   gate a human passes. At the pinned tag a file's `auth_config` is *not*
@@ -734,7 +737,7 @@ claim of every fresh store, and the deployed gateway sat unclaimed for exactly
 that reason — the setup page kept asking for the token because no admin account
 ever existed. The script now raises that one field to the smallest value the
 write path accepts (`CLAIM_LOG_RETENTION_DAYS`) and leaves every other value
-alone; the repo's real retention is `config.json`'s 90 days, and the file is
+alone; the repo's real retention is `config.json`'s 30 days, and the file is
 authoritative for it now that item 10's injection is wired. Nothing else in the
 echoed payload needs correcting: the validations that run before this one
 (including the first-admin password policy) had already passed.

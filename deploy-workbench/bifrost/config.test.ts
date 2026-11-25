@@ -780,7 +780,16 @@ describe("bifrost config.json", () => {
     }
     // Retention is explicit rather than defaulted, per "Persistence, backup and
     // upgrade": a log store that never prunes is the one value certainly wrong.
-    assert.equal(config.logs_store?.retention_days, 90);
+    //
+    // Thirty days, lowered from ninety on 2026-11-23 after the instance ran out
+    // of memory on a `db.t4g.micro`. The value is the store's own purge window
+    // and, on Postgres at the pinned tag, it is read but not acted on: only the
+    // ClickHouse store consumes `RetentionDays` (as its table TTL), so the
+    // effective window for this deployment is `client.log_retention_days`. It is
+    // still set explicitly and kept equal to that one, because the file has one
+    // retention story rather than two, and because the day this store type moves
+    // this value is already the right one.
+    assert.equal(config.logs_store?.retention_days, 30);
   });
 
   it("moves both stores to the password command in one change, never one", () => {
@@ -821,7 +830,14 @@ describe("bifrost config.json", () => {
     assert.equal(client.disable_content_logging, true);
     assert.equal(client.allow_per_request_content_storage_override, false);
     assert.equal(client.enable_logging, true);
-    assert.equal(client.log_retention_days, 90);
+    // Thirty days, lowered from ninety on 2026-11-23: this is the window the
+    // cleanup job actually enforces on the Postgres store, and ninety days of
+    // request metadata is what filled the instance that then ran out of memory.
+    // It is a debugging and operations window, not the cost record: the usage
+    // export lands every request's cost per key and team in the warehouse daily,
+    // so the history outlives this table. See "Retention" in
+    // `docs/bifrost-gateway.md` for what the export does and does not preserve.
+    assert.equal(client.log_retention_days, 30);
     // x-bf-direct-key would bypass the virtual-key credential model.
     assert.equal(client.allow_direct_keys, false);
     assert.ok(

@@ -63,8 +63,8 @@ export const USAGE_EXPORT_LOG_RETENTION_DAYS = 30;
  * The Lambda's shell.
  *
  * 900s is the runtime's ceiling and it is the number the monthly run is sized
- * against, not the daily one: a 7-day window is under a second of work, while a
- * 90-day window is the largest read this job ever does. Memory is 512 MB against
+ * against, not the daily one: a 7-day window is under a second of work, while the
+ * monthly 90 is the widest range this job ever asks for. Memory is 512 MB against
  * a measured peak under 125 MB at the monthly row count, because Lambda bills
  * duration and the headroom is fractions of a cent for a job that runs once a
  * day.
@@ -82,7 +82,7 @@ export const USAGE_EXPORT_MEMORY_MB = 512;
 export const USAGE_EXPORT_RESERVED_CONCURRENCY = 1;
 
 /**
- * The two windows, in days, against the gateway's 90-day log retention.
+ * The two windows, in days, against the gateway's log retention.
  *
  * Seven days daily, because `logs` rows are written `processing` and later
  * updated to a terminal status with cost and tokens, so a run that read only new
@@ -90,6 +90,15 @@ export const USAGE_EXPORT_RESERVED_CONCURRENCY = 1;
  * first of the month, so a row repriced after it left the 7-day window is
  * re-observed eventually (`plugins/logging/costrecalc.go` recalcs a
  * caller-supplied window, so late repricing is real if rare).
+ *
+ * The monthly 90 is deliberately not `client.log_retention_days`, which was 90
+ * when this was written and is 30 since 2026-11-23: the two answer different
+ * questions. The daily window only has to be shorter than retention, and is.
+ * The monthly one is a repricing sweep, and asking for more than retention is
+ * free — the query is a range predicate on `timestamp`, so a window wider than
+ * the table returns the same rows as a window exactly as wide. Lowering the
+ * monthly constant with retention would only lose the repricing of a row that
+ * was still present.
  */
 export const USAGE_EXPORT_DAILY_WINDOW_DAYS = 7;
 export const USAGE_EXPORT_MONTHLY_WINDOW_DAYS = 90;
