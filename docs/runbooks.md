@@ -104,14 +104,17 @@ failure.
 ## The Bifrost gateway is saturated or not serving
 
 **Alarms:** `bifrost-gateway-cpu-saturation`, `bifrost-gateway-memory-pressure`,
-`bifrost-gateway-alb-5xx`, `bifrost-gateway-no-running-task`, all in
+`bifrost-gateway-alb-5xx`, `bifrost-gateway-no-running-task`,
+`bifrost-db-memory-pressure`, `bifrost-db-storage-queue`, all in
 `deploy-workbench/alarms.ts`.
 **Email:** the `bifrost-gateway-health` SNS topic, subscribed to
 `aws-workbench@goodparty.org`.
 
-Four alarms, one topic, because they are four ways of answering the same
-question — is the gateway serving? — and the triage below is the same until step
-3. Which one fired tells you where to start, so start there.
+Six alarms, one topic, because they are six ways of answering the same
+question — is the gateway serving? — and the triage below is one sequence rather
+than six. Which one fired tells you where to start, so start there; the steps
+cross-reference each other, and step 3 is the one that decides whether you are
+looking at the task, the load balancer, or the database.
 
 | Alarm | What it counted | Where to look first |
 |---|---|---|
@@ -119,6 +122,8 @@ question — is the gateway serving? — and the triage below is the same until 
 | `bifrost-gateway-memory-pressure` | `AWS/ECS` `MemoryUtilization`, `Maximum` ≥ 85% in all of the last 6 | step 2 |
 | `bifrost-gateway-alb-5xx` | `AWS/ApplicationELB` `HTTPCode_ELB_5XX_Count` ≥ 30 in one five-minute period | step 3 |
 | `bifrost-gateway-no-running-task` | `ECS/ContainerInsights` `RunningTaskCount` < 1, or unpublished, for 4 consecutive periods | step 4 |
+| `bifrost-db-memory-pressure` | `AWS/RDS` `FreeableMemory`, `Minimum` < 5% of the instance's RAM in 3 of the last 6 | step 5 |
+| `bifrost-db-storage-queue` | `AWS/RDS` `DiskQueueDepth`, `Maximum` ≥ 1 in 2 of the last 6 | step 5 |
 
 ### 1. CPU saturation: requests are queueing inside the task
 
@@ -191,7 +196,14 @@ Check, in this order:
    problem and the 5XX is its symptom.
 3. **Was the task running?** If `bifrost-gateway-no-running-task` fired too, go
    to step 4 — the 5XX is that outage.
-4. Otherwise the container's log group around the burst:
+4. **Was the database the reason?** If either `bifrost-db-*` alarm fired, go to
+   step 5. That is the branch the 2026-11-23 outage needed and this runbook did
+   not have: the task had CPU and memory to spare and was returning 503s
+   anyway, because it was waiting on Postgres. If the burst is more than a
+   couple of minutes long and neither database alarm is firing, it is still
+   worth a glance at step 5's queue depth before the logs — this database's
+   queue moved before any alarm was watching it.
+5. Otherwise the container's log group around the burst:
    `aws logs tail /aws/ecs/bifrost --since 30m --region us-west-2`.
 
 A `504` instead of `503` means the task accepted the connection and did not
@@ -222,8 +234,120 @@ done: check `git log` on `deploy-workbench/ecs.ts` before assuming a bug.
 A three-hour version of this happened on 2026-10-26 and nothing paged; that
 outage is why this alarm exists.
 
-**Status:** not rehearsed. Written with the alarms, so the commands above were
-checked against the account but have not yet been run against a real firing.
+### 5. The database: the task is up and has capacity, and is waiting on Postgres
+
+This is the branch the 2026-11-23 outage needed and this runbook did not have.
+That day the load balancer started returning 5XX at 11:05, the task never lost
+`RunningTaskCount`, its CPU averaged 5% of the task over the outage and its
+memory maxed at 16%, and the gateway was not serving again until the instance
+was resized in the console at 12:42. The thing that was wrong was underneath
+the task, and the only way anyone found it was by reading CloudWatch by hand the
+next day.
+
+**Which metric, and what each one means.** All three are `AWS/RDS`, all three
+carry one dimension, and the value is the instance identifier from
+`deploy-workbench/rds.ts`:
+
+```
+DBInstanceIdentifier=bifrost-db
+```
+
+| Metric | What it is | Routine here | What a bad value means |
+|---|---|---|---|
+| `FreeableMemory` | bytes of RAM the instance can hand out | 52-110 MiB over the 13 days before the incident, on the 1 GiB class it ran on; 4.5-4.6 GiB free in the hour measured since the 8 GiB class came up | the instance has nothing left to cache with, so reads go to storage and queue there |
+| `DiskQueueDepth` | requests waiting on the volume | p99 0.06, max 0.198 over 32 days | the device is behind, whatever its provisioned IOPS say |
+| `WriteLatency` | seconds per write, as the instance sees them | ~2 ms median | writes are slow for the same reason the queue is deep |
+
+**A high `DiskQueueDepth` with low `WriteIOPS` is not an IOPS ceiling; it is a
+stalled device.** That is the distinction this step exists to make, and the one
+the incident was first described without. On 2026-11-23 the queue reached
+8.37 while `WriteIOPS` peaked at 61 and `ReadIOPS` at 224 against a 3,000-IOPS
+gp3 baseline — 2% and 7% of what the volume was provisioned for, and no higher
+than their own routine peaks, with the volume delivering less per request than it
+normally does. A volume at its IOPS ceiling shows the IOPS *at* the baseline with
+the queue growing behind it; a couple of dozen writes a second with eight queued
+behind them means the device is taking hundreds of milliseconds per request, not
+that there are too many requests. If you see a deep queue **and** IOPS near
+3,000, that is a real ceiling and the answer is provisioned IOPS, which is an
+open decision (`docs/bifrost-gateway.md`, the "RDS size and Multi-AZ" question).
+A deep queue with IOPS far below the baseline is this instance's storage not
+keeping up, which is what the class change was a stopgap for.
+
+Read the seven together, over an hour, and the shape tells you which:
+
+```sh
+for m in DiskQueueDepth WriteLatency WriteIOPS ReadIOPS FreeableMemory \
+         EBSByteBalance% EBSIOBalance%; do
+  echo "== $m"
+  aws cloudwatch get-metric-statistics \
+    --namespace AWS/RDS --metric-name "$m" \
+    --dimensions Name=DBInstanceIdentifier,Value=bifrost-db \
+    --start-time "$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)" \
+    --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --period 300 --statistics Minimum Average Maximum --region us-west-2 \
+    --query 'Datapoints[].[Timestamp,Minimum,Average,Maximum]' --output text
+done
+```
+
+**`EBSByteBalance%` and `EBSIOBalance%` are the ones to read if the queue is
+deep.** On 2026-11-23 the byte balance had been draining since about 08:30
+(57%), reached 0% at 11:15 and stayed at 0 for the next seventy minutes, while
+the IO balance fell from 99% to 73% and held in the low seventies. Both are
+burst credits of the **instance** (not the volume — gp3 does not burst), and
+byte balance at zero means the instance has no throughput headroom left: that
+is the storage stall stated directly, and it is the one graph that would have
+made the cause obvious in the first ten minutes. Be aware that this metric also
+drains and refills on quiet days as part of ordinary use; the signal is it
+sitting at or near zero *while the queue is deep*, not the drain alone.
+
+What to do, in order:
+
+1. **Is a task restart or a migration in flight?** Bifrost runs store migrations
+   at boot, and a migration against a small instance looks exactly like this.
+   `aws ecs describe-services --cluster bifrost --services bifrost --region us-west-2`
+   and the `/aws/ecs/bifrost` log group around the first slow bucket.
+2. **Is storage full?** `FreeStorageSpace` under a gigabyte is a different
+   incident and the fix is retention, not the class.
+3. **Is the memory alarm the one that fired?** `FreeableMemory` at 5% means the
+   instance has no page cache; the queue follows from that. Find what is holding
+   it — a long-running transaction, a migration, idle connections — before
+   touching the instance class. Raising the class buys time and hides the cause,
+   and it has already been raised once (#575).
+4. **If nothing is holding it, the instance is undersized for the workload.**
+   That is a PR against `deploy-workbench/rds.ts`, not a console change: the
+   class is Pulumi's, and a console resize is reverted by the next apply unless
+   the file agrees with it (that is what #575 was for). Provisioned IOPS and
+   throughput and Multi-AZ are open decisions in
+   [`bifrost-gateway.md`](./bifrost-gateway.md), not things to change during an
+   incident.
+5. **Restarting the task does not fix a database problem** and costs an outage
+   of its own (`DEPLOYMENT_MINIMUM_HEALTHY_PERCENT` is 0), so do not reach for
+   the deploy as the first move here. It changes nothing about the instance.
+
+**Escalation.** Reading these metrics needs no grant beyond what a
+`WorkbenchAccess` session has (`cloudwatch:GetMetricStatistics` on `AWS/RDS`
+worked for the post-incident measurements in this document). Acting on them is
+where it changes: anything that writes to the instance — a parameter group, a
+class change applied from the console to stop the bleeding, deleting a runaway
+session — needs `/breakglass` and an approval in `#sensitive-access-requests`
+([`sheriff.md`](./sheriff.md)). `rds:DescribeDBInstances` is **not** in
+`WorkbenchAccess`, so `aws rds describe-db-instances --db-instance-identifier
+bifrost-db` fails without an admin session; the console's RDS page needs the
+same. Everything this step asks you to read is in CloudWatch and needs neither.
+
+If the queue is deep and none of those five answers explain it, this is a
+database performance investigation rather than gateway triage: it belongs in
+`docs/bifrost-gateway.md`'s "RDS size and Multi-AZ" question with the window and
+the numbers, because the next step is a sizing decision rather than a fix.
+
+A `503` burst with a healthy task and a healthy database is not this step — go
+back to step 3 and read the task's own logs.
+
+**Status:** not rehearsed. Written from the 2026-11-23 outage's own CloudWatch
+record, with the alarm and the two new metrics chosen from it; the commands
+above were run against the account on 2026-11-23 and returned the datapoints
+quoted here, but nothing has yet been triaged by following this step during a
+real firing.
 
 ---
 
