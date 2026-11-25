@@ -276,18 +276,24 @@ jobs:
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           MODE: ${{ inputs.mode }}
+          EVAL_OUT: ./baseline
+          EVAL_REPLAYS: "3"
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-main
         run: |
           gh auth setup-git
-          args=(--mode replay --runs 3 --concurrency 5 --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main")
+          export EVAL_VARIANT="main-${GITHUB_SHA:0:7}"
+          if [ "$MODE" = tune ]; then export EVAL_SPLIT=tune; fi
           # A second pass replays only the runs the first left incomplete, so
-          # a transient error does not cost a whole re-dispatch.
+          # a transient error does not cost a whole re-dispatch. The plan
+          # `expected.test.ts` shares with `review:expect` decides that.
           for pass in 1 2; do
             if [ "$MODE" = tune ]; then
-              npm run -s review:expect -- "${args[@]}" --split tune
+              npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
             else
               # The replay prints each case id with its outcome, and gate mode
               # runs holdout cases, so the log is withheld.
-              npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay-$pass.log" 2>&1 \
+              npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5 \
+                > "$RUNNER_TEMP/replay-$pass.log" 2>&1 \
                 || { echo "::error::Main's replay failed; its log is withheld in gate mode."; exit 1; }
             fi
           done
@@ -310,9 +316,10 @@ jobs:
             --base ./baseline --ids-out "$RUNNER_TEMP/main-short.txt"
           if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
             ids=$(cat "$RUNNER_TEMP/main-short.txt")
+            export EVAL_CASE="$ids" EVAL_FROM_RUN=4 EVAL_REPLAYS=3 EVAL_VARIANT="main-${GITHUB_SHA:0:7}" \
+              EVAL_OUT=./baseline EVAL_WORK_DIR="$RUNNER_TEMP/work-main-more"
             for pass in 1 2; do
-              npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency 5 \
-                --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main-more" \
+              npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5 \
                 > "$RUNNER_TEMP/replay-more-$pass.log" 2>&1 \
                 || { echo "::error::Main's extra replay failed; its log is withheld."; exit 1; }
             done
@@ -428,15 +435,23 @@ jobs:
           MODE: ${{ inputs.mode }}
           CASES: ${{ inputs.cases }}
           SHA7: ${{ needs.prepare.outputs.sha7 }}
+          EVAL_OUT: ./cand
+          EVAL_WORK_DIR: ${{ runner.temp }}/work-cand
         run: |
           gh auth setup-git
-          args=(--mode replay --concurrency 5 --variant "cand-${SHA7}" --out ./cand --work-dir "$RUNNER_TEMP/work-cand")
+          export EVAL_VARIANT="cand-${SHA7}"
           case "$MODE" in
-            inner) npm run -s review:expect -- "${args[@]}" --runs 1 --case "$CASES" ;;
-            tune) npm run -s review:expect -- "${args[@]}" --runs 3 --split tune ;;
+            inner)
+              # A blank case list would replay the whole suite and charge it
+              # to the run id, so it fails here instead.
+              if [ -z "$CASES" ]; then echo "::error::inner mode needs cases."; exit 1; fi
+              EVAL_REPLAYS=1 EVAL_CASE="$CASES" npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
+              ;;
+            tune) EVAL_REPLAYS=3 EVAL_SPLIT=tune npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5 ;;
             *)
               # Gate mode runs holdout cases, so the log is withheld.
-              npm run -s review:expect -- "${args[@]}" --runs 3 > "$RUNNER_TEMP/replay.log" 2>&1 \
+              EVAL_REPLAYS=3 npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5 \
+                > "$RUNNER_TEMP/replay.log" 2>&1 \
                 || { echo "::error::The candidate's replay failed; its log is withheld in gate mode."; exit 1; }
               ;;
           esac
@@ -587,11 +602,13 @@ jobs:
         run: |
           gh auth setup-git
           RERUN_IDS=$(cat ./rerun/ids.txt)
-          args=(--mode replay --case "$RERUN_IDS" --runs 3 --from-run 4 --concurrency 5 --variant "cand-${SHA7}" --out ./cand-rerun --work-dir "$RUNNER_TEMP/work-rerun")
+          export EVAL_CASE="$RERUN_IDS" EVAL_FROM_RUN=4 EVAL_REPLAYS=3 EVAL_VARIANT="cand-${SHA7}" \
+            EVAL_OUT=./cand-rerun EVAL_WORK_DIR="$RUNNER_TEMP/work-rerun"
           if [ "$MODE" = tune ]; then
-            npm run -s review:expect -- "${args[@]}"
+            npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5
           else
-            npm run -s review:expect -- "${args[@]}" > "$RUNNER_TEMP/replay.log" 2>&1 \
+            npx vitest run delegate/review/eval/suites/expected.test.ts --maxConcurrency 5 \
+              > "$RUNNER_TEMP/replay.log" 2>&1 \
               || { echo "::error::The rerun failed; its log is withheld in gate mode."; exit 1; }
           fi
 
