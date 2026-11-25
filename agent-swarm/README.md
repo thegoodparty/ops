@@ -809,7 +809,9 @@ and has no CLI, same as its AWS access.
   written to `/etc/databrickscfg`, and the image sets
   `DATABRICKS_CONFIG_FILE` to it. It carries no host and no credentials:
   `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`
-  arrive as injected secrets and the CLI reads them from the environment.
+  are injected into the task environment by the swarm's secret store (not by
+  `docker-compose.yml`), and the CLI reads them from there. A bare
+  `docker exec` shell has no credentials, so run those calls from a task.
   `/etc/databrickscfg` is read-only to the worker, so point
   `DATABRICKS_CONFIG_FILE` at a writable path to keep profiles of your own.
 - Always pass `--profile delegate-sql`. Without it the CLI asks for the
