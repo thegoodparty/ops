@@ -157,7 +157,10 @@ The lead and both workers do not run the upstream worker image directly.
 22.23.4 (the [October 2026 security
 release](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases));
 upstream images up to v2.4.5 still ship 22.23.3. The build fails if Node is
-still older than v22.23.4. `render-env.sh` writes the patch hash to `.env`
+still older than v22.23.4. It also installs the Databricks CLI and its
+profile (see [Databricks access from inside the
+swarm](#databricks-access-from-inside-the-swarm)). `render-env.sh` writes
+the patch hash to `.env`
 as `WORKER_PATCH_HASH`, so the tag changes, and the agents are rebuilt and
 recreated, only when the version or the Dockerfile changes. A deploy that
 changes neither builds nothing and restarts no agent. The API image has no
@@ -167,10 +170,12 @@ Node and is used as is.
    the version lives.
 2. Check the new worker's Node:
    `docker run --rm --entrypoint node ghcr.io/desplega-ai/agent-swarm-worker:<version> -v`.
-   If it is v22.23.4 or later, delete `host/worker-patch/`, point
-   `x-worker-base` in `host/docker-compose.yml` back at that image, and
-   drop the build from `up.sh` and `WORKER_PATCH_HASH` from
-   `render-env.sh`.
+   If it is v22.23.4 or later, delete the Node step from
+   `host/worker-patch/Dockerfile` and point `x-worker-base` in
+   `host/docker-compose.yml` back at that image. Do not delete the directory
+   or drop `WORKER_PATCH_HASH` while it still carries the Databricks CLI:
+   that is the swarm's only image extension point, and losing it would leave
+   the agents without the CLI.
 3. Merge. `up.sh` sees the dashboard marker
    (`ui-dist/.agent-swarm-version`) is stale and rebuilds the UI from the new
    tag, builds the worker image, then recreates every agent-swarm container.
@@ -788,6 +793,35 @@ is mounted read-only into the lead and both workers, and
 the instance's own credentials from IMDS (the instance's hop limit is 2 so
 containers can reach IMDS). The api container has no AWS access.
 `host/global-setup-script.sh` installs the AWS CLI into the workers.
+
+## Databricks access from inside the swarm
+
+The agents reach the warehouse through a Databricks service principal. The
+CLI is in the worker image, which every agent container shares: lead, coder
+and reviewer all inherit `x-worker-base`, built from
+`host/worker-patch/Dockerfile`. The API container is the upstream image as is
+and has no CLI, same as its AWS access.
+
+- The binary is Databricks CLI v1.28.0, pinned in the Dockerfile with the
+  release's own SHA-256 per architecture, so a build installs exactly that
+  release or fails.
+- The profile `delegate-sql` (`auth_type = oauth-m2m`, `scopes = sql`) is
+  written to `/etc/databrickscfg`, and the image sets
+  `DATABRICKS_CONFIG_FILE` to it. It carries no host and no credentials:
+  `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`
+  arrive as injected secrets and the CLI reads them from the environment.
+  `/etc/databrickscfg` is read-only to the worker, so point
+  `DATABRICKS_CONFIG_FILE` at a writable path to keep profiles of your own.
+- Always pass `--profile delegate-sql`. Without it the CLI asks for the
+  `all-apis` scope, which this service principal rejects.
+
+```bash
+databricks api post /api/2.0/sql/statements --profile delegate-sql \
+  --json '{"warehouse_id":"18583d8b081c6486","statement":"SELECT 1"}'
+```
+
+Warehouse `18583d8b081c6486` is "Serverless Starter Warehouse". The access
+that backs it is deliberately small; ask Swain Molster to widen it.
 
 ## Bringing it up
 
