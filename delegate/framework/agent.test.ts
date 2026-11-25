@@ -15,9 +15,9 @@ import type { AgentConfig } from "./types";
 // Under S2 the implementation was the Claude Agent SDK and `agent.test.ts`
 // compared `claudeOptions` against the option object the SDK had been given
 // before the refactor, with `forceSynchronousTaskHook` and `toPreToolUseHook`
-// pinned as the harness's own vocabulary. **All four are gone in S5** and their
-// tests with them, because the harness they described is gone: there is no option
-// object, no `PreToolUse` hook, and no session.
+// pinned as the harness's own vocabulary. **All four went in S5** and their
+// tests with them, because the harness they described was going; S6 removed the
+// dependency, so those names cannot come back without a deliberate revert.
 //
 // What replaces them is the part of S5 that is delegate's own: the step counter,
 // the spend counter and the abort. The plan asks for a "test that each fires", and
@@ -411,6 +411,22 @@ describe("toolNamesFor", () => {
       subagents: { scout: { description: "d", prompt: "p" } },
     });
     assert.deepEqual(toolNamesFor(config, {}), ["Read"]);
+  });
+
+  it("carries no default allowlist, so `Skill` stays out even when the agent declares nothing", () => {
+    // Step 6 of `docs/delegate-harness-migration.md` lists "`Skill` out of the
+    // default allowlist (`agent.ts:80`)", and S5 got there by a wider route: it
+    // deleted the default list rather than trimming it, so the answer is now
+    // `Object.keys(config.tools)` and an agent that declares no tools has none.
+    // Pinned because the property is what the step wanted and a default list is
+    // the shape that would bring `Skill` back: it was the Agent SDK's skill
+    // loader, and nothing in this runtime implements it.
+    const config = baseConfig({ tools: { Read: {} } });
+    const names = toolNamesFor(config, {});
+    assert.deepEqual(names, ["Read"]);
+    assert.equal(names.includes("Skill"), false);
+    // An agent that declares no tools at all gets an empty list, not a default.
+    assert.deepEqual(toolNamesFor(baseConfig({}), {}), []);
   });
 });
 

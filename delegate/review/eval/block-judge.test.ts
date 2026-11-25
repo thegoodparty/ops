@@ -6,7 +6,6 @@ import {
   buildBlockJudgePrompt,
   createApiBlockJudge,
   defaultBlockJudge,
-  parseBlockJudgment,
 } from "./block-judge";
 import type { JudgeModel, JudgeRequest } from "./judge";
 
@@ -49,16 +48,6 @@ describe("createApiBlockJudge", () => {
   });
 });
 
-describe("parseBlockJudgment", () => {
-  it("takes the last judgment object in the answer", () => {
-    assert.deepEqual(
-      parseBlockJudgment('Thinking {"x": 1}. {"match": false, "why": "first"} then {"match": true, "finding": 2, "why": "second"}'),
-      { match: true, finding: 2, why: "second" },
-    );
-    assert.throws(() => parseBlockJudgment("no idea"), /no judgment object/);
-  });
-});
-
 describe("defaultBlockJudge", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
@@ -92,5 +81,18 @@ describe("defaultBlockJudge", () => {
     }) as typeof fetch;
     await assert.rejects(defaultBlockJudge({ ANTHROPIC_API_KEY: "k" })("r", findings), /HTTP 529/);
     assert.equal(calls, 3);
+  });
+
+  it("with no API key, says so once rather than retrying a configuration error", async () => {
+    // The Claude Code login path that answered this case went with the Agent
+    // SDK in step 6. What a local run without a key gets now is a sentence
+    // naming the key it needs, not three attempts and a 401.
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    await assert.rejects(defaultBlockJudge({})("r", findings), /needs ANTHROPIC_API_KEY/);
+    assert.equal(calls, 0);
   });
 });

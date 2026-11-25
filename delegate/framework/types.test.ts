@@ -23,23 +23,24 @@ import { REVIEW_OUTPUT_JSON_SCHEMA } from "../agents/pr-reviewer";
 //     because it has no `schema` member. S5 wraps it instead.
 
 test("toolSet keys are the tool names, in the order they were declared", () => {
-  // The order is not cosmetic: `agent.ts` passes `Object.keys(...)` as the
-  // harness's tool list, and an agent's prompt names its tools in that order.
+  // The order is not cosmetic: `agent.ts` passes `Object.keys(...)` as the tool
+  // list the child may offer, and an agent's prompt names its tools in that order.
   assert.deepEqual(Object.keys(toolSet("Read", "Grep", "Glob", "Task")), [
     "Read",
     "Grep",
     "Glob",
     "Task",
   ]);
-  // Every entry is an empty tool: the harness implements these itself in S2,
-  // and S5 replaces each with a `tool()` we write.
+  // Every entry is an empty tool, and stays empty: `tools.ts` builds the
+  // implementation for each name the runtime knows, so a declared name is a
+  // capability the runtime decides on, not a definition the agent ships.
   assert.deepEqual(toolSet("Read"), { Read: {} });
 });
 
 test("toolSet with no names is an empty set, not undefined", () => {
-  // The difference matters downstream: an empty list disables the harness's
-  // built-in tools and `undefined` leaves them alone. The post-mortem selector
-  // asks for none, and it says so with an empty set.
+  // The difference matters downstream: an empty set means the agent may call no
+  // tool at all, and `undefined` means the runtime's default. The post-mortem
+  // selector asks for none, and it says so with an empty set.
   assert.deepEqual(toolSet(), {});
 });
 

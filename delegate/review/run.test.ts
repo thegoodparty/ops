@@ -210,16 +210,19 @@ test("agentEnv drops anything it was not told about", () => {
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: "8000",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     DISABLE_TELEMETRY: "1",
+    ANTHROPIC_MODEL: "claude-sonnet-5-5",
     AWS_PROFILE: "admin",
     AWS_ACCESS_KEY_ID: "AKIA...",
   });
-  // **Nothing at all crosses.** The first four were the old list's refusals; the
-  // last five are the ones S5 added. The `CLAUDE_` / `DISABLE_` prefixes are gone
-  // with the Claude CLI whose knobs they were, and the two credential-provider
-  // names are refused on purpose: a child that could read role credentials would
-  // undo the separate principal S7 creates. Not an empty object by accident —
-  // every one of these is a name the old list kept or a name that would widen
-  // what the child can reach.
+  // **Nothing at all crosses.** The list mixes three kinds of refusal on purpose.
+  // The credential-ish ones (`DATABRICKS_TOKEN`, `SOME_NEW_SECRET`) are refusals
+  // because this is an allowlist, not a denylist. The `CLAUDE_` / `DISABLE_`
+  // prefixes and `ANTHROPIC_MODEL` are the Claude CLI's own knobs, dead since S5
+  // dropped the prefixes and S6 removed the SDK and `ANTHROPIC_MODEL` with it —
+  // `ANTHROPIC_MODEL` is the name step 6 actually took out of
+  // `ENV_ALLOW_EXACT`, so this asserts the removal rather than the prefix rule.
+  // The credential-provider names are refused on purpose: a child that could read
+  // role credentials would undo the separate principal S7 creates.
   assert.deepEqual(Object.keys(env), []);
 });
 
@@ -239,8 +242,8 @@ test("agentEnv keeps the provider key and the process names, and no credential p
   assert.deepEqual(Object.keys(env).sort(), ["ANTHROPIC_API_KEY", "AWS_REGION", "HOME", "PATH"]);
 });
 
-// A guard is asked about one tool call now, not handed a Claude hook event, so
-// the helper builds the call and reads the contract's own decision.
+// A guard is asked about one tool call now, not handed a `PreToolUse` hook event,
+// so the helper builds the call and reads the contract's own decision.
 const guardCall = async (guard: ToolCallHandler, tool: string, input: unknown) =>
   guard({ toolName: tool, input: input as Record<string, unknown> });
 

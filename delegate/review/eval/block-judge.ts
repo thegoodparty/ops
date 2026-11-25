@@ -1,8 +1,6 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { extractJsonObjects } from "../run";
 import type { Finding } from "../schema";
-import { DEFAULT_JUDGE_MODEL, createAnthropicJudgeModel } from "./judge";
+import { createAnthropicJudgeModel } from "./judge";
 import type { JudgeModel, JudgeTool } from "./judge";
 
 // A block case passes only when the review blocked for the reason the case
@@ -71,43 +69,31 @@ export const createApiBlockJudge = (model: JudgeModel): BlockJudge => async (rea
   return BlockJudgmentSchema.parse(toolInput);
 };
 
-// A local run without an API key uses the Claude Code login, through the SDK,
-// with no tools and an environment that carries nothing else.
-export const parseBlockJudgment = (text: string): BlockJudgment => {
-  const found = extractJsonObjects(text).filter((o) => BlockJudgmentSchema.safeParse(o).success);
-  if (found.length === 0) throw new Error(`no judgment object in the block judge's answer: ${text.slice(0, 200)}`);
-  return BlockJudgmentSchema.parse(found[found.length - 1]);
-};
-
-const sdkBlockJudge: BlockJudge = async (reason, findings) => {
-  let answer: string | undefined;
-  for await (const msg of query({
-    prompt: `${buildBlockJudgePrompt(reason, findings)}\n\nAnswer with only a JSON object: {"match": true or false, "finding": <the finding's number, omitted when match is false>, "why": "<one line>"}`,
-    options: {
-      systemPrompt: SYSTEM,
-      model: DEFAULT_JUDGE_MODEL,
-      tools: [],
-      allowedTools: [],
-      maxTurns: 2,
-      maxBudgetUsd: 1,
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, TMPDIR: process.env.TMPDIR },
-    },
-  })) {
-    if (msg.type !== "result") continue;
-    if (msg.subtype !== "success") throw new Error(`the block judge ended with ${msg.subtype}`);
-    answer = msg.result;
-  }
-  if (answer === undefined) throw new Error("the block judge returned no result");
-  return parseBlockJudgment(answer);
-};
-
 // Three tries, then the error stands: a judge that cannot answer fails the
 // scoring step rather than counting as a miss.
+//
+// **The no-API-key path went with the Agent SDK, and nothing replaces it.** It
+// ran the judge through `query()` against a Claude Code subscription login, which
+// is not a credential the AI SDK can reach: `@ai-sdk/anthropic` takes an API key
+// or a bearer token, and a subscription login is an OAuth cache file the CLI owns.
+// So `ANTHROPIC_API_KEY` is now the judge's only credential, and a missing one is
+// a configuration error answered once rather than retried three times: retrying
+// cannot conjure a key, and the message is the same on every attempt.
+//
+// What went with it is `parseBlockJudgment` and its test. That function existed to
+// read a judgment object out of the CLI's free-text answer; the API path returns
+// the answer as a `record_match` tool call, and `createApiBlockJudge`'s own test
+// pins the half that still matters — a reply with no call, or one off-schema, is a
+// judge failure rather than a pass.
 export const defaultBlockJudge = (env: NodeJS.ProcessEnv = process.env): BlockJudge => {
-  const judge = env.ANTHROPIC_API_KEY
-    ? createApiBlockJudge(createAnthropicJudgeModel({ apiKey: env.ANTHROPIC_API_KEY, tool: MATCH_TOOL }))
-    : sdkBlockJudge;
+  const apiKey = env.ANTHROPIC_API_KEY;
   return async (reason, findings) => {
+    if (!apiKey) {
+      throw new Error(
+        "the block judge needs ANTHROPIC_API_KEY: the Claude Code login path went with the Claude Agent SDK in step 6 of docs/delegate-harness-migration.md",
+      );
+    }
+    const judge = createApiBlockJudge(createAnthropicJudgeModel({ apiKey, tool: MATCH_TOOL }));
     for (let attempt = 1; ; attempt++) {
       try {
         const j = await judge(reason, findings);
