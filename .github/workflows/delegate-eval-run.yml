@@ -69,7 +69,7 @@ permissions:
   contents: read
 
 env:
-  REPLAY_CONCURRENCY: 25
+  REPLAY_CONCURRENCY: ${{ vars.DELEGATE_REPLAY_CONCURRENCY || '5' }}
 
 jobs:
   # Main's code only. Validates, applies the file allowlist, checks the budget

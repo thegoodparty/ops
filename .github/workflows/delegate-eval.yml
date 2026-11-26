@@ -21,7 +21,8 @@ permissions:
 # producing job's own upload fails, no id is reported and nothing is pushed.
 # Each job asks for `id-token: write` only if it assumes a role.
 env:
-  REPLAY_CONCURRENCY: 25
+  PAIRWISE_REPLAY_CONCURRENCY: ${{ vars.DELEGATE_REPLAY_CONCURRENCY || '4' }}
+  EXPECTED_REPLAY_CONCURRENCY: ${{ vars.DELEGATE_REPLAY_CONCURRENCY || '5' }}
 
 jobs:
   prepare:
@@ -271,7 +272,7 @@ jobs:
             --out ./eval/results-main \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --replays 2 \
-            --concurrency "$REPLAY_CONCURRENCY" \
+            --concurrency "$PAIRWISE_REPLAY_CONCURRENCY" \
             --work-dir ${{ runner.temp }}/work-main
 
       # Uploaded even when the replay failed, so the good results still reach
@@ -363,7 +364,7 @@ jobs:
             --out ../eval/results-pr \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --replays 2 \
-            --concurrency "$REPLAY_CONCURRENCY" \
+            --concurrency "$PAIRWISE_REPLAY_CONCURRENCY" \
             --work-dir ${{ runner.temp }}/work-pr
 
       - name: Upload PR results
@@ -557,7 +558,7 @@ jobs:
           npm run -s review:expect -- \
             --mode replay \
             --runs 3 \
-            --concurrency "$REPLAY_CONCURRENCY" \
+            --concurrency "$EXPECTED_REPLAY_CONCURRENCY" \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --out ./eval-expected-main \
             --work-dir ${{ runner.temp }}/work-expected-main
@@ -643,7 +644,7 @@ jobs:
             --mode replay \
             --manifest ../delegate/review/eval/expected/manifest.json \
             --runs 3 \
-            --concurrency "$REPLAY_CONCURRENCY" \
+            --concurrency "$EXPECTED_REPLAY_CONCURRENCY" \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --out ../eval-expected \
             --work-dir ${{ runner.temp }}/work-expected
@@ -765,7 +766,7 @@ jobs:
             --case "$RERUN_IDS" \
             --runs 3 \
             --from-run 4 \
-            --concurrency "$REPLAY_CONCURRENCY" \
+            --concurrency "$EXPECTED_REPLAY_CONCURRENCY" \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --out ../eval-expected-rerun \
             --work-dir ${{ runner.temp }}/work-expected-rerun

@@ -75,7 +75,7 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 ### How replays are scheduled
 
-`suites/expected.eval.ts` and `suites/pairwise.eval.ts` each declare their cases and a replay function. Vitest schedules one concurrent test per uncached (case, run). `--concurrency` caps the whole pool. CI uses 25 per replay job; local defaults stay at 4 or 5. `npm test` checks that 25 replays can overlap with no model calls.
+`suites/expected.eval.ts` and `suites/pairwise.eval.ts` each declare their cases and a replay function. Vitest schedules one concurrent test per uncached (case, run). `--concurrency` caps the whole pool. CI and local runs default to 4 for pairwise and 5 for expected-result replays. `npm test` checks that 25 replays can overlap with no model calls. To try 25 under real load, set the `DELEGATE_REPLAY_CONCURRENCY` Actions variable to `25` for a trial run. Check replay wall time, checkout failures, and provider throttling before keeping it. Delete the variable to restore both defaults.
 
 To list what would replay without calling a model, use `review:eval -- replay --dry-run` or `review:expect -- --mode replay --dry-run true`, plus your normal flags. An errored replay still writes a result; scoring decides how to count it.
 
