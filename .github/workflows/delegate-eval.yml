@@ -20,6 +20,9 @@ permissions:
 # producing job reports; if PR code got to that artifact name first, the
 # producing job's own upload fails, no id is reported and nothing is pushed.
 # Each job asks for `id-token: write` only if it assumes a role.
+env:
+  REPLAY_CONCURRENCY: 25
+
 jobs:
   prepare:
     # A reaction on a pull request's conversation comment is governed by the
@@ -268,7 +271,7 @@ jobs:
             --out ./eval/results-main \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --replays 2 \
-            --concurrency 4 \
+            --concurrency "$REPLAY_CONCURRENCY" \
             --work-dir ${{ runner.temp }}/work-main
 
       # Uploaded even when the replay failed, so the good results still reach
@@ -360,7 +363,7 @@ jobs:
             --out ../eval/results-pr \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --replays 2 \
-            --concurrency 4 \
+            --concurrency "$REPLAY_CONCURRENCY" \
             --work-dir ${{ runner.temp }}/work-pr
 
       - name: Upload PR results
@@ -554,7 +557,7 @@ jobs:
           npm run -s review:expect -- \
             --mode replay \
             --runs 3 \
-            --concurrency 5 \
+            --concurrency "$REPLAY_CONCURRENCY" \
             --variant main-${{ needs.prepare.outputs.main_sha7 }} \
             --out ./eval-expected-main \
             --work-dir ${{ runner.temp }}/work-expected-main
@@ -640,7 +643,7 @@ jobs:
             --mode replay \
             --manifest ../delegate/review/eval/expected/manifest.json \
             --runs 3 \
-            --concurrency 5 \
+            --concurrency "$REPLAY_CONCURRENCY" \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --out ../eval-expected \
             --work-dir ${{ runner.temp }}/work-expected
@@ -762,7 +765,7 @@ jobs:
             --case "$RERUN_IDS" \
             --runs 3 \
             --from-run 4 \
-            --concurrency 5 \
+            --concurrency "$REPLAY_CONCURRENCY" \
             --variant pr-${{ needs.prepare.outputs.sha7 }} \
             --out ../eval-expected-rerun \
             --work-dir ${{ runner.temp }}/work-expected-rerun

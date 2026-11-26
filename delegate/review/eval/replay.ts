@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import "../../agents";
 import { getAgent, runAgent } from "../../framework";
@@ -526,73 +526,4 @@ export const replayCase = async (
     gating,
     usage,
   );
-};
-
-export interface ReplayAllOptions {
-  out: string;
-  variant?: string;
-  workDir?: string;
-  force?: boolean;
-  // Replays per case, each written to <out>/<caseId>/run-<n>.json.
-  replays?: number;
-}
-
-export const replayAll = async (
-  records: ReviewRecord[],
-  opts: ReplayAllOptions,
-  poolOpts: { concurrency?: number } = {},
-  runAgentImpl?: RunAgentImpl,
-  checkoutFn?: CheckoutFn,
-): Promise<Result[]> => {
-  const { out, variant, workDir = "/tmp/review-eval", force = false, replays = 1 } = opts;
-  const { concurrency = 4 } = poolOpts;
-
-  mkdirSync(out, { recursive: true });
-  mkdirSync(workDir, { recursive: true });
-
-  const results: Result[] = [];
-  const toRun: { record: ReviewRecord; run: number }[] = [];
-
-  for (const record of records) {
-    for (let run = 1; run <= replays; run++) {
-      const resultPath = join(out, record.runId, `run-${run}.json`);
-      if (!force && existsSync(resultPath)) {
-        try {
-          results.push(JSON.parse(readFileSync(resultPath, "utf-8")) as Result);
-          continue;
-        } catch {
-          // file unreadable — fall through to replay
-        }
-      }
-      toRun.push({ record, run });
-    }
-  }
-
-  console.error(`Replaying ${toRun.length} run(s); ${results.length} already had results`);
-  if (toRun.length === 0) return results;
-
-  let index = 0;
-  const worker = async () => {
-    while (index < toRun.length) {
-      const { record, run } = toRun[index++];
-      // A case's replays run side by side, so each needs its own checkout dir.
-      const result = await replayCase(
-        record,
-        { workDir: join(workDir, `run-${run}`), variant },
-        runAgentImpl,
-        checkoutFn,
-      );
-      results.push(result);
-      mkdirSync(join(out, result.caseId), { recursive: true });
-      writeFileSync(
-        join(out, result.caseId, `run-${run}.json`),
-        JSON.stringify(result, null, 2),
-      );
-    }
-  };
-
-  const workerCount = Math.min(concurrency, toRun.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
-  return results;
 };

@@ -1,12 +1,13 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { loadCases, loadScenarios, saveCases, scenarioNames, scenarioSplits } from "./cases";
 import { pullCache, pullHistory, pushCache, replayKey, sameReviewerAs } from "./cache";
 import type { CacheLayout } from "./cache";
-import { SplitSchema, readManifest as readExpectedManifest, selectCases } from "./expect";
+import { readManifest as readExpectedManifest, selectCases } from "./expect";
 import { CANDIDATE_FILES, codeOutsideLiterals, disallowedChanges, parseIds, publishRun, validateBranch, validateBudget, validateIds, validateRunId } from "./dispatch";
 import { ModeSchema, addEntry, chargedUsd, checkBudget, estimateUsd, readLedger, sumResultCosts } from "./ledger";
-import { loadRunResults, replayAll, resultFromRecord } from "./replay";
+import { loadRunResults, resultFromRecord } from "./replay";
+import { runReplaySuite } from "./suite";
 import { createAnthropicJudgeModel, judgeAll, DEFAULT_JUDGE_MODEL } from "./judge";
 import { summarize, renderMarkdown, renderPrComment } from "./report";
 
@@ -276,24 +277,18 @@ const main = async () => {
     const concurrency = flag(flags, "concurrency") ? parseInt(flag(flags, "concurrency")!, 10) : 4;
     const workDir = flag(flags, "work-dir") ?? "/tmp/review-eval";
     const force = boolFlag(flags, "force");
-    const replays = flag(flags, "replays") ? parseInt(flag(flags, "replays")!, 10) : 1;
-    if (!(replays >= 1)) { console.error("--replays must be a positive integer"); process.exit(1); }
-
-    let records = loadCases(casesFrom);
-    const splitFlag = flag(flags, "split");
-    if (splitFlag) {
-      const split = SplitSchema.parse(splitFlag);
-      const manifest = flag(flags, "manifest");
-      if (!manifest) { console.error("--split needs --manifest <scenarios.json>"); process.exit(1); }
-      const inSplit = scenarioNames(loadScenarios(manifest, { split }));
-      records = records.filter((r) => inSplit.has(r.runId));
-    }
-    console.error(`Loaded ${records.length} case(s), ${replays} replay(s) each, concurrency ${concurrency}`);
-    const results = await replayAll(records, { out, variant, workDir, force, replays }, { concurrency });
-    const errors = results.filter((r) => r.error);
-    console.error(
-      `Done. ${results.length - errors.length} succeeded, ${errors.length} failed.`,
-    );
+    await runReplaySuite("delegate/review/eval/suites/pairwise.eval.ts", {
+      out: resolve(out),
+      workDir: resolve(workDir),
+      replays: Number(flag(flags, "replays") ?? 1),
+      force,
+      planOnly: boolFlag(flags, "dry-run"),
+      casesDir: resolve(casesFrom),
+      case: flag(flags, "case"),
+      variant,
+      split: flag(flags, "split"),
+      manifest: flag(flags, "manifest"),
+    }, concurrency);
     return;
   }
 

@@ -68,6 +68,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  REPLAY_CONCURRENCY: 25
+
 jobs:
   # Main's code only. Validates, applies the file allowlist, checks the budget
   # and prints the plan; a dry run ends here.
@@ -278,7 +281,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           gh auth setup-git
-          args=(--mode replay --runs 3 --concurrency 5 --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main")
+          args=(--mode replay --runs 3 --concurrency "$REPLAY_CONCURRENCY" --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main")
           # A second pass replays only the runs the first left incomplete, so
           # a transient error does not cost a whole re-dispatch.
           for pass in 1 2; do
@@ -311,7 +314,7 @@ jobs:
           if [ -s "$RUNNER_TEMP/main-short.txt" ]; then
             ids=$(cat "$RUNNER_TEMP/main-short.txt")
             for pass in 1 2; do
-              npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency 5 \
+              npm run -s review:expect -- --mode replay --case "$ids" --runs 3 --from-run 4 --concurrency "$REPLAY_CONCURRENCY" \
                 --variant "main-${GITHUB_SHA:0:7}" --out ./baseline --work-dir "$RUNNER_TEMP/work-main-more" \
                 > "$RUNNER_TEMP/replay-more-$pass.log" 2>&1 \
                 || { echo "::error::Main's extra replay failed; its log is withheld."; exit 1; }
@@ -430,7 +433,7 @@ jobs:
           SHA7: ${{ needs.prepare.outputs.sha7 }}
         run: |
           gh auth setup-git
-          args=(--mode replay --concurrency 5 --variant "cand-${SHA7}" --out ./cand --work-dir "$RUNNER_TEMP/work-cand")
+          args=(--mode replay --concurrency "$REPLAY_CONCURRENCY" --variant "cand-${SHA7}" --out ./cand --work-dir "$RUNNER_TEMP/work-cand")
           case "$MODE" in
             inner) npm run -s review:expect -- "${args[@]}" --runs 1 --case "$CASES" ;;
             tune) npm run -s review:expect -- "${args[@]}" --runs 3 --split tune ;;
@@ -587,7 +590,7 @@ jobs:
         run: |
           gh auth setup-git
           RERUN_IDS=$(cat ./rerun/ids.txt)
-          args=(--mode replay --case "$RERUN_IDS" --runs 3 --from-run 4 --concurrency 5 --variant "cand-${SHA7}" --out ./cand-rerun --work-dir "$RUNNER_TEMP/work-rerun")
+          args=(--mode replay --case "$RERUN_IDS" --runs 3 --from-run 4 --concurrency "$REPLAY_CONCURRENCY" --variant "cand-${SHA7}" --out ./cand-rerun --work-dir "$RUNNER_TEMP/work-rerun")
           if [ "$MODE" = tune ]; then
             npm run -s review:expect -- "${args[@]}"
           else
