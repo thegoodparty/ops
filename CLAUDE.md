@@ -28,7 +28,8 @@ own.
 defaults this repo does not use and reformats files nobody touched.
 
 **Tests are `node --test` via `tsx`**, files named `*.test.ts`. Run the
-whole suite with `npm test`.
+whole suite with `npm test`. Paid delegate replays use Vitest in separate
+`*.eval.ts` suites. See [PR-reviewer eval](delegate/review/eval/README.md).
 
 **Commit with `--no-verify`.** Explain *why* in PR bodies, not what. No
 "test plan" section, no Co-Authored-By.

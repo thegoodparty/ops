@@ -9,8 +9,8 @@ import type { Bundle, Finding, ReviewRecord } from "../schema";
 import { BlockJudgmentSchema, defaultBlockJudge } from "./block-judge";
 import type { BlockJudge, BlockJudgment } from "./block-judge";
 import { isCacheable } from "./cache";
-import { replayCase } from "./replay";
 import type { CheckoutFn, Result } from "./replay";
+import { runReplaySuite } from "./suite";
 
 // A small set of cases with a known right answer, scored on the outcome
 // alone. The pairwise suite asks "better or worse than main"; this one asks
@@ -172,7 +172,7 @@ export const ensureInMirror = (mirrorDir: string, repo: string, shas: string[]):
   return mirror;
 };
 
-const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
+export const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => (bundle, repoDir) => {
   const git = (args: string[], timeout = 120_000) =>
     execFileSync("git", args, { cwd: repoDir, stdio: "pipe", timeout });
   rmSync(repoDir, { recursive: true, force: true });
@@ -200,9 +200,9 @@ const checkoutFor = (synthetic: Set<string>, mirrorDir?: string): CheckoutFn => 
   }
 };
 
-// replayCase only reads runId and bundle, so a case needs no more than that.
-// runId is set to the case id so results are named after the case.
-const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
+// A replay reads only runId and bundle, so a case needs no more. runId is the
+// case id, so results are named after the case.
+export const loadRecord = (c: ExpectedCase, manifestPath: string): ReviewRecord => {
   const bundle = readBundleFile(manifestPath, c.bundle);
   return { runId: c.id, bundle } as ReviewRecord;
 };
@@ -773,37 +773,14 @@ const main = async () => {
   }
 
   if (mode === "replay" || mode === "all") {
-    const records = new Map<string, ReviewRecord>();
-    for (const c of cases) records.set(c.id, loadRecord(c, manifestPath));
-    // A bundle case is simulated unless its source says it is a real PR,
-    // whose head commit GitHub still serves.
-    const synthetic = new Set(
-      cases.filter((c) => c.source === "simulated").map((c) => records.get(c.id)!.bundle.headSha),
-    );
-    const checkout = checkoutFor(synthetic, flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined);
-
-    const tasks = cases.flatMap((c) => Array.from({ length: runs }, (_, i) => ({ c, run: fromRun + i })));
-    let next = 0;
-    const worker = async () => {
-      while (next < tasks.length) {
-        const { c, run } = tasks[next++];
-        // A result already on disk (pulled from the cache, or from an earlier
-        // run) stands; an errored or failed one is retried.
-        const existing = join(out, c.id, `run-${run}.json`);
-        if (existsSync(existing) && isCacheable(JSON.parse(readFileSync(existing, "utf-8")) as Result)) continue;
-        const result = await replayCase(
-          records.get(c.id)!,
-          { workDir: join(workDir, `run-${run}`), variant },
-          undefined,
-          checkout,
-        );
-        rmSync(join(workDir, `run-${run}`, c.id), { recursive: true, force: true });
-        mkdirSync(join(out, c.id), { recursive: true });
-        writeFileSync(join(out, c.id, `run-${run}.json`), JSON.stringify(result, null, 2));
-        console.error(`  ${c.id} run ${run}: ${scoreRun(c.expect, result).outcome}`);
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+    await runReplaySuite("delegate/review/eval/suites/expected.eval.ts", {
+      out, workDir, replays: runs, fromRun, variant, manifest: manifestPath,
+      case: flags.case,
+      split: flags.split,
+      planOnly: flags["dry-run"] === "true",
+      mirrorDir: flags["mirror-dir"] ? resolve(flags["mirror-dir"]) : undefined,
+    }, concurrency);
+    if (flags["dry-run"] === "true") return;
   }
 
   if (mode === "score" || mode === "all") {

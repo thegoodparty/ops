@@ -73,6 +73,12 @@ The workflow only runs for comments from users with `OWNER`, `MEMBER`, or `COLLA
 
 ## Commands
 
+### How replays are scheduled
+
+`suites/expected.eval.ts` and `suites/pairwise.eval.ts` each declare their cases and a replay function. Vitest schedules one concurrent test per uncached (case, run). `--concurrency` caps the whole pool. CI and local runs default to 4 for pairwise and 5 for expected-result replays. `npm test` checks that 25 replays can overlap with no model calls. To try 25 under real load, set the `DELEGATE_REPLAY_CONCURRENCY` Actions variable to `25` for a trial run. Check replay wall time, checkout failures, and provider throttling before keeping it. Delete the variable to restore both defaults.
+
+To list what would replay without calling a model, use `review:eval -- replay --dry-run` or `review:expect -- --mode replay --dry-run true`, plus your normal flags. An errored replay still writes a result; scoring decides how to count it.
+
 ### Replay from a variant
 
 ```sh
@@ -85,7 +91,7 @@ npm run review:eval -- replay \
   --work-dir /tmp/review-eval
 ```
 
-For each case, clones the target repo at `bundle.headSha`, runs the agent exactly as production does, and writes a `Result` JSON per replay (`--replays`, default 1). Skips replays that already have a result file (use `--force` to re-run), so a case with one of two replays done replays only the second.
+For each case, clones the target repo at `bundle.headSha`, runs the agent exactly as production does, and writes a `Result` JSON per replay (`--replays`, default 1). Skips a replay that already has a readable result file, even if the review failed (use `--force` to re-run), so a case with one of two replays done replays only the second. Runs are independent: nothing waits on another run of the same case, so the pool is as wide as `--concurrency`.
 
 Each replay is a full agent run — budget roughly $1–5 per case depending on diff size.
 
@@ -95,7 +101,7 @@ Each replay is a full agent run — budget roughly $1–5 per case depending on 
 
 ```sh
 npm run review:eval -- cache pull --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
-# replay as usual into the same directory: cases with a result file are skipped
+# replay as usual into the same directory: a run with a reusable result is not registered
 npm run review:eval -- cache push --suite core --layout runs --key "$(npm run -s review:eval -- cache key)" --out ./results-main
 ```
 
