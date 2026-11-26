@@ -570,5 +570,17 @@
     "split": "holdout",
     "source": "production-missed",
     "kind": "architecture"
+  },
+  {
+    "id": "omni-4100-meeting-schedule-prompt-text",
+    "bundle": "omni-4100-meeting-schedule-prompt-text.bundle.json",
+    "expect": {
+      "verdict": "block",
+      "reason": "The new meetingSchedule.prompt.test.ts pins fixed prompt wording with literal phrase checks and a prohibited-word regex, so harmless rewrites break the tests without checking the agent’s behavior."
+    },
+    "tests": "Delegate approved omni#4100 at 0f59651 before the author removed the test file in ed6d2ad. Block on the assertions that pin prompt wording, not on schema validation of structured examples or on the municipal-code fallback.",
+    "split": "tune",
+    "source": "production-missed",
+    "kind": "bug"
   }
 ]
